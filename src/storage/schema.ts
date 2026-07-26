@@ -23,7 +23,20 @@ export const SQLITE_STRATEGY_SCHEMA = `
     requested_base_quantity TEXT NOT NULL,
     effective_base_quantity TEXT NOT NULL,
     preflight_json TEXT NOT NULL,
-    last_error TEXT,
+    failure_code TEXT CHECK (
+      failure_code IS NULL
+      OR failure_code IN (
+        'ORDER_SUBMISSION_FAILED',
+        'ORDER_SUBMISSION_UNKNOWN',
+        'ORDER_NOT_FOUND',
+        'NO_FILL',
+        'MISSING_AVERAGE_PRICE',
+        'HEDGE_ORDER_REJECTED',
+        'HEDGE_ORDER_CANCELED',
+        'ORDER_RECONCILIATION_FAILED',
+        'INCONSISTENT_ORDER_STATE'
+      )
+    ),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );

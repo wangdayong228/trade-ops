@@ -17,6 +17,7 @@ import type {
 import type { PreflightResult } from '../strategy/preflight-service.js';
 import { SQLITE_STRATEGY_SCHEMA } from './schema.js';
 import type {
+  StrategyFailureCode,
   StrategyOrderRecord,
   StrategyOrderStatus,
   StrategyRecord,
@@ -35,6 +36,17 @@ const STRATEGY_STATES = new Set<StrategyState>([
   'HEDGED',
   'HEDGE_INCOMPLETE',
   'FAILED'
+]);
+const STRATEGY_FAILURE_CODES = new Set<StrategyFailureCode>([
+  'ORDER_SUBMISSION_FAILED',
+  'ORDER_SUBMISSION_UNKNOWN',
+  'ORDER_NOT_FOUND',
+  'NO_FILL',
+  'MISSING_AVERAGE_PRICE',
+  'HEDGE_ORDER_REJECTED',
+  'HEDGE_ORDER_CANCELED',
+  'ORDER_RECONCILIATION_FAILED',
+  'INCONSISTENT_ORDER_STATE'
 ]);
 const ORDER_ROLES = new Set<OrderRole>([
   'SPOT_MARKET',
@@ -164,6 +176,7 @@ const SNAPSHOT_KEYS = new Set([
   'status',
   'updatedAt'
 ]);
+const MAX_EXACT_DECIMAL_PRECISION = 1_000_000;
 
 interface StrategyDbRow {
   id: unknown;
@@ -175,7 +188,7 @@ interface StrategyDbRow {
   requested_base_quantity: unknown;
   effective_base_quantity: unknown;
   preflight_json: unknown;
-  last_error: unknown;
+  failure_code: unknown;
   created_at: unknown;
   updated_at: unknown;
 }
@@ -321,6 +334,47 @@ function decimalValue(
 
 function decimalEqual(left: string, right: string): boolean {
   return new Decimal(left).eq(right);
+}
+
+function exactSumEquals(
+  requestedValue: string,
+  filledValue: string,
+  remainingValue: string,
+  context: string
+): boolean {
+  const operands = [
+    new Decimal(requestedValue),
+    new Decimal(filledValue),
+    new Decimal(remainingValue)
+  ];
+  const highestExponent = Math.max(...operands.map((value) => value.e));
+  const lowestSignificantExponent = Math.min(...operands.map(
+    (value) => value.e - value.sd() + 1
+  ));
+  const requiredPrecision =
+    highestExponent - lowestSignificantExponent + 2;
+  if (
+    !Number.isSafeInteger(requiredPrecision)
+    || requiredPrecision <= 0
+    || requiredPrecision > MAX_EXACT_DECIMAL_PRECISION
+  ) {
+    return invalid(
+      context,
+      'exact snapshot quantity comparison exceeds supported precision'
+    );
+  }
+  const ExactDecimal = Decimal.clone({
+    precision: requiredPrecision,
+    rounding: Decimal.ROUND_DOWN,
+    minE: -9_000_000_000_000_000,
+    maxE: 9_000_000_000_000_000,
+    toExpNeg: -7,
+    toExpPos: 21
+  });
+  const requested = new ExactDecimal(requestedValue);
+  const filled = new ExactDecimal(filledValue);
+  const remaining = new ExactDecimal(remainingValue);
+  return filled.plus(remaining).eq(requested);
 }
 
 function deepFreeze<T>(value: T): T {
@@ -836,7 +890,12 @@ function validatedSnapshot(
   if (
     filled.gt(requested)
     || remaining.gt(requested)
-    || !filled.plus(remaining).eq(requested)
+    || !exactSumEquals(
+      snapshot.requestedBaseQuantity,
+      snapshot.filledBaseQuantity,
+      snapshot.remainingBaseQuantity,
+      context
+    )
   ) {
     return invalid(context, 'snapshot quantity totals are inconsistent');
   }
@@ -887,11 +946,14 @@ export class SqliteStrategyRepository implements StrategyRepository {
 
   constructor(private readonly database: Database.Database) {
     this.database.exec(SQLITE_STRATEGY_SCHEMA);
+    if (this.database.pragma('foreign_keys', { simple: true }) !== 1) {
+      throw new Error('SQLite foreign keys are required for strategy storage');
+    }
     this.insertStrategy = this.database.prepare(`
       INSERT INTO strategies (
         id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
         requested_base_quantity, effective_base_quantity, preflight_json,
-        last_error, created_at, updated_at
+        failure_code, created_at, updated_at
       ) VALUES (
         @id, @state, @mode, @spotExchangeId, @contractExchangeId, @symbol,
         @requestedBaseQuantity, @effectiveBaseQuantity, @preflightJson,
@@ -903,7 +965,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     );
     this.claimStrategy = this.database.prepare(`
       UPDATE strategies
-      SET state = 'EXECUTING', last_error = NULL, updated_at = @updatedAt
+      SET state = 'EXECUTING', failure_code = NULL, updated_at = @updatedAt
       WHERE id = @id AND state = 'PENDING_CONFIRMATION'
     `);
     this.selectRecoverable = this.database.prepare(`
@@ -1094,7 +1156,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     strategyId: string,
     from: StrategyState[],
     to: StrategyState,
-    error?: string
+    failureCode?: StrategyFailureCode
   ): boolean {
     const id = nonEmptyString(strategyId, 'strategy id', 128);
     const target = enumValue(to, STRATEGY_STATES, 'strategy state');
@@ -1113,18 +1175,22 @@ export class SqliteStrategyRepository implements StrategyRepository {
         );
       }
     }
-    const lastError = error === undefined
+    const safeFailureCode = failureCode === undefined
       ? null
-      : nonEmptyString(error, 'strategy transition error', 10_000);
+      : enumValue(
+        failureCode,
+        STRATEGY_FAILURE_CODES,
+        'strategy failure code'
+      );
     const placeholders = sources.map(() => '?').join(', ');
     const statement = this.database.prepare(`
       UPDATE strategies
-      SET state = ?, last_error = ?, updated_at = ?
+      SET state = ?, failure_code = ?, updated_at = ?
       WHERE id = ? AND state IN (${placeholders})
     `);
     const result = statement.run(
       target,
-      lastError,
+      safeFailureCode,
       new Date().toISOString(),
       id,
       ...sources
@@ -1258,12 +1324,12 @@ export class SqliteStrategyRepository implements StrategyRepository {
       if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
         return invalid('persisted strategy', 'update time precedes creation');
       }
-      const lastError = row.last_error === null
+      const failureCode = row.failure_code === null
         ? null
-        : nonEmptyString(
-          row.last_error,
-          'persisted strategy last error',
-          10_000
+        : enumValue(
+          row.failure_code,
+          STRATEGY_FAILURE_CODES,
+          'persisted strategy failure code'
         );
       return deepFreeze({
         id,
@@ -1275,7 +1341,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         requestedBaseQuantity,
         effectiveBaseQuantity,
         preflight: deepFreeze(preflight),
-        lastError,
+        failureCode,
         createdAt,
         updatedAt
       });

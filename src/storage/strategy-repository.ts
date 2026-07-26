@@ -7,6 +7,17 @@ import type {
 } from '../domain/types.js';
 import type { PreflightResult } from '../strategy/preflight-service.js';
 
+export type StrategyFailureCode =
+  | 'ORDER_SUBMISSION_FAILED'
+  | 'ORDER_SUBMISSION_UNKNOWN'
+  | 'ORDER_NOT_FOUND'
+  | 'NO_FILL'
+  | 'MISSING_AVERAGE_PRICE'
+  | 'HEDGE_ORDER_REJECTED'
+  | 'HEDGE_ORDER_CANCELED'
+  | 'ORDER_RECONCILIATION_FAILED'
+  | 'INCONSISTENT_ORDER_STATE';
+
 export interface StrategyRecord {
   readonly id: string;
   readonly state: StrategyState;
@@ -17,7 +28,7 @@ export interface StrategyRecord {
   readonly requestedBaseQuantity: string;
   readonly effectiveBaseQuantity: string;
   readonly preflight: PreflightResult;
-  readonly lastError: string | null;
+  readonly failureCode: StrategyFailureCode | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -57,7 +68,7 @@ export interface StrategyRepository {
     strategyId: string,
     from: StrategyState[],
     to: StrategyState,
-    error?: string
+    failureCode?: StrategyFailureCode
   ): boolean;
   listRecoverable(): StrategyRecord[];
 }

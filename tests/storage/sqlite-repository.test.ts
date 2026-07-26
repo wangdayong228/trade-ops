@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import Database from 'better-sqlite3';
+import { Decimal } from 'decimal.js';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
 import type {
   ExecutionMode,
@@ -167,6 +168,25 @@ test('enables foreign keys for every repository connection', (t) => {
   assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
 });
 
+test('fails construction when foreign keys cannot be enabled in an active transaction', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.pragma('foreign_keys = OFF');
+  database.exec('BEGIN');
+
+  try {
+    assert.throws(
+      () => new SqliteStrategyRepository(database),
+      /foreign keys.*required/i
+    );
+    assert.equal(database.pragma('foreign_keys', { simple: true }), 0);
+  } finally {
+    if (database.inTransaction) {
+      database.exec('ROLLBACK');
+    }
+  }
+});
+
 test('only one competing confirmation can claim a pending strategy', (t) => {
   const { database, repository } = setup(t);
   const competitor = new SqliteStrategyRepository(database);
@@ -235,13 +255,13 @@ test('permits only explicit domain state transitions with SQL source guards', (t
       id,
       ['EXECUTING'],
       'HEDGE_INCOMPLETE',
-      'exchange rejected hedge'
+      'HEDGE_ORDER_REJECTED'
     ),
     true
   );
   assert.equal(
-    repository.getStrategy(id).lastError,
-    'exchange rejected hedge'
+    repository.getStrategy(id).failureCode,
+    'HEDGE_ORDER_REJECTED'
   );
   assert.throws(
     () => repository.transition(
@@ -250,6 +270,67 @@ test('permits only explicit domain state transitions with SQL source guards', (t
       'EXECUTING'
     ),
     /illegal strategy state transition/i
+  );
+});
+
+test('transition persists only allowlisted failure codes and never arbitrary secrets', (t) => {
+  const sensitiveValues = [
+    'apiKey=review-fixture-api-key',
+    'secret=review-fixture-secret',
+    'password=review-fixture-password',
+    'signature=review-fixture-signature'
+  ];
+
+  for (const sensitiveValue of sensitiveValues) {
+    const { database, repository } = setup(t);
+    const id = repository.createPending(preflight()).id;
+    repository.claimForExecution(id);
+    const reviewedRepository = repository as unknown as {
+      transition(
+        strategyId: string,
+        from: StrategyState[],
+        to: StrategyState,
+        failureCode?: unknown
+      ): boolean;
+    };
+
+    assert.throws(
+      () => reviewedRepository.transition(
+        id,
+        ['EXECUTING'],
+        'FAILED',
+        sensitiveValue
+      ),
+      /failure code/i
+    );
+
+    const rawCells = JSON.stringify(database.prepare(
+      'SELECT * FROM strategies'
+    ).all());
+    assert.equal(rawCells.includes(sensitiveValue), false);
+    const loaded = repository.getStrategy(id) as unknown as
+      Record<string, unknown>;
+    assert.equal(loaded.state, 'EXECUTING');
+    assert.equal(loaded.failureCode, null);
+    assert.equal(Object.hasOwn(loaded, 'lastError'), false);
+    assert.equal(JSON.stringify(repository.listRecoverable()).includes(
+      sensitiveValue
+    ), false);
+  }
+});
+
+test('fails closed when a persisted strategy failure code is unknown', (t) => {
+  const { database, repository } = setup(t);
+  const id = repository.createPending(preflight()).id;
+  database.pragma('ignore_check_constraints = ON');
+  database.prepare(
+    'UPDATE strategies SET failure_code = ? WHERE id = ?'
+  ).run('UNSAFE_FAILURE_CODE', id);
+  database.pragma('ignore_check_constraints = OFF');
+
+  assert.throws(
+    () => repository.getStrategy(id),
+    /invalid persisted strategy/i
   );
 });
 
@@ -724,6 +805,56 @@ test('rejects inconsistent, non-finite, and regressing snapshot quantities', (t)
     );
   }
   assert.equal(repository.listOrderEvents(row.id).length, 1);
+});
+
+test('uses exact snapshot arithmetic independently of global Decimal precision', async (t) => {
+  const originalDecimalSettings = {
+    precision: Decimal.precision,
+    rounding: Decimal.rounding
+  };
+  t.after(() => Decimal.set(originalDecimalSettings));
+
+  for (const precision of [20, 40]) {
+    await t.test(`global precision ${precision}`, (child) => {
+      Decimal.set({ precision, rounding: Decimal.ROUND_DOWN });
+      const { database, repository } = setup(child);
+      const strategyId = repository.createPending(preflight()).id;
+      const request = requestFor(strategyId, 'SPOT_MARKET');
+      const row = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+
+      assert.throws(
+        () => repository.attachOrderSnapshot(
+          row.id,
+          snapshotFor(request, 'bitget', {
+            filledBaseQuantity:
+              '0.99999999999999999999999999999999999999999',
+            remainingBaseQuantity:
+              '0.00000000000000000000000000000000000000002'
+          })
+        ),
+        /snapshot quantity/i
+      );
+      assert.equal(
+        database.prepare(
+          'SELECT COUNT(*) FROM order_events WHERE strategy_order_id = ?'
+        ).pluck().get(row.id),
+        0
+      );
+      assert.equal(repository.listOrders(strategyId)[0]?.status, 'planned');
+      assert.equal(repository.listOrders(strategyId)[0]?.snapshot, null);
+
+      repository.attachOrderSnapshot(
+        row.id,
+        snapshotFor(request, 'bitget', {
+          filledBaseQuantity:
+            '0.99999999999999999999999999999999999999999',
+          remainingBaseQuantity:
+            '0.00000000000000000000000000000000000000001'
+        })
+      );
+      assert.equal(repository.listOrderEvents(row.id).length, 1);
+    });
+  }
 });
 
 test('rejects exchange-order identity changes and terminal status regression', (t) => {
