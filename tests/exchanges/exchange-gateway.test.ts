@@ -6,7 +6,11 @@ import {
   baseToExchangeAmount,
   exchangeAmountToBase
 } from '../../src/exchanges/exchange-gateway.js';
-import type { MarketRules } from '../../src/domain/types.js';
+import type {
+  MarketRules,
+  OrderRequest,
+  OrderSnapshot
+} from '../../src/domain/types.js';
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 import { order } from '../support/order-fixtures.js';
 
@@ -216,6 +220,240 @@ test('fake gateway throws descriptive errors for missing required configuration'
   );
   assert.equal(
     await gateway.findOrderByClientId('unknown-client', 'BTC/USDT', 'spot'),
+    null
+  );
+});
+
+test('fake gateway rejects unsafe create quantities before submission side effects', async () => {
+  const validRequest: OrderRequest = {
+    symbol: 'BTC/USDT',
+    kind: 'spot',
+    type: 'market',
+    side: 'buy',
+    baseQuantity: '1',
+    clientOrderId: 'valid-client'
+  };
+
+  for (const baseQuantity of ['0', '-1', 'NaN', 'Infinity']) {
+    const gateway = new FakeExchangeGateway('test-exchange');
+    const created = order({ clientOrderId: validRequest.clientOrderId });
+    gateway.createResults.push(created);
+
+    await assert.rejects(
+      gateway.createOrder({
+        ...validRequest,
+        baseQuantity,
+        clientOrderId: `invalid-${baseQuantity}`
+      }),
+      /OrderRequest\.baseQuantity/
+    );
+
+    assert.deepEqual(gateway.createdRequests, []);
+    assert.equal(
+      await gateway.findOrderByClientId(
+        `invalid-${baseQuantity}`,
+        validRequest.symbol,
+        validRequest.kind
+      ),
+      null
+    );
+    assert.equal(await gateway.createOrder(validRequest), created);
+  }
+});
+
+test('fake gateway preserves a complete swap limit short request', async () => {
+  const gateway = new FakeExchangeGateway('test-exchange');
+  const request: OrderRequest = {
+    symbol: 'BTC/USDT',
+    kind: 'swap',
+    type: 'limit',
+    side: 'sell',
+    baseQuantity: '0.8',
+    price: '61000',
+    timeInForce: 'GTC',
+    clientOrderId: 'strategy-1:CONTRACT_HEDGE_GTC',
+    positionSide: 'SHORT'
+  };
+  const created = order({
+    exchangeOrderId: 'swap-limit-1',
+    clientOrderId: request.clientOrderId,
+    kind: request.kind,
+    type: request.type,
+    side: request.side,
+    requestedBaseQuantity: request.baseQuantity,
+    remainingBaseQuantity: request.baseQuantity
+  });
+  gateway.createResults.push(created);
+
+  assert.equal(await gateway.createOrder(request), created);
+  assert.deepEqual(gateway.createdRequests, [request]);
+  assert.equal(
+    await gateway.findOrderByClientId(
+      request.clientOrderId,
+      request.symbol,
+      request.kind
+    ),
+    created
+  );
+});
+
+test('fake gateway rejects create snapshots that conflict with request identity', async () => {
+  const request: OrderRequest = {
+    symbol: 'BTC/USDT',
+    kind: 'spot',
+    type: 'market',
+    side: 'buy',
+    baseQuantity: '1',
+    clientOrderId: 'client-1'
+  };
+  const mismatches: Array<{
+    field: keyof OrderSnapshot;
+    overrides: Partial<OrderSnapshot>;
+  }> = [
+    { field: 'exchangeId', overrides: { exchangeId: 'other-exchange' } },
+    { field: 'clientOrderId', overrides: { clientOrderId: 'other-client' } },
+    { field: 'symbol', overrides: { symbol: 'ETH/USDT' } },
+    { field: 'kind', overrides: { kind: 'swap' } },
+    { field: 'type', overrides: { type: 'limit' } },
+    { field: 'side', overrides: { side: 'sell' } },
+    {
+      field: 'requestedBaseQuantity',
+      overrides: { requestedBaseQuantity: '2' }
+    }
+  ];
+
+  for (const { field, overrides } of mismatches) {
+    const gateway = new FakeExchangeGateway('test-exchange');
+    gateway.createResults.push(order(overrides));
+
+    await assert.rejects(
+      gateway.createOrder(request),
+      new RegExp(`configured create snapshot.*${field}`)
+    );
+    assert.equal(
+      await gateway.findOrderByClientId(
+        request.clientOrderId,
+        request.symbol,
+        request.kind
+      ),
+      null
+    );
+  }
+});
+
+test('fake gateway rejects fetch snapshots that conflict with lookup identity', async () => {
+  const mismatches: Array<{
+    field: 'exchangeOrderId' | 'symbol' | 'kind';
+    overrides: Partial<OrderSnapshot>;
+  }> = [
+    {
+      field: 'exchangeOrderId',
+      overrides: { exchangeOrderId: 'other-order' }
+    },
+    { field: 'symbol', overrides: { symbol: 'ETH/USDT' } },
+    { field: 'kind', overrides: { kind: 'swap' } }
+  ];
+
+  for (const { field, overrides } of mismatches) {
+    const gateway = new FakeExchangeGateway('test-exchange');
+    gateway.fetchResults.set('fetch-1', [
+      order({ exchangeOrderId: 'fetch-1', ...overrides })
+    ]);
+
+    await assert.rejects(
+      gateway.fetchOrder('fetch-1', 'BTC/USDT', 'spot'),
+      new RegExp(`configured fetch snapshot.*${field}`)
+    );
+  }
+});
+
+test('fake gateway recovers an exchange-created order after client timeout', async () => {
+  const gateway = new FakeExchangeGateway('test-exchange');
+  const request: OrderRequest = {
+    symbol: 'BTC/USDT',
+    kind: 'swap',
+    type: 'market',
+    side: 'sell',
+    baseQuantity: '0.6',
+    clientOrderId: 'strategy-1:CONTRACT_MARKET',
+    positionSide: 'SHORT'
+  };
+  const created = order({
+    exchangeOrderId: 'contract-market-1',
+    clientOrderId: request.clientOrderId,
+    kind: request.kind,
+    type: request.type,
+    side: request.side,
+    requestedBaseQuantity: request.baseQuantity,
+    filledBaseQuantity: request.baseQuantity,
+    remainingBaseQuantity: '0',
+    averagePrice: '61000',
+    status: 'closed'
+  });
+  gateway.createResults.push(created);
+  gateway.createErrors.set(
+    request.clientOrderId,
+    new Error('exchange response timed out')
+  );
+
+  await assert.rejects(
+    gateway.createOrder(request),
+    /exchange response timed out/
+  );
+  assert.deepEqual(gateway.createdRequests, [request]);
+  assert.equal(
+    await gateway.findOrderByClientId(
+      request.clientOrderId,
+      request.symbol,
+      request.kind
+    ),
+    created
+  );
+});
+
+test('fresh fake can seed a validated exchange-observed order for restart recovery', async () => {
+  const restarted = new FakeExchangeGateway('test-exchange');
+  const observed = order({
+    exchangeOrderId: 'spot-gtc-1',
+    clientOrderId: 'strategy-1:SPOT_HEDGE_GTC',
+    type: 'limit',
+    requestedBaseQuantity: '0.6',
+    filledBaseQuantity: '0.2',
+    remainingBaseQuantity: '0.4',
+    averagePrice: '61000'
+  });
+
+  restarted.seedObservedOrder(observed);
+
+  assert.equal(
+    await restarted.findOrderByClientId(
+      observed.clientOrderId,
+      observed.symbol,
+      observed.kind
+    ),
+    observed
+  );
+  assert.equal(
+    await restarted.findOrderByClientId(
+      observed.clientOrderId,
+      'ETH/USDT',
+      observed.kind
+    ),
+    null
+  );
+  assert.throws(
+    () => restarted.seedObservedOrder(order({
+      exchangeId: 'other-exchange',
+      clientOrderId: 'invalid-seed'
+    })),
+    /observed snapshot.*exchangeId/
+  );
+  assert.equal(
+    await restarted.findOrderByClientId(
+      'invalid-seed',
+      'BTC/USDT',
+      'spot'
+    ),
     null
   );
 });
