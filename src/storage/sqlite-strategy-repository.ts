@@ -48,6 +48,10 @@ const STRATEGY_FAILURE_CODES = new Set<StrategyFailureCode>([
   'ORDER_RECONCILIATION_FAILED',
   'INCONSISTENT_ORDER_STATE'
 ]);
+const FAILURE_STATES = new Set<StrategyState>([
+  'HEDGE_INCOMPLETE',
+  'FAILED'
+]);
 const ORDER_ROLES = new Set<OrderRole>([
   'SPOT_MARKET',
   'CONTRACT_MARKET',
@@ -177,6 +181,18 @@ const SNAPSHOT_KEYS = new Set([
   'updatedAt'
 ]);
 const MAX_EXACT_DECIMAL_PRECISION = 1_000_000;
+const STORAGE_DECIMAL_MIN_EXPONENT = -9_000_000_000_000_000;
+const STORAGE_DECIMAL_MAX_EXPONENT = 9_000_000_000_000_000;
+const DECIMAL_STRING_PATTERN =
+  /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+const StorageDecimal = Decimal.clone({
+  precision: MAX_EXACT_DECIMAL_PRECISION,
+  rounding: Decimal.ROUND_DOWN,
+  minE: STORAGE_DECIMAL_MIN_EXPONENT,
+  maxE: STORAGE_DECIMAL_MAX_EXPONENT,
+  toExpNeg: -7,
+  toExpPos: 21
+});
 
 interface StrategyDbRow {
   id: unknown;
@@ -219,6 +235,39 @@ interface LatestEventDbRow {
 }
 
 type DataObject = Record<string, unknown>;
+
+function sqliteIntegerEquals(value: unknown, expected: number): boolean {
+  return (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value === expected
+  ) || (
+    typeof value === 'bigint'
+    && value === BigInt(expected)
+  );
+}
+
+function isPositiveSqliteInteger(value: unknown): boolean {
+  return (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value > 0
+  ) || (
+    typeof value === 'bigint'
+    && value > 0n
+  );
+}
+
+function isNonNegativeSqliteInteger(value: unknown): boolean {
+  return (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+  ) || (
+    typeof value === 'bigint'
+    && value >= 0n
+  );
+}
 
 function invalid(context: string, detail: string): never {
   throw new Error(`invalid ${context}: ${detail}`);
@@ -311,14 +360,24 @@ function decimalValue(
   context: string,
   allowZero: boolean
 ): string {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 10_000) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > 10_000
+    || !DECIMAL_STRING_PATTERN.test(value)
+  ) {
     return invalid(context, 'must be a bounded decimal string');
   }
   let parsed: Decimal;
   try {
-    parsed = new Decimal(value);
+    parsed = new StorageDecimal(value);
   } catch {
     return invalid(context, 'must be a decimal string');
+  }
+  const coefficient = value.split(/[eE]/, 1)[0] ?? '';
+  const lexicalValueIsZero = !/[1-9]/.test(coefficient);
+  if (parsed.isZero() && !lexicalValueIsZero) {
+    return invalid(context, 'must be within the supported exponent range');
   }
   if (
     !parsed.isFinite()
@@ -333,7 +392,7 @@ function decimalValue(
 }
 
 function decimalEqual(left: string, right: string): boolean {
-  return new Decimal(left).eq(right);
+  return new StorageDecimal(left).eq(right);
 }
 
 function exactSumEquals(
@@ -343,9 +402,9 @@ function exactSumEquals(
   context: string
 ): boolean {
   const operands = [
-    new Decimal(requestedValue),
-    new Decimal(filledValue),
-    new Decimal(remainingValue)
+    new StorageDecimal(requestedValue),
+    new StorageDecimal(filledValue),
+    new StorageDecimal(remainingValue)
   ];
   const highestExponent = Math.max(...operands.map((value) => value.e));
   const lowestSignificantExponent = Math.min(...operands.map(
@@ -363,14 +422,7 @@ function exactSumEquals(
       'exact snapshot quantity comparison exceeds supported precision'
     );
   }
-  const ExactDecimal = Decimal.clone({
-    precision: requiredPrecision,
-    rounding: Decimal.ROUND_DOWN,
-    minE: -9_000_000_000_000_000,
-    maxE: 9_000_000_000_000_000,
-    toExpNeg: -7,
-    toExpPos: 21
-  });
+  const ExactDecimal = StorageDecimal.clone({ precision: requiredPrecision });
   const requested = new ExactDecimal(requestedValue);
   const filled = new ExactDecimal(filledValue);
   const remaining = new ExactDecimal(remainingValue);
@@ -485,14 +537,14 @@ function publicMarketSnapshot(
   }
   if (
     result.maxBaseAmount !== undefined
-    && new Decimal(result.minBaseAmount).gt(result.maxBaseAmount)
+    && new StorageDecimal(result.minBaseAmount).gt(result.maxBaseAmount)
   ) {
     return invalid(context, 'minimum base amount exceeds maximum');
   }
   if (
     result.minQuoteNotional !== undefined
     && result.maxQuoteNotional !== undefined
-    && new Decimal(result.minQuoteNotional).gt(result.maxQuoteNotional)
+    && new StorageDecimal(result.minQuoteNotional).gt(result.maxQuoteNotional)
   ) {
     return invalid(context, 'minimum quote notional exceeds maximum');
   }
@@ -564,7 +616,7 @@ function publicPreflightSnapshot(value: unknown): PreflightResult {
     `${context} effective base quantity`,
     false
   );
-  if (new Decimal(effectiveBaseQuantity).gt(requestedBaseQuantity)) {
+  if (new StorageDecimal(effectiveBaseQuantity).gt(requestedBaseQuantity)) {
     return invalid(context, 'effective quantity exceeds requested quantity');
   }
   const spotMarket = publicMarketSnapshot(object.spotMarket, {
@@ -784,7 +836,11 @@ function validatedRequestForRole(
   ) {
     return invalid(prefix, 'spot request cannot contain contract fields');
   }
-  if (new Decimal(request.baseQuantity).gt(strategy.effectiveBaseQuantity)) {
+  if (
+    new StorageDecimal(request.baseQuantity).gt(
+      strategy.effectiveBaseQuantity
+    )
+  ) {
     return invalid(prefix, 'request quantity exceeds strategy quantity');
   }
   if (request.clientOrderId !== makeClientOrderId(strategy.id, role)) {
@@ -884,9 +940,9 @@ function validatedSnapshot(
   ) {
     return invalid(context, 'requested quantity does not match planned request');
   }
-  const requested = new Decimal(snapshot.requestedBaseQuantity);
-  const filled = new Decimal(snapshot.filledBaseQuantity);
-  const remaining = new Decimal(snapshot.remainingBaseQuantity);
+  const requested = new StorageDecimal(snapshot.requestedBaseQuantity);
+  const filled = new StorageDecimal(snapshot.filledBaseQuantity);
+  const remaining = new StorageDecimal(snapshot.remainingBaseQuantity);
   if (
     filled.gt(requested)
     || remaining.gt(requested)
@@ -946,7 +1002,10 @@ export class SqliteStrategyRepository implements StrategyRepository {
 
   constructor(private readonly database: Database.Database) {
     this.database.exec(SQLITE_STRATEGY_SCHEMA);
-    if (this.database.pragma('foreign_keys', { simple: true }) !== 1) {
+    if (!sqliteIntegerEquals(
+      this.database.pragma('foreign_keys', { simple: true }),
+      1
+    )) {
       throw new Error('SQLite foreign keys are required for strategy storage');
     }
     this.insertStrategy = this.database.prepare(`
@@ -966,7 +1025,10 @@ export class SqliteStrategyRepository implements StrategyRepository {
     this.claimStrategy = this.database.prepare(`
       UPDATE strategies
       SET state = 'EXECUTING', failure_code = NULL, updated_at = @updatedAt
-      WHERE id = @id AND state = 'PENDING_CONFIRMATION'
+      WHERE
+        id = @id
+        AND state = 'PENDING_CONFIRMATION'
+        AND failure_code IS NULL
     `);
     this.selectRecoverable = this.database.prepare(`
       SELECT *
@@ -1081,7 +1143,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       id: strategyId,
       updatedAt: new Date().toISOString()
     });
-    return result.changes === 1;
+    return sqliteIntegerEquals(result.changes, 1);
   }
 
   planOrder(
@@ -1112,11 +1174,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     let previous: OrderSnapshot | null = null;
     for (const row of rows) {
       const snapshot = safely('persisted order event', () => {
-        if (
-          typeof row.id !== 'number'
-          || !Number.isSafeInteger(row.id)
-          || row.id <= 0
-        ) {
+        if (!isPositiveSqliteInteger(row.id)) {
           return invalid('persisted order event', 'id is invalid');
         }
         isoTimestamp(row.recorded_at, 'persisted order event recording time');
@@ -1182,11 +1240,21 @@ export class SqliteStrategyRepository implements StrategyRepository {
         STRATEGY_FAILURE_CODES,
         'strategy failure code'
       );
+    if (
+      FAILURE_STATES.has(target) !== (safeFailureCode !== null)
+    ) {
+      throw new Error(
+        'invalid strategy failure code: must match the target state'
+      );
+    }
     const placeholders = sources.map(() => '?').join(', ');
     const statement = this.database.prepare(`
       UPDATE strategies
       SET state = ?, failure_code = ?, updated_at = ?
-      WHERE id = ? AND state IN (${placeholders})
+      WHERE
+        id = ?
+        AND state IN (${placeholders})
+        AND failure_code IS NULL
     `);
     const result = statement.run(
       target,
@@ -1195,7 +1263,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       id,
       ...sources
     );
-    return result.changes === 1;
+    return sqliteIntegerEquals(result.changes, 1);
   }
 
   listRecoverable(): StrategyRecord[] {
@@ -1254,7 +1322,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ? null
         : JSON.stringify(order.snapshot)
     });
-    if (result.changes !== 1) {
+    if (!sqliteIntegerEquals(result.changes, 1)) {
       throw new Error('strategy order changed during snapshot attachment');
     }
   }
@@ -1331,6 +1399,12 @@ export class SqliteStrategyRepository implements StrategyRepository {
           STRATEGY_FAILURE_CODES,
           'persisted strategy failure code'
         );
+      if (FAILURE_STATES.has(state) !== (failureCode !== null)) {
+        return invalid(
+          'persisted strategy',
+          'failure code does not match state'
+        );
+      }
       return deepFreeze({
         id,
         state,
@@ -1496,22 +1570,21 @@ export class SqliteStrategyRepository implements StrategyRepository {
           id,
           id
         ) as LatestEventDbRow;
-        if (
-          typeof eventRow.event_count !== 'number'
-          || !Number.isSafeInteger(eventRow.event_count)
-          || eventRow.event_count < 0
-        ) {
+        if (!isNonNegativeSqliteInteger(eventRow.event_count)) {
           return invalid(
             'persisted strategy order',
             'event count is invalid'
           );
         }
         if (
-          (snapshot === null && eventRow.event_count !== 0)
+          (snapshot === null && !sqliteIntegerEquals(
+            eventRow.event_count,
+            0
+          ))
           || (
             snapshot !== null
             && (
-              eventRow.event_count === 0
+              sqliteIntegerEquals(eventRow.event_count, 0)
               || eventRow.latest_snapshot_json !== row.snapshot_json
             )
           )

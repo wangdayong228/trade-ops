@@ -187,6 +187,34 @@ test('fails construction when foreign keys cannot be enabled in an active transa
   }
 });
 
+test('supports foreign keys and event persistence with SQLite safe integers', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.defaultSafeIntegers(true);
+
+  const repository = new SqliteStrategyRepository(database);
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1n);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const order = repository.planOrder(
+    strategyId,
+    'SPOT_MARKET',
+    request
+  );
+
+  repository.attachOrderSnapshot(
+    order.id,
+    snapshotFor(request, 'bitget', {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6'
+    })
+  );
+
+  assert.equal(repository.listOrders(strategyId)[0]?.status, 'open');
+  assert.equal(repository.listOrderEvents(order.id).length, 1);
+});
+
 test('only one competing confirmation can claim a pending strategy', (t) => {
   const { database, repository } = setup(t);
   const competitor = new SqliteStrategyRepository(database);
@@ -319,7 +347,7 @@ test('transition persists only allowlisted failure codes and never arbitrary sec
   }
 });
 
-test('fails closed when a persisted strategy failure code is unknown', (t) => {
+test('never claims or launders a persisted unknown failure code', (t) => {
   const { database, repository } = setup(t);
   const id = repository.createPending(preflight()).id;
   database.pragma('ignore_check_constraints = ON');
@@ -331,6 +359,77 @@ test('fails closed when a persisted strategy failure code is unknown', (t) => {
   assert.throws(
     () => repository.getStrategy(id),
     /invalid persisted strategy/i
+  );
+  const before = database.prepare(
+    'SELECT state, failure_code FROM strategies WHERE id = ?'
+  ).get(id);
+
+  assert.equal(repository.claimForExecution(id), false);
+  assert.equal(
+    repository.transition(id, ['PENDING_CONFIRMATION'], 'EXECUTING'),
+    false
+  );
+  assert.deepEqual(
+    database.prepare(
+      'SELECT state, failure_code FROM strategies WHERE id = ?'
+    ).get(id),
+    before
+  );
+  assert.throws(
+    () => repository.getStrategy(id),
+    /invalid persisted strategy/i
+  );
+});
+
+test('keeps failure codes consistent with strategy state', (t) => {
+  const { database, repository } = setup(t);
+  const id = repository.createPending(preflight()).id;
+
+  assert.throws(
+    () => database.prepare(
+      'UPDATE strategies SET failure_code = ? WHERE id = ?'
+    ).run('ORDER_SUBMISSION_FAILED', id),
+    /CHECK constraint/i
+  );
+  assert.throws(
+    () => repository.transition(
+      id,
+      ['PENDING_CONFIRMATION'],
+      'EXECUTING',
+      'ORDER_SUBMISSION_FAILED'
+    ),
+    /failure code/i
+  );
+  assert.equal(repository.claimForExecution(id), true);
+  assert.throws(
+    () => repository.transition(id, ['EXECUTING'], 'FAILED'),
+    /failure code/i
+  );
+  assert.equal(repository.getStrategy(id).state, 'EXECUTING');
+});
+
+test('fails closed on a persisted state and failure-code mismatch', (t) => {
+  const { database, repository } = setup(t);
+  const id = repository.createPending(preflight()).id;
+  database.pragma('ignore_check_constraints = ON');
+  database.prepare(
+    'UPDATE strategies SET failure_code = ? WHERE id = ?'
+  ).run('ORDER_SUBMISSION_FAILED', id);
+  database.pragma('ignore_check_constraints = OFF');
+
+  assert.throws(
+    () => repository.getStrategy(id),
+    /invalid persisted strategy/i
+  );
+  assert.equal(repository.claimForExecution(id), false);
+  assert.deepEqual(
+    database.prepare(
+      'SELECT state, failure_code FROM strategies WHERE id = ?'
+    ).get(id),
+    {
+      state: 'PENDING_CONFIRMATION',
+      failure_code: 'ORDER_SUBMISSION_FAILED'
+    }
   );
 });
 
@@ -810,7 +909,13 @@ test('rejects inconsistent, non-finite, and regressing snapshot quantities', (t)
 test('uses exact snapshot arithmetic independently of global Decimal precision', async (t) => {
   const originalDecimalSettings = {
     precision: Decimal.precision,
-    rounding: Decimal.rounding
+    rounding: Decimal.rounding,
+    minE: Decimal.minE,
+    maxE: Decimal.maxE,
+    toExpNeg: Decimal.toExpNeg,
+    toExpPos: Decimal.toExpPos,
+    modulo: Decimal.modulo,
+    crypto: Decimal.crypto
   };
   t.after(() => Decimal.set(originalDecimalSettings));
 
@@ -855,6 +960,73 @@ test('uses exact snapshot arithmetic independently of global Decimal precision',
       assert.equal(repository.listOrderEvents(row.id).length, 1);
     });
   }
+});
+
+test('does not let ambient Decimal exponent settings underflow snapshot quantities', (t) => {
+  const originalMinE = Decimal.minE;
+  t.after(() => Decimal.set({ minE: originalMinE }));
+  const { database, repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const row = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+  Decimal.set({ minE: -2 });
+
+  assert.equal(repository.getStrategy(strategyId).id, strategyId);
+  assert.throws(
+    () => repository.attachOrderSnapshot(
+      row.id,
+      snapshotFor(request, 'bitget', {
+        filledBaseQuantity: '1',
+        remainingBaseQuantity: '.001'
+      })
+    ),
+    /snapshot quantity/i
+  );
+  assert.equal(
+    database.prepare(
+      'SELECT COUNT(*) FROM order_events WHERE strategy_order_id = ?'
+    ).pluck().get(row.id),
+    0
+  );
+  assert.equal(repository.listOrders(strategyId)[0]?.status, 'planned');
+  assert.equal(repository.listOrders(strategyId)[0]?.snapshot, null);
+
+  repository.attachOrderSnapshot(
+    row.id,
+    snapshotFor(request, 'bitget', {
+      filledBaseQuantity:
+        '0.99999999999999999999999999999999999999999',
+      remainingBaseQuantity:
+        '0.00000000000000000000000000000000000000001'
+    })
+  );
+  assert.equal(repository.listOrderEvents(row.id).length, 1);
+});
+
+test('rejects nonzero decimals beyond the private exponent range', (t) => {
+  const { database, repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const row = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+
+  assert.throws(
+    () => repository.attachOrderSnapshot(
+      row.id,
+      snapshotFor(request, 'bitget', {
+        filledBaseQuantity: '1',
+        remainingBaseQuantity: '1e-9000000000000001'
+      })
+    ),
+    /snapshot quantity/i
+  );
+  assert.equal(
+    database.prepare(
+      'SELECT COUNT(*) FROM order_events WHERE strategy_order_id = ?'
+    ).pluck().get(row.id),
+    0
+  );
+  assert.equal(repository.listOrders(strategyId)[0]?.status, 'planned');
+  assert.equal(repository.listOrders(strategyId)[0]?.snapshot, null);
 });
 
 test('rejects exchange-order identity changes and terminal status regression', (t) => {

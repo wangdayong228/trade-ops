@@ -38,7 +38,18 @@ export const SQLITE_STRATEGY_SCHEMA = `
       )
     ),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (
+        state IN ('HEDGE_INCOMPLETE', 'FAILED')
+        AND failure_code IS NOT NULL
+      )
+      OR
+      (
+        state NOT IN ('HEDGE_INCOMPLETE', 'FAILED')
+        AND failure_code IS NULL
+      )
+    )
   );
 
   CREATE TABLE IF NOT EXISTS strategy_orders (
