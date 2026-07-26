@@ -22,6 +22,8 @@
 - GTC orders have no local expiry and are never automatically canceled, repriced, resubmitted, rolled back, or closed.
 - SQLite is the only persistence service and the first release runs as one application process.
 - API credentials are never stored in SQLite or logs and must not have withdrawal permission.
+- Client order IDs are deterministic 32-character lowercase alphanumeric digests of strategy ID plus order role; literal `${strategyId}:${role}` values must never be sent to an exchange.
+- Bitget spot market buys use a fresh ask price, falling back to last price, to convert requested base quantity into Bitget's quote-cost request; the actual base fill remains the hedge target, and missing reference prices block submission.
 - Closing the hedge is outside this plan.
 
 ---
@@ -37,6 +39,7 @@ src/config/exchange-credentials.ts        environment-backed secret lookup
 src/domain/decimal.ts                     Decimal.js construction and serialization
 src/domain/types.ts                       strategy, order, market, and API types
 src/domain/quantity-normalizer.ts         common executable base-quantity calculation
+src/domain/client-order-id.ts             OKX-safe deterministic client order IDs
 src/exchanges/exchange-gateway.ts         normalized exchange interface
 src/exchanges/ccxt-exchange-gateway.ts    CCXT implementation
 src/exchanges/exchange-registry.ts        configured gateway lookup
@@ -500,6 +503,7 @@ git commit -m "feat: define normalized exchange contracts"
 
 **Files:**
 - Create: `src/config/exchange-credentials.ts`
+- Create: `src/domain/client-order-id.ts`
 - Create: `src/exchanges/ccxt-exchange-gateway.ts`
 - Create: `src/exchanges/exchange-registry.ts`
 - Create: `src/exchanges/exchange-profile.ts`
@@ -513,6 +517,7 @@ git commit -m "feat: define normalized exchange contracts"
 - Produces: `CcxtExchangeGateway`
 - Produces: `ExchangeRegistry.get(exchangeId: string): ExchangeGateway`
 - Produces: `ExchangeProfile` implementations for `bitget` and `okx`
+- Produces: `makeClientOrderId(strategyId: string, role: OrderRole): string`
 
 - [ ] **Step 1: Write failing adapter tests with an injected CCXT double**
 
@@ -556,6 +561,13 @@ test('creates a hedged-mode short with GTC and a stable client id', async () => 
     reduceOnly: false,
     positionSide: 'SHORT'
   });
+});
+
+test('creates a deterministic OKX-safe client order id', () => {
+  const id = makeClientOrderId('strategy-uuid', 'CONTRACT_HEDGE_GTC');
+  assert.match(id, /^[a-z0-9]{32}$/);
+  assert.equal(id, makeClientOrderId('strategy-uuid', 'CONTRACT_HEDGE_GTC'));
+  assert.notEqual(id, makeClientOrderId('strategy-uuid', 'SPOT_HEDGE_GTC'));
 });
 ```
 
@@ -608,11 +620,15 @@ export function loadExchangeCredentials(
 7. Use `amountToPrecision` and `priceToPrecision` immediately before submission.
 8. Pass `reduceOnly: false`; pass `positionSide: 'SHORT'` only when required by the account snapshot.
 9. Normalize `fetchOrder`, `fetchOpenOrders`, and `fetchClosedOrders` results into `OrderSnapshot`.
-10. Implement `findOrderByClientId` by scanning open and closed orders for the same symbol without submitting a replacement.
+10. Implement `findOrderByClientId` with Bitget/OKX direct client-ID order lookup without submitting a replacement.
 
 Expose `quantizePrice` by resolving the normalized market and returning `exchange.priceToPrecision(exchangeSymbol, price)`. The coordinator must use this method for every GTC price.
 
 `ExchangeProfile` is the only place allowed to add exchange-specific order parameters. Implement one profile for Bitget and one for OKX using their verified CCXT adapter/API semantics for client order IDs, GTC, and hedged-position direction. The registry accepts only `bitget` and `okx`; any other exchange ID is rejected before a gateway is constructed.
+
+For Bitget spot market buys, the profile must fetch a fresh ticker immediately before submission, use `ask` and fall back to `last`, and pass that price to CCXT so it can convert base quantity to quote cost. Reject the order if neither price is finite and positive. Normalize returned fills back to base quantity; do not treat the conversion price as an actual fill price.
+
+For both Bitget and OKX, `findOrderByClientId` must use the exchange's direct `fetchOrder` client-ID parameter first. It must return `null` only for a verified order-not-found response and must propagate authentication, permission, network, and malformed-response errors. It must never submit a replacement.
 
 The order parameter builder must be a pure function with this exact behavior:
 
@@ -925,7 +941,7 @@ git commit -m "feat: persist hedge strategy state"
 **Interfaces:**
 - Consumes: `ExchangeRegistry`, `StrategyRepository`, persisted `PreflightResult`
 - Produces: `HedgeCoordinator.confirmAndExecute(strategyId: string): Promise<void>`
-- Produces: stable client IDs `${strategyId}:${role}`
+- Produces: stable client IDs from `makeClientOrderId(strategyId, role)`
 
 - [ ] **Step 1: Write failing sequential-mode tests**
 
@@ -1015,7 +1031,7 @@ Expected: FAIL because `HedgeCoordinator` does not exist.
 
 Add a private `submit` method with this sequence:
 
-1. Create the stable client order ID from strategy ID and order role.
+1. Create the stable 32-character lowercase alphanumeric client order ID with `makeClientOrderId(strategyId, role)`.
 2. Call `repository.planOrder` before contacting the exchange.
 3. Call `gateway.createOrder`.
 4. Persist the returned snapshot.
