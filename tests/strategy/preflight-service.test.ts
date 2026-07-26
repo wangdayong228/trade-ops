@@ -17,6 +17,58 @@ import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
 
+function deferred(): {
+  promise: Promise<void>;
+  resolve: () => void;
+} {
+  let resolvePromise!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
+class DeferredReadGateway extends FakeExchangeGateway {
+  readonly readStarted = deferred();
+  readonly continueRead = deferred();
+
+  override async fetchFreeBalance(
+    asset: 'USDT',
+    kind: MarketKind
+  ): Promise<string> {
+    this.readStarted.resolve();
+    await this.continueRead.promise;
+    return super.fetchFreeBalance(asset, kind);
+  }
+}
+
+class ReadTrackingGateway extends FakeExchangeGateway {
+  readonly readRequests: string[] = [];
+
+  override async fetchFreeBalance(
+    asset: 'USDT',
+    kind: MarketKind
+  ): Promise<string> {
+    this.readRequests.push(`balance:${asset}:${kind}`);
+    return super.fetchFreeBalance(asset, kind);
+  }
+
+  override async fetchAccountSettings(
+    symbol: string
+  ): Promise<AccountSettings> {
+    this.readRequests.push(`settings:${symbol}`);
+    return super.fetchAccountSettings(symbol);
+  }
+
+  override async fetchLastPrice(
+    symbol: string,
+    kind: MarketKind
+  ): Promise<string> {
+    this.readRequests.push(`price:${symbol}:${kind}`);
+    return super.fetchLastPrice(symbol, kind);
+  }
+}
+
 function market(
   exchangeId: string,
   kind: MarketKind,
@@ -59,13 +111,15 @@ function setup(options: {
   spotFreeUsdt?: string;
   contractFreeUsdt?: string;
   accountSettings?: AccountSettings;
+  spotGateway?: FakeExchangeGateway;
+  contractGateway?: FakeExchangeGateway;
 } = {}): {
   service: PreflightService;
   spot: FakeExchangeGateway;
   contract: FakeExchangeGateway;
 } {
-  const spot = new FakeExchangeGateway('bitget');
-  const contract = new FakeExchangeGateway('okx');
+  const spot = options.spotGateway ?? new FakeExchangeGateway('bitget');
+  const contract = options.contractGateway ?? new FakeExchangeGateway('okx');
   spot.markets.set(
     `spot:${SYMBOL}`,
     market('bitget', 'spot', options.spotMarket)
@@ -124,6 +178,62 @@ test('requests each free balance from the correct market kind', async () => {
   assert.deepEqual(contract.balanceRequests, [{ asset: 'USDT', kind: 'swap' }]);
 });
 
+test('keeps one input and market snapshot across async reads and after return', async () => {
+  const contractGateway = new DeferredReadGateway('okx');
+  const configured = setup({ contractGateway });
+  const mutableInput = input();
+  const sourceSpotMarket = configured.spot.markets.get(`spot:${SYMBOL}`);
+  const sourceContractMarket = configured.contract.markets.get(`swap:${SYMBOL}`);
+  assert.ok(sourceSpotMarket);
+  assert.ok(sourceContractMarket);
+  const expectedInput = { ...mutableInput };
+  const expectedSpotMarket = { ...sourceSpotMarket };
+  const expectedContractMarket = { ...sourceContractMarket };
+
+  const resultPromise = configured.service.run(mutableInput);
+  await contractGateway.readStarted.promise;
+
+  Object.assign(mutableInput, {
+    spotExchangeId: 'okx',
+    contractExchangeId: 'okx',
+    symbol: 'ETH/USDT',
+    requestedBaseQuantity: '999',
+    mode: 'SPOT_FIRST' as const
+  });
+  Object.assign(sourceSpotMarket, {
+    exchangeId: 'okx',
+    symbol: 'ETH/USDT',
+    base: 'ETH',
+    active: false
+  });
+  Object.assign(sourceContractMarket, {
+    exchangeId: 'bitget',
+    symbol: 'ETH/USDT',
+    base: 'ETH',
+    active: false
+  });
+  contractGateway.continueRead.resolve();
+
+  const result = await resultPromise;
+  assert.deepEqual({
+    spotExchangeId: result.spotExchangeId,
+    contractExchangeId: result.contractExchangeId,
+    symbol: result.symbol,
+    requestedBaseQuantity: result.requestedBaseQuantity,
+    mode: result.mode
+  }, expectedInput);
+  assert.deepEqual(result.spotMarket, expectedSpotMarket);
+  assert.deepEqual(result.contractMarket, expectedContractMarket);
+  assert.equal(result.effectiveBaseQuantity, '1');
+
+  Object.assign(mutableInput, { symbol: 'SOL/USDT' });
+  Object.assign(sourceSpotMarket, { symbol: 'SOL/USDT' });
+  Object.assign(sourceContractMarket, { symbol: 'SOL/USDT' });
+  assert.equal(result.symbol, SYMBOL);
+  assert.equal(result.spotMarket.symbol, SYMBOL);
+  assert.equal(result.contractMarket.symbol, SYMBOL);
+});
+
 test('rejects same-exchange and unsupported exchange selections', async () => {
   const { service } = setup();
 
@@ -136,6 +246,49 @@ test('rejects same-exchange and unsupported exchange selections', async () => {
     /unsupported exchange/
   );
 });
+
+for (const identityCase of [
+  {
+    name: 'spot exchangeId',
+    options: { spotMarket: { exchangeId: 'okx' } }
+  },
+  {
+    name: 'spot symbol',
+    options: { spotMarket: { symbol: 'ETH/USDT' } }
+  },
+  {
+    name: 'contract exchangeId',
+    options: { contractMarket: { exchangeId: 'bitget' } }
+  },
+  {
+    name: 'contract symbol',
+    options: { contractMarket: { symbol: 'ETH/USDT' } }
+  }
+] satisfies Array<{
+  name: string;
+  options: {
+    spotMarket?: Partial<MarketRules>;
+    contractMarket?: Partial<MarketRules>;
+  };
+}>) {
+  test(`rejects ${identityCase.name} mismatch before account reads`, async () => {
+    const spotGateway = new ReadTrackingGateway('bitget');
+    const contractGateway = new ReadTrackingGateway('okx');
+    const configured = setup({
+      ...identityCase.options,
+      spotGateway,
+      contractGateway
+    });
+
+    await assert.rejects(
+      configured.service.run(input()),
+      /market snapshot identity/
+    );
+
+    assert.deepEqual(spotGateway.readRequests, []);
+    assert.deepEqual(contractGateway.readRequests, []);
+  });
+}
 
 test('rejects different base assets or non-USDT quote markets', async () => {
   const differentBase = setup({

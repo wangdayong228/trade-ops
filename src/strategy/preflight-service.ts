@@ -71,9 +71,9 @@ function exactProduct(left: Decimal, right: Decimal, field: string): Decimal {
 }
 
 function assertMarketPair(
-  input: PreflightInput,
-  spotMarket: MarketRules,
-  contractMarket: MarketRules
+  input: Readonly<PreflightInput>,
+  spotMarket: Readonly<MarketRules>,
+  contractMarket: Readonly<MarketRules>
 ): void {
   const symbolParts = input.symbol.split('/');
   const expectedBase = symbolParts[0];
@@ -142,7 +142,7 @@ function confirmedAccountSettings(settings: AccountSettings): {
 }
 
 function quoteNotionalLimits(
-  market: MarketRules,
+  market: Readonly<MarketRules>,
   leg: 'spot' | 'contract'
 ): {
   minimum: Decimal | undefined;
@@ -172,7 +172,7 @@ function quoteNotionalLimits(
 
 function assertQuoteNotional(
   notional: Decimal,
-  market: MarketRules,
+  market: Readonly<MarketRules>,
   leg: 'spot' | 'contract'
 ): void {
   const { minimum, maximum } = quoteNotionalLimits(market, leg);
@@ -188,23 +188,33 @@ export class PreflightService {
   constructor(private readonly registry: ExchangeRegistry) {}
 
   async run(input: PreflightInput): Promise<PreflightResult> {
-    if (!EXECUTION_MODES.has(input.mode)) {
-      throw new Error(`unsupported execution mode: ${String(input.mode)}`);
+    const request = Object.freeze({
+      spotExchangeId: input.spotExchangeId,
+      contractExchangeId: input.contractExchangeId,
+      symbol: input.symbol,
+      requestedBaseQuantity: input.requestedBaseQuantity,
+      mode: input.mode
+    });
+
+    if (!EXECUTION_MODES.has(request.mode)) {
+      throw new Error(`unsupported execution mode: ${String(request.mode)}`);
     }
-    if (input.spotExchangeId === input.contractExchangeId) {
+    if (request.spotExchangeId === request.contractExchangeId) {
       throw new Error('spot and contract legs must use different exchanges');
     }
 
-    const spotGateway = this.registry.get(input.spotExchangeId);
-    const contractGateway = this.registry.get(input.contractExchangeId);
-    const [spotMarket, contractMarket] = await Promise.all([
-      spotGateway.loadMarket(input.symbol, 'spot'),
-      contractGateway.loadMarket(input.symbol, 'swap')
+    const spotGateway = this.registry.get(request.spotExchangeId);
+    const contractGateway = this.registry.get(request.contractExchangeId);
+    const [loadedSpotMarket, loadedContractMarket] = await Promise.all([
+      spotGateway.loadMarket(request.symbol, 'spot'),
+      contractGateway.loadMarket(request.symbol, 'swap')
     ]);
-    assertMarketPair(input, spotMarket, contractMarket);
+    const spotMarket = Object.freeze({ ...loadedSpotMarket });
+    const contractMarket = Object.freeze({ ...loadedContractMarket });
+    assertMarketPair(request, spotMarket, contractMarket);
 
     const effectiveBaseQuantity = normalizeCommonBaseQuantity({
-      requestedBaseQuantity: input.requestedBaseQuantity,
+      requestedBaseQuantity: request.requestedBaseQuantity,
       spot: spotMarket,
       swap: contractMarket
     });
@@ -218,9 +228,9 @@ export class PreflightService {
     ] = await Promise.all([
       spotGateway.fetchFreeBalance('USDT', 'spot'),
       contractGateway.fetchFreeBalance('USDT', 'swap'),
-      contractGateway.fetchAccountSettings(input.symbol),
-      spotGateway.fetchLastPrice(input.symbol, 'spot'),
-      contractGateway.fetchLastPrice(input.symbol, 'swap')
+      contractGateway.fetchAccountSettings(request.symbol),
+      spotGateway.fetchLastPrice(request.symbol, 'spot'),
+      contractGateway.fetchLastPrice(request.symbol, 'swap')
     ]);
 
     const quantity = positiveDecimal(
@@ -271,7 +281,7 @@ export class PreflightService {
     }
 
     return {
-      ...input,
+      ...request,
       effectiveBaseQuantity,
       spotMarket: { ...spotMarket },
       contractMarket: { ...contractMarket },
