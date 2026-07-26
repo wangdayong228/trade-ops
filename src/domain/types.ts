@@ -27,6 +27,8 @@ export interface MarketRules {
   contractSize: string;
   minBaseAmount: string;
   maxBaseAmount?: string;
+  minQuoteNotional?: string;
+  maxQuoteNotional?: string;
   priceStep: string;
 }
 
@@ -46,6 +48,7 @@ export interface OrderRequest {
   timeInForce?: 'GTC';
   clientOrderId: string;
   positionSide?: 'SHORT';
+  marginMode?: 'isolated' | 'cross';
 }
 
 export interface OrderSnapshot {

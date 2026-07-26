@@ -55,6 +55,10 @@ function oneValue<T>(
 export class OkxProfile implements ExchangeProfile {
   readonly exchangeId = 'okx';
 
+  balanceParams(kind: 'spot' | 'swap'): Record<string, unknown> {
+    return { type: kind };
+  }
+
   buildCreateOrderParams(request: OrderRequest): Record<string, unknown> {
     const params = buildCreateOrderParams(request);
     if (request.type === 'limit' && request.timeInForce === 'GTC') {

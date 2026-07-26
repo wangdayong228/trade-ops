@@ -26,6 +26,21 @@ function validateCreateQuantity(baseQuantity: string): void {
   }
 }
 
+function validateCreateMarginMode(request: OrderRequest): void {
+  if (
+    request.kind === 'swap'
+    && request.marginMode !== 'isolated'
+    && request.marginMode !== 'cross'
+  ) {
+    throw new Error(
+      'swap order requires a confirmed isolated or cross margin mode'
+    );
+  }
+  if (request.kind === 'spot' && request.marginMode !== undefined) {
+    throw new Error('spot order must not include a margin mode');
+  }
+}
+
 function validateIdentityField(
   context: 'create' | 'fetch' | 'observed',
   field: string,
@@ -86,6 +101,10 @@ export class FakeExchangeGateway implements ExchangeGateway {
   readonly markets = new Map<string, MarketRules>();
   readonly lastPrices = new Map<string, string>();
   readonly quantizedPrices = new Map<string, string>();
+  readonly balanceRequests: Array<{
+    asset: 'USDT';
+    kind: MarketKind;
+  }> = [];
   readonly createdRequests: OrderRequest[] = [];
   readonly createResults: OrderSnapshot[] = [];
   readonly createErrors = new Map<string, Error>();
@@ -130,7 +149,11 @@ export class FakeExchangeGateway implements ExchangeGateway {
     return this.quantizedPrices.get(marketKey(symbol, kind)) ?? price;
   }
 
-  async fetchFreeBalance(_asset: 'USDT'): Promise<string> {
+  async fetchFreeBalance(
+    asset: 'USDT',
+    kind: MarketKind
+  ): Promise<string> {
+    this.balanceRequests.push({ asset, kind });
     return this.freeUsdt;
   }
 
@@ -148,6 +171,7 @@ export class FakeExchangeGateway implements ExchangeGateway {
 
   async createOrder(request: OrderRequest): Promise<OrderSnapshot> {
     validateCreateQuantity(request.baseQuantity);
+    validateCreateMarginMode(request);
     this.createdRequests.push(request);
     const configured = this.createResults.shift();
     if (configured === undefined) {

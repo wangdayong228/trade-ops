@@ -99,10 +99,12 @@ export interface CcxtExchangeLike {
   loadMarkets(): Promise<Record<string, CcxtMarket>>;
   amountToPrecision(symbol: string, amount: number): string;
   priceToPrecision(symbol: string, price: number): string;
-  fetchBalance(): Promise<Record<string, unknown>>;
+  fetchBalance(
+    params?: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
   fetchTicker(
     symbol: string
-  ): Promise<{ ask?: Numeric; last?: Numeric }>;
+  ): Promise<{ ask?: Numeric; bid?: Numeric; last?: Numeric }>;
   createOrder(
     symbol: string,
     type: string,
@@ -321,6 +323,88 @@ function exactDifference(left: string, right: string): string {
   return new ExactDecimal(left).sub(right).toFixed();
 }
 
+function exactProduct(
+  left: string,
+  right: string,
+  field: string
+): string {
+  const leftValue = decimalString(left, `${field} left operand`);
+  const rightValue = decimalString(right, `${field} right operand`);
+  const leftDecimal = decimal(leftValue);
+  const rightDecimal = decimal(rightValue);
+  const requiredPrecision = leftDecimal.sd() + rightDecimal.sd() + 4;
+  if (!Number.isSafeInteger(requiredPrecision) || requiredPrecision > 1_000_000) {
+    throw new Error(`${field} precision exceeds supported bounds`);
+  }
+  const ExactDecimal = Decimal.clone({
+    precision: Math.max(Decimal.precision, requiredPrecision),
+    rounding: Decimal.ROUND_DOWN
+  });
+  const product = new ExactDecimal(leftValue).mul(rightValue);
+  if (!product.isFinite() || product.lte(0)) {
+    throw new Error(`${field} must be finite and positive`);
+  }
+  return product.toFixed();
+}
+
+function validateBaseAmount(
+  baseQuantity: string,
+  rules: MarketRules
+): void {
+  const base = decimal(baseQuantity);
+  if (base.lt(rules.minBaseAmount)) {
+    throw new Error(
+      `order is below minimum base amount ${rules.minBaseAmount}`
+    );
+  }
+  if (
+    rules.maxBaseAmount !== undefined
+    && base.gt(rules.maxBaseAmount)
+  ) {
+    throw new Error(
+      `order exceeds maximum base amount ${rules.maxBaseAmount}`
+    );
+  }
+}
+
+function validateQuoteNotional(
+  baseQuantity: string,
+  referencePrice: string,
+  rules: MarketRules
+): void {
+  const quoteNotional = exactProduct(
+    baseQuantity,
+    referencePrice,
+    'quote notional'
+  );
+  if (
+    rules.minQuoteNotional !== undefined
+    && decimal(quoteNotional).lt(rules.minQuoteNotional)
+  ) {
+    throw new Error(
+      `order is below minimum quote notional ${rules.minQuoteNotional}`
+    );
+  }
+  if (
+    rules.maxQuoteNotional !== undefined
+    && decimal(quoteNotional).gt(rules.maxQuoteNotional)
+  ) {
+    throw new Error(
+      `order exceeds maximum quote notional ${rules.maxQuoteNotional}`
+    );
+  }
+}
+
+function positiveTickerValue(value: unknown): string | undefined {
+  try {
+    return value === undefined
+      ? undefined
+      : decimalString(value, 'ticker reference price');
+  } catch {
+    return undefined;
+  }
+}
+
 function baseToCcxtAmount(
   baseQuantity: string,
   contractSize: string
@@ -453,6 +537,31 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     const maxBaseAmount = maximumAmount === undefined
       ? undefined
       : exchangeAmountToBase(maximumAmount, contractSize);
+    if (
+      maxBaseAmount !== undefined
+      && decimal(minBaseAmount).gt(maxBaseAmount)
+    ) {
+      throw new Error('invalid base amount range');
+    }
+    const minQuoteNotional = selected.limits.cost.min === undefined
+      ? undefined
+      : decimalString(
+        selected.limits.cost.min,
+        'minimum quote notional'
+      );
+    const maxQuoteNotional = selected.limits.cost.max === undefined
+      ? undefined
+      : decimalString(
+        selected.limits.cost.max,
+        'maximum quote notional'
+      );
+    if (
+      minQuoteNotional !== undefined
+      && maxQuoteNotional !== undefined
+      && decimal(minQuoteNotional).gt(maxQuoteNotional)
+    ) {
+      throw new Error('invalid quote notional range');
+    }
 
     return {
       market: selected,
@@ -468,7 +577,13 @@ export class CcxtExchangeGateway implements ExchangeGateway {
         contractSize,
         minBaseAmount,
         priceStep,
-        ...(maxBaseAmount === undefined ? {} : { maxBaseAmount })
+        ...(maxBaseAmount === undefined ? {} : { maxBaseAmount }),
+        ...(minQuoteNotional === undefined
+          ? {}
+          : { minQuoteNotional }),
+        ...(maxQuoteNotional === undefined
+          ? {}
+          : { maxQuoteNotional })
       }
     };
   }
@@ -494,8 +609,13 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     return decimalString(formatted, 'quantized price');
   }
 
-  async fetchFreeBalance(asset: 'USDT'): Promise<string> {
-    const balance = await this.exchange.fetchBalance();
+  async fetchFreeBalance(
+    asset: 'USDT',
+    kind: MarketKind
+  ): Promise<string> {
+    const balance = await this.exchange.fetchBalance(
+      this.profile.balanceParams(kind)
+    );
     const free = balance.free;
     const freeByCurrency = typeof free === 'object' && free !== null
       ? free as Record<string, unknown>
@@ -528,6 +648,18 @@ export class CcxtExchangeGateway implements ExchangeGateway {
   }
 
   async createOrder(request: OrderRequest): Promise<OrderSnapshot> {
+    if (
+      request.kind === 'swap'
+      && request.marginMode !== 'isolated'
+      && request.marginMode !== 'cross'
+    ) {
+      throw new Error(
+        'swap order requires a confirmed isolated or cross margin mode'
+      );
+    }
+    if (request.kind === 'spot' && request.marginMode !== undefined) {
+      throw new Error('spot order must not include a margin mode');
+    }
     const { market, rules } = await this.resolveMarket(
       request.symbol,
       request.kind
@@ -536,6 +668,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       request.baseQuantity,
       'base quantity'
     );
+    validateBaseAmount(baseQuantity, rules);
     const exchangeAmount = request.kind === 'swap'
       ? baseToCcxtAmount(baseQuantity, rules.contractSize)
       : baseQuantity;
@@ -573,6 +706,27 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       market.symbol,
       formattedPrice
     );
+    const hasQuoteNotionalLimit = rules.minQuoteNotional !== undefined
+      || rules.maxQuoteNotional !== undefined;
+    if (hasQuoteNotionalLimit) {
+      let referencePrice = submissionPrice;
+      if (referencePrice === undefined) {
+        const ticker = await this.exchange.fetchTicker(market.symbol);
+        const preferredValue = request.side === 'buy'
+          ? ticker.ask
+          : ticker.bid;
+        referencePrice = positiveTickerValue(preferredValue)
+          ?? positiveTickerValue(ticker.last);
+        if (referencePrice === undefined) {
+          const preferredField = request.side === 'buy' ? 'ask' : 'bid';
+          throw new Error(
+            `market ${request.side} requires a finite positive ticker `
+            + `${preferredField} or last for quote notional validation`
+          );
+        }
+      }
+      validateQuoteNotional(baseQuantity, referencePrice, rules);
+    }
     const params = this.profile.buildCreateOrderParams(request);
     const order = await this.exchange.createOrder(
       market.symbol,

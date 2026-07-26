@@ -8,6 +8,7 @@ import type {
 
 export interface ExchangeProfile {
   readonly exchangeId: 'bitget' | 'okx';
+  balanceParams(kind: 'spot' | 'swap'): Record<string, unknown>;
   buildCreateOrderParams(request: OrderRequest): Record<string, unknown>;
   prepareSubmissionPrice(
     request: OrderRequest,
@@ -35,6 +36,9 @@ export function buildCreateOrderParams(
   }
   if (request.kind === 'swap') {
     params.reduceOnly = false;
+    if (request.marginMode !== undefined) {
+      params.marginMode = request.marginMode;
+    }
   }
   if (request.positionSide !== undefined) {
     params.positionSide = request.positionSide;

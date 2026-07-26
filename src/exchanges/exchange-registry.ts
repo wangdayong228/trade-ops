@@ -9,19 +9,21 @@ function assertSupportedExchangeId(exchangeId: string): void {
 }
 
 export class ExchangeRegistry {
-  constructor(
-    private readonly gateways: ReadonlyMap<string, ExchangeGateway>
-  ) {
-    for (const exchangeId of gateways.keys()) {
+  private readonly gateways: ReadonlyMap<string, ExchangeGateway>;
+
+  constructor(gateways: ReadonlyMap<string, ExchangeGateway>) {
+    const snapshot = new Map(gateways);
+    for (const exchangeId of snapshot.keys()) {
       assertSupportedExchangeId(exchangeId);
     }
-    for (const [exchangeId, gateway] of gateways) {
+    for (const [exchangeId, gateway] of snapshot) {
       if (gateway.exchangeId !== exchangeId) {
         throw new Error(
           `gateway identity mismatch for configured exchange ${exchangeId}`
         );
       }
     }
+    this.gateways = snapshot;
   }
 
   get(exchangeId: string): ExchangeGateway {
@@ -29,6 +31,11 @@ export class ExchangeRegistry {
     const gateway = this.gateways.get(exchangeId);
     if (gateway === undefined) {
       throw new Error(`exchange is not configured: ${exchangeId}`);
+    }
+    if (gateway.exchangeId !== exchangeId) {
+      throw new Error(
+        `gateway identity mismatch for configured exchange ${exchangeId}`
+      );
     }
     return gateway;
   }

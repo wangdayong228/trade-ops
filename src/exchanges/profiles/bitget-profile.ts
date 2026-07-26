@@ -49,6 +49,12 @@ function normalizedPositionMode(value: unknown): AccountSettings['positionMode']
 export class BitgetProfile implements ExchangeProfile {
   readonly exchangeId = 'bitget';
 
+  balanceParams(kind: 'spot' | 'swap'): Record<string, unknown> {
+    return kind === 'spot'
+      ? { type: 'spot' }
+      : { type: 'swap', productType: 'USDT-FUTURES' };
+  }
+
   buildCreateOrderParams(request: OrderRequest): Record<string, unknown> {
     const params = buildCreateOrderParams(request);
     if (request.kind === 'swap') {

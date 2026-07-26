@@ -12,7 +12,7 @@ export interface ExchangeGateway {
   readonly exchangeId: string;
   loadMarket(symbol: string, kind: MarketKind): Promise<MarketRules>;
   quantizePrice(symbol: string, kind: MarketKind, price: string): Promise<string>;
-  fetchFreeBalance(asset: 'USDT'): Promise<string>;
+  fetchFreeBalance(asset: 'USDT', kind: MarketKind): Promise<string>;
   fetchAccountSettings(symbol: string): Promise<AccountSettings>;
   fetchLastPrice(symbol: string, kind: MarketKind): Promise<string>;
   createOrder(request: OrderRequest): Promise<OrderSnapshot>;

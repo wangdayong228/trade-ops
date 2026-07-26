@@ -4,6 +4,8 @@ export interface ExchangeCredentials {
   password?: string;
 }
 
+const PASSWORD_REQUIRED_EXCHANGES = new Set(['bitget', 'okx']);
+
 function requiredCredential(
   value: string | undefined,
   exchangeId: string
@@ -24,6 +26,9 @@ export function loadExchangeCredentials(
   const password = env[`${prefix}_PASSWORD`];
 
   if (password === undefined) {
+    if (PASSWORD_REQUIRED_EXCHANGES.has(exchangeId)) {
+      throw new Error(`missing credentials for configured exchange ${exchangeId}`);
+    }
     return { apiKey, secret };
   }
   if (password.trim() === '') {

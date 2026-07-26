@@ -142,7 +142,11 @@ test('fake gateway returns configured market data, prices, balance, and settings
     await gateway.quantizePrice('ETH/USDT', 'spot', '3500.12'),
     '3500.12'
   );
-  assert.equal(await gateway.fetchFreeBalance('USDT'), '2500.5');
+  assert.equal(await gateway.fetchFreeBalance('USDT', 'spot'), '2500.5');
+  assert.deepEqual(gateway.balanceRequests, [{
+    asset: 'USDT',
+    kind: 'spot'
+  }]);
   assert.deepEqual(
     await gateway.fetchAccountSettings('BTC/USDT'),
     gateway.accountSettings
@@ -272,7 +276,8 @@ test('fake gateway preserves a complete swap limit short request', async () => {
     price: '61000',
     timeInForce: 'GTC',
     clientOrderId: 'strategy-1:CONTRACT_HEDGE_GTC',
-    positionSide: 'SHORT'
+    positionSide: 'SHORT',
+    marginMode: 'isolated'
   };
   const created = order({
     exchangeOrderId: 'swap-limit-1',
@@ -387,7 +392,8 @@ test('fake gateway recovers an exchange-created order after client timeout', asy
     side: 'sell',
     baseQuantity: '0.6',
     clientOrderId: 'strategy-1:CONTRACT_MARKET',
-    positionSide: 'SHORT'
+    positionSide: 'SHORT',
+    marginMode: 'isolated'
   };
   const created = order({
     exchangeOrderId: 'contract-market-1',
@@ -420,6 +426,32 @@ test('fake gateway recovers an exchange-created order after client timeout', asy
     ),
     created
   );
+});
+
+test('fake gateway rejects swap orders without a confirmed margin mode', async () => {
+  const gateway = new FakeExchangeGateway('test-exchange');
+  const request: OrderRequest = {
+    symbol: 'BTC/USDT',
+    kind: 'swap',
+    type: 'market',
+    side: 'sell',
+    baseQuantity: '0.6',
+    clientOrderId: 'missing-margin-mode',
+    positionSide: 'SHORT'
+  };
+  gateway.createResults.push(order({
+    clientOrderId: request.clientOrderId,
+    kind: 'swap',
+    side: 'sell',
+    requestedBaseQuantity: request.baseQuantity,
+    remainingBaseQuantity: request.baseQuantity
+  }));
+
+  await assert.rejects(
+    gateway.createOrder(request),
+    /swap order requires.*margin mode/
+  );
+  assert.deepEqual(gateway.createdRequests, []);
 });
 
 test('fresh fake can seed a validated exchange-observed order for restart recovery', async () => {
