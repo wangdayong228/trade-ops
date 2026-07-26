@@ -519,7 +519,7 @@ git commit -m "feat: define normalized exchange contracts"
 - Produces: `ExchangeProfile` implementations for `bitget` and `okx`
 - Produces: `makeClientOrderId(strategyId: string, role: OrderRole): string`
 
-- [ ] **Step 1: Write failing adapter tests with an injected CCXT double**
+- [x] **Step 1: Write failing adapter tests with an injected CCXT double**
 
 Create tests that verify:
 
@@ -571,7 +571,7 @@ test('creates a deterministic OKX-safe client order id', () => {
 });
 ```
 
-- [ ] **Step 2: Run the adapter test and verify failure**
+- [x] **Step 2: Run the adapter test and verify failure**
 
 Run:
 
@@ -581,7 +581,7 @@ npm run build
 
 Expected: FAIL because `CcxtExchangeGateway` and its test factory do not exist.
 
-- [ ] **Step 3: Implement environment-only credential lookup**
+- [x] **Step 3: Implement environment-only credential lookup**
 
 Create `src/config/exchange-credentials.ts`:
 
@@ -607,7 +607,7 @@ export function loadExchangeCredentials(
 }
 ```
 
-- [ ] **Step 4: Implement the CCXT gateway**
+- [x] **Step 4: Implement the CCXT gateway**
 
 `CcxtExchangeGateway` must:
 
@@ -642,7 +642,7 @@ export function buildCreateOrderParams(request: OrderRequest): Record<string, un
 }
 ```
 
-- [ ] **Step 5: Implement configured gateway lookup**
+- [x] **Step 5: Implement configured gateway lookup**
 
 Create `src/exchanges/exchange-registry.ts`:
 
@@ -666,7 +666,7 @@ export class ExchangeRegistry {
 }
 ```
 
-- [ ] **Step 6: Run adapter tests**
+- [x] **Step 6: Run adapter tests**
 
 Run:
 
@@ -676,7 +676,7 @@ npm test
 
 Expected: all tests pass without any network request.
 
-- [ ] **Step 7: Commit the CCXT boundary**
+- [x] **Step 7: Commit the CCXT boundary**
 
 ```bash
 git add src/config src/exchanges tests/exchanges
