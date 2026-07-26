@@ -45,6 +45,21 @@ function nonNegativeDecimal(value: string, field: string): Decimal {
   return parsed;
 }
 
+function positiveDerivedDecimal(value: Decimal, field: string): Decimal {
+  if (!value.isFinite() || value.lte('0')) {
+    throw new Error(`invalid ${field}: derived value must be finite and greater than zero`);
+  }
+  return value;
+}
+
+function derivedBaseStep(
+  amountStep: Decimal,
+  contractSize: Decimal,
+  field: string
+): Decimal {
+  return positiveDerivedDecimal(amountStep.mul(contractSize), field);
+}
+
 function validatedRules(
   market: 'spot' | 'swap',
   rules: TradableAmountRules
@@ -60,8 +75,11 @@ function validatedRules(
 }
 
 export function baseStepFor(rules: TradableAmountRules): Decimal {
-  return positiveDecimal(rules.amountStep, 'amountStep')
-    .mul(positiveDecimal(rules.contractSize, 'contractSize'));
+  return derivedBaseStep(
+    positiveDecimal(rules.amountStep, 'amountStep'),
+    positiveDecimal(rules.contractSize, 'contractSize'),
+    'baseStep'
+  );
 }
 
 function gcd(left: bigint, right: bigint): bigint {
@@ -88,9 +106,19 @@ export function normalizeCommonBaseQuantity(input: CommonQuantityInput): string 
   const requested = positiveDecimal(input.requestedBaseQuantity, 'requestedBaseQuantity');
   const spot = validatedRules('spot', input.spot);
   const swap = validatedRules('swap', input.swap);
-  const step = commonStep(
-    spot.amountStep.mul(spot.contractSize),
-    swap.amountStep.mul(swap.contractSize)
+  const spotBaseStep = derivedBaseStep(
+    spot.amountStep,
+    spot.contractSize,
+    'spot.baseStep'
+  );
+  const swapBaseStep = derivedBaseStep(
+    swap.amountStep,
+    swap.contractSize,
+    'swap.baseStep'
+  );
+  const step = positiveDerivedDecimal(
+    commonStep(spotBaseStep, swapBaseStep),
+    'commonStep'
   );
   let effective = requested.div(step).floor().mul(step);
 
@@ -100,6 +128,9 @@ export function normalizeCommonBaseQuantity(input: CommonQuantityInput): string 
     }
   }
 
+  if (!effective.isFinite()) {
+    throw new Error('invalid effective quantity: must be finite');
+  }
   if (
     effective.lte('0')
     || effective.lt(spot.minBaseAmount)

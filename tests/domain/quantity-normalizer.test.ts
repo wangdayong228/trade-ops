@@ -24,6 +24,21 @@ test('converts amount steps from market units into base units', () => {
   }).toFixed(), '0.003');
 });
 
+test('rejects a derived base step that underflows to zero', () => {
+  const underflowRules = {
+    amountStep: '1e-5000000000000000',
+    contractSize: '1e-5000000000000000',
+    minBaseAmount: '0'
+  };
+
+  assert.throws(() => normalizeCommonBaseQuantity({
+    requestedBaseQuantity: '1',
+    spot: underflowRules,
+    swap: { amountStep: '0.001', contractSize: '1', minBaseAmount: '0' }
+  }), /spot\.baseStep/);
+  assert.throws(() => baseStepFor(underflowRules), /baseStep/);
+});
+
 test('supports common steps with different decimal places', () => {
   assert.equal(normalizeCommonBaseQuantity({
     requestedBaseQuantity: '0.13',
