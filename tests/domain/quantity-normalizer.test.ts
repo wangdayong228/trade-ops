@@ -48,14 +48,62 @@ test('rejects a normalized amount below either market minimum', () => {
   }), /minimum/);
 });
 
-test('rejects zero and negative requested base quantities', () => {
-  for (const requestedBaseQuantity of ['0', '-0.001']) {
+test('rejects non-finite, zero, and negative requested base quantities', () => {
+  for (const requestedBaseQuantity of ['NaN', 'Infinity', '0', '-0.001']) {
     assert.throws(() => normalizeCommonBaseQuantity({
       requestedBaseQuantity,
       spot: { amountStep: '0.001', contractSize: '1', minBaseAmount: '0.001' },
       swap: { amountStep: '1', contractSize: '0.001', minBaseAmount: '0.001' }
-    }), /minimum/);
+    }), /requestedBaseQuantity/);
   }
+});
+
+test('rejects non-finite, zero, and negative amount steps and contract sizes', () => {
+  const validRules = {
+    amountStep: '0.001',
+    contractSize: '1',
+    minBaseAmount: '0.001'
+  };
+
+  for (const field of ['amountStep', 'contractSize'] as const) {
+    for (const value of ['NaN', 'Infinity', '0', '-0.001']) {
+      assert.throws(() => normalizeCommonBaseQuantity({
+        requestedBaseQuantity: '1',
+        spot: { ...validRules, [field]: value },
+        swap: validRules
+      }), new RegExp(field));
+    }
+  }
+});
+
+test('rejects invalid market minima and maxima', () => {
+  const validRules = {
+    amountStep: '0.001',
+    contractSize: '1',
+    minBaseAmount: '0.001'
+  };
+  const cases = [
+    { rules: { ...validRules, minBaseAmount: 'NaN' }, field: 'minBaseAmount' },
+    { rules: { ...validRules, minBaseAmount: '-0.001' }, field: 'minBaseAmount' },
+    { rules: { ...validRules, maxBaseAmount: 'Infinity' }, field: 'maxBaseAmount' },
+    { rules: { ...validRules, maxBaseAmount: '0' }, field: 'maxBaseAmount' }
+  ];
+
+  for (const { rules, field } of cases) {
+    assert.throws(() => normalizeCommonBaseQuantity({
+      requestedBaseQuantity: '1',
+      spot: validRules,
+      swap: rules
+    }), new RegExp(field));
+  }
+});
+
+test('accepts a zero market minimum', () => {
+  assert.equal(normalizeCommonBaseQuantity({
+    requestedBaseQuantity: '0.001',
+    spot: { amountStep: '0.001', contractSize: '1', minBaseAmount: '0' },
+    swap: { amountStep: '1', contractSize: '0.001', minBaseAmount: '0' }
+  }), '0.001');
 });
 
 test('handles quantities just below, at, and just above the minimum', () => {
