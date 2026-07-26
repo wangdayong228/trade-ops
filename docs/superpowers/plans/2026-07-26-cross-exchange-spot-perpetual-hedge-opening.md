@@ -82,7 +82,7 @@ README.md                                 setup, secrets, runbook, and risk beha
 - Produces: `normalizeCommonBaseQuantity(input: CommonQuantityInput): string`
 - Produces: `baseStepFor(rules: TradableAmountRules): Decimal`
 
-- [ ] **Step 1: Verify Git and install the exact project dependencies**
+- [x] **Step 1: Verify Git and install the exact project dependencies**
 
 Run:
 
@@ -95,7 +95,7 @@ npm install --save-dev typescript @types/node @types/better-sqlite3
 
 Expected: Git reports the current branch; `package.json` and `package-lock.json` exist; npm exits successfully.
 
-- [ ] **Step 2: Replace the generated package scripts and add strict TypeScript configuration**
+- [x] **Step 2: Replace the generated package scripts and add strict TypeScript configuration**
 
 Write `package.json` with the installed versions retained from `npm install`, `"type": "module"`, and these scripts:
 
@@ -144,7 +144,7 @@ data/
 *.sqlite-wal
 ```
 
-- [ ] **Step 3: Write failing common-quantity tests**
+- [x] **Step 3: Write failing common-quantity tests**
 
 Create `tests/domain/quantity-normalizer.test.ts`:
 
@@ -170,7 +170,7 @@ test('rejects a normalized amount below either market minimum', () => {
 });
 ```
 
-- [ ] **Step 4: Run the test and verify the missing module failure**
+- [x] **Step 4: Run the test and verify the missing module failure**
 
 Run:
 
@@ -180,7 +180,7 @@ npm test
 
 Expected: FAIL because `src/domain/quantity-normalizer.ts` does not exist.
 
-- [ ] **Step 5: Implement Decimal.js setup and common-step normalization**
+- [x] **Step 5: Implement Decimal.js setup and common-step normalization**
 
 Create `src/domain/decimal.ts`:
 
@@ -259,7 +259,7 @@ export function normalizeCommonBaseQuantity(input: CommonQuantityInput): string 
 }
 ```
 
-- [ ] **Step 6: Build and run the domain tests**
+- [x] **Step 6: Build and run the domain tests**
 
 Run:
 
@@ -269,7 +269,7 @@ npm test
 
 Expected: 2 tests pass and TypeScript reports no errors.
 
-- [ ] **Step 7: Commit the project baseline**
+- [x] **Step 7: Commit the project baseline**
 
 ```bash
 git add .gitignore package.json package-lock.json tsconfig.json src/domain tests/domain
