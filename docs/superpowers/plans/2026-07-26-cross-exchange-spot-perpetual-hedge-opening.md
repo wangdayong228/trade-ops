@@ -290,7 +290,7 @@ git commit -m "feat: establish decimal quantity domain"
 - Produces: `ExchangeGateway`
 - Produces: `FakeExchangeGateway`
 
-- [ ] **Step 1: Write a failing base/contracts conversion test**
+- [x] **Step 1: Write a failing base/contracts conversion test**
 
 Create `tests/exchanges/exchange-gateway.test.ts`:
 
@@ -309,7 +309,7 @@ test('rejects a base quantity that is not an exact contract count', () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test**
+- [x] **Step 2: Run the focused test**
 
 Run:
 
@@ -319,7 +319,7 @@ npm run build
 
 Expected: FAIL because the exchange gateway module does not exist.
 
-- [ ] **Step 3: Define the complete domain and gateway contracts**
+- [x] **Step 3: Define the complete domain and gateway contracts**
 
 Create `src/domain/types.ts` with these exact exported contracts:
 
@@ -428,7 +428,7 @@ export function exchangeAmountToBase(amount: string, contractSize: string): stri
 }
 ```
 
-- [ ] **Step 4: Add the reusable fake gateway**
+- [x] **Step 4: Add the reusable fake gateway**
 
 Create `tests/support/fake-exchange-gateway.ts` as a class implementing every `ExchangeGateway` method. It must expose `markets`, `freeUsdt`, `accountSettings`, `lastPrices`, `createdRequests`, `createResults`, and `fetchResults` collections; `createOrder` shifts one result from `createResults`, and `fetchOrder` shifts one result from the matching `fetchResults` queue. Missing configured values throw descriptive errors so tests never pass accidentally.
 
@@ -479,7 +479,7 @@ export function order(overrides: Partial<OrderSnapshot> = {}): OrderSnapshot {
 }
 ```
 
-- [ ] **Step 5: Run all tests**
+- [x] **Step 5: Run all tests**
 
 Run:
 
@@ -489,7 +489,7 @@ npm test
 
 Expected: 4 tests pass.
 
-- [ ] **Step 6: Commit the contracts**
+- [x] **Step 6: Commit the contracts**
 
 ```bash
 git add src/domain/types.ts src/exchanges tests/exchanges tests/support
