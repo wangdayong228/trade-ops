@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - Only same-base, `USDT`-quoted spot and USDT-margined perpetual markets are supported.
+- The first release supports only Bitget and OKX; either may provide the spot or perpetual leg, but the two legs must use different exchanges.
 - The system reads and displays the current margin mode, position mode, and leverage; it never changes them.
 - Order price, quantity, contract-size, and fill-difference calculations use Decimal.js, never JavaScript `number` arithmetic.
 - Fees do not change the second-leg price.
@@ -39,6 +40,9 @@ src/domain/quantity-normalizer.ts         common executable base-quantity calcul
 src/exchanges/exchange-gateway.ts         normalized exchange interface
 src/exchanges/ccxt-exchange-gateway.ts    CCXT implementation
 src/exchanges/exchange-registry.ts        configured gateway lookup
+src/exchanges/exchange-profile.ts         exchange-specific order parameter contract
+src/exchanges/profiles/bitget-profile.ts  Bitget client-id, GTC, and position parameters
+src/exchanges/profiles/okx-profile.ts     OKX client-id, GTC, and position parameters
 src/strategy/preflight-service.ts         market/account validation and preview
 src/strategy/hedge-coordinator.ts         three execution modes and idempotent submission
 src/strategy/order-monitor.ts             GTC reconciliation and restart recovery
@@ -134,6 +138,7 @@ dist/
 data/
 .env
 .firecrawl/
+.superpowers/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
@@ -497,6 +502,9 @@ git commit -m "feat: define normalized exchange contracts"
 - Create: `src/config/exchange-credentials.ts`
 - Create: `src/exchanges/ccxt-exchange-gateway.ts`
 - Create: `src/exchanges/exchange-registry.ts`
+- Create: `src/exchanges/exchange-profile.ts`
+- Create: `src/exchanges/profiles/bitget-profile.ts`
+- Create: `src/exchanges/profiles/okx-profile.ts`
 - Create: `tests/exchanges/ccxt-gateway.test.ts`
 
 **Interfaces:**
@@ -504,6 +512,7 @@ git commit -m "feat: define normalized exchange contracts"
 - Produces: `loadExchangeCredentials(exchangeId: string, env?: NodeJS.ProcessEnv): ExchangeCredentials`
 - Produces: `CcxtExchangeGateway`
 - Produces: `ExchangeRegistry.get(exchangeId: string): ExchangeGateway`
+- Produces: `ExchangeProfile` implementations for `bitget` and `okx`
 
 - [ ] **Step 1: Write failing adapter tests with an injected CCXT double**
 
@@ -602,6 +611,8 @@ export function loadExchangeCredentials(
 10. Implement `findOrderByClientId` by scanning open and closed orders for the same symbol without submitting a replacement.
 
 Expose `quantizePrice` by resolving the normalized market and returning `exchange.priceToPrecision(exchangeSymbol, price)`. The coordinator must use this method for every GTC price.
+
+`ExchangeProfile` is the only place allowed to add exchange-specific order parameters. Implement one profile for Bitget and one for OKX using their verified CCXT adapter/API semantics for client order IDs, GTC, and hedged-position direction. The registry accepts only `bitget` and `okx`; any other exchange ID is rejected before a gateway is constructed.
 
 The order parameter builder must be a pure function with this exact behavior:
 
@@ -737,6 +748,7 @@ export interface PreflightResult extends PreflightInput {
 
 `PreflightService.run` must load both markets concurrently, assert matching base and `USDT` quote, normalize the common quantity, fetch balances/prices/settings concurrently, and reject when:
 
+- either exchange is not `bitget` or `okx`, or both legs select the same exchange;
 - spot free USDT is less than `effectiveBaseQuantity × spotReferencePrice`;
 - contract free USDT is less than `effectiveBaseQuantity × contractReferencePrice ÷ leverage` when leverage is known;
 - the contract is not an active linear USDT-settled perpetual;
