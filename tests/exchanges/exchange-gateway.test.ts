@@ -343,9 +343,10 @@ test('fake gateway rejects create snapshots that conflict with request identity'
 
 test('fake gateway rejects fetch snapshots that conflict with lookup identity', async () => {
   const mismatches: Array<{
-    field: 'exchangeOrderId' | 'symbol' | 'kind';
+    field: 'exchangeId' | 'exchangeOrderId' | 'symbol' | 'kind';
     overrides: Partial<OrderSnapshot>;
   }> = [
+    { field: 'exchangeId', overrides: { exchangeId: 'other-exchange' } },
     {
       field: 'exchangeOrderId',
       overrides: { exchangeOrderId: 'other-order' }
@@ -356,13 +357,23 @@ test('fake gateway rejects fetch snapshots that conflict with lookup identity', 
 
   for (const { field, overrides } of mismatches) {
     const gateway = new FakeExchangeGateway('test-exchange');
+    const correct = order({ exchangeOrderId: 'fetch-1' });
     gateway.fetchResults.set('fetch-1', [
-      order({ exchangeOrderId: 'fetch-1', ...overrides })
+      order({ exchangeOrderId: 'fetch-1', ...overrides }),
+      correct
     ]);
 
     await assert.rejects(
       gateway.fetchOrder('fetch-1', 'BTC/USDT', 'spot'),
       new RegExp(`configured fetch snapshot.*${field}`)
+    );
+    assert.equal(
+      await gateway.findOrderByClientId('client-1', 'BTC/USDT', 'spot'),
+      null
+    );
+    assert.equal(
+      await gateway.fetchOrder('fetch-1', 'BTC/USDT', 'spot'),
+      correct
     );
   }
 });

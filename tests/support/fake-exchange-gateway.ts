@@ -65,11 +65,13 @@ function validateCreateSnapshot(
 }
 
 function validateFetchSnapshot(
+  exchangeId: string,
   exchangeOrderId: string,
   symbol: string,
   kind: MarketKind,
   snapshot: OrderSnapshot
 ): void {
+  validateIdentityField('fetch', 'exchangeId', snapshot.exchangeId, exchangeId);
   validateIdentityField(
     'fetch',
     'exchangeOrderId',
@@ -170,7 +172,13 @@ export class FakeExchangeGateway implements ExchangeGateway {
     if (configured === undefined) {
       throw new Error(`missing fetch result for exchange order ${exchangeOrderId}`);
     }
-    validateFetchSnapshot(exchangeOrderId, symbol, kind, configured);
+    validateFetchSnapshot(
+      this.exchangeId,
+      exchangeOrderId,
+      symbol,
+      kind,
+      configured
+    );
     this.#observedOrders.push(configured);
     return configured;
   }
@@ -182,7 +190,8 @@ export class FakeExchangeGateway implements ExchangeGateway {
   ): Promise<OrderSnapshot | null> {
     return this.#observedOrders.findLast(
       (snapshot) => (
-        snapshot.clientOrderId === clientOrderId
+        snapshot.exchangeId === this.exchangeId
+        && snapshot.clientOrderId === clientOrderId
         && snapshot.symbol === symbol
         && snapshot.kind === kind
       )
