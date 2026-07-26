@@ -803,7 +803,7 @@ git commit -m "feat: add hedge opening preflight"
 - Produces: `StrategyRecord`, `StrategyOrderRecord`, `StrategyRepository`
 - Produces: `SqliteStrategyRepository`
 
-- [ ] **Step 1: Write failing persistence tests**
+- [x] **Step 1: Write failing persistence tests**
 
 Create tests using `new Database(':memory:')`:
 
@@ -835,7 +835,7 @@ test('keeps an immutable event for every order snapshot change', () => {
 });
 ```
 
-- [ ] **Step 2: Run the storage test**
+- [x] **Step 2: Run the storage test**
 
 Run:
 
@@ -845,7 +845,7 @@ npm run build
 
 Expected: FAIL because the repository modules do not exist.
 
-- [ ] **Step 3: Define the SQLite schema**
+- [x] **Step 3: Define the SQLite schema**
 
 Create `src/storage/schema.ts` exporting SQL with:
 
@@ -891,7 +891,7 @@ CREATE TABLE IF NOT EXISTS order_events (
 );
 ```
 
-- [ ] **Step 4: Define the repository interface**
+- [x] **Step 4: Define the repository interface**
 
 `StrategyRepository` must expose:
 
@@ -911,11 +911,11 @@ export interface StrategyRepository {
 
 Generate IDs with `randomUUID()`. `claimForExecution` must be one SQL update from `PENDING_CONFIRMATION` to `EXECUTING` and return whether exactly one row changed. Every transition must compare its allowed source states in SQL.
 
-- [ ] **Step 5: Implement the SQLite repository and transactions**
+- [x] **Step 5: Implement the SQLite repository and transactions**
 
 Use prepared statements for every query. Parse `preflight_json`, `request_json`, and `snapshot_json` only inside the repository. `attachOrderSnapshot` must insert an immutable `order_events` row and update the latest `strategy_orders.snapshot_json` in one transaction. Wrap `planOrder` and state-changing snapshot updates in `database.transaction`. Never persist credentials or gateway objects.
 
-- [ ] **Step 6: Run repository tests**
+- [x] **Step 6: Run repository tests**
 
 Run:
 
@@ -925,7 +925,7 @@ npm test
 
 Expected: all tests pass; no SQLite file is created because tests use `:memory:`.
 
-- [ ] **Step 7: Commit persistence**
+- [x] **Step 7: Commit persistence**
 
 ```bash
 git add src/storage tests/storage
