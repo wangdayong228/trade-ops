@@ -693,7 +693,7 @@ git commit -m "feat: add ccxt exchange gateway"
 - Consumes: `ExchangeRegistry`, `normalizeCommonBaseQuantity`
 - Produces: `PreflightInput`, `PreflightResult`, `PreflightService.run(input)`
 
-- [ ] **Step 1: Write failing preflight tests**
+- [x] **Step 1: Write failing preflight tests**
 
 Cover the accepted happy path and the critical rejections:
 
@@ -725,7 +725,7 @@ test('rejects insufficient estimated spot balance', async () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused tests**
+- [x] **Step 2: Run the focused tests**
 
 Run:
 
@@ -735,7 +735,7 @@ npm run build
 
 Expected: FAIL because `PreflightService` does not exist.
 
-- [ ] **Step 3: Implement the preflight contract and checks**
+- [x] **Step 3: Implement the preflight contract and checks**
 
 Use these exact result fields:
 
@@ -773,7 +773,7 @@ export interface PreflightResult extends PreflightInput {
 
 The result is a preview snapshot, not a guarantee that balances remain unchanged.
 
-- [ ] **Step 4: Run preflight tests**
+- [x] **Step 4: Run preflight tests**
 
 Run:
 
@@ -783,7 +783,7 @@ npm test
 
 Expected: all preflight and earlier tests pass.
 
-- [ ] **Step 5: Commit preflight behavior**
+- [x] **Step 5: Commit preflight behavior**
 
 ```bash
 git add src/strategy/preflight-service.ts tests/strategy/preflight-service.test.ts
