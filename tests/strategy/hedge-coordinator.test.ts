@@ -316,6 +316,11 @@ class DirectResultGateway extends TrackingGateway {
 
 class DeferredCreateGateway extends TrackingGateway {
   #release: (() => void) | undefined;
+  #markStarted: (() => void) | undefined;
+  readonly started = new Promise<void>((resolve) => {
+    this.#markStarted = resolve;
+  });
+  createStarts = 0;
   readonly #gate = new Promise<void>((resolve) => {
     this.#release = resolve;
   });
@@ -326,6 +331,8 @@ class DeferredCreateGateway extends TrackingGateway {
 
   override async createOrder(request: OrderRequest): Promise<OrderSnapshot> {
     this.beforeCreate?.();
+    this.createStarts += 1;
+    this.#markStarted?.();
     await this.#gate;
     return super.createOrder(request);
   }
@@ -726,6 +733,138 @@ test('direct unknown result keeps its known fill exposure when lookup finds noth
   assert.equal(strategy.failureCode, 'ORDER_NOT_FOUND');
   assert.equal(contract.createdRequests.length, 1);
   assert.equal(contract.findRequests.length, 1);
+  assert.equal(context.spot.createdRequests.length, 0);
+});
+
+test('direct unknown positive fill rejects a later zero snapshot without downgrading exposure', async (t) => {
+  const contract = new UnknownStatusGateway('okx');
+  const context = setup(t, 'CONTRACT_FIRST', { contract });
+  contract.result = snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6',
+      averagePrice: '60000',
+      status: 'unknown'
+    }
+  );
+  contract.seedObservedOrder(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null,
+      status: 'unknown'
+    }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const strategy = context.repository.getStrategy(context.strategyId);
+  const order = context.repository.listOrders(context.strategyId)[0];
+  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
+  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
+  assert.equal(order?.snapshot?.filledBaseQuantity, '0.4');
+  assert.equal(context.repository.listOrderEvents(order!.id).length, 1);
+  assert.equal(contract.createdRequests.length, 1);
+  assert.equal(contract.findRequests.length, 1);
+  assert.equal(context.spot.createdRequests.length, 0);
+});
+
+test('direct unknown positive fill survives a malformed zero lookup snapshot', async (t) => {
+  const contract = new UnknownStatusGateway('okx');
+  const context = setup(t, 'CONTRACT_FIRST', { contract });
+  contract.result = snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6',
+      averagePrice: '60000',
+      status: 'unknown'
+    }
+  );
+  contract.seedObservedOrder(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '0',
+      averagePrice: null,
+      status: 'unknown'
+    }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const strategy = context.repository.getStrategy(context.strategyId);
+  const order = context.repository.listOrders(context.strategyId)[0];
+  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
+  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
+  assert.equal(order?.snapshot?.filledBaseQuantity, '0.4');
+  assert.equal(context.repository.listOrderEvents(order!.id).length, 1);
+  assert.equal(contract.createdRequests.length, 1);
+  assert.equal(contract.findRequests.length, 1);
+  assert.equal(context.spot.createdRequests.length, 0);
+});
+
+test('attach failure after a persisted positive unknown fill never downgrades exposure', async (t) => {
+  const contract = new UnknownStatusGateway('okx');
+  const context = setup(t, 'CONTRACT_FIRST', { contract });
+  contract.result = snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6',
+      averagePrice: '60000',
+      status: 'unknown'
+    }
+  );
+  contract.seedObservedOrder(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.6',
+      remainingBaseQuantity: '0.4',
+      averagePrice: '60000',
+      status: 'closed',
+      updatedAt: '2026-07-26T00:02:00.000Z'
+    }
+  ));
+  const repositoryFailure = new Error('second-attach-integrity-failure');
+  const originalAttach = context.repository.attachOrderSnapshot.bind(
+    context.repository
+  );
+  let attachCalls = 0;
+  context.repository.attachOrderSnapshot = (orderId, snapshot) => {
+    attachCalls += 1;
+    if (attachCalls === 2) {
+      throw repositoryFailure;
+    }
+    originalAttach(orderId, snapshot);
+  };
+
+  await assert.rejects(
+    context.coordinator.confirmAndExecute(context.strategyId),
+    (error) => error === repositoryFailure
+  );
+
+  const strategy = context.repository.getStrategy(context.strategyId);
+  const order = context.repository.listOrders(context.strategyId)[0];
+  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
+  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
+  assert.equal(order?.snapshot?.filledBaseQuantity, '0.4');
+  assert.equal(context.repository.listOrderEvents(order!.id).length, 1);
+  assert.equal(attachCalls, 2);
   assert.equal(context.spot.createdRequests.length, 0);
 });
 
@@ -1535,6 +1674,64 @@ test('a second confirmation and a failed competing claim never submit any role t
   assert.equal(context.spot.createdRequests.length, 1);
   assert.equal(context.contract.createdRequests.length, 1);
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+});
+
+test('an active execution owner blocks restart recovery across coordinator instances', async (t) => {
+  const spot = new DeferredCreateGateway('bitget');
+  const contract = new DeferredCreateGateway('okx');
+  const context = setup(t, 'CONCURRENT', { spot, contract });
+  spot.createResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_MARKET',
+    '1'
+  ));
+  contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    { averagePrice: '60001' }
+  ));
+  const competingCoordinator = new HedgeCoordinator(
+    new ExchangeRegistry(new Map([
+      ['bitget', spot],
+      ['okx', contract]
+    ])),
+    context.repository
+  );
+  const originalTransition = context.repository.transition.bind(
+    context.repository
+  );
+  let transitionCalls = 0;
+  context.repository.transition = (...args) => {
+    transitionCalls += 1;
+    return originalTransition(...args);
+  };
+
+  const execution = context.coordinator.confirmAndExecute(context.strategyId);
+  await Promise.all([spot.started, contract.started]);
+
+  try {
+    await competingCoordinator.confirmAndExecute(context.strategyId);
+
+    assert.equal(
+      context.repository.getStrategy(context.strategyId).state,
+      'EXECUTING'
+    );
+    assert.equal(transitionCalls, 0);
+    assert.equal(spot.createStarts, 1);
+    assert.equal(contract.createStarts, 1);
+    assert.equal(spot.findRequests.length, 0);
+    assert.equal(contract.findRequests.length, 0);
+  } finally {
+    spot.release();
+    contract.release();
+    await execution;
+  }
+
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'HEDGED');
+  assert.equal(transitionCalls, 1);
+  assert.equal(spot.createdRequests.length, 1);
+  assert.equal(contract.createdRequests.length, 1);
 });
 
 test('pre-existing planned or snapshotted pending roles are never submitted', async (t) => {

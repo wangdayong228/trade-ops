@@ -52,6 +52,7 @@ const SNAPSHOT_STATUSES = new Set<OrderSnapshot['status']>([
 const MAX_COORDINATOR_PRECISION = 1_000_000;
 const COORDINATOR_MIN_EXPONENT = -9_000_000_000_000_000;
 const COORDINATOR_MAX_EXPONENT = 9_000_000_000_000_000;
+const ACTIVE_STRATEGY_EXECUTIONS = new Set<string>();
 const CoordinatorDecimal = Decimal.clone({
   precision: 80,
   rounding: Decimal.ROUND_DOWN,
@@ -255,6 +256,18 @@ export class HedgeCoordinator {
   ) {}
 
   async confirmAndExecute(strategyId: string): Promise<void> {
+    if (ACTIVE_STRATEGY_EXECUTIONS.has(strategyId)) {
+      return;
+    }
+    ACTIVE_STRATEGY_EXECUTIONS.add(strategyId);
+    try {
+      await this.confirmAndExecuteOwned(strategyId);
+    } finally {
+      ACTIVE_STRATEGY_EXECUTIONS.delete(strategyId);
+    }
+  }
+
+  private async confirmAndExecuteOwned(strategyId: string): Promise<void> {
     let strategy = this.repository.getStrategy(strategyId);
     const recovering = strategy.state === 'EXECUTING';
     if (strategy.state === 'PENDING_CONFIRMATION') {
@@ -360,6 +373,9 @@ export class HedgeCoordinator {
         existedBeforePreparation: true
       };
     }
+    if (!this.isExecuting(strategy.id)) {
+      throw new Error('strategy execution ended before order planning');
+    }
     return {
       gateway,
       record: this.repository.planOrder(strategy.id, role, request),
@@ -417,6 +433,9 @@ export class HedgeCoordinator {
     missingCode: StrategyFailureCode,
     fallbackExposureKnown = false
   ): Promise<SubmissionOutcome> {
+    if (!this.isExecuting(prepared.record.strategyId)) {
+      return failed('INCONSISTENT_ORDER_STATE', fallbackExposureKnown);
+    }
     let found: OrderSnapshot | null;
     try {
       found = await prepared.gateway.findOrderByClientId(
@@ -433,20 +452,78 @@ export class HedgeCoordinator {
     if (found === null) {
       return failed(missingCode, fallbackExposureKnown);
     }
-    return this.persistSnapshot(prepared, found);
+    return this.persistSnapshot(prepared, found, fallbackExposureKnown);
   }
 
   private persistSnapshot(
     prepared: Readonly<PreparedOrder>,
-    snapshot: OrderSnapshot
+    snapshot: OrderSnapshot,
+    fallbackExposureKnown = false
   ): SubmissionOutcome {
-    const validation = validateSnapshot(
-      snapshot,
-      prepared.record.request,
-      prepared.gateway.exchangeId
+    let exposureKnown = fallbackExposureKnown || (
+      prepared.record.snapshot !== null
+      && (
+        parsedDecimal(
+          prepared.record.snapshot.filledBaseQuantity,
+          true
+        )?.gt(0) ?? false
+      )
     );
+    let persistedSnapshot = prepared.record.snapshot;
+    try {
+      const persistedOrder = this.repository
+        .listOrders(prepared.record.strategyId)
+        .find((order) => order.id === prepared.record.id);
+      if (persistedOrder === undefined) {
+        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
+      }
+      persistedSnapshot = persistedOrder.snapshot;
+      exposureKnown = exposureKnown || (
+        persistedSnapshot !== null
+        && (
+          parsedDecimal(
+            persistedSnapshot.filledBaseQuantity,
+            true
+          )?.gt(0) ?? false
+        )
+      );
+    } catch {
+      return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
+    }
+
+    let validation: SnapshotValidation;
+    try {
+      validation = validateSnapshot(
+        snapshot,
+        prepared.record.request,
+        prepared.gateway.exchangeId
+      );
+    } catch {
+      return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
+    }
+    exposureKnown = exposureKnown || validation.exposureKnown;
     if (!validation.valid) {
-      return failed(validation.failureCode, validation.exposureKnown);
+      return failed(validation.failureCode, exposureKnown);
+    }
+    if (persistedSnapshot !== null) {
+      const persistedFill = parsedDecimal(
+        persistedSnapshot.filledBaseQuantity,
+        true
+      );
+      const candidateFill = parsedDecimal(
+        snapshot.filledBaseQuantity,
+        true
+      );
+      if (
+        persistedFill === null
+        || candidateFill === null
+        || candidateFill.lt(persistedFill)
+      ) {
+        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
+      }
+    }
+    if (!this.isExecuting(prepared.record.strategyId)) {
+      return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
     }
     try {
       this.repository.attachOrderSnapshot(prepared.record.id, snapshot);
@@ -454,7 +531,7 @@ export class HedgeCoordinator {
       try {
         this.failStrategy(
           prepared.record.strategyId,
-          validation.exposureKnown,
+          exposureKnown,
           'INCONSISTENT_ORDER_STATE'
         );
       } catch {
@@ -465,7 +542,7 @@ export class HedgeCoordinator {
     if (snapshot.status === 'unknown') {
       return failed(
         'ORDER_RECONCILIATION_FAILED',
-        validation.exposureKnown
+        exposureKnown
       );
     }
     return { kind: 'snapshot', snapshot };
@@ -474,16 +551,24 @@ export class HedgeCoordinator {
   private async submit(
     prepared: Readonly<PreparedOrder>
   ): Promise<SubmissionOutcome> {
-    if (prepared.record.snapshot !== null) {
-      if (prepared.record.snapshot.status === 'unknown') {
-        const knownFill = parsedDecimal(
+    const persistedExposureKnown = (
+      prepared.record.snapshot !== null
+      && (
+        parsedDecimal(
           prepared.record.snapshot.filledBaseQuantity,
           true
-        )?.gt(0) ?? false;
+        )?.gt(0) ?? false
+      )
+    );
+    if (!this.isExecuting(prepared.record.strategyId)) {
+      return failed('INCONSISTENT_ORDER_STATE', persistedExposureKnown);
+    }
+    if (prepared.record.snapshot !== null) {
+      if (prepared.record.snapshot.status === 'unknown') {
         return this.lookupAndPersist(
           prepared,
           'ORDER_NOT_FOUND',
-          knownFill
+          persistedExposureKnown
         );
       }
       return {
@@ -517,6 +602,14 @@ export class HedgeCoordinator {
       );
     }
     return this.persistSnapshot(prepared, snapshot);
+  }
+
+  private isExecuting(strategyId: string): boolean {
+    try {
+      return this.repository.getStrategy(strategyId).state === 'EXECUTING';
+    } catch {
+      return false;
+    }
   }
 
   private failStrategy(
