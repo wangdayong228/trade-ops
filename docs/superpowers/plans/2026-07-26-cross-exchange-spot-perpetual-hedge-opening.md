@@ -943,7 +943,7 @@ git commit -m "feat: persist hedge strategy state"
 - Produces: `HedgeCoordinator.confirmAndExecute(strategyId: string): Promise<void>`
 - Produces: stable client IDs from `makeClientOrderId(strategyId, role)`
 
-- [ ] **Step 1: Write failing sequential-mode tests**
+- [x] **Step 1: Write failing sequential-mode tests**
 
 Use `FakeExchangeGateway` and an in-memory repository:
 
@@ -984,7 +984,7 @@ test('spot-first sends a SHORT GTC for the actual spot fill', async () => {
 });
 ```
 
-- [ ] **Step 2: Write failing concurrent-mode tests**
+- [x] **Step 2: Write failing concurrent-mode tests**
 
 Cover equal fills, unequal fills, both zero, and one rejected side:
 
@@ -1017,7 +1017,7 @@ test('concurrent mode fills the smaller contract side at the spot average', asyn
 });
 ```
 
-- [ ] **Step 3: Run the coordinator tests and verify failure**
+- [x] **Step 3: Run the coordinator tests and verify failure**
 
 Run:
 
@@ -1027,7 +1027,7 @@ npm run build
 
 Expected: FAIL because `HedgeCoordinator` does not exist.
 
-- [ ] **Step 4: Implement idempotent order submission**
+- [x] **Step 4: Implement idempotent order submission**
 
 Add a private `submit` method with this sequence:
 
@@ -1059,7 +1059,7 @@ async confirmAndExecute(strategyId: string): Promise<void> {
 }
 ```
 
-- [ ] **Step 5: Implement sequential execution**
+- [x] **Step 5: Implement sequential execution**
 
 For the first market leg, submit the preflight effective quantity. When its terminal snapshot has zero fill, transition to `FAILED`. When it has a positive fill and average price, quantize the price through the second gateway, submit exactly the filled base quantity as GTC, and transition to:
 
@@ -1069,7 +1069,7 @@ For the first market leg, submit the preflight effective quantity. When its term
 
 Do not submit the second leg if no reliable average price exists.
 
-- [ ] **Step 6: Implement concurrent execution**
+- [x] **Step 6: Implement concurrent execution**
 
 Submit both planned market orders with `Promise.allSettled`, reconcile unknown submissions by client ID, and compare normalized filled base quantities using Decimal.js.
 
@@ -1080,7 +1080,7 @@ Submit both planned market orders with `Promise.allSettled`, reconcile unknown s
 - Contract is smaller: sell/open `SHORT` at the spot market order’s average price.
 - Missing required average price: transition to `HEDGE_INCOMPLETE`.
 
-- [ ] **Step 7: Run coordinator tests**
+- [x] **Step 7: Run coordinator tests**
 
 Run:
 
@@ -1090,7 +1090,7 @@ npm test
 
 Expected: sequential, concurrent, partial-fill, zero-fill, and idempotency cases pass.
 
-- [ ] **Step 8: Commit execution coordination**
+- [x] **Step 8: Commit execution coordination**
 
 ```bash
 git add src/strategy/hedge-coordinator.ts tests/strategy/hedge-coordinator.test.ts
