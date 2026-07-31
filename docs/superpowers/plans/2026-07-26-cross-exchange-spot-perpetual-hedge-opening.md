@@ -1330,7 +1330,7 @@ git commit -m "feat: expose hedge opening operator flow"
 - Produces: runnable single-process service
 - Produces: simulated end-to-end acceptance coverage
 
-- [ ] **Step 1: Write the failing end-to-end acceptance test**
+- [x] **Step 1: Write the failing end-to-end acceptance test**
 
 The test must compose real preflight, SQLite repository, coordinator, monitor, and Fastify server with two fake gateways, then prove:
 
@@ -1359,7 +1359,7 @@ test('operator confirms contract-first and restart recovery reaches HEDGED', asy
 });
 ```
 
-- [ ] **Step 2: Run the acceptance test**
+- [x] **Step 2: Run the acceptance test**
 
 Run:
 
@@ -1369,7 +1369,7 @@ npm run build
 
 Expected: FAIL because the production composition root does not exist.
 
-- [ ] **Step 3: Implement the production composition root**
+- [x] **Step 3: Implement the production composition root**
 
 `src/main.ts` must:
 
@@ -1384,7 +1384,7 @@ Expected: FAIL because the production composition root does not exist.
 
 The startup path must fail before listening when the exchange allowlist is empty, credentials are missing, or the database cannot be opened.
 
-- [ ] **Step 4: Write the operations and risk guide**
+- [x] **Step 4: Write the operations and risk guide**
 
 Create `README.md` with:
 
@@ -1397,7 +1397,7 @@ Create `README.md` with:
 - Recovery steps for `HEDGE_INCOMPLETE`: inspect both exchange order IDs and positions, then resolve manually outside this release.
 - A statement that tests use fakes or exchange sandboxes and never real funds.
 
-- [ ] **Step 5: Run all verification**
+- [x] **Step 5: Run all verification**
 
 Run:
 
@@ -1408,7 +1408,7 @@ npm run build
 
 Expected: every unit, coordinator, persistence, API, monitor, and acceptance test passes; the strict TypeScript build exits successfully.
 
-- [ ] **Step 6: Verify the documented feature boundary**
+- [x] **Step 6: Verify the documented feature boundary**
 
 After all tests pass, change the opening checkbox in `docs/manual/feature_list.md` from:
 
@@ -1432,7 +1432,7 @@ rg -n "开空合约，同时买现货|卖出现货，同时平掉合约空单" d
 
 Expected: opening is marked as the current implementation and closing remains explicitly marked as a later feature.
 
-- [ ] **Step 7: Commit the runnable service**
+- [x] **Step 7: Commit the runnable service**
 
 ```bash
 git add src/main.ts tests/acceptance README.md docs/manual/feature_list.md
