@@ -5,6 +5,9 @@ const quantityInput = document.querySelector('#base-quantity');
 const modeInput = document.querySelector('#mode');
 const preflightForm = document.querySelector('#preflight-form');
 const preflightButton = document.querySelector('#preflight-button');
+const resumeStrategyIdInput = document.querySelector('#resume-strategy-id');
+const resumeForm = document.querySelector('#resume-form');
+const loadStrategyButton = document.querySelector('#load-strategy-button');
 const riskAck = document.querySelector('#risk-ack');
 const confirmButton = document.querySelector('#confirm-button');
 const refreshButton = document.querySelector('#refresh-button');
@@ -28,6 +31,7 @@ const executionModes = new Set([
   'CONTRACT_FIRST',
   'SPOT_FIRST'
 ]);
+const configuredExchangeIds = new Set(['bitget', 'okx']);
 const strategyStates = new Set([
   'PENDING_CONFIRMATION',
   'EXECUTING',
@@ -41,6 +45,10 @@ const orderRoles = new Set([
   'CONTRACT_MARKET',
   'SPOT_HEDGE_GTC',
   'CONTRACT_HEDGE_GTC'
+]);
+const resumableStates = new Set([
+  'PENDING_CONFIRMATION',
+  'EXECUTING'
 ]);
 
 function setText(id, value) {
@@ -79,6 +87,7 @@ function clearPreview() {
     'margin-mode',
     'position-mode',
     'leverage',
+    'strategy-id',
     'strategy-state'
   ]) {
     setText(id, '—');
@@ -97,6 +106,7 @@ function resetActionablePreview(message, kind = '') {
   submittedStrategyInput = null;
   riskAck.checked = false;
   preflightButton.disabled = false;
+  loadStrategyButton.disabled = false;
   refreshButton.disabled = true;
   updateConfirmButton();
   clearPreview();
@@ -112,6 +122,11 @@ for (const input of preflightInputs) {
   input.addEventListener('input', invalidatePreflight);
   input.addEventListener('change', invalidatePreflight);
 }
+
+resumeStrategyIdInput.addEventListener('input', () => {
+  inputRevision += 1;
+  resetActionablePreview('策略 ID 已变更，请重新加载。');
+});
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -312,8 +327,74 @@ function validatedStatusResponse(
   };
 }
 
+function canonicalStrategyId(value) {
+  const id = requiredString(value, 36);
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      .test(id)
+  ) {
+    throw new Error('invalid strategy id');
+  }
+  return id;
+}
+
+function validatedLoadedInput(value) {
+  if (!isRecord(value)) {
+    throw new Error('invalid loaded preflight identity');
+  }
+  const spotExchangeId = requiredString(value.spotExchangeId, 128);
+  const contractExchangeId = requiredString(
+    value.contractExchangeId,
+    128
+  );
+  if (
+    !configuredExchangeIds.has(spotExchangeId)
+    || !configuredExchangeIds.has(contractExchangeId)
+    || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(spotExchangeId)
+    || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(contractExchangeId)
+    || spotExchangeId === contractExchangeId
+  ) {
+    throw new Error('invalid loaded exchange identity');
+  }
+  const symbol = requiredString(value.symbol, 64);
+  if (!/^[A-Z0-9][A-Z0-9._-]{0,30}\/USDT$/.test(symbol)) {
+    throw new Error('invalid loaded symbol');
+  }
+  const requestedBaseQuantity = positiveDecimalString(
+    value.requestedBaseQuantity,
+    256
+  );
+  const mode = requiredString(value.mode, 32);
+  if (!executionModes.has(mode)) {
+    throw new Error('invalid loaded execution mode');
+  }
+  return Object.freeze({
+    spotExchangeId,
+    contractExchangeId,
+    symbol,
+    requestedBaseQuantity,
+    mode
+  });
+}
+
+function validatedLoadedStatusResponse(value, expectedStrategyId) {
+  if (!isRecord(value)) {
+    throw new Error('invalid loaded status response');
+  }
+  const submittedInput = validatedLoadedInput(value.preflight);
+  return {
+    submittedInput,
+    status: validatedStatusResponse(
+      value,
+      submittedInput,
+      expectedStrategyId
+    )
+  };
+}
+
 function renderPreflight(strategy) {
   const preview = strategy.preflight;
+  setText('strategy-id', strategy.id);
   setText('requested-quantity', preview.requestedBaseQuantity);
   setText('effective-quantity', preview.effectiveBaseQuantity);
   setText('spot-price', preview.spotReferencePrice);
@@ -344,6 +425,7 @@ function renderOrderIds(id, orders) {
 
 function renderStatus(status) {
   renderPreflight({
+    id: status.strategy.id,
     preflight: status.preflight,
     state: status.strategy.state
   });
@@ -384,6 +466,7 @@ async function refreshStatus() {
   const statusExpectedInput = submittedStrategyInput;
   requestPending = true;
   refreshButton.disabled = true;
+  loadStrategyButton.disabled = true;
   updateConfirmButton();
   try {
     const response = await fetch(
@@ -405,6 +488,10 @@ async function refreshStatus() {
     ) {
       return;
     }
+    preflightReady = resumableStates.has(status.strategy.state);
+    if (!preflightReady) {
+      riskAck.checked = false;
+    }
     renderStatus(status);
     setMessage('状态已刷新。', 'success');
   } catch {
@@ -424,10 +511,86 @@ async function refreshStatus() {
     ) {
       requestPending = false;
       refreshButton.disabled = false;
+      loadStrategyButton.disabled = false;
       updateConfirmButton();
     }
   }
 }
+
+resumeForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  inputRevision += 1;
+  const loadRevision = inputRevision;
+  resetActionablePreview('正在加载已有策略。');
+  let requestedStrategyId;
+  try {
+    if (!resumeForm.reportValidity()) {
+      throw new Error('invalid strategy id');
+    }
+    requestedStrategyId = canonicalStrategyId(
+      resumeStrategyIdInput.value
+    );
+  } catch {
+    resetActionablePreview('策略 ID 格式无效。', 'error');
+    return;
+  }
+
+  requestPending = true;
+  preflightButton.disabled = true;
+  loadStrategyButton.disabled = true;
+  updateConfirmButton();
+  try {
+    const response = await fetch(
+      `/api/hedges/${encodeURIComponent(requestedStrategyId)}`
+    );
+    const body = await responseJson(response);
+    if (!response.ok || body === null) {
+      throw new Error('strategy unavailable');
+    }
+    const loaded = validatedLoadedStatusResponse(
+      body,
+      requestedStrategyId
+    );
+    if (
+      loadRevision !== inputRevision
+      || requestedStrategyId !== resumeStrategyIdInput.value
+    ) {
+      return;
+    }
+    const submittedInput = loaded.submittedInput;
+    spotExchange.value = submittedInput.spotExchangeId;
+    contractExchange.value = submittedInput.contractExchangeId;
+    symbolInput.value = submittedInput.symbol;
+    quantityInput.value = submittedInput.requestedBaseQuantity;
+    modeInput.value = submittedInput.mode;
+    submittedStrategyInput = submittedInput;
+    strategyId = requestedStrategyId;
+    preflightReady = resumableStates.has(loaded.status.strategy.state);
+    riskAck.checked = false;
+    renderStatus(loaded.status);
+    refreshButton.disabled = false;
+    setMessage(
+      preflightReady
+        ? '策略已加载。请核对状态并重新确认风险。'
+        : '策略已加载，仅供查看。',
+      'success'
+    );
+  } catch {
+    if (loadRevision === inputRevision) {
+      resetActionablePreview(
+        '策略加载失败或响应无效，请检查策略 ID。',
+        'error'
+      );
+    }
+  } finally {
+    if (loadRevision === inputRevision) {
+      requestPending = false;
+      preflightButton.disabled = false;
+      loadStrategyButton.disabled = false;
+      updateConfirmButton();
+    }
+  }
+});
 
 preflightForm.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -446,6 +609,7 @@ preflightForm.addEventListener('submit', async (event) => {
   });
   requestPending = true;
   preflightButton.disabled = true;
+  loadStrategyButton.disabled = true;
   updateConfirmButton();
   setMessage('正在预检，请稍候。');
   try {
@@ -482,6 +646,7 @@ preflightForm.addEventListener('submit', async (event) => {
     if (submittedRevision === inputRevision) {
       requestPending = false;
       preflightButton.disabled = false;
+      loadStrategyButton.disabled = false;
       updateConfirmButton();
     }
   }
@@ -503,6 +668,7 @@ confirmButton.addEventListener('click', async () => {
   requestPending = true;
   preflightReady = false;
   preflightButton.disabled = true;
+  loadStrategyButton.disabled = true;
   updateConfirmButton();
   setMessage('正在提交确认。');
   try {
@@ -526,6 +692,7 @@ confirmButton.addEventListener('click', async () => {
     ) {
       return;
     }
+    riskAck.checked = false;
     setMessage('确认已受理，正在后台执行', 'success');
   } catch {
     if (
@@ -542,6 +709,7 @@ confirmButton.addEventListener('click', async () => {
     ) {
       requestPending = false;
       preflightButton.disabled = false;
+      loadStrategyButton.disabled = false;
       refreshButton.disabled = false;
       updateConfirmButton();
     }

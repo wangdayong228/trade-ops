@@ -670,6 +670,14 @@ export class OrderMonitor {
     return stop;
   }
 
+  async stop(): Promise<void> {
+    this.activeStop?.();
+    const recovery = this.activeRecovery;
+    if (recovery !== null) {
+      await recovery;
+    }
+  }
+
   private async recoverOnce(): Promise<void> {
     const strategies = this.repository.listRecoverable();
     for (const strategy of strategies) {

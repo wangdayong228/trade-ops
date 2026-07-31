@@ -185,7 +185,10 @@ function assertQuoteNotional(
 }
 
 export class PreflightService {
-  constructor(private readonly registry: ExchangeRegistry) {}
+  constructor(
+    private readonly registry: ExchangeRegistry,
+    private readonly clock: () => Date = () => new Date()
+  ) {}
 
   async run(input: PreflightInput): Promise<PreflightResult> {
     const request = Object.freeze({
@@ -291,7 +294,7 @@ export class PreflightService {
       spotReferencePrice: spotReferencePrice.toFixed(),
       contractReferencePrice: contractReferencePrice.toFixed(),
       riskAcknowledgementRequired: true,
-      createdAt: new Date().toISOString()
+      createdAt: this.clock().toISOString()
     };
   }
 }

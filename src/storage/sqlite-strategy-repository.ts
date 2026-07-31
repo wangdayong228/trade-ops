@@ -1001,7 +1001,10 @@ export class SqliteStrategyRepository implements StrategyRepository {
   private readonly planOrderTransaction;
   private readonly attachSnapshotTransaction;
 
-  constructor(private readonly database: Database.Database) {
+  constructor(
+    private readonly database: Database.Database,
+    private readonly clock: () => Date = () => new Date()
+  ) {
     this.database.exec(SQLITE_STRATEGY_SCHEMA);
     if (!sqliteIntegerEquals(
       this.database.pragma('foreign_keys', { simple: true }),
@@ -1112,7 +1115,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
   createPending(preflight: PreflightResult): StrategyRecord {
     const snapshot = publicPreflightSnapshot(preflight);
     const id = randomUUID();
-    const now = new Date().toISOString();
+    const now = this.clock().toISOString();
     this.insertStrategy.run({
       id,
       state: 'PENDING_CONFIRMATION',
@@ -1142,7 +1145,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     const strategyId = nonEmptyString(id, 'strategy id', 128);
     const result = this.claimStrategy.run({
       id: strategyId,
-      updatedAt: new Date().toISOString()
+      updatedAt: this.clock().toISOString()
     });
     return sqliteIntegerEquals(result.changes, 1);
   }
@@ -1260,7 +1263,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     const result = statement.run(
       target,
       safeFailureCode,
-      new Date().toISOString(),
+      this.clock().toISOString(),
       id,
       ...sources
     );
@@ -1280,7 +1283,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     const strategy = this.getStrategy(strategyId);
     const validated = validatedRequestForRole(strategy, role, request, false);
     const id = randomUUID();
-    const now = new Date().toISOString();
+    const now = this.clock().toISOString();
     this.insertOrder.run({
       id,
       strategyId: strategy.id,
@@ -1306,7 +1309,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       'order snapshot'
     );
     const snapshotJson = JSON.stringify(snapshot);
-    const recordedAt = new Date().toISOString();
+    const recordedAt = this.clock().toISOString();
     this.insertEvent.run({
       strategyOrderId: order.id,
       snapshotJson,

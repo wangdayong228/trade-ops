@@ -1897,6 +1897,79 @@ test('start recovers immediately, prevents overlap, and stops idempotently', asy
   assertNoCreates(f);
 });
 
+test('stop clears scheduling and waits for the immediate recovery to settle', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(
+    f.repository,
+    'CONTRACT_FIRST',
+    'WAITING_HEDGE'
+  );
+  planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '1', '0', 'closed')
+  );
+  const gtc = planOrder(
+    f.repository,
+    strategy.id,
+    'SPOT_HEDGE_GTC',
+    '1',
+    snapshotFor(strategy.id, 'SPOT_HEDGE_GTC', '1', '0', '1', 'open')
+  );
+  let releaseFetch: (() => void) | undefined;
+  let markFetchStarted: (() => void) | undefined;
+  const fetchStarted = new Promise<void>((resolve) => {
+    markFetchStarted = resolve;
+  });
+  const fetchGate = new Promise<void>((resolve) => {
+    releaseFetch = resolve;
+  });
+  let fetches = 0;
+  const originalFetch = f.spot.fetchOrder.bind(f.spot);
+  f.spot.fetchOrder = async (
+    exchangeOrderId: string,
+    symbol: string,
+    kind: MarketKind
+  ): Promise<OrderSnapshot> => {
+    fetches += 1;
+    markFetchStarted?.();
+    await fetchGate;
+    return originalFetch(exchangeOrderId, symbol, kind);
+  };
+  f.spot.scriptedFetches.set(gtc.exchangeOrderId as string, [
+    snapshotFor(strategy.id, 'SPOT_HEDGE_GTC', '1', '1', '0', 'closed', {
+      updatedAt: SECOND_UPDATE
+    })
+  ]);
+  const clock = installManualIntervals(t);
+  const monitor = new OrderMonitor(f.registry, f.repository);
+
+  monitor.start(10);
+  await fetchStarted;
+  let stopped = false;
+  const stopping = monitor.stop().then(() => {
+    stopped = true;
+  });
+  await Promise.resolve();
+  assert.equal(stopped, false);
+  clock.tick(10);
+  assert.equal(fetches, 1);
+
+  releaseFetch?.();
+  await stopping;
+  assert.equal(stopped, true);
+  assert.equal(
+    f.repository.getStrategy(strategy.id).state,
+    'HEDGED'
+  );
+  clock.tick(10);
+  await flushMicrotasks();
+  assert.equal(fetches, 1);
+  assertNoCreates(f);
+});
+
 test('a rejected immediate recovery does not cause an unhandled rejection or stop later rounds', async (t) => {
   const f = fixture(t);
   const strategy = createStrategy(

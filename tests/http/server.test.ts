@@ -350,6 +350,9 @@ async function browserHarness(): Promise<BrowserHarness> {
     'mode',
     'preflight-form',
     'preflight-button',
+    'resume-strategy-id',
+    'resume-form',
+    'load-strategy-button',
     'risk-ack',
     'confirm-button',
     'refresh-button',
@@ -363,6 +366,7 @@ async function browserHarness(): Promise<BrowserHarness> {
     'margin-mode',
     'position-mode',
     'leverage',
+    'strategy-id',
     'strategy-state',
     'spot-order-ids',
     'contract-order-ids',
@@ -1560,6 +1564,10 @@ test('operator UI enables confirmation for a complete matching response', async 
   await browser.element('preflight-form').emit('submit');
   assert.equal(browser.element('requested-quantity').textContent, '1');
   assert.equal(
+    browser.element('strategy-id').textContent,
+    'strategy-browser-1'
+  );
+  assert.equal(
     browser.element('strategy-state').textContent,
     'PENDING_CONFIRMATION'
   );
@@ -1616,6 +1624,10 @@ test('operator UI accepts a matching status id and canonical high-precision fill
   await browser.element('refresh-button').emit('click');
 
   assert.equal(browser.element('strategy-state').textContent, 'EXECUTING');
+  assert.equal(
+    browser.element('strategy-id').textContent,
+    'strategy-browser-1'
+  );
   assert.equal(browser.element('spot-actual-fill').textContent, '0');
   assert.equal(
     browser.element('contract-actual-fill').textContent,
@@ -1836,6 +1848,267 @@ test('operator UI admits only one confirmation request across a double click', a
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
+test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgement to resume', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174000';
+  const status = browserStatusResponse();
+  (status.strategy as Record<string, unknown>).id = strategyId;
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url, options) => {
+    if (url === `/api/hedges/${strategyId}`) {
+      assert.equal(options, undefined);
+      return browserResponse(200, status);
+    }
+    if (url === `/api/hedges/${strategyId}/confirm`) {
+      assert.equal(options?.method, 'POST');
+      assert.equal(
+        options?.body,
+        JSON.stringify({ riskAcknowledged: true })
+      );
+      return browserResponse(202, { accepted: true });
+    }
+    throw new Error(`unexpected resume URL: ${url}`);
+  });
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(browser.element('strategy-state').textContent, 'EXECUTING');
+  assert.equal(browser.element('strategy-id').textContent, strategyId);
+  assert.equal(browser.element('spot-exchange').value, 'bitget');
+  assert.equal(browser.element('contract-exchange').value, 'okx');
+  assert.equal(browser.element('symbol').value, SYMBOL);
+  assert.equal(browser.element('base-quantity').value, '1');
+  assert.equal(browser.element('mode').value, 'CONCURRENT');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, false);
+
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
+  await browser.element('confirm-button').emit('click');
+  assert.equal(
+    browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
+    1
+  );
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI loads WAITING_HEDGE for observation without enabling confirmation', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174001';
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    state: 'WAITING_HEDGE'
+  });
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url) => {
+    assert.equal(url, `/api/hedges/${strategyId}`);
+    return browserResponse(200, status);
+  });
+
+  await browser.element('resume-form').emit('submit');
+  assert.equal(
+    browser.element('strategy-state').textContent,
+    'WAITING_HEDGE'
+  );
+  assert.equal(browser.element('refresh-button').disabled, false);
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI disables recovery confirmation when refresh reaches WAITING_HEDGE', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174008';
+  const executing = browserStatusResponse();
+  (executing.strategy as Record<string, unknown>).id = strategyId;
+  browser.element('resume-strategy-id').value = strategyId;
+  let status = executing;
+  browser.setFetch(async (url) => {
+    assert.equal(url, `/api/hedges/${strategyId}`);
+    return browserResponse(200, status);
+  });
+  await browser.element('resume-form').emit('submit');
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
+
+  const waiting = browserStatusResponse();
+  Object.assign(waiting.strategy as Record<string, unknown>, {
+    id: strategyId,
+    state: 'WAITING_HEDGE'
+  });
+  status = waiting;
+  await browser.element('refresh-button').emit('click');
+
+  assert.equal(
+    browser.element('strategy-state').textContent,
+    'WAITING_HEDGE'
+  );
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI rejects an invalid or internally inconsistent loaded strategy', async (t) => {
+  const strategyId = '123e4567-e89b-42d3-a456-426614174002';
+  const cases = [
+    {
+      name: 'response id mismatch',
+      mutate(body: Record<string, unknown>): void {
+        (body.strategy as Record<string, unknown>).id =
+          '123e4567-e89b-42d3-a456-426614174099';
+      }
+    },
+    {
+      name: 'strategy and preflight identity mismatch',
+      mutate(body: Record<string, unknown>): void {
+        (body.strategy as Record<string, unknown>).symbol = 'ETH/USDT';
+      }
+    },
+    {
+      name: 'self-consistent unsupported exchange',
+      mutate(body: Record<string, unknown>): void {
+        (body.strategy as Record<string, unknown>).spotExchangeId = 'kraken';
+        (body.preflight as Record<string, unknown>).spotExchangeId = 'kraken';
+      }
+    },
+    {
+      name: 'non-actionable preflight',
+      mutate(body: Record<string, unknown>): void {
+        const preview = body.preflight as Record<string, unknown>;
+        const settings = preview.accountSettings as Record<string, unknown>;
+        settings.marginMode = 'unknown';
+      }
+    },
+    {
+      name: 'invalid actual fills',
+      mutate(body: Record<string, unknown>): void {
+        const fills = body.actualFills as Record<string, unknown>;
+        fills.unmatchedBaseQuantity = '-1';
+      }
+    },
+    {
+      name: 'invalid order projection',
+      mutate(body: Record<string, unknown>): void {
+        body.orders = [{
+          role: 'UNSAFE_ROLE',
+          clientOrderId: 'client-sentinel',
+          exchangeOrderId: 'exchange-sentinel'
+        }];
+      }
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const browser = await browserHarness();
+      const body = browserStatusResponse();
+      (body.strategy as Record<string, unknown>).id = strategyId;
+      item.mutate(body);
+      browser.element('resume-strategy-id').value = strategyId;
+      browser.setFetch(async (url) => {
+        assert.equal(url, `/api/hedges/${strategyId}`);
+        return browserResponse(200, body);
+      });
+
+      await browser.element('resume-form').emit('submit');
+      assert.equal(browser.element('requested-quantity').textContent, '—');
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.element('refresh-button').disabled, true);
+    });
+  }
+});
+
+test('operator UI clears actionable state when strategy loading returns an error', async () => {
+  const browser = await browserWithValidPreflight();
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
+  const strategyId = '123e4567-e89b-42d3-a456-426614174007';
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async () => browserResponse(404, {
+    code: 'STRATEGY_NOT_FOUND'
+  }));
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, true);
+});
+
+test('operator UI invalidates a loaded strategy when the resume id is edited', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174003';
+  const status = browserStatusResponse();
+  (status.strategy as Record<string, unknown>).id = strategyId;
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async () => browserResponse(200, status));
+  await browser.element('resume-form').emit('submit');
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
+
+  browser.element('resume-strategy-id').value =
+    '123e4567-e89b-42d3-a456-426614174004';
+  await browser.element('resume-strategy-id').emit('input');
+
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, true);
+});
+
+test('operator UI ignores a stale loaded strategy after the resume id changes', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174005';
+  let resolveLoad: ((response: FakeBrowserResponse) => void) | undefined;
+  const delayedLoad = new Promise<FakeBrowserResponse>((resolve) => {
+    resolveLoad = resolve;
+  });
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async () => delayedLoad);
+
+  const loading = browser.element('resume-form').emit('submit');
+  await flushImmediate();
+  browser.element('resume-strategy-id').value =
+    '123e4567-e89b-42d3-a456-426614174006';
+  await browser.element('resume-strategy-id').emit('input');
+  const stale = browserStatusResponse();
+  (stale.strategy as Record<string, unknown>).id = strategyId;
+  resolveLoad?.(browserResponse(200, stale));
+  await loading;
+
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, true);
+});
+
+test('operator UI rejects a non-canonical resume id before fetching status', async () => {
+  const browser = await browserHarness();
+  browser.element('resume-strategy-id').value = 'strategy-browser-1';
+  browser.setFetch(async () => {
+    throw new Error('invalid resume id must not fetch');
+  });
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(
+    browser.fetchCalls.filter(({ url }) => url.startsWith('/api/hedges/'))
+      .length,
+    0
+  );
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
 test('operator page has explicit modes, safe acknowledgement, complete rendering, and invalidation contracts', async (t) => {
   const { server } = setup(t);
   const [pageResponse, scriptResponse, styleResponse] = await Promise.all([
@@ -1881,6 +2154,9 @@ test('operator page has explicit modes, safe acknowledgement, complete rendering
     'base-quantity',
     'mode',
     'preflight-button',
+    'resume-strategy-id',
+    'resume-form',
+    'load-strategy-button',
     'risk-ack',
     'confirm-button',
     'refresh-button',
@@ -1893,6 +2169,7 @@ test('operator page has explicit modes, safe acknowledgement, complete rendering
     'margin-mode',
     'position-mode',
     'leverage',
+    'strategy-id',
     'strategy-state',
     'spot-order-ids',
     'contract-order-ids',
@@ -1905,6 +2182,7 @@ test('operator page has explicit modes, safe acknowledgement, complete rendering
   assert.doesNotMatch(page, /api.?key|secret|password/i);
   assert.match(page, /<link rel="stylesheet" href="\/styles\.css">/);
   assert.match(page, /id="base-quantity"[^>]*maxlength="256"/);
+  assert.match(page, /id="resume-strategy-id"[^>]*maxlength="36"/);
   assert.doesNotMatch(script, /innerHTML/);
   assert.match(script, /riskAcknowledged:\s*true/);
   assert.match(script, /input\.addEventListener\('input', invalidatePreflight\)/);
