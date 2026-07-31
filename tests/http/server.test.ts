@@ -351,9 +351,10 @@ function browserPreflightResponse(
 function browserOrderResponse(
   strategyId: string,
   role: OrderRole = 'SPOT_MARKET',
-  orderId = '223e4567-e89b-42d3-a456-426614174000'
+  orderId = '223e4567-e89b-42d3-a456-426614174000',
+  baseQuantity = '1'
 ): Record<string, unknown> {
-  const request = requestFor(strategyId, role, '1');
+  const request = requestFor(strategyId, role, baseQuantity);
   const exchangeId = role.startsWith('SPOT_') ? 'bitget' : 'okx';
   const snapshot = snapshotFor(request, exchangeId);
   return {
@@ -368,6 +369,29 @@ function browserOrderResponse(
     status: snapshot.status,
     createdAt: '2026-07-31T00:01:00.000Z',
     updatedAt: '2026-07-31T00:01:00.000Z'
+  };
+}
+
+function setBrowserOrderSnapshot(
+  order: Record<string, unknown>,
+  overrides: Partial<OrderSnapshot>
+): void {
+  Object.assign(order.snapshot as Record<string, unknown>, overrides);
+  if (overrides.status !== undefined) {
+    order.status = overrides.status;
+  }
+}
+
+function setBrowserActualFills(
+  body: Record<string, unknown>,
+  spotBuyBaseQuantity: string,
+  contractShortBaseQuantity: string,
+  unmatchedBaseQuantity: string
+): void {
+  body.actualFills = {
+    spotBuyBaseQuantity,
+    contractShortBaseQuantity,
+    unmatchedBaseQuantity
   };
 }
 
@@ -2301,6 +2325,347 @@ test('operator UI rejects every malformed full status DTO before enabling confir
       }
     },
     {
+      name: 'concurrent difference hedge is on the larger fill side',
+      mutate(body) {
+        const spotMarket = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174014'
+        );
+        setBrowserOrderSnapshot(spotMarket, {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174015'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60010',
+          status: 'closed'
+        });
+        body.orders = [
+          spotMarket,
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'SPOT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174016',
+            '0.6'
+          )
+        ];
+        setBrowserActualFills(body, '1', '0.4', '0.6');
+      }
+    },
+    {
+      name: 'concurrent difference hedge quantity differs from market fills',
+      mutate(body) {
+        const spotMarket = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174017'
+        );
+        setBrowserOrderSnapshot(spotMarket, {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174018'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60010',
+          status: 'closed'
+        });
+        body.orders = [
+          spotMarket,
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174019',
+            '0.5'
+          )
+        ];
+        setBrowserActualFills(body, '1', '0.4', '0.6');
+      }
+    },
+    {
+      name: 'sequential second leg quantity differs from first actual fill',
+      mutate(body) {
+        setMode(body, 'CONTRACT_FIRST');
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174020'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0.2',
+          averagePrice: '60010',
+          status: 'closed'
+        });
+        body.orders = [
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'SPOT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174021',
+            '0.7'
+          )
+        ];
+        setBrowserActualFills(body, '0', '0.8', '0.8');
+      }
+    },
+    {
+      name: 'sequential second leg exists before a positive first fill',
+      mutate(body) {
+        setMode(body, 'CONTRACT_FIRST');
+        body.orders = [
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174022'
+          ),
+          browserOrderResponse(
+            strategyId,
+            'SPOT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174023'
+          )
+        ];
+      }
+    },
+    {
+      name: 'sequential second leg derives from a fill without average price',
+      mutate(body) {
+        setMode(body, 'CONTRACT_FIRST');
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174024'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0.2',
+          averagePrice: null,
+          status: 'closed'
+        });
+        body.orders = [
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'SPOT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174025',
+            '0.8'
+          )
+        ];
+        setBrowserActualFills(body, '0', '0.8', '0.8');
+      }
+    },
+    {
+      name: 'sequential second leg derives from an open first market',
+      mutate(body) {
+        setMode(body, 'CONTRACT_FIRST');
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174026'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0.2',
+          averagePrice: '60010',
+          status: 'open'
+        });
+        body.orders = [
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'SPOT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174027',
+            '0.8'
+          )
+        ];
+        setBrowserActualFills(body, '0', '0.8', '0.8');
+      }
+    },
+    {
+      name: 'concurrent difference hedge derives from a nonclosed market',
+      mutate(body) {
+        const spotMarket = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174028'
+        );
+        setBrowserOrderSnapshot(spotMarket, {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174029'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60010',
+          status: 'open'
+        });
+        body.orders = [
+          spotMarket,
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174030',
+            '0.6'
+          )
+        ];
+        setBrowserActualFills(body, '1', '0.4', '0.6');
+      }
+    },
+    {
+      name: 'concurrent equal market fills contain a difference hedge',
+      mutate(body) {
+        const spotMarket = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174031'
+        );
+        setBrowserOrderSnapshot(spotMarket, {
+          filledBaseQuantity: '0.5',
+          remainingBaseQuantity: '0.5',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174032'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.5',
+          remainingBaseQuantity: '0.5',
+          averagePrice: '60010',
+          status: 'closed'
+        });
+        body.orders = [
+          spotMarket,
+          contractMarket,
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174033',
+            '0.1'
+          )
+        ];
+        setBrowserActualFills(body, '0.5', '0.5', '0');
+      }
+    },
+    {
+      name: 'hedged state has unequal positive actual exposure',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).state = 'HEDGED';
+        const spotMarket = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174034'
+        );
+        setBrowserOrderSnapshot(spotMarket, {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174035'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60010',
+          status: 'closed'
+        });
+        body.orders = [spotMarket, contractMarket];
+        setBrowserActualFills(body, '1', '0.4', '0.6');
+      }
+    },
+    {
+      name: 'hedged state has no positive actual exposure',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).state = 'HEDGED';
+        body.orders = [
+          browserOrderResponse(
+            strategyId,
+            'SPOT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174036'
+          ),
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174037'
+          )
+        ];
+      }
+    },
+    {
+      name: 'waiting state contains a fully closed difference hedge',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).state = 'WAITING_HEDGE';
+        const spotMarket = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174038'
+        );
+        setBrowserOrderSnapshot(spotMarket, {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        const contractMarket = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174039'
+        );
+        setBrowserOrderSnapshot(contractMarket, {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60010',
+          status: 'closed'
+        });
+        const contractHedge = browserOrderResponse(
+          strategyId,
+          'CONTRACT_HEDGE_GTC',
+          '223e4567-e89b-42d3-a456-426614174040',
+          '0.6'
+        );
+        setBrowserOrderSnapshot(contractHedge, {
+          filledBaseQuantity: '0.6',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        });
+        body.orders = [spotMarket, contractMarket, contractHedge];
+        setBrowserActualFills(body, '1', '1', '0');
+      }
+    },
+    {
       name: 'strategy effective quantity differs from preflight',
       mutate(body) {
         (body.strategy as Record<string, unknown>).effectiveBaseQuantity = '2';
@@ -2553,6 +2918,15 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       | 'HEDGE_INCOMPLETE'
       | 'FAILED';
     readonly roles: readonly OrderRole[];
+    readonly quantities?: Partial<Record<OrderRole, string>>;
+    readonly snapshots?: Partial<
+      Record<OrderRole, Partial<OrderSnapshot>>
+    >;
+    readonly actualFills?: {
+      readonly spot: string;
+      readonly contract: string;
+      readonly unmatched: string;
+    };
     readonly actionable: boolean;
   };
   const cases: readonly TopologyCase[] = [
@@ -2566,16 +2940,9 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
     ...([
       ['CONTRACT_FIRST', []],
       ['CONTRACT_FIRST', ['CONTRACT_MARKET']],
-      ['CONTRACT_FIRST', ['CONTRACT_MARKET', 'SPOT_HEDGE_GTC']],
       ['SPOT_FIRST', []],
       ['SPOT_FIRST', ['SPOT_MARKET']],
-      ['SPOT_FIRST', ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC']],
-      ['CONCURRENT', []],
-      ['CONCURRENT', ['SPOT_MARKET', 'CONTRACT_MARKET']],
-      [
-        'CONCURRENT',
-        ['SPOT_MARKET', 'CONTRACT_MARKET', 'SPOT_HEDGE_GTC']
-      ]
+      ['CONCURRENT', []]
     ] as const).map(([mode, roles]) => ({
       name: `executing ${mode} with ${roles.join(',') || 'no orders'}`,
       mode,
@@ -2584,10 +2951,131 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       actionable: true
     })),
     {
+      name: 'executing contract-first with a derived spot second leg',
+      mode: 'CONTRACT_FIRST',
+      state: 'EXECUTING',
+      roles: ['CONTRACT_MARKET', 'SPOT_HEDGE_GTC'],
+      quantities: { SPOT_HEDGE_GTC: '0.6' },
+      snapshots: {
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '0.6',
+          remainingBaseQuantity: '0.4',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0', contract: '0.6', unmatched: '0.6' },
+      actionable: true
+    },
+    {
+      name: 'executing spot-first with a derived contract second leg',
+      mode: 'SPOT_FIRST',
+      state: 'EXECUTING',
+      roles: ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      quantities: { CONTRACT_HEDGE_GTC: '0.7' },
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '0.7',
+          remainingBaseQuantity: '0.3',
+          averagePrice: '60000',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0.7', contract: '0', unmatched: '0.7' },
+      actionable: true
+    },
+    {
+      name: 'executing concurrent with equal positive market fills',
+      mode: 'CONCURRENT',
+      state: 'EXECUTING',
+      roles: ['SPOT_MARKET', 'CONTRACT_MARKET'],
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0.2',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0.2',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0.8', contract: '0.8', unmatched: '0' },
+      actionable: true
+    },
+    {
+      name: 'executing concurrent preserves an exact tiny contract hedge',
+      mode: 'CONCURRENT',
+      state: 'EXECUTING',
+      roles: ['SPOT_MARKET', 'CONTRACT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      quantities: {
+        CONTRACT_HEDGE_GTC:
+          '0.0000000000000000000000000000000000000001'
+      },
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity:
+            '0.5000000000000000000000000000000000000001',
+          remainingBaseQuantity:
+            '0.4999999999999999999999999999999999999999',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '0.5',
+          remainingBaseQuantity: '0.5',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: {
+        spot: '0.5000000000000000000000000000000000000001',
+        contract: '0.5',
+        unmatched: '0.0000000000000000000000000000000000000001'
+      },
+      actionable: true
+    },
+    {
+      name: 'executing concurrent hedges the smaller spot fill',
+      mode: 'CONCURRENT',
+      state: 'EXECUTING',
+      roles: ['SPOT_MARKET', 'CONTRACT_MARKET', 'SPOT_HEDGE_GTC'],
+      quantities: { SPOT_HEDGE_GTC: '0.6' },
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0.4', contract: '1', unmatched: '0.6' },
+      actionable: true
+    },
+    {
       name: 'waiting contract-first with both sequential roles',
       mode: 'CONTRACT_FIRST',
       state: 'WAITING_HEDGE',
       roles: ['CONTRACT_MARKET', 'SPOT_HEDGE_GTC'],
+      quantities: { SPOT_HEDGE_GTC: '0.75' },
+      snapshots: {
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '0.75',
+          remainingBaseQuantity: '0.25',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0', contract: '0.75', unmatched: '0.75' },
       actionable: false
     },
     {
@@ -2595,6 +3083,22 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       mode: 'CONCURRENT',
       state: 'WAITING_HEDGE',
       roles: ['SPOT_MARKET', 'CONTRACT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      quantities: { CONTRACT_HEDGE_GTC: '0.6' },
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '1', contract: '0.4', unmatched: '0.6' },
       actionable: false
     },
     {
@@ -2602,6 +3106,22 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       mode: 'SPOT_FIRST',
       state: 'HEDGED',
       roles: ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      quantities: { CONTRACT_HEDGE_GTC: '0.8' },
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0.2',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_HEDGE_GTC: {
+          filledBaseQuantity: '0.8',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0.8', contract: '0.8', unmatched: '0' },
       actionable: false
     },
     {
@@ -2609,6 +3129,21 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       mode: 'CONCURRENT',
       state: 'HEDGED',
       roles: ['SPOT_MARKET', 'CONTRACT_MARKET'],
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '0.9',
+          remainingBaseQuantity: '0.1',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '0.9',
+          remainingBaseQuantity: '0.1',
+          averagePrice: '60010',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '0.9', contract: '0.9', unmatched: '0' },
       actionable: false
     },
     {
@@ -2616,6 +3151,28 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       mode: 'CONCURRENT',
       state: 'HEDGED',
       roles: ['SPOT_MARKET', 'CONTRACT_MARKET', 'SPOT_HEDGE_GTC'],
+      quantities: { SPOT_HEDGE_GTC: '0.6' },
+      snapshots: {
+        SPOT_MARKET: {
+          filledBaseQuantity: '0.4',
+          remainingBaseQuantity: '0.6',
+          averagePrice: '60000',
+          status: 'closed'
+        },
+        CONTRACT_MARKET: {
+          filledBaseQuantity: '1',
+          remainingBaseQuantity: '0',
+          averagePrice: '60010',
+          status: 'closed'
+        },
+        SPOT_HEDGE_GTC: {
+          filledBaseQuantity: '0.6',
+          remainingBaseQuantity: '0',
+          averagePrice: '60000',
+          status: 'closed'
+        }
+      },
+      actualFills: { spot: '1', contract: '1', unmatched: '0' },
       actionable: false
     },
     {
@@ -2661,11 +3218,27 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
           : null
       });
       (body.preflight as Record<string, unknown>).mode = item.mode;
-      body.orders = item.roles.map((role, index) => browserOrderResponse(
-        strategyId,
-        role,
-        `323e4567-e89b-42d3-a456-${String(index + 1).padStart(12, '0')}`
-      ));
+      body.orders = item.roles.map((role, index) => {
+        const order = browserOrderResponse(
+          strategyId,
+          role,
+          `323e4567-e89b-42d3-a456-${String(index + 1).padStart(12, '0')}`,
+          item.quantities?.[role] ?? '1'
+        );
+        const snapshot = item.snapshots?.[role];
+        if (snapshot !== undefined) {
+          setBrowserOrderSnapshot(order, snapshot);
+        }
+        return order;
+      });
+      if (item.actualFills !== undefined) {
+        setBrowserActualFills(
+          body,
+          item.actualFills.spot,
+          item.actualFills.contract,
+          item.actualFills.unmatched
+        );
+      }
       browser.element('resume-strategy-id').value = strategyId;
       browser.setFetch(async (url) => {
         assert.equal(url, `/api/hedges/${strategyId}`);

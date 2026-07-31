@@ -904,6 +904,139 @@ function validatedActualFills(value, orders) {
   return result;
 }
 
+function orderForRole(orders, role) {
+  return orders.find((order) => order.role === role);
+}
+
+function isTrustedSequentialFirst(order) {
+  const snapshot = order?.snapshot;
+  return (
+    snapshot !== null
+    && snapshot !== undefined
+    && compareDecimals(snapshot.filledBaseQuantity, '0') > 0
+    && snapshot.averagePrice !== null
+    && (snapshot.status === 'closed' || snapshot.status === 'canceled')
+  );
+}
+
+function isTrustedConcurrentMarket(order) {
+  const snapshot = order?.snapshot;
+  return (
+    snapshot !== null
+    && snapshot !== undefined
+    && snapshot.status === 'closed'
+    && compareDecimals(snapshot.filledBaseQuantity, '0') > 0
+    && snapshot.averagePrice !== null
+  );
+}
+
+function isPendingHedge(order) {
+  return (
+    order.snapshot === null
+    || order.snapshot.status === 'open'
+    || order.snapshot.status === 'unknown'
+  );
+}
+
+function isFullClosedHedge(order) {
+  const snapshot = order.snapshot;
+  return (
+    snapshot !== null
+    && snapshot.status === 'closed'
+    && compareDecimals(
+      snapshot.filledBaseQuantity,
+      order.request.baseQuantity
+    ) === 0
+    && compareDecimals(snapshot.remainingBaseQuantity, '0') === 0
+  );
+}
+
+function orderExecutionMatchesStrategy(strategy, orders, actualFills) {
+  if (
+    strategy.state === 'PENDING_CONFIRMATION'
+    || failureStates.has(strategy.state)
+  ) {
+    return true;
+  }
+
+  const hedge = orders.find((order) => order.role.endsWith('_HEDGE_GTC'));
+  if (
+    strategy.state === 'WAITING_HEDGE'
+    && (hedge === undefined || !isPendingHedge(hedge))
+  ) {
+    return false;
+  }
+  if (
+    strategy.state === 'HEDGED'
+    && (
+      compareDecimals(actualFills.spotBuyBaseQuantity, '0') <= 0
+      || compareDecimals(actualFills.contractShortBaseQuantity, '0') <= 0
+      || compareDecimals(
+        actualFills.spotBuyBaseQuantity,
+        actualFills.contractShortBaseQuantity
+      ) !== 0
+      || (hedge !== undefined && !isFullClosedHedge(hedge))
+    )
+  ) {
+    return false;
+  }
+
+  if (strategy.mode !== 'CONCURRENT') {
+    if (hedge === undefined) {
+      return true;
+    }
+    const firstRole = strategy.mode === 'CONTRACT_FIRST'
+      ? 'CONTRACT_MARKET'
+      : 'SPOT_MARKET';
+    const first = orderForRole(orders, firstRole);
+    return (
+      isTrustedSequentialFirst(first)
+      && compareDecimals(
+        hedge.request.baseQuantity,
+        first.snapshot.filledBaseQuantity
+      ) === 0
+    );
+  }
+
+  const spot = orderForRole(orders, 'SPOT_MARKET');
+  const contract = orderForRole(orders, 'CONTRACT_MARKET');
+  if (hedge === undefined) {
+    return (
+      strategy.state !== 'HEDGED'
+      || (
+        isTrustedConcurrentMarket(spot)
+        && isTrustedConcurrentMarket(contract)
+      )
+    );
+  }
+  if (
+    !isTrustedConcurrentMarket(spot)
+    || !isTrustedConcurrentMarket(contract)
+  ) {
+    return false;
+  }
+  const fillComparison = compareDecimals(
+    spot.snapshot.filledBaseQuantity,
+    contract.snapshot.filledBaseQuantity
+  );
+  if (fillComparison === 0) {
+    return false;
+  }
+  const expectedRole = fillComparison > 0
+    ? 'CONTRACT_HEDGE_GTC'
+    : 'SPOT_HEDGE_GTC';
+  return (
+    hedge.role === expectedRole
+    && decimalPartsEqual(
+      absoluteDecimalDifference(
+        decimalParts(spot.snapshot.filledBaseQuantity),
+        decimalParts(contract.snapshot.filledBaseQuantity)
+      ),
+      decimalParts(hedge.request.baseQuantity)
+    )
+  );
+}
+
 async function validatedStatusResponse(
   value,
   expectedInput,
@@ -944,11 +1077,15 @@ async function validatedStatusResponse(
   if (!orderTopologyMatchesStrategy(strategy, orders)) {
     throw new Error('strategy order topology mismatch');
   }
+  const actualFills = validatedActualFills(response.actualFills, orders);
+  if (!orderExecutionMatchesStrategy(strategy, orders, actualFills)) {
+    throw new Error('strategy order execution mismatch');
+  }
   return {
     strategy,
     preflight: preview,
     orders,
-    actualFills: validatedActualFills(response.actualFills, orders)
+    actualFills
   };
 }
 
