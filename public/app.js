@@ -128,12 +128,17 @@ function requiredString(value, maximumLength = 10_000) {
   return value;
 }
 
-function positiveDecimalString(value, maximumLength = 10_000) {
+function nonNegativeDecimalString(value, maximumLength = 10_000) {
   const text = requiredString(value, maximumLength);
-  if (
-    !/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text)
-    || !/[1-9]/.test(text)
-  ) {
+  if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text)) {
+    throw new Error('invalid non-negative decimal');
+  }
+  return text;
+}
+
+function positiveDecimalString(value, maximumLength = 10_000) {
+  const text = nonNegativeDecimalString(value, maximumLength);
+  if (!/[1-9]/.test(text)) {
     throw new Error('invalid positive decimal');
   }
   return text;
@@ -147,22 +152,9 @@ function matchingString(value, expected, maximumLength) {
   return text;
 }
 
-function validatedPreview(value, expectedInput) {
-  if (!isRecord(value) || !isRecord(value.accountSettings)) {
-    throw new Error('invalid preflight preview');
-  }
-  const accountSettings = value.accountSettings;
-  const marginMode = requiredString(accountSettings.marginMode, 32);
-  const positionMode = requiredString(accountSettings.positionMode, 32);
-  if (!['isolated', 'cross'].includes(marginMode)) {
-    throw new Error('invalid margin mode');
-  }
-  if (!['one-way', 'hedged'].includes(positionMode)) {
-    throw new Error('invalid position mode');
-  }
-  const leverage = positiveDecimalString(accountSettings.leverage);
-  if (value.riskAcknowledgementRequired !== true) {
-    throw new Error('invalid risk acknowledgement requirement');
+function validatedIdentity(value, expectedInput) {
+  if (!isRecord(value)) {
+    throw new Error('invalid response identity');
   }
   const spotExchangeId = matchingString(
     value.spotExchangeId,
@@ -191,7 +183,30 @@ function validatedPreview(value, expectedInput) {
     contractExchangeId,
     symbol,
     requestedBaseQuantity,
-    mode,
+    mode
+  };
+}
+
+function validatedPreview(value, expectedInput) {
+  if (!isRecord(value) || !isRecord(value.accountSettings)) {
+    throw new Error('invalid preflight preview');
+  }
+  const identity = validatedIdentity(value, expectedInput);
+  const accountSettings = value.accountSettings;
+  const marginMode = requiredString(accountSettings.marginMode, 32);
+  const positionMode = requiredString(accountSettings.positionMode, 32);
+  if (!['isolated', 'cross'].includes(marginMode)) {
+    throw new Error('invalid margin mode');
+  }
+  if (!['one-way', 'hedged'].includes(positionMode)) {
+    throw new Error('invalid position mode');
+  }
+  const leverage = positiveDecimalString(accountSettings.leverage);
+  if (value.riskAcknowledgementRequired !== true) {
+    throw new Error('invalid risk acknowledgement requirement');
+  }
+  return {
+    ...identity,
     effectiveBaseQuantity: positiveDecimalString(
       value.effectiveBaseQuantity
     ),
@@ -228,7 +243,11 @@ function validatedPreflightResponse(value, expectedInput) {
   };
 }
 
-function validatedStatusResponse(value, expectedInput) {
+function validatedStatusResponse(
+  value,
+  expectedInput,
+  expectedStrategyId
+) {
   if (
     !isRecord(value)
     || !isRecord(value.strategy)
@@ -241,6 +260,15 @@ function validatedStatusResponse(value, expectedInput) {
   if (!strategyStates.has(state)) {
     throw new Error('invalid strategy state');
   }
+  const strategyId = matchingString(
+    value.strategy.id,
+    expectedStrategyId,
+    128
+  );
+  const strategyIdentity = validatedIdentity(
+    value.strategy,
+    expectedInput
+  );
   const orders = value.orders.map((order) => {
     if (!isRecord(order)) {
       throw new Error('invalid order');
@@ -263,17 +291,21 @@ function validatedStatusResponse(value, expectedInput) {
     };
   });
   return {
-    strategy: { state },
+    strategy: {
+      id: strategyId,
+      state,
+      ...strategyIdentity
+    },
     preflight: validatedPreview(value.preflight, expectedInput),
     orders,
     actualFills: {
-      spotBuyBaseQuantity: requiredString(
+      spotBuyBaseQuantity: nonNegativeDecimalString(
         value.actualFills.spotBuyBaseQuantity
       ),
-      contractShortBaseQuantity: requiredString(
+      contractShortBaseQuantity: nonNegativeDecimalString(
         value.actualFills.contractShortBaseQuantity
       ),
-      unmatchedBaseQuantity: requiredString(
+      unmatchedBaseQuantity: nonNegativeDecimalString(
         value.actualFills.unmatchedBaseQuantity
       )
     }
@@ -362,7 +394,11 @@ async function refreshStatus() {
     if (!response.ok || body === null) {
       throw new Error('status unavailable');
     }
-    const status = validatedStatusResponse(body, statusExpectedInput);
+    const status = validatedStatusResponse(
+      body,
+      statusExpectedInput,
+      statusStrategyId
+    );
     if (
       statusRevision !== inputRevision
       || statusStrategyId !== strategyId

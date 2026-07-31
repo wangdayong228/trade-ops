@@ -315,6 +315,32 @@ function browserPreflightResponse(
   };
 }
 
+function browserStatusResponse(
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const preflight = browserPreflightResponse().preflight;
+  return {
+    strategy: {
+      id: 'strategy-browser-1',
+      state: 'EXECUTING',
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol: SYMBOL,
+      requestedBaseQuantity: '1',
+      effectiveBaseQuantity: '1',
+      mode: 'CONCURRENT'
+    },
+    preflight,
+    orders: [],
+    actualFills: {
+      spotBuyBaseQuantity: '0',
+      contractShortBaseQuantity: '0',
+      unmatchedBaseQuantity: '0'
+    },
+    ...overrides
+  };
+}
+
 async function browserHarness(): Promise<BrowserHarness> {
   const ids = [
     'spot-exchange',
@@ -392,6 +418,16 @@ async function browserHarness(): Promise<BrowserHarness> {
       currentFetch = fetch;
     }
   };
+}
+
+async function browserWithValidPreflight(): Promise<BrowserHarness> {
+  const browser = await browserHarness();
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/preflight');
+    return browserResponse(201, browserPreflightResponse());
+  });
+  await browser.element('preflight-form').emit('submit');
+  return browser;
 }
 
 test('lists only configured exchange ids', async (t) => {
@@ -1554,6 +1590,186 @@ test('operator UI validates against the immutable submitted snapshot', async () 
   browser.element('risk-ack').checked = true;
   await browser.element('risk-ack').emit('change');
   assert.equal(browser.element('confirm-button').disabled, false);
+});
+
+test('operator UI accepts a matching status id and canonical high-precision fills', async () => {
+  const browser = await browserWithValidPreflight();
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  const highPrecision = '0.123456789012345678901234567890123456789';
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/strategy-browser-1');
+    return browserResponse(200, browserStatusResponse({
+      orders: [{
+        role: 'SPOT_MARKET',
+        clientOrderId: 'client-browser-1',
+        exchangeOrderId: 'exchange-browser-1'
+      }],
+      actualFills: {
+        spotBuyBaseQuantity: '0',
+        contractShortBaseQuantity: highPrecision,
+        unmatchedBaseQuantity: highPrecision
+      }
+    }));
+  });
+
+  await browser.element('refresh-button').emit('click');
+
+  assert.equal(browser.element('strategy-state').textContent, 'EXECUTING');
+  assert.equal(browser.element('spot-actual-fill').textContent, '0');
+  assert.equal(
+    browser.element('contract-actual-fill').textContent,
+    highPrecision
+  );
+  assert.equal(
+    browser.element('unmatched-quantity').textContent,
+    highPrecision
+  );
+  assert.match(
+    browser.element('spot-order-ids').children[0]?.textContent ?? '',
+    /exchange-browser-1/
+  );
+  assert.equal(browser.element('risk-ack').checked, true);
+  assert.equal(browser.element('confirm-button').disabled, false);
+});
+
+test('operator UI rejects status strategy identity mismatches before rendering', async (t) => {
+  const mismatches = [
+    {
+      name: 'different strategy id',
+      mutate(body: Record<string, unknown>): void {
+        const strategy = body.strategy as Record<string, unknown>;
+        strategy.id = 'strategy-browser-2';
+      }
+    },
+    {
+      name: 'different strategy symbol',
+      mutate(body: Record<string, unknown>): void {
+        const strategy = body.strategy as Record<string, unknown>;
+        strategy.symbol = 'ETH/USDT';
+      }
+    }
+  ];
+
+  for (const mismatch of mismatches) {
+    await t.test(mismatch.name, async () => {
+      const browser = await browserWithValidPreflight();
+      browser.element('risk-ack').checked = true;
+      await browser.element('risk-ack').emit('change');
+      const body = browserStatusResponse({
+        orders: [{
+          role: 'SPOT_MARKET',
+          clientOrderId: 'client-status-sentinel',
+          exchangeOrderId: 'exchange-status-sentinel'
+        }],
+        actualFills: {
+          spotBuyBaseQuantity: '9',
+          contractShortBaseQuantity: '8',
+          unmatchedBaseQuantity: '1'
+        }
+      });
+      mismatch.mutate(body);
+      browser.setFetch(async (url) => {
+        assert.equal(url, '/api/hedges/strategy-browser-1');
+        return browserResponse(200, body);
+      });
+
+      await browser.element('refresh-button').emit('click');
+
+      assert.equal(browser.element('requested-quantity').textContent, '—');
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('spot-actual-fill').textContent, '0');
+      assert.equal(browser.element('contract-actual-fill').textContent, '0');
+      assert.equal(browser.element('unmatched-quantity').textContent, '0');
+      assert.doesNotMatch(
+        browser.element('spot-order-ids').children[0]?.textContent ?? '',
+        /status-sentinel/
+      );
+      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.element('refresh-button').disabled, true);
+    });
+  }
+});
+
+test('operator UI rejects every non-canonical actual-fill field', async (t) => {
+  const invalidFills = [
+    ['spotBuyBaseQuantity', '-1'],
+    ['spotBuyBaseQuantity', 'NaN'],
+    ['contractShortBaseQuantity', 'Infinity'],
+    ['contractShortBaseQuantity', '0x10'],
+    ['unmatchedBaseQuantity', '1e3'],
+    ['unmatchedBaseQuantity', ''],
+    ['spotBuyBaseQuantity', '1'.repeat(10_001)],
+    ['contractShortBaseQuantity', 1]
+  ] as const;
+
+  for (const [field, invalidValue] of invalidFills) {
+    await t.test(`${field}=${String(invalidValue).slice(0, 32)}`, async () => {
+      const browser = await browserWithValidPreflight();
+      browser.element('risk-ack').checked = true;
+      await browser.element('risk-ack').emit('change');
+      const body = browserStatusResponse();
+      const actualFills = body.actualFills as Record<string, unknown>;
+      actualFills[field] = invalidValue;
+      browser.setFetch(async (url) => {
+        assert.equal(url, '/api/hedges/strategy-browser-1');
+        return browserResponse(200, body);
+      });
+
+      await browser.element('refresh-button').emit('click');
+
+      assert.equal(browser.element('requested-quantity').textContent, '—');
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('spot-actual-fill').textContent, '0');
+      assert.equal(browser.element('contract-actual-fill').textContent, '0');
+      assert.equal(browser.element('unmatched-quantity').textContent, '0');
+      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.element('refresh-button').disabled, true);
+    });
+  }
+});
+
+test('operator UI ignores a delayed status response after input invalidation', async () => {
+  const browser = await browserWithValidPreflight();
+  let resolveStatus: ((response: FakeBrowserResponse) => void) | undefined;
+  const delayedStatus = new Promise<FakeBrowserResponse>((resolve) => {
+    resolveStatus = resolve;
+  });
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/strategy-browser-1');
+    return delayedStatus;
+  });
+
+  const pendingRefresh = browser.element('refresh-button').emit('click');
+  await flushImmediate();
+  browser.element('base-quantity').value = '2';
+  await browser.element('base-quantity').emit('input');
+  resolveStatus?.(browserResponse(200, browserStatusResponse({
+    orders: [{
+      role: 'SPOT_MARKET',
+      clientOrderId: 'client-stale-sentinel',
+      exchangeOrderId: 'exchange-stale-sentinel'
+    }],
+    actualFills: {
+      spotBuyBaseQuantity: '9',
+      contractShortBaseQuantity: '8',
+      unmatchedBaseQuantity: '1'
+    }
+  })));
+  await pendingRefresh;
+
+  assert.equal(browser.element('requested-quantity').textContent, '—');
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('spot-actual-fill').textContent, '0');
+  assert.doesNotMatch(
+    browser.element('spot-order-ids').children[0]?.textContent ?? '',
+    /stale-sentinel/
+  );
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, true);
 });
 
 test('operator UI ignores a delayed preflight response after an input edit', async () => {

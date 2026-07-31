@@ -233,3 +233,57 @@ exit 0
 ```
 
 No network request or live exchange order was used in this follow-up.
+
+## Final Independent Review Follow-up
+
+The final two status-rendering findings were reproduced with the real browser
+script in a Node VM/DOM harness:
+
+```text
+different strategy ID or strategy symbol
+actual: response orders/fills rendered and preview remained actionable
+expected: fail closed before rendering
+
+negative, NaN, Infinity, hexadecimal, or exponent actual fills
+actual: values rendered
+expected: fail closed before rendering
+```
+
+Status validation now receives both values frozen when the request starts:
+the requested strategy ID and the submitted five-field input snapshot. The
+response strategy ID must exactly match the requested ID, and the response
+strategy's spot exchange, contract exchange, symbol, requested quantity, and
+mode must exactly match the submitted snapshot. A mismatch clears the entire
+preview, acknowledgement, order lists, and fills and disables confirmation
+and refresh. A delayed status response after input invalidation remains unable
+to render or restore state.
+
+Actual spot-buy, contract-short, and unmatched base quantities must be
+bounded canonical non-negative decimal strings. Literal `0` and exact
+high-precision decimals are preserved; negative, empty, oversized,
+non-string, `NaN`, `Infinity`, hexadecimal, and exponent syntax are rejected.
+Order snapshot fill fields are not rendered by the browser: validation
+projects only the allowlisted order role and order identifiers before DOM
+rendering.
+
+Final-review GREEN:
+
+```text
+npm run build && node --test dist/tests/http/server.test.js
+tests 56
+pass 56
+fail 0
+
+npm test
+tests 305
+pass 305
+fail 0
+
+node --check public/app.js
+exit 0
+
+git diff --check
+exit 0
+```
+
+No network request or live exchange order was used in this follow-up.
