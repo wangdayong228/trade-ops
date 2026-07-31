@@ -22,6 +22,21 @@ let preflightReady = false;
 let requestPending = false;
 let inputRevision = 0;
 
+const strategyStates = new Set([
+  'PENDING_CONFIRMATION',
+  'EXECUTING',
+  'WAITING_HEDGE',
+  'HEDGED',
+  'HEDGE_INCOMPLETE',
+  'FAILED'
+]);
+const orderRoles = new Set([
+  'SPOT_MARKET',
+  'CONTRACT_MARKET',
+  'SPOT_HEDGE_GTC',
+  'CONTRACT_HEDGE_GTC'
+]);
+
 function setText(id, value) {
   document.querySelector(`#${id}`).textContent = String(value);
 }
@@ -69,8 +84,7 @@ function clearPreview() {
   resetOrderList('contract-order-ids');
 }
 
-function invalidatePreflight() {
-  inputRevision += 1;
+function resetActionablePreview(message, kind = '') {
   strategyId = null;
   preflightReady = false;
   requestPending = false;
@@ -79,12 +93,141 @@ function invalidatePreflight() {
   refreshButton.disabled = true;
   updateConfirmButton();
   clearPreview();
-  setMessage('参数已变更，请重新预检。');
+  setMessage(message, kind);
+}
+
+function invalidatePreflight() {
+  inputRevision += 1;
+  resetActionablePreview('参数已变更，请重新预检。');
 }
 
 for (const input of preflightInputs) {
   input.addEventListener('input', invalidatePreflight);
   input.addEventListener('change', invalidatePreflight);
+}
+
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function requiredString(value, maximumLength = 10_000) {
+  if (
+    typeof value !== 'string'
+    || value.length === 0
+    || value.length > maximumLength
+  ) {
+    throw new Error('invalid response string');
+  }
+  return value;
+}
+
+function validatedPreview(value) {
+  if (!isRecord(value) || !isRecord(value.accountSettings)) {
+    throw new Error('invalid preflight preview');
+  }
+  const accountSettings = value.accountSettings;
+  const marginMode = requiredString(accountSettings.marginMode, 32);
+  const positionMode = requiredString(accountSettings.positionMode, 32);
+  if (!['isolated', 'cross', 'unknown'].includes(marginMode)) {
+    throw new Error('invalid margin mode');
+  }
+  if (!['one-way', 'hedged', 'unknown'].includes(positionMode)) {
+    throw new Error('invalid position mode');
+  }
+  const leverage = accountSettings.leverage;
+  if (leverage !== null && typeof leverage !== 'string') {
+    throw new Error('invalid leverage');
+  }
+  if (typeof leverage === 'string' && leverage.length > 10_000) {
+    throw new Error('invalid leverage');
+  }
+  if (value.riskAcknowledgementRequired !== true) {
+    throw new Error('invalid risk acknowledgement requirement');
+  }
+  return {
+    requestedBaseQuantity: requiredString(value.requestedBaseQuantity),
+    effectiveBaseQuantity: requiredString(value.effectiveBaseQuantity),
+    spotReferencePrice: requiredString(value.spotReferencePrice),
+    contractReferencePrice: requiredString(value.contractReferencePrice),
+    spotFreeUsdt: requiredString(value.spotFreeUsdt),
+    contractFreeUsdt: requiredString(value.contractFreeUsdt),
+    riskAcknowledgementRequired: true,
+    accountSettings: {
+      marginMode,
+      positionMode,
+      leverage: leverage === null ? '未配置' : leverage
+    }
+  };
+}
+
+function validatedPreflightResponse(value) {
+  if (!isRecord(value)) {
+    throw new Error('invalid preflight response');
+  }
+  const id = requiredString(value.id, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) {
+    throw new Error('invalid strategy id');
+  }
+  if (value.state !== 'PENDING_CONFIRMATION') {
+    throw new Error('invalid preflight state');
+  }
+  return {
+    id,
+    state: value.state,
+    preflight: validatedPreview(value.preflight)
+  };
+}
+
+function validatedStatusResponse(value) {
+  if (
+    !isRecord(value)
+    || !isRecord(value.strategy)
+    || !Array.isArray(value.orders)
+    || !isRecord(value.actualFills)
+  ) {
+    throw new Error('invalid status response');
+  }
+  const state = requiredString(value.strategy.state, 32);
+  if (!strategyStates.has(state)) {
+    throw new Error('invalid strategy state');
+  }
+  const orders = value.orders.map((order) => {
+    if (!isRecord(order)) {
+      throw new Error('invalid order');
+    }
+    const role = requiredString(order.role, 32);
+    if (!orderRoles.has(role)) {
+      throw new Error('invalid order role');
+    }
+    const exchangeOrderId = order.exchangeOrderId;
+    if (
+      exchangeOrderId !== null
+      && typeof exchangeOrderId !== 'string'
+    ) {
+      throw new Error('invalid exchange order id');
+    }
+    return {
+      role,
+      clientOrderId: requiredString(order.clientOrderId, 256),
+      exchangeOrderId
+    };
+  });
+  return {
+    strategy: { state },
+    preflight: validatedPreview(value.preflight),
+    orders,
+    actualFills: {
+      spotBuyBaseQuantity: requiredString(
+        value.actualFills.spotBuyBaseQuantity
+      ),
+      contractShortBaseQuantity: requiredString(
+        value.actualFills.contractShortBaseQuantity
+      ),
+      unmatchedBaseQuantity: requiredString(
+        value.actualFills.unmatchedBaseQuantity
+      )
+    }
+  };
 }
 
 function renderPreflight(strategy) {
@@ -164,20 +307,24 @@ async function refreshStatus() {
     if (!response.ok || body === null) {
       throw new Error('status unavailable');
     }
+    const status = validatedStatusResponse(body);
     if (
       statusRevision !== inputRevision
       || statusStrategyId !== strategyId
     ) {
       return;
     }
-    renderStatus(body);
+    renderStatus(status);
     setMessage('状态已刷新。', 'success');
   } catch {
     if (
       statusRevision === inputRevision
       && statusStrategyId === strategyId
     ) {
-      setMessage('状态刷新失败，请稍后重试。', 'error');
+      resetActionablePreview(
+        '状态响应无效或刷新失败，请重新预检。',
+        'error'
+      );
     }
   } finally {
     if (
@@ -222,17 +369,21 @@ preflightForm.addEventListener('submit', async (event) => {
     if (response.status !== 201 || body === null) {
       throw new Error('preflight rejected');
     }
+    const preflight = validatedPreflightResponse(body);
     if (submittedRevision !== inputRevision) {
       return;
     }
-    strategyId = body.id;
+    renderPreflight(preflight);
+    strategyId = preflight.id;
     preflightReady = true;
-    renderPreflight(body);
     refreshButton.disabled = false;
     setMessage('预检完成。请核对快照并确认风险。', 'success');
   } catch {
     if (submittedRevision === inputRevision) {
-      setMessage('预检未通过，请检查参数和账户状态。', 'error');
+      resetActionablePreview(
+        '预检未通过，请检查参数和账户状态。',
+        'error'
+      );
     }
   } finally {
     if (submittedRevision === inputRevision) {

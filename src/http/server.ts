@@ -394,6 +394,65 @@ function errorProperty(
   }
 }
 
+interface LoopbackAuthority {
+  readonly hostname: 'localhost' | '127.0.0.1' | '[::1]';
+  readonly port: number;
+}
+
+function loopbackAuthority(
+  value: unknown,
+  protocol: string
+): LoopbackAuthority | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const match = /^(localhost|127\.0\.0\.1|\[::1\])(?::([0-9]{1,5}))?$/i
+    .exec(value);
+  if (match === null) {
+    return null;
+  }
+  const rawHostname = match[1];
+  if (rawHostname === undefined) {
+    return null;
+  }
+  const hostname = rawHostname.toLowerCase() as LoopbackAuthority['hostname'];
+  const rawPort = match[2];
+  const port = rawPort === undefined
+    ? protocol === 'https' ? 443 : 80
+    : Number(rawPort);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    return null;
+  }
+  return { hostname, port };
+}
+
+function matchingLoopbackOrigin(
+  value: unknown,
+  requestAuthority: Readonly<LoopbackAuthority>
+): boolean {
+  if (typeof value !== 'string' || value === 'null') {
+    return false;
+  }
+  const match = /^(https?):\/\/(.+)$/i.exec(value);
+  if (match === null) {
+    return false;
+  }
+  const protocol = match[1]?.toLowerCase();
+  const authority = match[2];
+  if (
+    authority === undefined
+    || (protocol !== 'http' && protocol !== 'https')
+  ) {
+    return false;
+  }
+  const originAuthority = loopbackAuthority(authority, protocol);
+  return (
+    originAuthority !== null
+    && originAuthority.hostname === requestAuthority.hostname
+    && originAuthority.port === requestAuthority.port
+  );
+}
+
 export function buildServer(
   dependencies: BuildServerDependencies
 ): FastifyInstance {
@@ -403,6 +462,7 @@ export function buildServer(
     },
     ajv: {
       customOptions: {
+        coerceTypes: false,
         removeAdditional: false
       }
     }
@@ -429,6 +489,38 @@ export function buildServer(
       });
     backgroundTasks.add(task);
   }
+
+  app.addHook('onRequest', async (request, reply) => {
+    const requestAuthority = loopbackAuthority(
+      request.headers.host,
+      request.protocol
+    );
+    const isStateChangingPost = request.method === 'POST';
+    const origin = request.headers.origin;
+    const fetchSite = request.headers['sec-fetch-site'];
+    const forbidden = (
+      requestAuthority === null
+      || (
+        isStateChangingPost
+        && (
+          (
+            origin !== undefined
+            && !matchingLoopbackOrigin(origin, requestAuthority)
+          )
+          || (
+            typeof fetchSite === 'string'
+            && fetchSite.toLowerCase() === 'cross-site'
+          )
+        )
+      )
+    );
+    if (forbidden) {
+      return reply.status(403).send({
+        code: 'FORBIDDEN',
+        message: 'Request forbidden'
+      });
+    }
+  });
 
   app.addHook('onSend', async (request, reply) => {
     reply.header('Content-Security-Policy', CONTENT_SECURITY_POLICY);
@@ -511,7 +603,10 @@ export function buildServer(
     },
     async (request, reply) => {
       const strategy = dependencies.repository.getStrategy(request.params.id);
-      if (strategy.state === 'PENDING_CONFIRMATION') {
+      if (
+        strategy.state === 'PENDING_CONFIRMATION'
+        || strategy.state === 'EXECUTING'
+      ) {
         queueConfirmation(strategy.id);
       }
       return reply.status(202).send({ accepted: true });

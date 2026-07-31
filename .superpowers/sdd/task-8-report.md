@@ -105,4 +105,70 @@ Two issues were found and corrected during review:
    allowance. The HTTP and UI boundary is now capped at 256 characters while
    persisted high-precision status values retain their existing safety limits.
 
-No unresolved Task 8 implementation concern remains.
+No unresolved concern was identified in the original implementation pass;
+the independent review below superseded that conclusion.
+
+## Independent Review Follow-up
+
+All independent-review findings were reproduced and fixed with regression
+tests:
+
+1. Every request now rejects a missing, malformed, userinfo-bearing, or
+   non-loopback `Host` before API or static route work. Only `localhost`,
+   `127.0.0.1`, and `[::1]`, with an optional valid port, are accepted.
+   Forwarded host headers cannot replace `Host`.
+2. State-changing `POST` requests accept a missing `Origin` for local CLI use,
+   but an included origin must be HTTP(S), loopback, and exactly match the
+   request host and effective port. `Origin: null`, cross-origin values, and
+   `Sec-Fetch-Site: cross-site` are rejected with a fixed 403 body.
+3. Confirmation queues both `PENDING_CONFIRMATION` and recoverable
+   `EXECUTING` strategies through the same per-strategy deduplication set.
+   Terminal strategies remain idempotent 202 responses without coordinator
+   work. A real coordinator/repository/fake-gateway recovery test proves that
+   an observed existing intent is reconciled without duplicate creation.
+4. Fastify validation explicitly disables AJV type coercion while retaining
+   `removeAdditional: false`. Runtime numbers, booleans, arrays, and objects
+   are rejected for string fields, and non-boolean acknowledgement values are
+   rejected before application services run.
+5. The browser script validates the complete actionable/rendered response
+   shape before rendering, and renders before retaining a strategy ID or
+   enabling confirmation. Parse, shape, or render failures clear the preview,
+   acknowledgement, strategy ID, and action controls. Node VM/DOM tests cover
+   malformed 201 responses, stale delayed responses after input edits, and
+   confirmation double clicks. External values continue to use DOM
+   `textContent`; no `innerHTML` was introduced.
+
+Review RED evidence included hostile hosts/origins returning success instead
+of 403, `EXECUTING` confirmation performing zero recovery attempts, a numeric
+string field being coerced and reaching a 500 path, and malformed 201 browser
+responses leaving a partial preview (`"1"` instead of `"—"`).
+
+Review GREEN:
+
+```text
+npm run build && node --test dist/tests/http/server.test.js
+tests 28
+pass 28
+fail 0
+
+npm test
+tests 277
+pass 277
+fail 0
+
+node --check public/app.js
+exit 0
+
+git diff --check
+exit 0
+```
+
+No network request or live exchange order was used in this follow-up.
+
+### Task 9 Composition-Root Handoff
+
+Task 9 must bind the Fastify listener only to a validated loopback address
+(for example `127.0.0.1` or `::1`), never `0.0.0.0` or another externally
+reachable interface. The risk checkbox is only an explicit acknowledgement
+gate; it is not authentication, user identity, or proof that a human performed
+the confirmation.
