@@ -294,7 +294,7 @@ export class HedgeCoordinator {
         error instanceof SubmissionPersistenceError
         && this.isExecuting(strategyId)
       ) {
-        this.failStrategy(
+        this.failStrategyBestEffort(
           strategyId,
           error.exposureKnown,
           error.failureCode
@@ -458,13 +458,14 @@ export class HedgeCoordinator {
     const settled = await Promise.allSettled(orders.map((order) => (
       this.submit(this.prepareExisting(strategy, order))
     )));
-    this.failStrategy(strategy.id, true, failureCode);
     const rejected = settled.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected'
     );
     if (rejected !== undefined) {
+      this.failStrategyBestEffort(strategy.id, true, failureCode);
       throw rejected.reason;
     }
+    this.failStrategy(strategy.id, true, failureCode);
   }
 
   private async lookupAndPersist(
@@ -555,15 +556,11 @@ export class HedgeCoordinator {
     try {
       this.repository.attachOrderSnapshot(prepared.record.id, snapshot);
     } catch {
-      try {
-        this.failStrategy(
-          prepared.record.strategyId,
-          exposureKnown,
-          'INCONSISTENT_ORDER_STATE'
-        );
-      } catch {
-        // The typed carrier below retains the monotonic exposure signal.
-      }
+      this.failStrategyBestEffort(
+        prepared.record.strategyId,
+        exposureKnown,
+        'INCONSISTENT_ORDER_STATE'
+      );
       throw new SubmissionPersistenceError(
         'INCONSISTENT_ORDER_STATE',
         exposureKnown
@@ -648,6 +645,18 @@ export class HedgeCoordinator {
       exposureKnown ? 'HEDGE_INCOMPLETE' : 'FAILED',
       failureCode
     );
+  }
+
+  private failStrategyBestEffort(
+    strategyId: string,
+    exposureKnown: boolean,
+    failureCode: StrategyFailureCode
+  ): void {
+    try {
+      this.failStrategy(strategyId, exposureKnown, failureCode);
+    } catch {
+      // Preserve the fixed typed carrier without retaining the unsafe cause.
+    }
   }
 
   private async quantizedPrice(
@@ -942,7 +951,7 @@ export class HedgeCoordinator {
       (result): result is PromiseRejectedResult => result.status === 'rejected'
     );
     if (rejected !== undefined) {
-      this.failStrategy(
+      this.failStrategyBestEffort(
         strategy.id,
         knownExposure,
         'INCONSISTENT_ORDER_STATE'

@@ -1433,6 +1433,95 @@ test('rejected concurrent outcome carries positive exposure across a transient s
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
 });
 
+test('concurrent safe-transition errors never replace the fixed exposure carrier', async (t) => {
+  const spot = new DirectResultGateway('bitget');
+  const contract = new DirectResultGateway('okx');
+  const context = setup(t, 'CONCURRENT', { spot, contract });
+  spot.directResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6'
+    }
+  ));
+  contract.directResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null
+    }
+  ));
+  const originalAttach = context.repository.attachOrderSnapshot.bind(
+    context.repository
+  );
+  context.repository.attachOrderSnapshot = (orderId, snapshot) => {
+    if (snapshot.kind === 'spot') {
+      throw new Error('spot attach secret=must-never-escape');
+    }
+    originalAttach(orderId, snapshot);
+  };
+  const originalTransition = context.repository.transition.bind(
+    context.repository
+  );
+  let transitionCalls = 0;
+  context.repository.transition = () => {
+    transitionCalls += 1;
+    throw new Error('transition secret=must-never-escape');
+  };
+  let rejected: unknown;
+
+  await assert.rejects(
+    context.coordinator.confirmAndExecute(context.strategyId),
+    (error) => {
+      rejected = error;
+      return true;
+    }
+  );
+
+  assert.ok(rejected instanceof Error);
+  assert.equal(rejected.name, 'SubmissionPersistenceError');
+  assert.equal(rejected.message, 'order snapshot persistence failed');
+  assert.doesNotMatch(
+    [
+      String(rejected),
+      String(rejected.stack),
+      JSON.stringify(rejected)
+    ].join('\n'),
+    /secret|must-never-escape/
+  );
+  assert.equal(
+    context.repository.getStrategy(context.strategyId).state,
+    'EXECUTING'
+  );
+  assert.equal(transitionCalls, 3);
+  assert.equal(spot.createdRequests.length, 1);
+  assert.equal(contract.createdRequests.length, 1);
+  assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+
+  context.repository.attachOrderSnapshot = originalAttach;
+  context.repository.transition = originalTransition;
+  spot.findOrderByClientId = async (clientOrderId, symbol, kind) => {
+    spot.findRequests.push({ clientOrderId, symbol, kind });
+    return null;
+  };
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.equal(spot.findRequests.length, 1);
+  assert.equal(spot.createdRequests.length, 1);
+  assert.equal(contract.createdRequests.length, 1);
+  assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+  assert.equal(
+    context.repository.getStrategy(context.strategyId).failureCode,
+    'ORDER_NOT_FOUND'
+  );
+});
+
 test('repository snapshot failure uses a safe carrier and retries its safe transition', async (t) => {
   const context = setup(t, 'CONTRACT_FIRST');
   const repositoryFailure = new Error(
@@ -1481,6 +1570,84 @@ test('repository snapshot failure uses a safe carrier and retries its safe trans
   assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
   assert.equal(transitionCalls, 2);
   assert.equal(context.spot.createdRequests.length, 0);
+});
+
+test('sequential safe-transition errors never replace the fixed exposure carrier', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6'
+    }
+  ));
+  const originalAttach = context.repository.attachOrderSnapshot.bind(
+    context.repository
+  );
+  context.repository.attachOrderSnapshot = () => {
+    throw new Error('market attach secret=must-never-escape');
+  };
+  const originalTransition = context.repository.transition.bind(
+    context.repository
+  );
+  let transitionCalls = 0;
+  context.repository.transition = () => {
+    transitionCalls += 1;
+    throw new Error('transition secret=must-never-escape');
+  };
+  let rejected: unknown;
+
+  await assert.rejects(
+    context.coordinator.confirmAndExecute(context.strategyId),
+    (error) => {
+      rejected = error;
+      return true;
+    }
+  );
+
+  assert.ok(rejected instanceof Error);
+  assert.equal(rejected.name, 'SubmissionPersistenceError');
+  assert.equal(rejected.message, 'order snapshot persistence failed');
+  assert.doesNotMatch(
+    [
+      String(rejected),
+      String(rejected.stack),
+      JSON.stringify(rejected)
+    ].join('\n'),
+    /secret|must-never-escape/
+  );
+  assert.equal(
+    context.repository.getStrategy(context.strategyId).state,
+    'EXECUTING'
+  );
+  assert.equal(transitionCalls, 2);
+  assert.equal(context.contract.createdRequests.length, 1);
+  assert.equal(context.spot.createdRequests.length, 0);
+  assert.equal(context.repository.listOrders(context.strategyId).length, 1);
+
+  context.repository.attachOrderSnapshot = originalAttach;
+  context.repository.transition = originalTransition;
+  context.contract.findOrderByClientId = async (
+    clientOrderId,
+    symbol,
+    kind
+  ) => {
+    context.contract.findRequests.push({ clientOrderId, symbol, kind });
+    return null;
+  };
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.equal(context.contract.findRequests.length, 1);
+  assert.equal(context.contract.createdRequests.length, 1);
+  assert.equal(context.spot.createdRequests.length, 0);
+  assert.equal(context.repository.listOrders(context.strategyId).length, 1);
+  assert.equal(
+    context.repository.getStrategy(context.strategyId).failureCode,
+    'ORDER_NOT_FOUND'
+  );
 });
 
 test('sequential restart reconciles an existing first role before creating only its hedge', async (t) => {
