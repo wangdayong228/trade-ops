@@ -808,6 +808,54 @@ async function validatedOrder(value, strategy, preview) {
   };
 }
 
+function orderTopologyMatchesStrategy(strategy, orders) {
+  const roles = new Set(orders.map((order) => order.role));
+  if (strategy.state === 'PENDING_CONFIRMATION') {
+    return roles.size === 0;
+  }
+
+  const diagnosticState = failureStates.has(strategy.state);
+  if (strategy.mode !== 'CONCURRENT') {
+    const [firstRole, secondRole] = strategy.mode === 'CONTRACT_FIRST'
+      ? ['CONTRACT_MARKET', 'SPOT_HEDGE_GTC']
+      : ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC'];
+    if ([...roles].some((role) => (
+      role !== firstRole && role !== secondRole
+    ))) {
+      return false;
+    }
+    if (diagnosticState) {
+      return true;
+    }
+    if (strategy.state === 'EXECUTING') {
+      return !roles.has(secondRole) || roles.has(firstRole);
+    }
+    return roles.size === 2;
+  }
+
+  const hasBothMarkets = (
+    roles.has('SPOT_MARKET')
+    && roles.has('CONTRACT_MARKET')
+  );
+  const hedgeCount = [
+    'SPOT_HEDGE_GTC',
+    'CONTRACT_HEDGE_GTC'
+  ].filter((role) => roles.has(role)).length;
+  if (hedgeCount > 1) {
+    return false;
+  }
+  if (diagnosticState) {
+    return true;
+  }
+  if (strategy.state === 'EXECUTING') {
+    return roles.size === 0 || hasBothMarkets;
+  }
+  if (strategy.state === 'WAITING_HEDGE') {
+    return hasBothMarkets && hedgeCount === 1;
+  }
+  return hasBothMarkets;
+}
+
 function validatedActualFills(value, orders) {
   const fills = exactObject(value, [
     'spotBuyBaseQuantity',
@@ -892,6 +940,9 @@ async function validatedStatusResponse(
     || orderIdSet.size !== orders.length
   ) {
     throw new Error('duplicate strategy order identity');
+  }
+  if (!orderTopologyMatchesStrategy(strategy, orders)) {
+    throw new Error('strategy order topology mismatch');
   }
   return {
     strategy,

@@ -400,6 +400,42 @@ function browserStatusResponse(
   };
 }
 
+function browserContractFirstWaitingStatus(
+  strategyId: string
+): Record<string, unknown> {
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    state: 'WAITING_HEDGE',
+    mode: 'CONTRACT_FIRST'
+  });
+  (status.preflight as Record<string, unknown>).mode = 'CONTRACT_FIRST';
+  const contract = browserOrderResponse(
+    strategyId,
+    'CONTRACT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174001'
+  );
+  Object.assign(contract.snapshot as Record<string, unknown>, {
+    filledBaseQuantity: '1',
+    remainingBaseQuantity: '0',
+    averagePrice: '60010',
+    status: 'closed'
+  });
+  contract.status = 'closed';
+  const spotHedge = browserOrderResponse(
+    strategyId,
+    'SPOT_HEDGE_GTC',
+    '423e4567-e89b-42d3-a456-426614174002'
+  );
+  status.orders = [contract, spotHedge];
+  status.actualFills = {
+    spotBuyBaseQuantity: '0',
+    contractShortBaseQuantity: '1',
+    unmatchedBaseQuantity: '1'
+  };
+  return status;
+}
+
 async function browserHarness(): Promise<BrowserHarness> {
   const ids = [
     'spot-exchange',
@@ -1753,16 +1789,22 @@ test('operator UI accepts a matching status id and canonical high-precision fill
     status: 'closed'
   });
   order.status = 'closed';
+  const spotOrder = browserOrderResponse(
+    'strategy-browser-1',
+    'SPOT_MARKET',
+    '223e4567-e89b-42d3-a456-426614174015'
+  );
   browser.setFetch(async (url) => {
     assert.equal(url, '/api/hedges/strategy-browser-1');
-    return browserResponse(200, browserStatusResponse({
-      orders: [order],
+    const status = browserStatusResponse({
+      orders: [spotOrder, order],
       actualFills: {
         spotBuyBaseQuantity: '0',
         contractShortBaseQuantity: highPrecision,
         unmatchedBaseQuantity: highPrecision
       }
-    }));
+    });
+    return browserResponse(200, status);
   });
 
   await browser.element('refresh-button').emit('click');
@@ -2054,11 +2096,7 @@ test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgeme
 test('operator UI loads WAITING_HEDGE for observation without enabling confirmation', async () => {
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174001';
-  const status = browserStatusResponse();
-  Object.assign(status.strategy as Record<string, unknown>, {
-    id: strategyId,
-    state: 'WAITING_HEDGE'
-  });
+  const status = browserContractFirstWaitingStatus(strategyId);
   browser.element('resume-strategy-id').value = strategyId;
   browser.setFetch(async (url) => {
     assert.equal(url, `/api/hedges/${strategyId}`);
@@ -2080,7 +2118,11 @@ test('operator UI disables recovery confirmation when refresh reaches WAITING_HE
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174008';
   const executing = browserStatusResponse();
-  (executing.strategy as Record<string, unknown>).id = strategyId;
+  Object.assign(executing.strategy as Record<string, unknown>, {
+    id: strategyId,
+    mode: 'CONTRACT_FIRST'
+  });
+  (executing.preflight as Record<string, unknown>).mode = 'CONTRACT_FIRST';
   browser.element('resume-strategy-id').value = strategyId;
   let status = executing;
   browser.setFetch(async (url) => {
@@ -2092,11 +2134,7 @@ test('operator UI disables recovery confirmation when refresh reaches WAITING_HE
   await browser.element('risk-ack').emit('change');
   assert.equal(browser.element('confirm-button').disabled, false);
 
-  const waiting = browserStatusResponse();
-  Object.assign(waiting.strategy as Record<string, unknown>, {
-    id: strategyId,
-    state: 'WAITING_HEDGE'
-  });
+  const waiting = browserContractFirstWaitingStatus(strategyId);
   status = waiting;
   await browser.element('refresh-button').emit('click');
 
@@ -2194,7 +2232,74 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     body.orders = [order];
     return order;
   };
+  const setMode = (
+    body: Record<string, unknown>,
+    mode: 'CONCURRENT' | 'CONTRACT_FIRST' | 'SPOT_FIRST'
+  ): void => {
+    (body.strategy as Record<string, unknown>).mode = mode;
+    (body.preflight as Record<string, unknown>).mode = mode;
+  };
   const cases: StatusMutation[] = [
+    {
+      name: 'contract-first contains the spot-first market role',
+      mutate(body) {
+        setMode(body, 'CONTRACT_FIRST');
+        oneOrder(body, 'SPOT_MARKET');
+      }
+    },
+    {
+      name: 'spot-first contains the contract-first market role',
+      mutate(body) {
+        setMode(body, 'SPOT_FIRST');
+        oneOrder(body, 'CONTRACT_MARKET');
+      }
+    },
+    {
+      name: 'concurrent execution contains only one market role',
+      mutate(body) {
+        oneOrder(body, 'SPOT_MARKET');
+      }
+    },
+    {
+      name: 'concurrent execution contains a hedge before either market',
+      mutate(body) {
+        oneOrder(body, 'SPOT_HEDGE_GTC');
+      }
+    },
+    {
+      name: 'concurrent execution contains a hedge before both markets',
+      mutate(body) {
+        body.orders = [
+          browserOrderResponse(
+            strategyId,
+            'SPOT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174010'
+          ),
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174011'
+          )
+        ];
+      }
+    },
+    {
+      name: 'concurrent execution contains two hedge roles',
+      mutate(body) {
+        body.orders = [
+          browserOrderResponse(
+            strategyId,
+            'SPOT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174012'
+          ),
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_HEDGE_GTC',
+            '223e4567-e89b-42d3-a456-426614174013'
+          )
+        ];
+      }
+    },
     {
       name: 'strategy effective quantity differs from preflight',
       mutate(body) {
@@ -2409,18 +2514,174 @@ test('operator UI rejects every malformed full status DTO before enabling confir
       item.mutate(body);
       browser.element('resume-strategy-id').value = strategyId;
       browser.setFetch(async (url) => {
+        if (url === `/api/hedges/${strategyId}`) {
+          return browserResponse(200, body);
+        }
+        if (url === `/api/hedges/${strategyId}/confirm`) {
+          return browserResponse(202, { accepted: true });
+        }
+        throw new Error(`unexpected malformed-status URL: ${url}`);
+      });
+
+      await browser.element('resume-form').emit('submit');
+      browser.element('risk-ack').checked = true;
+      await browser.element('risk-ack').emit('change');
+      await browser.element('confirm-button').emit('click');
+      assert.equal(
+        browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
+        0
+      );
+      assert.equal(browser.element('requested-quantity').textContent, '—');
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('risk-ack').checked, true);
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.element('refresh-button').disabled, true);
+    });
+  }
+});
+
+test('operator UI preserves every reachable or diagnostic mode-state topology', async (t) => {
+  const strategyId = '123e4567-e89b-42d3-a456-426614174014';
+  type TopologyCase = {
+    readonly name: string;
+    readonly mode: 'CONCURRENT' | 'CONTRACT_FIRST' | 'SPOT_FIRST';
+    readonly state:
+      | 'PENDING_CONFIRMATION'
+      | 'EXECUTING'
+      | 'WAITING_HEDGE'
+      | 'HEDGED'
+      | 'HEDGE_INCOMPLETE'
+      | 'FAILED';
+    readonly roles: readonly OrderRole[];
+    readonly actionable: boolean;
+  };
+  const cases: readonly TopologyCase[] = [
+    {
+      name: 'pending without orders',
+      mode: 'CONCURRENT',
+      state: 'PENDING_CONFIRMATION',
+      roles: [],
+      actionable: true
+    },
+    ...([
+      ['CONTRACT_FIRST', []],
+      ['CONTRACT_FIRST', ['CONTRACT_MARKET']],
+      ['CONTRACT_FIRST', ['CONTRACT_MARKET', 'SPOT_HEDGE_GTC']],
+      ['SPOT_FIRST', []],
+      ['SPOT_FIRST', ['SPOT_MARKET']],
+      ['SPOT_FIRST', ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC']],
+      ['CONCURRENT', []],
+      ['CONCURRENT', ['SPOT_MARKET', 'CONTRACT_MARKET']],
+      [
+        'CONCURRENT',
+        ['SPOT_MARKET', 'CONTRACT_MARKET', 'SPOT_HEDGE_GTC']
+      ]
+    ] as const).map(([mode, roles]) => ({
+      name: `executing ${mode} with ${roles.join(',') || 'no orders'}`,
+      mode,
+      state: 'EXECUTING' as const,
+      roles,
+      actionable: true
+    })),
+    {
+      name: 'waiting contract-first with both sequential roles',
+      mode: 'CONTRACT_FIRST',
+      state: 'WAITING_HEDGE',
+      roles: ['CONTRACT_MARKET', 'SPOT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'waiting concurrent with both markets and one hedge',
+      mode: 'CONCURRENT',
+      state: 'WAITING_HEDGE',
+      roles: ['SPOT_MARKET', 'CONTRACT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'hedged spot-first with both sequential roles',
+      mode: 'SPOT_FIRST',
+      state: 'HEDGED',
+      roles: ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'hedged concurrent with equal market legs and no hedge',
+      mode: 'CONCURRENT',
+      state: 'HEDGED',
+      roles: ['SPOT_MARKET', 'CONTRACT_MARKET'],
+      actionable: false
+    },
+    {
+      name: 'hedged concurrent with both markets and one hedge',
+      mode: 'CONCURRENT',
+      state: 'HEDGED',
+      roles: ['SPOT_MARKET', 'CONTRACT_MARKET', 'SPOT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'incomplete contract-first preserves a second-leg-only diagnostic',
+      mode: 'CONTRACT_FIRST',
+      state: 'HEDGE_INCOMPLETE',
+      roles: ['SPOT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'failed spot-first preserves a second-leg-only diagnostic',
+      mode: 'SPOT_FIRST',
+      state: 'FAILED',
+      roles: ['CONTRACT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'incomplete concurrent preserves a hedge-only diagnostic',
+      mode: 'CONCURRENT',
+      state: 'HEDGE_INCOMPLETE',
+      roles: ['SPOT_HEDGE_GTC'],
+      actionable: false
+    },
+    {
+      name: 'failed concurrent preserves one market plus one hedge',
+      mode: 'CONCURRENT',
+      state: 'FAILED',
+      roles: ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC'],
+      actionable: false
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const browser = await browserHarness();
+      const body = browserStatusResponse();
+      Object.assign(body.strategy as Record<string, unknown>, {
+        id: strategyId,
+        mode: item.mode,
+        state: item.state,
+        failureCode: ['HEDGE_INCOMPLETE', 'FAILED'].includes(item.state)
+          ? 'INCONSISTENT_ORDER_STATE'
+          : null
+      });
+      (body.preflight as Record<string, unknown>).mode = item.mode;
+      body.orders = item.roles.map((role, index) => browserOrderResponse(
+        strategyId,
+        role,
+        `323e4567-e89b-42d3-a456-${String(index + 1).padStart(12, '0')}`
+      ));
+      browser.element('resume-strategy-id').value = strategyId;
+      browser.setFetch(async (url) => {
         assert.equal(url, `/api/hedges/${strategyId}`);
         return browserResponse(200, body);
       });
 
       await browser.element('resume-form').emit('submit');
-      assert.equal(browser.element('requested-quantity').textContent, '—');
-      assert.equal(browser.element('strategy-state').textContent, '—');
-      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('strategy-state').textContent, item.state);
+      assert.equal(browser.element('requested-quantity').textContent, '1');
+      assert.equal(browser.element('refresh-button').disabled, false);
       browser.element('risk-ack').checked = true;
       await browser.element('risk-ack').emit('change');
-      assert.equal(browser.element('confirm-button').disabled, true);
-      assert.equal(browser.element('refresh-button').disabled, true);
+      assert.equal(
+        browser.element('confirm-button').disabled,
+        !item.actionable
+      );
       assert.equal(
         browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
         0
