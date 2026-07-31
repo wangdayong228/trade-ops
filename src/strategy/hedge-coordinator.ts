@@ -14,6 +14,10 @@ import type {
   StrategyRecord,
   StrategyRepository
 } from '../storage/strategy-repository.js';
+import {
+  releaseStrategyOperation,
+  tryAcquireStrategyOperation
+} from './strategy-operation-owner.js';
 
 type ConfirmedMarginMode = 'isolated' | 'cross';
 
@@ -63,7 +67,6 @@ const SNAPSHOT_STATUSES = new Set<OrderSnapshot['status']>([
 const MAX_COORDINATOR_PRECISION = 1_000_000;
 const COORDINATOR_MIN_EXPONENT = -9_000_000_000_000_000;
 const COORDINATOR_MAX_EXPONENT = 9_000_000_000_000_000;
-const ACTIVE_STRATEGY_EXECUTIONS = new Set<string>();
 const CoordinatorDecimal = Decimal.clone({
   precision: 80,
   rounding: Decimal.ROUND_DOWN,
@@ -283,10 +286,9 @@ export class HedgeCoordinator {
   ) {}
 
   async confirmAndExecute(strategyId: string): Promise<void> {
-    if (ACTIVE_STRATEGY_EXECUTIONS.has(strategyId)) {
+    if (!tryAcquireStrategyOperation(strategyId)) {
       return;
     }
-    ACTIVE_STRATEGY_EXECUTIONS.add(strategyId);
     try {
       await this.confirmAndExecuteOwned(strategyId);
     } catch (error) {
@@ -302,7 +304,7 @@ export class HedgeCoordinator {
       }
       throw error;
     } finally {
-      ACTIVE_STRATEGY_EXECUTIONS.delete(strategyId);
+      releaseStrategyOperation(strategyId);
     }
   }
 
