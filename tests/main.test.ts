@@ -367,6 +367,107 @@ test('starts monitoring before loopback listen and installs each signal once', a
   assert.equal(signals.exitCode, 0);
 });
 
+test('a signal during listen is owned by the same idempotent shutdown', async () => {
+  const events: string[] = [];
+  const fixture = runnableFixture(events);
+  const signals = new SignalTarget();
+  let finishListen: (() => void) | undefined;
+  const listenGate = new Promise<void>((resolve) => {
+    finishListen = resolve;
+  });
+
+  const starting = startService(fixture.composition, {
+    signalTarget: signals,
+    listen: async () => {
+      events.push('listen');
+      await listenGate;
+    }
+  });
+
+  assert.equal(signals.listenerCount('SIGINT'), 1);
+  assert.equal(signals.listenerCount('SIGTERM'), 1);
+  signals.emit('SIGINT');
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+  finishListen?.();
+  const started = await starting;
+  await started.shutdown();
+
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.deepEqual(fixture.counts(), {
+    monitorStarts: 1,
+    monitorStops: 1,
+    serverCloses: 1,
+    databaseCloses: 1
+  });
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
+  assert.equal(signals.exitCode, 0);
+});
+
+test('repeated signals remain owned until gated shutdown completes', async () => {
+  const events: string[] = [];
+  const fixture = runnableFixture(events);
+  const signals = new SignalTarget();
+  let monitorStopCalls = 0;
+  let finishMonitorStop: (() => void) | undefined;
+  const monitorStopGate = new Promise<void>((resolve) => {
+    finishMonitorStop = resolve;
+  });
+  fixture.composition.monitor.stop = async () => {
+    monitorStopCalls += 1;
+    events.push('monitor.stop');
+    await monitorStopGate;
+  };
+  const started = await startService(fixture.composition, {
+    signalTarget: signals,
+    listen: async () => {
+      events.push('listen');
+    }
+  });
+
+  signals.emit('SIGINT');
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+  assert.equal(signals.listenerCount('SIGINT'), 1);
+  assert.equal(signals.listenerCount('SIGTERM'), 1);
+  signals.emit('SIGTERM');
+  signals.emit('SIGINT');
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'monitor.stop'
+  ]);
+
+  finishMonitorStop?.();
+  await started.shutdown();
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.deepEqual(fixture.counts(), {
+    monitorStarts: 1,
+    monitorStops: 0,
+    serverCloses: 1,
+    databaseCloses: 1
+  });
+  assert.equal(monitorStopCalls, 1);
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
+  assert.equal(signals.exitCode, 0);
+});
+
 test('listen failure stops monitoring and closes server and database', async () => {
   const events: string[] = [];
   const fixture = runnableFixture(events);

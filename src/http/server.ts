@@ -509,13 +509,10 @@ export function buildServer(
       || (
         isStateChangingPost
         && (
-          (
-            origin !== undefined
-            && !matchingLoopbackOrigin(
-              origin,
-              requestAuthority,
-              LOCAL_HTTP_PROTOCOL
-            )
+          !matchingLoopbackOrigin(
+            origin,
+            requestAuthority,
+            LOCAL_HTTP_PROTOCOL
           )
           || (
             typeof fetchSite === 'string'

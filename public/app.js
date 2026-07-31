@@ -46,6 +46,33 @@ const orderRoles = new Set([
   'SPOT_HEDGE_GTC',
   'CONTRACT_HEDGE_GTC'
 ]);
+const strategyFailureCodes = new Set([
+  'ORDER_SUBMISSION_FAILED',
+  'ORDER_SUBMISSION_UNKNOWN',
+  'ORDER_NOT_FOUND',
+  'NO_FILL',
+  'MISSING_AVERAGE_PRICE',
+  'HEDGE_ORDER_REJECTED',
+  'HEDGE_ORDER_CANCELED',
+  'ORDER_RECONCILIATION_FAILED',
+  'INCONSISTENT_ORDER_STATE'
+]);
+const failureStates = new Set(['HEDGE_INCOMPLETE', 'FAILED']);
+const orderStatuses = new Set([
+  'planned',
+  'open',
+  'closed',
+  'canceled',
+  'rejected',
+  'unknown'
+]);
+const snapshotStatuses = new Set([
+  'open',
+  'closed',
+  'canceled',
+  'rejected',
+  'unknown'
+]);
 const resumableStates = new Set([
   'PENDING_CONFIRMATION',
   'EXECUTING'
@@ -167,6 +194,151 @@ function matchingString(value, expected, maximumLength) {
   return text;
 }
 
+function exactObject(value, requiredKeys, optionalKeys = []) {
+  if (!isRecord(value)) {
+    throw new Error('invalid response object');
+  }
+  const allowed = new Set([...requiredKeys, ...optionalKeys]);
+  const keys = Object.keys(value);
+  if (
+    requiredKeys.some((key) => !Object.hasOwn(value, key))
+    || keys.some((key) => !allowed.has(key))
+  ) {
+    throw new Error('invalid response fields');
+  }
+  return value;
+}
+
+function canonicalTimestamp(value) {
+  const timestamp = requiredString(value, 64);
+  try {
+    if (new Date(timestamp).toISOString() !== timestamp) {
+      throw new Error('invalid response timestamp');
+    }
+  } catch {
+    throw new Error('invalid response timestamp');
+  }
+  return timestamp;
+}
+
+function decimalParts(value, positive = false) {
+  const text = positive
+    ? positiveDecimalString(value)
+    : nonNegativeDecimalString(value);
+  const [whole, fraction = ''] = text.split('.');
+  return {
+    text,
+    units: BigInt(`${whole}${fraction}`),
+    scale: fraction.length
+  };
+}
+
+function scaledUnits(value, scale) {
+  return value.units * (10n ** BigInt(scale - value.scale));
+}
+
+function compareDecimals(leftText, rightText) {
+  const left = decimalParts(leftText);
+  const right = decimalParts(rightText);
+  const scale = Math.max(left.scale, right.scale);
+  const leftUnits = scaledUnits(left, scale);
+  const rightUnits = scaledUnits(right, scale);
+  return leftUnits < rightUnits ? -1 : leftUnits > rightUnits ? 1 : 0;
+}
+
+function sumDecimalParts(values) {
+  const parsed = values.map((value) => decimalParts(value));
+  const scale = parsed.reduce(
+    (highest, value) => Math.max(highest, value.scale),
+    0
+  );
+  return {
+    units: parsed.reduce(
+      (total, value) => total + scaledUnits(value, scale),
+      0n
+    ),
+    scale
+  };
+}
+
+function decimalPartsEqual(left, right) {
+  const scale = Math.max(left.scale, right.scale);
+  return scaledUnits(left, scale) === scaledUnits(right, scale);
+}
+
+function absoluteDecimalDifference(left, right) {
+  const scale = Math.max(left.scale, right.scale);
+  const difference = scaledUnits(left, scale) - scaledUnits(right, scale);
+  return {
+    units: difference < 0n ? -difference : difference,
+    scale
+  };
+}
+
+function validatedMarket(value, expected) {
+  const market = exactObject(value, [
+    'exchangeId',
+    'symbol',
+    'marketId',
+    'kind',
+    'base',
+    'quote',
+    'active',
+    'amountStep',
+    'contractSize',
+    'minBaseAmount',
+    'priceStep'
+  ], [
+    'maxBaseAmount',
+    'minQuoteNotional',
+    'maxQuoteNotional'
+  ]);
+  const result = {
+    exchangeId: matchingString(market.exchangeId, expected.exchangeId, 128),
+    symbol: matchingString(market.symbol, expected.symbol, 64),
+    marketId: requiredString(market.marketId, 256),
+    kind: matchingString(market.kind, expected.kind, 16),
+    base: matchingString(market.base, expected.base, 64),
+    quote: matchingString(market.quote, 'USDT', 16),
+    active: market.active,
+    amountStep: positiveDecimalString(market.amountStep),
+    contractSize: positiveDecimalString(market.contractSize),
+    minBaseAmount: nonNegativeDecimalString(market.minBaseAmount),
+    priceStep: positiveDecimalString(market.priceStep)
+  };
+  if (result.active !== true) {
+    throw new Error('inactive response market');
+  }
+  for (const [key, positive] of [
+    ['maxBaseAmount', true],
+    ['minQuoteNotional', false],
+    ['maxQuoteNotional', true]
+  ]) {
+    if (Object.hasOwn(market, key)) {
+      result[key] = positive
+        ? positiveDecimalString(market[key])
+        : nonNegativeDecimalString(market[key]);
+    }
+  }
+  if (
+    result.maxBaseAmount !== undefined
+    && compareDecimals(result.minBaseAmount, result.maxBaseAmount) > 0
+  ) {
+    throw new Error('invalid market amount range');
+  }
+  if (
+    result.minQuoteNotional !== undefined
+    && result.maxQuoteNotional !== undefined
+    && compareDecimals(
+      result.minQuoteNotional,
+      result.maxQuoteNotional
+    ) > 0
+  ) {
+    throw new Error('invalid market notional range');
+  }
+  return result;
+}
+
 function validatedIdentity(value, expectedInput) {
   if (!isRecord(value)) {
     throw new Error('invalid response identity');
@@ -203,11 +375,29 @@ function validatedIdentity(value, expectedInput) {
 }
 
 function validatedPreview(value, expectedInput) {
-  if (!isRecord(value) || !isRecord(value.accountSettings)) {
-    throw new Error('invalid preflight preview');
-  }
-  const identity = validatedIdentity(value, expectedInput);
-  const accountSettings = value.accountSettings;
+  const preview = exactObject(value, [
+    'spotExchangeId',
+    'contractExchangeId',
+    'symbol',
+    'requestedBaseQuantity',
+    'mode',
+    'effectiveBaseQuantity',
+    'spotMarket',
+    'contractMarket',
+    'accountSettings',
+    'spotFreeUsdt',
+    'contractFreeUsdt',
+    'spotReferencePrice',
+    'contractReferencePrice',
+    'riskAcknowledgementRequired',
+    'createdAt'
+  ]);
+  const identity = validatedIdentity(preview, expectedInput);
+  const accountSettings = exactObject(preview.accountSettings, [
+    'marginMode',
+    'positionMode',
+    'leverage'
+  ]);
   const marginMode = requiredString(accountSettings.marginMode, 32);
   const positionMode = requiredString(accountSettings.positionMode, 32);
   if (!['isolated', 'cross'].includes(marginMode)) {
@@ -217,113 +407,497 @@ function validatedPreview(value, expectedInput) {
     throw new Error('invalid position mode');
   }
   const leverage = positiveDecimalString(accountSettings.leverage);
-  if (value.riskAcknowledgementRequired !== true) {
+  if (preview.riskAcknowledgementRequired !== true) {
     throw new Error('invalid risk acknowledgement requirement');
+  }
+  const effectiveBaseQuantity = positiveDecimalString(
+    preview.effectiveBaseQuantity
+  );
+  if (
+    compareDecimals(
+      effectiveBaseQuantity,
+      identity.requestedBaseQuantity
+    ) > 0
+  ) {
+    throw new Error('effective quantity exceeds request');
+  }
+  const base = identity.symbol.split('/')[0];
+  if (base === undefined || base.length === 0) {
+    throw new Error('invalid market base');
   }
   return {
     ...identity,
-    effectiveBaseQuantity: positiveDecimalString(
-      value.effectiveBaseQuantity
-    ),
-    spotReferencePrice: positiveDecimalString(value.spotReferencePrice),
+    effectiveBaseQuantity,
+    spotMarket: validatedMarket(preview.spotMarket, {
+      exchangeId: identity.spotExchangeId,
+      symbol: identity.symbol,
+      kind: 'spot',
+      base
+    }),
+    contractMarket: validatedMarket(preview.contractMarket, {
+      exchangeId: identity.contractExchangeId,
+      symbol: identity.symbol,
+      kind: 'swap',
+      base
+    }),
+    spotReferencePrice: positiveDecimalString(preview.spotReferencePrice),
     contractReferencePrice: positiveDecimalString(
-      value.contractReferencePrice
+      preview.contractReferencePrice
     ),
-    spotFreeUsdt: positiveDecimalString(value.spotFreeUsdt),
-    contractFreeUsdt: positiveDecimalString(value.contractFreeUsdt),
+    spotFreeUsdt: positiveDecimalString(preview.spotFreeUsdt),
+    contractFreeUsdt: positiveDecimalString(preview.contractFreeUsdt),
     riskAcknowledgementRequired: true,
     accountSettings: {
       marginMode,
       positionMode,
       leverage
-    }
+    },
+    createdAt: canonicalTimestamp(preview.createdAt)
   };
 }
 
 function validatedPreflightResponse(value, expectedInput) {
-  if (!isRecord(value)) {
-    throw new Error('invalid preflight response');
-  }
-  const id = requiredString(value.id, 128);
+  const response = exactObject(value, ['id', 'state', 'preflight']);
+  const id = requiredString(response.id, 128);
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) {
     throw new Error('invalid strategy id');
   }
-  if (value.state !== 'PENDING_CONFIRMATION') {
+  if (response.state !== 'PENDING_CONFIRMATION') {
     throw new Error('invalid preflight state');
   }
   return {
     id,
-    state: value.state,
-    preflight: validatedPreview(value.preflight, expectedInput)
+    state: response.state,
+    preflight: validatedPreview(response.preflight, expectedInput)
   };
 }
 
-function validatedStatusResponse(
+function validatedStrategy(value, expectedInput, expectedStrategyId, preview) {
+  const strategy = exactObject(value, [
+    'id',
+    'state',
+    'mode',
+    'spotExchangeId',
+    'contractExchangeId',
+    'symbol',
+    'requestedBaseQuantity',
+    'effectiveBaseQuantity',
+    'failureCode',
+    'createdAt',
+    'updatedAt'
+  ]);
+  const id = matchingString(strategy.id, expectedStrategyId, 128);
+  const state = requiredString(strategy.state, 32);
+  if (!strategyStates.has(state)) {
+    throw new Error('invalid strategy state');
+  }
+  const identity = validatedIdentity(strategy, expectedInput);
+  const effectiveBaseQuantity = matchingString(
+    strategy.effectiveBaseQuantity,
+    preview.effectiveBaseQuantity,
+    10_000
+  );
+  const failureCode = strategy.failureCode;
+  if (
+    failureStates.has(state)
+      ? typeof failureCode !== 'string'
+        || !strategyFailureCodes.has(failureCode)
+      : failureCode !== null
+  ) {
+    throw new Error('invalid strategy failure state');
+  }
+  const createdAt = canonicalTimestamp(strategy.createdAt);
+  const updatedAt = canonicalTimestamp(strategy.updatedAt);
+  if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
+    throw new Error('strategy time regression');
+  }
+  return {
+    id,
+    state,
+    ...identity,
+    effectiveBaseQuantity,
+    failureCode,
+    createdAt,
+    updatedAt
+  };
+}
+
+function expectedOrderSemantics(role, strategy) {
+  switch (role) {
+    case 'SPOT_MARKET':
+      return {
+        exchangeId: strategy.spotExchangeId,
+        kind: 'spot',
+        type: 'market',
+        side: 'buy',
+        contract: false,
+        hedge: false
+      };
+    case 'CONTRACT_MARKET':
+      return {
+        exchangeId: strategy.contractExchangeId,
+        kind: 'swap',
+        type: 'market',
+        side: 'sell',
+        contract: true,
+        hedge: false
+      };
+    case 'SPOT_HEDGE_GTC':
+      return {
+        exchangeId: strategy.spotExchangeId,
+        kind: 'spot',
+        type: 'limit',
+        side: 'buy',
+        contract: false,
+        hedge: true
+      };
+    case 'CONTRACT_HEDGE_GTC':
+      return {
+        exchangeId: strategy.contractExchangeId,
+        kind: 'swap',
+        type: 'limit',
+        side: 'sell',
+        contract: true,
+        hedge: true
+      };
+    default:
+      throw new Error('invalid order role');
+  }
+}
+
+async function expectedClientOrderId(strategyId, role) {
+  if (
+    globalThis.crypto === undefined
+    || globalThis.crypto.subtle === undefined
+  ) {
+    throw new Error('secure digest unavailable');
+  }
+  const encoded = new TextEncoder().encode(`${strategyId}\0${role}`);
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', encoded);
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32);
+}
+
+function validatedOrderRequest(
+  value,
+  strategy,
+  clientOrderId,
+  semantics,
+  preview
+) {
+  const requiredKeys = [
+    'symbol',
+    'kind',
+    'type',
+    'side',
+    'baseQuantity',
+    'clientOrderId'
+  ];
+  if (semantics.hedge) {
+    requiredKeys.push('price', 'timeInForce');
+  }
+  if (semantics.contract) {
+    requiredKeys.push('positionSide', 'marginMode');
+  }
+  const request = exactObject(value, requiredKeys);
+  const baseQuantity = positiveDecimalString(request.baseQuantity);
+  if (compareDecimals(baseQuantity, strategy.effectiveBaseQuantity) > 0) {
+    throw new Error('order quantity exceeds strategy');
+  }
+  const result = {
+    symbol: matchingString(request.symbol, strategy.symbol, 64),
+    kind: matchingString(request.kind, semantics.kind, 16),
+    type: matchingString(request.type, semantics.type, 16),
+    side: matchingString(request.side, semantics.side, 16),
+    baseQuantity,
+    clientOrderId: matchingString(
+      request.clientOrderId,
+      clientOrderId,
+      32
+    )
+  };
+  if (semantics.hedge) {
+    result.price = positiveDecimalString(request.price);
+    result.timeInForce = matchingString(
+      request.timeInForce,
+      'GTC',
+      16
+    );
+  }
+  if (semantics.contract) {
+    result.positionSide = matchingString(
+      request.positionSide,
+      'SHORT',
+      16
+    );
+    result.marginMode = matchingString(
+      request.marginMode,
+      preview.accountSettings.marginMode,
+      16
+    );
+  }
+  return result;
+}
+
+function validatedOrderSnapshot(
+  value,
+  order,
+  request,
+  orderStatus,
+  exchangeOrderId
+) {
+  const snapshot = exactObject(value, [
+    'exchangeId',
+    'exchangeOrderId',
+    'clientOrderId',
+    'symbol',
+    'kind',
+    'type',
+    'side',
+    'requestedBaseQuantity',
+    'filledBaseQuantity',
+    'remainingBaseQuantity',
+    'averagePrice',
+    'status',
+    'updatedAt'
+  ]);
+  const status = requiredString(snapshot.status, 16);
+  if (!snapshotStatuses.has(status) || status !== orderStatus) {
+    throw new Error('snapshot status mismatch');
+  }
+  const requestedBaseQuantity = positiveDecimalString(
+    snapshot.requestedBaseQuantity
+  );
+  if (compareDecimals(requestedBaseQuantity, request.baseQuantity) !== 0) {
+    throw new Error('snapshot request quantity mismatch');
+  }
+  const filledBaseQuantity = nonNegativeDecimalString(
+    snapshot.filledBaseQuantity
+  );
+  const remainingBaseQuantity = nonNegativeDecimalString(
+    snapshot.remainingBaseQuantity
+  );
+  if (
+    !decimalPartsEqual(
+      sumDecimalParts([filledBaseQuantity, remainingBaseQuantity]),
+      decimalParts(requestedBaseQuantity)
+    )
+  ) {
+    throw new Error('snapshot quantity mismatch');
+  }
+  const averagePrice = snapshot.averagePrice === null
+    ? null
+    : positiveDecimalString(snapshot.averagePrice);
+  return {
+    exchangeId: matchingString(
+      snapshot.exchangeId,
+      order.exchangeId,
+      128
+    ),
+    exchangeOrderId: matchingString(
+      snapshot.exchangeOrderId,
+      exchangeOrderId,
+      256
+    ),
+    clientOrderId: matchingString(
+      snapshot.clientOrderId,
+      order.clientOrderId,
+      32
+    ),
+    symbol: matchingString(snapshot.symbol, request.symbol, 64),
+    kind: matchingString(snapshot.kind, request.kind, 16),
+    type: matchingString(snapshot.type, request.type, 16),
+    side: matchingString(snapshot.side, request.side, 16),
+    requestedBaseQuantity,
+    filledBaseQuantity,
+    remainingBaseQuantity,
+    averagePrice,
+    status,
+    updatedAt: canonicalTimestamp(snapshot.updatedAt)
+  };
+}
+
+async function validatedOrder(value, strategy, preview) {
+  const order = exactObject(value, [
+    'id',
+    'strategyId',
+    'role',
+    'exchangeId',
+    'clientOrderId',
+    'exchangeOrderId',
+    'request',
+    'snapshot',
+    'status',
+    'createdAt',
+    'updatedAt'
+  ]);
+  const id = requiredString(order.id, 36);
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      .test(id)
+  ) {
+    throw new Error('invalid strategy order id');
+  }
+  matchingString(order.strategyId, strategy.id, 128);
+  const role = requiredString(order.role, 32);
+  if (!orderRoles.has(role)) {
+    throw new Error('invalid order role');
+  }
+  const semantics = expectedOrderSemantics(role, strategy);
+  const exchangeId = matchingString(
+    order.exchangeId,
+    semantics.exchangeId,
+    128
+  );
+  const clientOrderId = requiredString(order.clientOrderId, 32);
+  if (
+    !/^[0-9a-f]{32}$/.test(clientOrderId)
+    || clientOrderId !== await expectedClientOrderId(strategy.id, role)
+  ) {
+    throw new Error('invalid client order id');
+  }
+  const request = validatedOrderRequest(
+    order.request,
+    strategy,
+    clientOrderId,
+    semantics,
+    preview
+  );
+  const status = requiredString(order.status, 16);
+  if (!orderStatuses.has(status)) {
+    throw new Error('invalid order status');
+  }
+  const createdAt = canonicalTimestamp(order.createdAt);
+  const updatedAt = canonicalTimestamp(order.updatedAt);
+  if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
+    throw new Error('order time regression');
+  }
+  let exchangeOrderId = null;
+  let snapshot = null;
+  if (status === 'planned') {
+    if (order.exchangeOrderId !== null || order.snapshot !== null) {
+      throw new Error('planned order has exchange state');
+    }
+  } else {
+    exchangeOrderId = requiredString(order.exchangeOrderId, 256);
+    snapshot = validatedOrderSnapshot(
+      order.snapshot,
+      {
+        exchangeId,
+        clientOrderId
+      },
+      request,
+      status,
+      exchangeOrderId
+    );
+  }
+  return {
+    id,
+    strategyId: strategy.id,
+    role,
+    exchangeId,
+    clientOrderId,
+    exchangeOrderId,
+    request,
+    snapshot,
+    status,
+    createdAt,
+    updatedAt
+  };
+}
+
+function validatedActualFills(value, orders) {
+  const fills = exactObject(value, [
+    'spotBuyBaseQuantity',
+    'contractShortBaseQuantity',
+    'unmatchedBaseQuantity'
+  ]);
+  const result = {
+    spotBuyBaseQuantity: nonNegativeDecimalString(
+      fills.spotBuyBaseQuantity
+    ),
+    contractShortBaseQuantity: nonNegativeDecimalString(
+      fills.contractShortBaseQuantity
+    ),
+    unmatchedBaseQuantity: nonNegativeDecimalString(
+      fills.unmatchedBaseQuantity
+    )
+  };
+  const spot = sumDecimalParts(orders
+    .filter((order) => (
+      order.snapshot !== null
+      && order.snapshot.kind === 'spot'
+      && order.snapshot.side === 'buy'
+    ))
+    .map((order) => order.snapshot.filledBaseQuantity));
+  const contract = sumDecimalParts(orders
+    .filter((order) => (
+      order.snapshot !== null
+      && order.snapshot.kind === 'swap'
+      && order.snapshot.side === 'sell'
+      && order.request.positionSide === 'SHORT'
+    ))
+    .map((order) => order.snapshot.filledBaseQuantity));
+  if (
+    !decimalPartsEqual(spot, decimalParts(result.spotBuyBaseQuantity))
+    || !decimalPartsEqual(
+      contract,
+      decimalParts(result.contractShortBaseQuantity)
+    )
+    || !decimalPartsEqual(
+      absoluteDecimalDifference(spot, contract),
+      decimalParts(result.unmatchedBaseQuantity)
+    )
+  ) {
+    throw new Error('actual fill totals mismatch');
+  }
+  return result;
+}
+
+async function validatedStatusResponse(
   value,
   expectedInput,
   expectedStrategyId
 ) {
+  const response = exactObject(value, [
+    'strategy',
+    'preflight',
+    'orders',
+    'actualFills'
+  ]);
   if (
-    !isRecord(value)
-    || !isRecord(value.strategy)
-    || !Array.isArray(value.orders)
-    || !isRecord(value.actualFills)
+    !Array.isArray(response.orders)
+    || response.orders.length > orderRoles.size
   ) {
-    throw new Error('invalid status response');
+    throw new Error('invalid status orders');
   }
-  const state = requiredString(value.strategy.state, 32);
-  if (!strategyStates.has(state)) {
-    throw new Error('invalid strategy state');
-  }
-  const strategyId = matchingString(
-    value.strategy.id,
+  const preview = validatedPreview(response.preflight, expectedInput);
+  const strategy = validatedStrategy(
+    response.strategy,
+    expectedInput,
     expectedStrategyId,
-    128
+    preview
   );
-  const strategyIdentity = validatedIdentity(
-    value.strategy,
-    expectedInput
+  const orders = await Promise.all(
+    response.orders.map((order) => validatedOrder(order, strategy, preview))
   );
-  const orders = value.orders.map((order) => {
-    if (!isRecord(order)) {
-      throw new Error('invalid order');
-    }
-    const role = requiredString(order.role, 32);
-    if (!orderRoles.has(role)) {
-      throw new Error('invalid order role');
-    }
-    const exchangeOrderId = order.exchangeOrderId;
-    if (
-      exchangeOrderId !== null
-      && typeof exchangeOrderId !== 'string'
-    ) {
-      throw new Error('invalid exchange order id');
-    }
-    return {
-      role,
-      clientOrderId: requiredString(order.clientOrderId, 256),
-      exchangeOrderId
-    };
-  });
+  const roleSet = new Set(orders.map((order) => order.role));
+  const clientIdSet = new Set(orders.map((order) => order.clientOrderId));
+  const orderIdSet = new Set(orders.map((order) => order.id));
+  if (
+    roleSet.size !== orders.length
+    || clientIdSet.size !== orders.length
+    || orderIdSet.size !== orders.length
+  ) {
+    throw new Error('duplicate strategy order identity');
+  }
   return {
-    strategy: {
-      id: strategyId,
-      state,
-      ...strategyIdentity
-    },
-    preflight: validatedPreview(value.preflight, expectedInput),
+    strategy,
+    preflight: preview,
     orders,
-    actualFills: {
-      spotBuyBaseQuantity: nonNegativeDecimalString(
-        value.actualFills.spotBuyBaseQuantity
-      ),
-      contractShortBaseQuantity: nonNegativeDecimalString(
-        value.actualFills.contractShortBaseQuantity
-      ),
-      unmatchedBaseQuantity: nonNegativeDecimalString(
-        value.actualFills.unmatchedBaseQuantity
-      )
-    }
+    actualFills: validatedActualFills(response.actualFills, orders)
   };
 }
 
@@ -377,14 +951,14 @@ function validatedLoadedInput(value) {
   });
 }
 
-function validatedLoadedStatusResponse(value, expectedStrategyId) {
+async function validatedLoadedStatusResponse(value, expectedStrategyId) {
   if (!isRecord(value)) {
     throw new Error('invalid loaded status response');
   }
   const submittedInput = validatedLoadedInput(value.preflight);
   return {
     submittedInput,
-    status: validatedStatusResponse(
+    status: await validatedStatusResponse(
       value,
       submittedInput,
       expectedStrategyId
@@ -477,7 +1051,7 @@ async function refreshStatus() {
     if (!response.ok || body === null) {
       throw new Error('status unavailable');
     }
-    const status = validatedStatusResponse(
+    const status = await validatedStatusResponse(
       body,
       statusExpectedInput,
       statusStrategyId
@@ -547,7 +1121,7 @@ resumeForm.addEventListener('submit', async (event) => {
     if (!response.ok || body === null) {
       throw new Error('strategy unavailable');
     }
-    const loaded = validatedLoadedStatusResponse(
+    const loaded = await validatedLoadedStatusResponse(
       body,
       requestedStrategyId
     );

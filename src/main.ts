@@ -77,7 +77,7 @@ export interface RunnableComposition {
 
 export interface SignalTarget {
   exitCode: number | undefined;
-  once(
+  on(
     signal: 'SIGINT' | 'SIGTERM',
     listener: () => void
   ): unknown;
@@ -303,7 +303,6 @@ export async function startService<T extends RunnableComposition>(
   };
 
   const closeResources = async (): Promise<void> => {
-    removeSignalListeners();
     let firstError: unknown;
     try {
       await composition.monitor.stop();
@@ -320,6 +319,7 @@ export async function startService<T extends RunnableComposition>(
     } catch (error) {
       firstError ??= error;
     }
+    removeSignalListeners();
     if (firstError !== undefined) {
       throw firstError;
     }
@@ -337,15 +337,15 @@ export async function startService<T extends RunnableComposition>(
     });
   };
 
+  signalTarget.on('SIGINT', handleSignal);
+  signalTarget.on('SIGTERM', handleSignal);
+  signalsInstalled = true;
   try {
     composition.monitor.start(MONITOR_INTERVAL_MS);
     await listen(composition.server, {
       host: composition.config.host,
       port: composition.config.port
     });
-    signalTarget.once('SIGINT', handleSignal);
-    signalTarget.once('SIGTERM', handleSignal);
-    signalsInstalled = true;
     return { composition, shutdown };
   } catch (startupError) {
     try {

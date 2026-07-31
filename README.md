@@ -88,11 +88,11 @@ GTC 对冲单可能无限期保持未成交或部分成交。本期不会自动�
 3. 如果状态是 `WAITING_HEDGE`，确认按钮会保持禁用；监控器会自动继续观察 GTC，操作员只需在界面刷新状态。成交后可推进到 `HEDGED`。
 4. `HEDGED`、`HEDGE_INCOMPLETE` 和 `FAILED` 只能加载查看，不能再次确认。
 
-本地 API `GET /api/hedges/:id` 可作为界面不可用时的诊断备选；`POST /api/hedges/:id/confirm` 仍要求精确 JSON `{ "riskAcknowledged": true }`，它不是绕过风险确认的后门。优先使用界面完成恢复和确认。
+本地 API `GET /api/hedges/:id` 可作为界面不可用时的诊断备选；`POST /api/hedges/:id/confirm` 仍要求精确 JSON `{ "riskAcknowledged": true }`，并且必须携带与原始回环 `Host` 完整匹配的 HTTP `Origin`（包括端口），它不是绕过风险确认的后门。优先使用界面完成恢复和确认。
 
 ## 本地 HTTP 安全边界
 
-服务只提供明文 HTTP，并且只绑定 `127.0.0.1` 或 `::1`。请求还会校验原始 `Host`；修改状态的浏览器请求会校验同源的回环 `Origin`，不信任 `Forwarded` 或 `X-Forwarded-*`，以降低 DNS rebinding 和代理头欺骗风险。不要用反向代理把它暴露到局域网或公网。
+服务只提供明文 HTTP，并且只绑定 `127.0.0.1` 或 `::1`。请求还会校验原始 `Host`；所有 `POST` 请求都必须提供同源的回环 `Origin`，并与原始 `Host` 的主机及端口精确匹配。服务不信任 `Forwarded` 或 `X-Forwarded-*`，以降低 DNS rebinding 和代理头欺骗风险。不要用反向代理把它暴露到局域网或公网。
 
 界面上的风险勾选只是一次本地显式确认门槛，不是身份认证、用户鉴权，也不能证明操作确实由某个人完成。任何能在本机进程权限和回环网络边界内发请求的程序，都可能调用本地 API；应同时使用操作系统账户、文件权限和本机访问控制保护服务。
 

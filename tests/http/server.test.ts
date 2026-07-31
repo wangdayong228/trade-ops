@@ -1,6 +1,7 @@
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
+import { webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test, { type TestContext } from 'node:test';
 import { runInNewContext } from 'node:vm';
@@ -30,7 +31,10 @@ import {
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
-const LOCAL_HEADERS = { host: 'localhost:80' } as const;
+const LOCAL_HEADERS = {
+  host: 'localhost:80',
+  origin: 'http://localhost:80'
+} as const;
 
 function preflight(
   overrides: Partial<PreflightResult> = {}
@@ -309,9 +313,61 @@ function browserPreflightResponse(
         marginMode: 'isolated',
         positionMode: 'one-way',
         leverage: '2'
-      }
+      },
+      spotMarket: {
+        exchangeId: 'bitget',
+        symbol: SYMBOL,
+        marketId: 'BTCUSDT',
+        kind: 'spot',
+        base: 'BTC',
+        quote: 'USDT',
+        active: true,
+        amountStep: '0.001',
+        contractSize: '1',
+        minBaseAmount: '0.001',
+        minQuoteNotional: '5',
+        priceStep: '0.1'
+      },
+      contractMarket: {
+        exchangeId: 'okx',
+        symbol: SYMBOL,
+        marketId: 'BTC-USDT-SWAP',
+        kind: 'swap',
+        base: 'BTC',
+        quote: 'USDT',
+        active: true,
+        amountStep: '1',
+        contractSize: '0.001',
+        minBaseAmount: '0.001',
+        minQuoteNotional: '5',
+        priceStep: '0.1'
+      },
+      createdAt: '2026-07-31T00:00:00.000Z'
     },
     ...overrides
+  };
+}
+
+function browserOrderResponse(
+  strategyId: string,
+  role: OrderRole = 'SPOT_MARKET',
+  orderId = '223e4567-e89b-42d3-a456-426614174000'
+): Record<string, unknown> {
+  const request = requestFor(strategyId, role, '1');
+  const exchangeId = role.startsWith('SPOT_') ? 'bitget' : 'okx';
+  const snapshot = snapshotFor(request, exchangeId);
+  return {
+    id: orderId,
+    strategyId,
+    role,
+    exchangeId,
+    clientOrderId: request.clientOrderId,
+    exchangeOrderId: snapshot.exchangeOrderId,
+    request,
+    snapshot,
+    status: snapshot.status,
+    createdAt: '2026-07-31T00:01:00.000Z',
+    updatedAt: '2026-07-31T00:01:00.000Z'
   };
 }
 
@@ -328,7 +384,10 @@ function browserStatusResponse(
       symbol: SYMBOL,
       requestedBaseQuantity: '1',
       effectiveBaseQuantity: '1',
-      mode: 'CONCURRENT'
+      mode: 'CONCURRENT',
+      failureCode: null,
+      createdAt: '2026-07-31T00:00:00.000Z',
+      updatedAt: '2026-07-31T00:00:00.000Z'
     },
     preflight,
     orders: [],
@@ -396,6 +455,7 @@ async function browserHarness(): Promise<BrowserHarness> {
   };
   const script = await readFile('public/app.js', 'utf8');
   runInNewContext(script, {
+    crypto: webcrypto,
     document,
     fetch: async (
       url: string,
@@ -403,7 +463,8 @@ async function browserHarness(): Promise<BrowserHarness> {
     ): Promise<FakeBrowserResponse> => {
       fetchCalls.push({ url, options });
       return currentFetch(url, options);
-    }
+    },
+    TextEncoder
   });
   await flushImmediate();
   elements.get('spot-exchange')!.value = 'bitget';
@@ -673,6 +734,80 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
         : { riskAcknowledged: true }
     });
     assert.equal(response.statusCode, 403);
+  }
+  await flushImmediate();
+  assert.equal(preflightCalls, 0);
+  assert.equal(repositoryCalls, 0);
+  assert.equal(coordinatorCalls, 0);
+});
+
+test('requires Origin on every POST before any write-path dependency', async (t) => {
+  const database = new Database(':memory:');
+  const targetRepository = new SqliteStrategyRepository(database);
+  const strategy = targetRepository.createPending(preflight());
+  let repositoryCalls = 0;
+  let preflightCalls = 0;
+  let coordinatorCalls = 0;
+  const repository = new Proxy<StrategyRepository>(targetRepository, {
+    get(target, property) {
+      const value = Reflect.get(target, property);
+      if (typeof value !== 'function') {
+        return value;
+      }
+      return (...args: unknown[]) => {
+        repositoryCalls += 1;
+        return Reflect.apply(value, target, args);
+      };
+    }
+  });
+  const server = buildServer({
+    registry: { ids: () => ['bitget', 'okx'] },
+    preflightService: {
+      run: async () => {
+        preflightCalls += 1;
+        return preflight();
+      }
+    },
+    repository,
+    coordinator: {
+      confirmAndExecute: async () => {
+        coordinatorCalls += 1;
+      }
+    },
+    logger: false
+  });
+  t.after(async () => {
+    await server.close();
+    database.close();
+  });
+
+  const [preflightResponse, confirmationResponse] = await Promise.all([
+    server.inject({
+      method: 'POST',
+      url: '/api/hedges/preflight',
+      headers: { host: 'localhost:80' },
+      payload: {
+        spotExchangeId: 'bitget',
+        contractExchangeId: 'okx',
+        symbol: SYMBOL,
+        requestedBaseQuantity: '1',
+        mode: 'CONCURRENT'
+      }
+    }),
+    server.inject({
+      method: 'POST',
+      url: `/api/hedges/${strategy.id}/confirm`,
+      headers: { host: 'localhost:80' },
+      payload: { riskAcknowledged: true }
+    })
+  ]);
+
+  for (const response of [preflightResponse, confirmationResponse]) {
+    assert.equal(response.statusCode, 403);
+    assert.deepEqual(response.json(), {
+      code: 'FORBIDDEN',
+      message: 'Request forbidden'
+    });
   }
   await flushImmediate();
   assert.equal(preflightCalls, 0);
@@ -1605,14 +1740,23 @@ test('operator UI accepts a matching status id and canonical high-precision fill
   browser.element('risk-ack').checked = true;
   await browser.element('risk-ack').emit('change');
   const highPrecision = '0.123456789012345678901234567890123456789';
+  const order = browserOrderResponse(
+    'strategy-browser-1',
+    'CONTRACT_MARKET'
+  );
+  (order.request as Record<string, unknown>).baseQuantity = highPrecision;
+  Object.assign(order.snapshot as Record<string, unknown>, {
+    requestedBaseQuantity: highPrecision,
+    filledBaseQuantity: highPrecision,
+    remainingBaseQuantity: '0',
+    averagePrice: '60010',
+    status: 'closed'
+  });
+  order.status = 'closed';
   browser.setFetch(async (url) => {
     assert.equal(url, '/api/hedges/strategy-browser-1');
     return browserResponse(200, browserStatusResponse({
-      orders: [{
-        role: 'SPOT_MARKET',
-        clientOrderId: 'client-browser-1',
-        exchangeOrderId: 'exchange-browser-1'
-      }],
+      orders: [order],
       actualFills: {
         spotBuyBaseQuantity: '0',
         contractShortBaseQuantity: highPrecision,
@@ -1638,8 +1782,8 @@ test('operator UI accepts a matching status id and canonical high-precision fill
     highPrecision
   );
   assert.match(
-    browser.element('spot-order-ids').children[0]?.textContent ?? '',
-    /exchange-browser-1/
+    browser.element('contract-order-ids').children[0]?.textContent ?? '',
+    /okx-/
   );
   assert.equal(browser.element('risk-ack').checked, true);
   assert.equal(browser.element('confirm-button').disabled, false);
@@ -1852,7 +1996,19 @@ test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgeme
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174000';
   const status = browserStatusResponse();
-  (status.strategy as Record<string, unknown>).id = strategyId;
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    mode: 'CONTRACT_FIRST'
+  });
+  (status.preflight as Record<string, unknown>).mode = 'CONTRACT_FIRST';
+  const plannedIntent = browserOrderResponse(
+    strategyId,
+    'CONTRACT_MARKET'
+  );
+  plannedIntent.exchangeOrderId = null;
+  plannedIntent.snapshot = null;
+  plannedIntent.status = 'planned';
+  status.orders = [plannedIntent];
   browser.element('resume-strategy-id').value = strategyId;
   browser.setFetch(async (url, options) => {
     if (url === `/api/hedges/${strategyId}`) {
@@ -1878,7 +2034,7 @@ test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgeme
   assert.equal(browser.element('contract-exchange').value, 'okx');
   assert.equal(browser.element('symbol').value, SYMBOL);
   assert.equal(browser.element('base-quantity').value, '1');
-  assert.equal(browser.element('mode').value, 'CONCURRENT');
+  assert.equal(browser.element('mode').value, 'CONTRACT_FIRST');
   assert.equal(browser.element('risk-ack').checked, false);
   assert.equal(browser.element('confirm-button').disabled, true);
   assert.equal(browser.element('refresh-button').disabled, false);
@@ -2020,6 +2176,255 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
       assert.equal(browser.element('risk-ack').checked, false);
       assert.equal(browser.element('confirm-button').disabled, true);
       assert.equal(browser.element('refresh-button').disabled, true);
+    });
+  }
+});
+
+test('operator UI rejects every malformed full status DTO before enabling confirmation', async (t) => {
+  const strategyId = '123e4567-e89b-42d3-a456-426614174009';
+  type StatusMutation = {
+    readonly name: string;
+    mutate(body: Record<string, unknown>): void;
+  };
+  const oneOrder = (
+    body: Record<string, unknown>,
+    role: OrderRole = 'SPOT_MARKET'
+  ): Record<string, unknown> => {
+    const order = browserOrderResponse(strategyId, role);
+    body.orders = [order];
+    return order;
+  };
+  const cases: StatusMutation[] = [
+    {
+      name: 'strategy effective quantity differs from preflight',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).effectiveBaseQuantity = '2';
+      }
+    },
+    {
+      name: 'nonfailure strategy state carries a failure code',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).failureCode = 'NO_FILL';
+      }
+    },
+    {
+      name: 'strategy update time precedes creation',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).updatedAt =
+          '2026-07-30T23:59:59.000Z';
+      }
+    },
+    {
+      name: 'preflight spot market identity differs',
+      mutate(body) {
+        const preview = body.preflight as Record<string, unknown>;
+        (preview.spotMarket as Record<string, unknown>).exchangeId = 'okx';
+      }
+    },
+    {
+      name: 'preflight contract market kind differs',
+      mutate(body) {
+        const preview = body.preflight as Record<string, unknown>;
+        (preview.contractMarket as Record<string, unknown>).kind = 'spot';
+      }
+    },
+    {
+      name: 'preflight creation time is not canonical',
+      mutate(body) {
+        (body.preflight as Record<string, unknown>).createdAt = 'yesterday';
+      }
+    },
+    {
+      name: 'order strategy id differs',
+      mutate(body) {
+        oneOrder(body).strategyId =
+          '123e4567-e89b-42d3-a456-426614174099';
+      }
+    },
+    {
+      name: 'order exchange differs from its role',
+      mutate(body) {
+        oneOrder(body).exchangeId = 'okx';
+      }
+    },
+    {
+      name: 'order request is missing',
+      mutate(body) {
+        delete oneOrder(body).request;
+      }
+    },
+    {
+      name: 'order snapshot is missing for an open order',
+      mutate(body) {
+        oneOrder(body).snapshot = null;
+      }
+    },
+    {
+      name: 'order status differs from snapshot',
+      mutate(body) {
+        oneOrder(body).status = 'closed';
+      }
+    },
+    {
+      name: 'order timestamp is not canonical',
+      mutate(body) {
+        oneOrder(body).createdAt = 'not-a-time';
+      }
+    },
+    {
+      name: 'client order id has invalid format',
+      mutate(body) {
+        const order = oneOrder(body);
+        order.clientOrderId = 'client-id';
+        (order.request as Record<string, unknown>).clientOrderId = 'client-id';
+        (order.snapshot as Record<string, unknown>).clientOrderId = 'client-id';
+      }
+    },
+    {
+      name: 'client order id is formatted but not deterministic',
+      mutate(body) {
+        const order = oneOrder(body);
+        const wrongId = '0'.repeat(32);
+        order.clientOrderId = wrongId;
+        (order.request as Record<string, unknown>).clientOrderId = wrongId;
+        (order.snapshot as Record<string, unknown>).clientOrderId = wrongId;
+      }
+    },
+    {
+      name: 'duplicate order role',
+      mutate(body) {
+        body.orders = [
+          browserOrderResponse(
+            strategyId,
+            'SPOT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174001'
+          ),
+          browserOrderResponse(
+            strategyId,
+            'SPOT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174002'
+          )
+        ];
+      }
+    },
+    {
+      name: 'duplicate client id across roles',
+      mutate(body) {
+        const first = browserOrderResponse(
+          strategyId,
+          'SPOT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174003'
+        );
+        const second = browserOrderResponse(
+          strategyId,
+          'CONTRACT_MARKET',
+          '223e4567-e89b-42d3-a456-426614174004'
+        );
+        const duplicateId = first.clientOrderId;
+        second.clientOrderId = duplicateId;
+        (second.request as Record<string, unknown>).clientOrderId = duplicateId;
+        (second.snapshot as Record<string, unknown>).clientOrderId = duplicateId;
+        body.orders = [first, second];
+      }
+    },
+    {
+      name: 'spot role request uses swap kind',
+      mutate(body) {
+        const order = oneOrder(body);
+        (order.request as Record<string, unknown>).kind = 'swap';
+        (order.snapshot as Record<string, unknown>).kind = 'swap';
+      }
+    },
+    {
+      name: 'market role request uses limit type',
+      mutate(body) {
+        const order = oneOrder(body);
+        (order.request as Record<string, unknown>).type = 'limit';
+        (order.snapshot as Record<string, unknown>).type = 'limit';
+      }
+    },
+    {
+      name: 'spot role request uses sell side',
+      mutate(body) {
+        const order = oneOrder(body);
+        (order.request as Record<string, unknown>).side = 'sell';
+        (order.snapshot as Record<string, unknown>).side = 'sell';
+      }
+    },
+    {
+      name: 'spot request carries contract position side',
+      mutate(body) {
+        (oneOrder(body).request as Record<string, unknown>).positionSide =
+          'SHORT';
+      }
+    },
+    {
+      name: 'GTC hedge omits time in force',
+      mutate(body) {
+        const order = oneOrder(body, 'SPOT_HEDGE_GTC');
+        delete (order.request as Record<string, unknown>).timeInForce;
+      }
+    },
+    {
+      name: 'snapshot symbol differs from request',
+      mutate(body) {
+        (oneOrder(body).snapshot as Record<string, unknown>).symbol =
+          'ETH/USDT';
+      }
+    },
+    {
+      name: 'snapshot client id differs from order',
+      mutate(body) {
+        (oneOrder(body).snapshot as Record<string, unknown>).clientOrderId =
+          'f'.repeat(32);
+      }
+    },
+    {
+      name: 'snapshot exchange differs from order',
+      mutate(body) {
+        (oneOrder(body).snapshot as Record<string, unknown>).exchangeId = 'okx';
+      }
+    },
+    {
+      name: 'snapshot exchange order id differs from order',
+      mutate(body) {
+        (oneOrder(body).snapshot as Record<string, unknown>).exchangeOrderId =
+          'other-exchange-order';
+      }
+    },
+    {
+      name: 'snapshot quantities do not sum to request',
+      mutate(body) {
+        (oneOrder(body).snapshot as Record<string, unknown>)
+          .remainingBaseQuantity = '0.5';
+      }
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const browser = await browserHarness();
+      const body = browserStatusResponse();
+      (body.strategy as Record<string, unknown>).id = strategyId;
+      item.mutate(body);
+      browser.element('resume-strategy-id').value = strategyId;
+      browser.setFetch(async (url) => {
+        assert.equal(url, `/api/hedges/${strategyId}`);
+        return browserResponse(200, body);
+      });
+
+      await browser.element('resume-form').emit('submit');
+      assert.equal(browser.element('requested-quantity').textContent, '—');
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('risk-ack').checked, false);
+      browser.element('risk-ack').checked = true;
+      await browser.element('risk-ack').emit('change');
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.element('refresh-button').disabled, true);
+      assert.equal(
+        browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
+        0
+      );
     });
   }
 });
