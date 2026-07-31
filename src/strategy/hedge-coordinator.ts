@@ -36,6 +36,17 @@ interface FailureOutcome {
 
 type SubmissionOutcome = SnapshotOutcome | FailureOutcome;
 
+class SubmissionPersistenceError extends Error {
+  readonly name = 'SubmissionPersistenceError';
+
+  constructor(
+    readonly failureCode: StrategyFailureCode,
+    readonly exposureKnown: boolean
+  ) {
+    super('order snapshot persistence failed');
+  }
+}
+
 interface SnapshotValidation {
   readonly valid: boolean;
   readonly exposureKnown: boolean;
@@ -136,6 +147,22 @@ function decimalEquals(leftValue: string, rightValue: string): boolean {
 
 function positivePrice(value: unknown): value is string {
   return parsedDecimal(value, false) !== null;
+}
+
+function positiveFillKnown(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  try {
+    return (
+      parsedDecimal(
+        Reflect.get(value, 'filledBaseQuantity'),
+        true
+      )?.gt(0) ?? false
+    );
+  } catch {
+    return false;
+  }
 }
 
 function requestMatches(
@@ -262,6 +289,18 @@ export class HedgeCoordinator {
     ACTIVE_STRATEGY_EXECUTIONS.add(strategyId);
     try {
       await this.confirmAndExecuteOwned(strategyId);
+    } catch (error) {
+      if (
+        error instanceof SubmissionPersistenceError
+        && this.isExecuting(strategyId)
+      ) {
+        this.failStrategy(
+          strategyId,
+          error.exposureKnown,
+          error.failureCode
+        );
+      }
+      throw error;
     } finally {
       ACTIVE_STRATEGY_EXECUTIONS.delete(strategyId);
     }
@@ -460,14 +499,10 @@ export class HedgeCoordinator {
     snapshot: OrderSnapshot,
     fallbackExposureKnown = false
   ): SubmissionOutcome {
-    let exposureKnown = fallbackExposureKnown || (
-      prepared.record.snapshot !== null
-      && (
-        parsedDecimal(
-          prepared.record.snapshot.filledBaseQuantity,
-          true
-        )?.gt(0) ?? false
-      )
+    let exposureKnown = (
+      fallbackExposureKnown
+      || positiveFillKnown(snapshot)
+      || positiveFillKnown(prepared.record.snapshot)
     );
     let persistedSnapshot = prepared.record.snapshot;
     try {
@@ -478,15 +513,7 @@ export class HedgeCoordinator {
         return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
       }
       persistedSnapshot = persistedOrder.snapshot;
-      exposureKnown = exposureKnown || (
-        persistedSnapshot !== null
-        && (
-          parsedDecimal(
-            persistedSnapshot.filledBaseQuantity,
-            true
-          )?.gt(0) ?? false
-        )
-      );
+      exposureKnown = exposureKnown || positiveFillKnown(persistedSnapshot);
     } catch {
       return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
     }
@@ -527,7 +554,7 @@ export class HedgeCoordinator {
     }
     try {
       this.repository.attachOrderSnapshot(prepared.record.id, snapshot);
-    } catch (error) {
+    } catch {
       try {
         this.failStrategy(
           prepared.record.strategyId,
@@ -535,9 +562,12 @@ export class HedgeCoordinator {
           'INCONSISTENT_ORDER_STATE'
         );
       } catch {
-        // Preserve the original repository integrity failure.
+        // The typed carrier below retains the monotonic exposure signal.
       }
-      throw error;
+      throw new SubmissionPersistenceError(
+        'INCONSISTENT_ORDER_STATE',
+        exposureKnown
+      );
     }
     if (snapshot.status === 'unknown') {
       return failed(
@@ -587,18 +617,13 @@ export class HedgeCoordinator {
       return this.lookupAndPersist(prepared, 'ORDER_SUBMISSION_UNKNOWN');
     }
     if (snapshot.status === 'unknown') {
-      const validation = validateSnapshot(
-        snapshot,
-        prepared.record.request,
-        prepared.gateway.exchangeId
-      );
       const persisted = this.persistSnapshot(prepared, snapshot);
       return this.lookupAndPersist(
         prepared,
         'ORDER_NOT_FOUND',
         persisted.kind === 'failure'
           ? persisted.exposureKnown
-          : validation.exposureKnown
+          : positiveFillKnown(snapshot)
       );
     }
     return this.persistSnapshot(prepared, snapshot);
@@ -901,23 +926,22 @@ export class HedgeCoordinator {
       this.submit(spot),
       this.submit(contract)
     ]);
+    const knownExposure = settled.some((result) => (
+      result.status === 'fulfilled'
+        ? (
+          result.value.kind === 'snapshot'
+            ? positiveFillKnown(result.value.snapshot)
+            : result.value.exposureKnown
+        )
+        : (
+          result.reason instanceof SubmissionPersistenceError
+          && result.reason.exposureKnown
+        )
+    ));
     const rejected = settled.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected'
     );
     if (rejected !== undefined) {
-      const knownExposure = settled.some((result) => (
-        result.status === 'fulfilled'
-        && (
-          result.value.kind === 'snapshot'
-            ? (
-              parsedDecimal(
-                result.value.snapshot.filledBaseQuantity,
-                true
-              )?.gt(0) ?? false
-            )
-            : result.value.exposureKnown
-        )
-      ));
       this.failStrategy(
         strategy.id,
         knownExposure,
