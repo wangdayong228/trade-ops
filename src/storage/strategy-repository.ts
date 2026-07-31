@@ -7,6 +7,14 @@ import type {
 } from '../domain/types.js';
 import type { PreflightResult } from '../strategy/preflight-service.js';
 
+export class StrategyNotFoundError extends Error {
+  readonly name = 'StrategyNotFoundError';
+
+  constructor() {
+    super('unknown strategy');
+  }
+}
+
 export type StrategyFailureCode =
   | 'ORDER_SUBMISSION_FAILED'
   | 'ORDER_SUBMISSION_UNKNOWN'

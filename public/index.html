@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>跨交易所对冲开仓</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">TRADE OPS</p>
+        <h1>跨交易所对冲开仓</h1>
+        <p class="lead">先预检，再由操作员明确确认。受理不代表执行成功，请持续刷新状态。</p>
+      </header>
+
+      <section class="panel" aria-labelledby="opening-title">
+        <h2 id="opening-title">开仓参数</h2>
+        <form id="preflight-form">
+          <div class="form-grid">
+            <label>
+              现货交易所
+              <select id="spot-exchange" name="spotExchangeId" required>
+                <option value="" selected disabled>请选择现货交易所</option>
+              </select>
+            </label>
+            <label>
+              合约交易所
+              <select id="contract-exchange" name="contractExchangeId" required>
+                <option value="" selected disabled>请选择合约交易所</option>
+              </select>
+            </label>
+            <label>
+              交易对
+              <input id="symbol" name="symbol" value="BTC/USDT" maxlength="64" required>
+            </label>
+            <label>
+              基础资产数量
+              <input id="base-quantity" name="requestedBaseQuantity" inputmode="decimal" maxlength="256" required>
+            </label>
+            <label for="mode">执行模式</label>
+            <select id="mode" name="mode" required>
+              <option value="" selected disabled>请选择执行模式</option>
+              <option value="CONCURRENT">并发：两边同时市价下单</option>
+              <option value="CONTRACT_FIRST">合约优先：合约市价后挂现货 GTC</option>
+              <option value="SPOT_FIRST">现货优先：现货市价后挂合约 GTC</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button id="preflight-button" type="submit">预检</button>
+          </div>
+        </form>
+        <p id="operator-message" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="preview-title">
+        <h2 id="preview-title">预检快照</h2>
+        <dl class="metrics">
+          <div><dt>输入数量</dt><dd id="requested-quantity">—</dd></div>
+          <div><dt>有效数量</dt><dd id="effective-quantity">—</dd></div>
+          <div><dt>现货参考价</dt><dd id="spot-price">—</dd></div>
+          <div><dt>合约参考价</dt><dd id="contract-price">—</dd></div>
+          <div><dt>现货 USDT 余额</dt><dd id="spot-balance">—</dd></div>
+          <div><dt>合约 USDT 余额</dt><dd id="contract-balance">—</dd></div>
+          <div><dt>保证金模式</dt><dd id="margin-mode">—</dd></div>
+          <div><dt>持仓模式</dt><dd id="position-mode">—</dd></div>
+          <div><dt>杠杆</dt><dd id="leverage">—</dd></div>
+        </dl>
+        <label class="risk">
+          <input id="risk-ack" type="checkbox">
+          我理解顺序模式和差额补单可能长期产生单边敞口
+        </label>
+        <div class="actions">
+          <button id="confirm-button" type="button" disabled>确认开仓</button>
+          <button id="refresh-button" type="button" disabled>刷新状态</button>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="status-title">
+        <h2 id="status-title">执行状态</h2>
+        <dl class="metrics">
+          <div><dt>策略状态</dt><dd id="strategy-state">—</dd></div>
+          <div><dt>现货实际成交</dt><dd id="spot-actual-fill">0</dd></div>
+          <div><dt>合约做空实际成交</dt><dd id="contract-actual-fill">0</dd></div>
+          <div><dt>未匹配基础资产数量</dt><dd id="unmatched-quantity">0</dd></div>
+        </dl>
+        <div class="orders">
+          <div>
+            <h3>现货订单 ID</h3>
+            <ul id="spot-order-ids"><li>暂无</li></ul>
+          </div>
+          <div>
+            <h3>合约订单 ID</h3>
+            <ul id="contract-order-ids"><li>暂无</li></ul>
+          </div>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

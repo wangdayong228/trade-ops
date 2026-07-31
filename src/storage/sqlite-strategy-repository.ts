@@ -23,6 +23,7 @@ import type {
   StrategyRecord,
   StrategyRepository
 } from './strategy-repository.js';
+import { StrategyNotFoundError } from './strategy-repository.js';
 
 const EXECUTION_MODES = new Set<ExecutionMode>([
   'CONCURRENT',
@@ -1132,7 +1133,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     const strategyId = nonEmptyString(id, 'strategy id', 128);
     const row = this.selectStrategy.get(strategyId) as StrategyDbRow | undefined;
     if (row === undefined) {
-      throw new Error(`unknown strategy: ${strategyId}`);
+      throw new StrategyNotFoundError();
     }
     return this.strategyFromRow(row);
   }
