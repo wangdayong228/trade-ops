@@ -1206,7 +1206,7 @@ git commit -m "feat: recover and monitor open hedge orders"
 - Produces: `POST /api/hedges/:id/confirm`
 - Produces: `GET /api/hedges/:id`
 
-- [ ] **Step 1: Write failing API tests with Fastify injection**
+- [x] **Step 1: Write failing API tests with Fastify injection**
 
 ```ts
 test('preflight persists a pending strategy and returns the preview', async () => {
@@ -1236,7 +1236,7 @@ test('two confirmations create only one execution claim', async () => {
 });
 ```
 
-- [ ] **Step 2: Run the HTTP tests**
+- [x] **Step 2: Run the HTTP tests**
 
 Run:
 
@@ -1246,7 +1246,7 @@ npm run build
 
 Expected: FAIL because `buildServer` does not exist.
 
-- [ ] **Step 3: Implement the API**
+- [x] **Step 3: Implement the API**
 
 `POST /api/hedges/preflight` validates all five required fields, calls `PreflightService.run`, persists the result with `createPending`, and returns the ID, `PENDING_CONFIRMATION`, and preview.
 
@@ -1271,7 +1271,7 @@ const app = Fastify({
 
 Serve `public/` with `@fastify/static`.
 
-- [ ] **Step 4: Build the explicit mode-selection page**
+- [x] **Step 4: Build the explicit mode-selection page**
 
 `public/index.html` must contain:
 
@@ -1296,11 +1296,11 @@ The form must also select both exchanges, accept symbol and base quantity, and h
 
 `public/app.js` must render input quantity, effective quantity, both reference prices, balances, margin mode, position mode, leverage, strategy state, both order IDs, actual fills, and unmatched quantity. Any input edit invalidates the previous preview and disables confirmation.
 
-- [ ] **Step 5: Test the page contract**
+- [x] **Step 5: Test the page contract**
 
 Add an HTTP test that fetches `/`, asserts the three exact execution mode values, asserts there is no preselected valid mode, and asserts the risk acknowledgement text is present.
 
-- [ ] **Step 6: Run API and page tests**
+- [x] **Step 6: Run API and page tests**
 
 Run:
 
@@ -1310,7 +1310,7 @@ npm test
 
 Expected: API validation, duplicate confirmation, status response, explicit mode selection, and risk acknowledgement tests pass.
 
-- [ ] **Step 7: Commit the operator surface**
+- [x] **Step 7: Commit the operator surface**
 
 ```bash
 git add src/http public tests/http
