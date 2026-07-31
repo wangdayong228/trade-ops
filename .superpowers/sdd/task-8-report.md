@@ -118,8 +118,9 @@ tests:
    `127.0.0.1`, and `[::1]`, with an optional valid port, are accepted.
    Forwarded host headers cannot replace `Host`.
 2. State-changing `POST` requests accept a missing `Origin` for local CLI use,
-   but an included origin must be HTTP(S), loopback, and exactly match the
-   request host and effective port. `Origin: null`, cross-origin values, and
+   but an included origin must use the server's local HTTP scheme, be
+   loopback, and exactly match the request host and effective port.
+   `Origin: null`, cross-origin values, and
    `Sec-Fetch-Site: cross-site` are rejected with a fixed 403 body.
 3. Confirmation queues both `PENDING_CONFIRMATION` and recoverable
    `EXECUTING` strategies through the same per-strategy deduplication set.
@@ -172,3 +173,63 @@ Task 9 must bind the Fastify listener only to a validated loopback address
 reachable interface. The risk checkbox is only an explicit acknowledgement
 gate; it is not authentication, user identity, or proof that a human performed
 the confirmation.
+
+## Second Independent Review Follow-up
+
+The remaining semantic-identity and origin-scheme findings were reproduced
+before implementation:
+
+```text
+HTTP request, Host localhost:80, Origin https://localhost:80
+actual 201
+expected 403
+
+Ten malformed/mismatched browser response cases
+actual partial/actionable preview
+expected cleared preview and disabled confirmation
+```
+
+The browser now freezes the five-field input snapshot that is actually sent
+to preflight. Before any response is rendered or made actionable, it requires
+the returned spot exchange, contract exchange, symbol, requested quantity,
+and mode to exactly match that immutable snapshot. The same snapshot is
+retained for status-response validation.
+
+Effective quantity, both prices, both balances, and leverage must be bounded,
+canonical, finite positive decimal strings. Margin mode is limited to
+`cross`/`isolated`, position mode to `one-way`/`hedged`, the strategy state to
+`PENDING_CONFIRMATION`, and risk acknowledgement requirement to literal
+`true`. Unknown, null, missing, mismatched, zero, negative, or non-finite
+values invalidate and clear every actionable UI field. VM/DOM tests also
+prove that a complete matching response enables confirmation, a delayed
+response is checked against the submitted snapshot rather than mutable DOM,
+and real input events retain the revision-based stale-response guard.
+
+`buildServer` is now explicitly a cleartext local-HTTP boundary. Origin
+validation compares the full scheme/hostname/effective-port tuple, accepts
+only `http:` origins for this server, and ignores `X-Forwarded-Proto`.
+Accordingly, Task 9 must serve this boundary over loopback HTTP. Supporting
+HTTPS later requires an explicit TLS-aware protocol policy and matching tests;
+forwarded headers must not be used to infer it.
+
+Second-review GREEN:
+
+```text
+npm run build && node --test dist/tests/http/server.test.js
+tests 42
+pass 42
+fail 0
+
+npm test
+tests 291
+pass 291
+fail 0
+
+node --check public/app.js
+exit 0
+
+git diff --check
+exit 0
+```
+
+No network request or live exchange order was used in this follow-up.

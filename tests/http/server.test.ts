@@ -294,7 +294,11 @@ function browserPreflightResponse(
     id: 'strategy-browser-1',
     state: 'PENDING_CONFIRMATION',
     preflight: {
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol: SYMBOL,
       requestedBaseQuantity: '1',
+      mode: 'CONCURRENT',
       effectiveBaseQuantity: '1',
       spotReferencePrice: '60000',
       contractReferencePrice: '60010',
@@ -674,6 +678,46 @@ test('allows matching loopback Host and Origin forms', async (t) => {
     assert.equal(confirmation.statusCode, 202);
   }
   assert.equal(preflightInputs.length, loopbackPairs.length);
+});
+
+test('requires the local HTTP origin scheme and ignores forwarded protocol', async (t) => {
+  const { server, preflightInputs } = setup(t);
+  const payload = {
+    spotExchangeId: 'bitget',
+    contractExchangeId: 'okx',
+    symbol: SYMBOL,
+    requestedBaseQuantity: '1',
+    mode: 'CONCURRENT'
+  };
+  const wrongScheme = await server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: {
+      host: 'localhost:80',
+      origin: 'https://localhost:80',
+      'x-forwarded-proto': 'https'
+    },
+    payload
+  });
+  assert.equal(wrongScheme.statusCode, 403);
+  assert.deepEqual(wrongScheme.json(), {
+    code: 'FORBIDDEN',
+    message: 'Request forbidden'
+  });
+  assert.equal(preflightInputs.length, 0);
+
+  const forwardedProtocolIgnored = await server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: {
+      host: 'localhost:80',
+      origin: 'http://localhost:80',
+      'x-forwarded-proto': 'https'
+    },
+    payload
+  });
+  assert.equal(forwardedProtocolIgnored.statusCode, 201);
+  assert.equal(preflightInputs.length, 1);
 });
 
 test('preflight requires exactly five public fields and persists a pending strategy', async (t) => {
@@ -1376,6 +1420,140 @@ test('operator UI rejects malformed preflight responses without retaining action
       assert.equal(browser.element('confirm-button').disabled, true);
     });
   }
+});
+
+test('operator UI rejects mismatched or non-actionable preflight semantics', async (t) => {
+  const invalidResponses = [
+    {
+      name: 'unknown margin mode',
+      mutate(preview: Record<string, unknown>): void {
+        const settings = preview.accountSettings as Record<string, unknown>;
+        settings.marginMode = 'unknown';
+      }
+    },
+    {
+      name: 'null leverage',
+      mutate(preview: Record<string, unknown>): void {
+        const settings = preview.accountSettings as Record<string, unknown>;
+        settings.leverage = null;
+      }
+    },
+    {
+      name: 'swapped exchanges',
+      mutate(preview: Record<string, unknown>): void {
+        preview.spotExchangeId = 'okx';
+        preview.contractExchangeId = 'bitget';
+      }
+    },
+    {
+      name: 'symbol mismatch',
+      mutate(preview: Record<string, unknown>): void {
+        preview.symbol = 'ETH/USDT';
+      }
+    },
+    {
+      name: 'missing symbol',
+      mutate(preview: Record<string, unknown>): void {
+        delete preview.symbol;
+      }
+    },
+    {
+      name: 'mode mismatch',
+      mutate(preview: Record<string, unknown>): void {
+        preview.mode = 'SPOT_FIRST';
+      }
+    },
+    {
+      name: 'requested quantity mismatch',
+      mutate(preview: Record<string, unknown>): void {
+        preview.requestedBaseQuantity = '2';
+      }
+    },
+    {
+      name: 'zero effective quantity',
+      mutate(preview: Record<string, unknown>): void {
+        preview.effectiveBaseQuantity = '0';
+      }
+    },
+    {
+      name: 'non-finite spot price',
+      mutate(preview: Record<string, unknown>): void {
+        preview.spotReferencePrice = 'Infinity';
+      }
+    },
+    {
+      name: 'negative contract balance',
+      mutate(preview: Record<string, unknown>): void {
+        preview.contractFreeUsdt = '-1';
+      }
+    }
+  ];
+
+  for (const invalid of invalidResponses) {
+    await t.test(invalid.name, async () => {
+      const browser = await browserHarness();
+      const body = browserPreflightResponse();
+      invalid.mutate(body.preflight as Record<string, unknown>);
+      browser.setFetch(async (url) => {
+        assert.equal(url, '/api/hedges/preflight');
+        return browserResponse(201, body);
+      });
+
+      await browser.element('preflight-form').emit('submit');
+      assert.equal(browser.element('requested-quantity').textContent, '—');
+      assert.equal(browser.element('effective-quantity').textContent, '—');
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.element('refresh-button').disabled, true);
+
+      browser.element('risk-ack').checked = true;
+      await browser.element('risk-ack').emit('change');
+      assert.equal(browser.element('confirm-button').disabled, true);
+    });
+  }
+});
+
+test('operator UI enables confirmation for a complete matching response', async () => {
+  const browser = await browserHarness();
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/preflight');
+    return browserResponse(201, browserPreflightResponse());
+  });
+
+  await browser.element('preflight-form').emit('submit');
+  assert.equal(browser.element('requested-quantity').textContent, '1');
+  assert.equal(
+    browser.element('strategy-state').textContent,
+    'PENDING_CONFIRMATION'
+  );
+  assert.equal(browser.element('refresh-button').disabled, false);
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
+});
+
+test('operator UI validates against the immutable submitted snapshot', async () => {
+  const browser = await browserHarness();
+  let resolvePreflight: ((response: FakeBrowserResponse) => void) | undefined;
+  const delayedPreflight = new Promise<FakeBrowserResponse>((resolve) => {
+    resolvePreflight = resolve;
+  });
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/preflight');
+    return delayedPreflight;
+  });
+
+  const pendingSubmission = browser.element('preflight-form').emit('submit');
+  await flushImmediate();
+  browser.element('base-quantity').value = '2';
+  resolvePreflight?.(browserResponse(201, browserPreflightResponse()));
+  await pendingSubmission;
+
+  assert.equal(browser.element('requested-quantity').textContent, '1');
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
 });
 
 test('operator UI ignores a delayed preflight response after an input edit', async () => {

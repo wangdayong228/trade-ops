@@ -21,7 +21,13 @@ let strategyId = null;
 let preflightReady = false;
 let requestPending = false;
 let inputRevision = 0;
+let submittedStrategyInput = null;
 
+const executionModes = new Set([
+  'CONCURRENT',
+  'CONTRACT_FIRST',
+  'SPOT_FIRST'
+]);
 const strategyStates = new Set([
   'PENDING_CONFIRMATION',
   'EXECUTING',
@@ -88,6 +94,7 @@ function resetActionablePreview(message, kind = '') {
   strategyId = null;
   preflightReady = false;
   requestPending = false;
+  submittedStrategyInput = null;
   riskAck.checked = false;
   preflightButton.disabled = false;
   refreshButton.disabled = true;
@@ -121,46 +128,89 @@ function requiredString(value, maximumLength = 10_000) {
   return value;
 }
 
-function validatedPreview(value) {
+function positiveDecimalString(value, maximumLength = 10_000) {
+  const text = requiredString(value, maximumLength);
+  if (
+    !/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text)
+    || !/[1-9]/.test(text)
+  ) {
+    throw new Error('invalid positive decimal');
+  }
+  return text;
+}
+
+function matchingString(value, expected, maximumLength) {
+  const text = requiredString(value, maximumLength);
+  if (text !== expected) {
+    throw new Error('response identity mismatch');
+  }
+  return text;
+}
+
+function validatedPreview(value, expectedInput) {
   if (!isRecord(value) || !isRecord(value.accountSettings)) {
     throw new Error('invalid preflight preview');
   }
   const accountSettings = value.accountSettings;
   const marginMode = requiredString(accountSettings.marginMode, 32);
   const positionMode = requiredString(accountSettings.positionMode, 32);
-  if (!['isolated', 'cross', 'unknown'].includes(marginMode)) {
+  if (!['isolated', 'cross'].includes(marginMode)) {
     throw new Error('invalid margin mode');
   }
-  if (!['one-way', 'hedged', 'unknown'].includes(positionMode)) {
+  if (!['one-way', 'hedged'].includes(positionMode)) {
     throw new Error('invalid position mode');
   }
-  const leverage = accountSettings.leverage;
-  if (leverage !== null && typeof leverage !== 'string') {
-    throw new Error('invalid leverage');
-  }
-  if (typeof leverage === 'string' && leverage.length > 10_000) {
-    throw new Error('invalid leverage');
-  }
+  const leverage = positiveDecimalString(accountSettings.leverage);
   if (value.riskAcknowledgementRequired !== true) {
     throw new Error('invalid risk acknowledgement requirement');
   }
+  const spotExchangeId = matchingString(
+    value.spotExchangeId,
+    expectedInput.spotExchangeId,
+    128
+  );
+  const contractExchangeId = matchingString(
+    value.contractExchangeId,
+    expectedInput.contractExchangeId,
+    128
+  );
+  const symbol = matchingString(value.symbol, expectedInput.symbol, 64);
+  const requestedBaseQuantity = positiveDecimalString(
+    value.requestedBaseQuantity,
+    256
+  );
+  if (requestedBaseQuantity !== expectedInput.requestedBaseQuantity) {
+    throw new Error('response quantity mismatch');
+  }
+  const mode = matchingString(value.mode, expectedInput.mode, 32);
+  if (!executionModes.has(mode)) {
+    throw new Error('invalid execution mode');
+  }
   return {
-    requestedBaseQuantity: requiredString(value.requestedBaseQuantity),
-    effectiveBaseQuantity: requiredString(value.effectiveBaseQuantity),
-    spotReferencePrice: requiredString(value.spotReferencePrice),
-    contractReferencePrice: requiredString(value.contractReferencePrice),
-    spotFreeUsdt: requiredString(value.spotFreeUsdt),
-    contractFreeUsdt: requiredString(value.contractFreeUsdt),
+    spotExchangeId,
+    contractExchangeId,
+    symbol,
+    requestedBaseQuantity,
+    mode,
+    effectiveBaseQuantity: positiveDecimalString(
+      value.effectiveBaseQuantity
+    ),
+    spotReferencePrice: positiveDecimalString(value.spotReferencePrice),
+    contractReferencePrice: positiveDecimalString(
+      value.contractReferencePrice
+    ),
+    spotFreeUsdt: positiveDecimalString(value.spotFreeUsdt),
+    contractFreeUsdt: positiveDecimalString(value.contractFreeUsdt),
     riskAcknowledgementRequired: true,
     accountSettings: {
       marginMode,
       positionMode,
-      leverage: leverage === null ? '未配置' : leverage
+      leverage
     }
   };
 }
 
-function validatedPreflightResponse(value) {
+function validatedPreflightResponse(value, expectedInput) {
   if (!isRecord(value)) {
     throw new Error('invalid preflight response');
   }
@@ -174,11 +224,11 @@ function validatedPreflightResponse(value) {
   return {
     id,
     state: value.state,
-    preflight: validatedPreview(value.preflight)
+    preflight: validatedPreview(value.preflight, expectedInput)
   };
 }
 
-function validatedStatusResponse(value) {
+function validatedStatusResponse(value, expectedInput) {
   if (
     !isRecord(value)
     || !isRecord(value.strategy)
@@ -214,7 +264,7 @@ function validatedStatusResponse(value) {
   });
   return {
     strategy: { state },
-    preflight: validatedPreview(value.preflight),
+    preflight: validatedPreview(value.preflight, expectedInput),
     orders,
     actualFills: {
       spotBuyBaseQuantity: requiredString(
@@ -290,11 +340,16 @@ async function responseJson(response) {
 }
 
 async function refreshStatus() {
-  if (strategyId === null || requestPending) {
+  if (
+    strategyId === null
+    || submittedStrategyInput === null
+    || requestPending
+  ) {
     return;
   }
   const statusRevision = inputRevision;
   const statusStrategyId = strategyId;
+  const statusExpectedInput = submittedStrategyInput;
   requestPending = true;
   refreshButton.disabled = true;
   updateConfirmButton();
@@ -307,7 +362,7 @@ async function refreshStatus() {
     if (!response.ok || body === null) {
       throw new Error('status unavailable');
     }
-    const status = validatedStatusResponse(body);
+    const status = validatedStatusResponse(body, statusExpectedInput);
     if (
       statusRevision !== inputRevision
       || statusStrategyId !== strategyId
@@ -346,6 +401,13 @@ preflightForm.addEventListener('submit', async (event) => {
     return;
   }
   const submittedRevision = inputRevision;
+  const submittedInput = Object.freeze({
+    spotExchangeId: spotExchange.value,
+    contractExchangeId: contractExchange.value,
+    symbol: symbolInput.value,
+    requestedBaseQuantity: quantityInput.value,
+    mode: modeInput.value
+  });
   requestPending = true;
   preflightButton.disabled = true;
   updateConfirmButton();
@@ -357,23 +419,18 @@ preflightForm.addEventListener('submit', async (event) => {
         accept: 'application/json',
         'content-type': 'application/json'
       },
-      body: JSON.stringify({
-        spotExchangeId: spotExchange.value,
-        contractExchangeId: contractExchange.value,
-        symbol: symbolInput.value,
-        requestedBaseQuantity: quantityInput.value,
-        mode: modeInput.value
-      })
+      body: JSON.stringify(submittedInput)
     });
     const body = await responseJson(response);
     if (response.status !== 201 || body === null) {
       throw new Error('preflight rejected');
     }
-    const preflight = validatedPreflightResponse(body);
+    const preflight = validatedPreflightResponse(body, submittedInput);
     if (submittedRevision !== inputRevision) {
       return;
     }
     renderPreflight(preflight);
+    submittedStrategyInput = submittedInput;
     strategyId = preflight.id;
     preflightReady = true;
     refreshButton.disabled = false;

@@ -399,6 +399,8 @@ interface LoopbackAuthority {
   readonly port: number;
 }
 
+const LOCAL_HTTP_PROTOCOL = 'http';
+
 function loopbackAuthority(
   value: unknown,
   protocol: string
@@ -428,7 +430,8 @@ function loopbackAuthority(
 
 function matchingLoopbackOrigin(
   value: unknown,
-  requestAuthority: Readonly<LoopbackAuthority>
+  requestAuthority: Readonly<LoopbackAuthority>,
+  requestProtocol: 'http' | 'https'
 ): boolean {
   if (typeof value !== 'string' || value === 'null') {
     return false;
@@ -442,6 +445,7 @@ function matchingLoopbackOrigin(
   if (
     authority === undefined
     || (protocol !== 'http' && protocol !== 'https')
+    || protocol !== requestProtocol
   ) {
     return false;
   }
@@ -491,9 +495,11 @@ export function buildServer(
   }
 
   app.addHook('onRequest', async (request, reply) => {
+    // This server is the cleartext local-HTTP boundary. Task 9 must bind it
+    // only to loopback; proxy headers never upgrade or replace this tuple.
     const requestAuthority = loopbackAuthority(
       request.headers.host,
-      request.protocol
+      LOCAL_HTTP_PROTOCOL
     );
     const isStateChangingPost = request.method === 'POST';
     const origin = request.headers.origin;
@@ -505,7 +511,11 @@ export function buildServer(
         && (
           (
             origin !== undefined
-            && !matchingLoopbackOrigin(origin, requestAuthority)
+            && !matchingLoopbackOrigin(
+              origin,
+              requestAuthority,
+              LOCAL_HTTP_PROTOCOL
+            )
           )
           || (
             typeof fetchSite === 'string'
