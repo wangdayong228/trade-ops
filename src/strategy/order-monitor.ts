@@ -994,6 +994,17 @@ export class OrderMonitor {
     }
     if (
       initialState === 'EXECUTING'
+      && strategy.mode === 'CONCURRENT'
+      && gtcOrders.length === 0
+      && marketsConfirmed
+      && totals.spot.gt(0)
+      && totals.contract.gt(0)
+      && !totals.spot.eq(totals.contract)
+    ) {
+      return;
+    }
+    if (
+      initialState === 'EXECUTING'
       && !hasPositiveExposure(totals)
     ) {
       return;

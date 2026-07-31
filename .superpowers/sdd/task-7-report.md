@@ -213,3 +213,79 @@ The full command was `npm test`, which includes the strict TypeScript build.
   cross-process or distributed mutual exclusion.
 - Verification used no network, real credentials, real database file, or live
   order endpoint.
+
+## Independent review follow-up
+
+### Restart recovery topology
+
+The review found one valid restart-only gap. After both concurrent market
+orders were confirmed with unequal positive fills, a crash could occur before
+Task 6 persisted the difference GTC. A newly constructed monitor had no active
+process owner and classified that recoverable `EXECUTING` topology as
+`HEDGE_INCOMPLETE`, preventing a fresh coordinator from completing recovery.
+
+The classification now preserves only this narrow precursor:
+
+- the persisted state is `EXECUTING`;
+- the strategy mode is `CONCURRENT`;
+- both required market orders are confirmed;
+- both sides have positive, unequal filled quantities; and
+- no GTC order has been persisted.
+
+The monitor remains observational and performs no exchange write. A restart
+integration test constructs a new repository and monitor over the existing
+database, verifies the strategy remains `EXECUTING`, then constructs another
+new repository and coordinator. The coordinator creates exactly one `0.1`
+contract GTC and transitions to `WAITING_HEDGE`; a second fresh coordinator
+does not resubmit it.
+
+Related missing-GTC topologies that the coordinator can still continue are
+also characterized as `EXECUTING`: either sequential first leg only, one
+concurrent market order only, and no concurrent orders yet. The exception does
+not apply when a GTC exists. Existing extra, canceled, and rejected GTC safety
+tests remain unchanged, and a new malformed persisted-GTC case still fails
+closed as `HEDGE_INCOMPLETE / INCONSISTENT_ORDER_STATE`.
+
+### Partial attachment persistence
+
+The requested half-write regression was already handled correctly by the
+implementation and was therefore GREEN immediately. With three validated
+candidates, a successful first attachment and a failing second attachment:
+
+- the first snapshot and event remain durable;
+- the second and third orders remain unchanged;
+- no third attachment, terminal success transition, or gateway write occurs;
+  and
+- the strategy fails closed as
+  `HEDGE_INCOMPLETE / INCONSISTENT_ORDER_STATE`.
+
+### Follow-up TDD and verification evidence
+
+The restart test first failed with actual `HEDGE_INCOMPLETE` where
+`EXECUTING` was expected. The partial-attachment characterization passed
+before any production change. After the narrow classification fix:
+
+```text
+focused review cases
+pass 2
+fail 0
+
+monitor suite
+tests 28
+pass 28
+fail 0
+
+coordinator suite
+tests 51
+pass 51
+fail 0
+
+full development regression
+tests 249
+pass 249
+fail 0
+```
+
+The full command remains `npm test`, including the strict TypeScript build.
+No network, real credentials, real database file, or live order endpoint was
+used.

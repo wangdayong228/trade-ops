@@ -696,6 +696,209 @@ test('does not race an active coordinator planning a concurrent difference GTC',
   assert.equal(f.spot.createdRequests.length, 0);
 });
 
+test('restart monitor preserves an executable concurrent difference topology for coordinator recovery', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(f.repository, 'CONCURRENT');
+  const spot = planOrder(
+    f.repository,
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+  );
+  const contract = planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0.9', '0.1', 'closed')
+  );
+  const restartedMonitorRepository = new SqliteStrategyRepository(f.database);
+
+  await new OrderMonitor(
+    f.registry,
+    restartedMonitorRepository
+  ).reconcileStrategy(strategy.id);
+
+  assert.equal(
+    restartedMonitorRepository.getStrategy(strategy.id).state,
+    'EXECUTING'
+  );
+  assert.equal(restartedMonitorRepository.listOrderEvents(spot.id).length, 1);
+  assert.equal(
+    restartedMonitorRepository.listOrderEvents(contract.id).length,
+    1
+  );
+  assertNoCreates(f);
+
+  f.contract.createResults.push(
+    snapshotFor(
+      strategy.id,
+      'CONTRACT_HEDGE_GTC',
+      '0.1',
+      '0',
+      '0.1',
+      'open'
+    )
+  );
+  const restartedCoordinatorRepository =
+    new SqliteStrategyRepository(f.database);
+  await new HedgeCoordinator(
+    f.registry,
+    restartedCoordinatorRepository
+  ).confirmAndExecute(strategy.id);
+
+  assert.equal(
+    restartedCoordinatorRepository.getStrategy(strategy.id).state,
+    'WAITING_HEDGE'
+  );
+  assert.equal(f.contract.createdRequests.length, 1);
+  assert.deepEqual(
+    {
+      kind: f.contract.createdRequests[0]?.kind,
+      type: f.contract.createdRequests[0]?.type,
+      side: f.contract.createdRequests[0]?.side,
+      baseQuantity: f.contract.createdRequests[0]?.baseQuantity,
+      positionSide: f.contract.createdRequests[0]?.positionSide,
+      timeInForce: f.contract.createdRequests[0]?.timeInForce
+    },
+    {
+      kind: 'swap',
+      type: 'limit',
+      side: 'sell',
+      baseQuantity: '0.1',
+      positionSide: 'SHORT',
+      timeInForce: 'GTC'
+    }
+  );
+  await new HedgeCoordinator(
+    f.registry,
+    new SqliteStrategyRepository(f.database)
+  ).confirmAndExecute(strategy.id);
+  assert.equal(f.contract.createdRequests.length, 1);
+  assert.equal(f.spot.createdRequests.length, 0);
+});
+
+test('keeps coordinator-continuable missing-GTC topologies executing', async (t) => {
+  const f = fixture(t);
+  const contractFirst = createStrategy(f.repository, 'CONTRACT_FIRST');
+  planOrder(
+    f.repository,
+    contractFirst.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(
+      contractFirst.id,
+      'CONTRACT_MARKET',
+      '1',
+      '1',
+      '0',
+      'closed'
+    )
+  );
+  const spotFirst = createStrategy(f.repository, 'SPOT_FIRST');
+  planOrder(
+    f.repository,
+    spotFirst.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(spotFirst.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+  );
+  const oneConcurrentMarket = createStrategy(f.repository, 'CONCURRENT');
+  planOrder(
+    f.repository,
+    oneConcurrentMarket.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(
+      oneConcurrentMarket.id,
+      'SPOT_MARKET',
+      '1',
+      '1',
+      '0',
+      'closed'
+    )
+  );
+  const noConcurrentOrders = createStrategy(f.repository, 'CONCURRENT');
+  const monitor = new OrderMonitor(f.registry, f.repository);
+
+  for (const strategy of [
+    contractFirst,
+    spotFirst,
+    oneConcurrentMarket,
+    noConcurrentOrders
+  ]) {
+    await monitor.reconcileStrategy(strategy.id);
+    assert.equal(f.repository.getStrategy(strategy.id).state, 'EXECUTING');
+  }
+  assertNoCreates(f);
+});
+
+test('does not preserve a malformed persisted GTC as a restart precursor', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(f.repository, 'CONCURRENT');
+  planOrder(
+    f.repository,
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+  );
+  planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0.9', '0.1', 'closed')
+  );
+  planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_HEDGE_GTC',
+    '0.1',
+    snapshotFor(
+      strategy.id,
+      'CONTRACT_HEDGE_GTC',
+      '0.1',
+      '0.1',
+      '0',
+      'closed'
+    )
+  );
+  class MalformedGtcRepository extends RepositoryProxy {
+    override listOrders(strategyId: string): StrategyOrderRecord[] {
+      return super.listOrders(strategyId).map((record) => (
+        record.role === 'CONTRACT_HEDGE_GTC'
+          ? {
+            ...record,
+            request: {
+              ...record.request,
+              price: '0'
+            }
+          }
+          : record
+      ));
+    }
+  }
+
+  await new OrderMonitor(
+    f.registry,
+    new MalformedGtcRepository(f.repository)
+  ).reconcileStrategy(strategy.id);
+
+  assert.deepEqual(
+    {
+      state: f.repository.getStrategy(strategy.id).state,
+      failureCode: f.repository.getStrategy(strategy.id).failureCode
+    },
+    {
+      state: 'HEDGE_INCOMPLETE',
+      failureCode: 'INCONSISTENT_ORDER_STATE'
+    }
+  );
+  assertNoCreates(f);
+});
+
 test('gives canceled GTC status priority over an inconsistent extra GTC role', async (t) => {
   const f = fixture(t);
   const strategy = createStrategy(
@@ -1254,6 +1457,127 @@ test('marks attach failure incomplete without leaking the raw repository error',
     }
   );
   assert.equal(f.repository.listOrderEvents(gtc.id).length, 1);
+  assertNoCreates(f);
+});
+
+test('keeps the first attachment and stops before the third when the second attachment fails', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(
+    f.repository,
+    'CONCURRENT',
+    'WAITING_HEDGE'
+  );
+  const spot = planOrder(
+    f.repository,
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '0', '1', 'unknown')
+  );
+  const contract = planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0', '1', 'unknown')
+  );
+  const gtc = planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_HEDGE_GTC',
+    '0.1',
+    snapshotFor(
+      strategy.id,
+      'CONTRACT_HEDGE_GTC',
+      '0.1',
+      '0',
+      '0.1',
+      'open'
+    )
+  );
+  f.spot.scriptedFetches.set(spot.exchangeOrderId as string, [
+    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '1', '0', 'closed', {
+      updatedAt: SECOND_UPDATE
+    })
+  ]);
+  f.contract.scriptedFetches.set(contract.exchangeOrderId as string, [
+    snapshotFor(
+      strategy.id,
+      'CONTRACT_MARKET',
+      '1',
+      '0.9',
+      '0.1',
+      'closed',
+      { updatedAt: SECOND_UPDATE }
+    )
+  ]);
+  f.contract.scriptedFetches.set(gtc.exchangeOrderId as string, [
+    snapshotFor(
+      strategy.id,
+      'CONTRACT_HEDGE_GTC',
+      '0.1',
+      '0.1',
+      '0',
+      'closed',
+      { updatedAt: SECOND_UPDATE }
+    )
+  ]);
+  class FailSecondAttachRepository extends RepositoryProxy {
+    readonly attachmentAttempts: string[] = [];
+    readonly transitionTargets: StrategyState[] = [];
+
+    override attachOrderSnapshot(
+      strategyOrderId: string,
+      snapshot: OrderSnapshot
+    ): void {
+      this.attachmentAttempts.push(strategyOrderId);
+      if (this.attachmentAttempts.length === 2) {
+        throw new Error('second attach secret=must-not-escape');
+      }
+      super.attachOrderSnapshot(strategyOrderId, snapshot);
+    }
+
+    override transition(
+      strategyId: string,
+      from: StrategyState[],
+      to: StrategyState,
+      failureCode?: StrategyFailureCode
+    ): boolean {
+      this.transitionTargets.push(to);
+      return super.transition(strategyId, from, to, failureCode);
+    }
+  }
+  const repository = new FailSecondAttachRepository(f.repository);
+
+  await new OrderMonitor(f.registry, repository)
+    .reconcileStrategy(strategy.id);
+
+  assert.deepEqual(repository.attachmentAttempts, [spot.id, contract.id]);
+  assert.deepEqual(repository.transitionTargets, ['HEDGE_INCOMPLETE']);
+  assert.deepEqual(
+    {
+      state: f.repository.getStrategy(strategy.id).state,
+      failureCode: f.repository.getStrategy(strategy.id).failureCode
+    },
+    {
+      state: 'HEDGE_INCOMPLETE',
+      failureCode: 'INCONSISTENT_ORDER_STATE'
+    }
+  );
+  const latest = new Map(
+    f.repository.listOrders(strategy.id).map((order) => [
+      order.id,
+      order.snapshot?.filledBaseQuantity
+    ])
+  );
+  assert.equal(latest.get(spot.id), '1');
+  assert.equal(latest.get(contract.id), '0');
+  assert.equal(latest.get(gtc.id), '0');
+  assert.equal(f.repository.listOrderEvents(spot.id).length, 2);
+  assert.equal(f.repository.listOrderEvents(contract.id).length, 1);
+  assert.equal(f.repository.listOrderEvents(gtc.id).length, 1);
+  assert.equal(f.spot.fetchRequests.length, 1);
+  assert.equal(f.contract.fetchRequests.length, 2);
   assertNoCreates(f);
 });
 
