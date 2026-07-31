@@ -1109,7 +1109,7 @@ git commit -m "feat: coordinate three hedge opening modes"
 - Produces: `OrderMonitor.recover(): Promise<void>`
 - Produces: `OrderMonitor.start(intervalMs: number): () => void`
 
-- [ ] **Step 1: Write failing monitor tests**
+- [x] **Step 1: Write failing monitor tests**
 
 ```ts
 test('keeps waiting after a partial GTC fill', async () => {
@@ -1144,7 +1144,7 @@ test('retains exposure and marks an externally canceled GTC incomplete', async (
 });
 ```
 
-- [ ] **Step 2: Run the focused test**
+- [x] **Step 2: Run the focused test**
 
 Run:
 
@@ -1154,7 +1154,7 @@ npm run build
 
 Expected: FAIL because `OrderMonitor` does not exist.
 
-- [ ] **Step 3: Implement reconciliation**
+- [x] **Step 3: Implement reconciliation**
 
 `reconcileStrategy` must:
 
@@ -1167,13 +1167,13 @@ Expected: FAIL because `OrderMonitor` does not exist.
 7. Transition to `HEDGE_INCOMPLETE` when the GTC is canceled or rejected.
 8. On a transient fetch error, preserve state and return without an order mutation.
 
-- [ ] **Step 4: Implement recovery and scheduling**
+- [x] **Step 4: Implement recovery and scheduling**
 
 `recover()` calls `listRecoverable()` and reconciles each strategy independently so one exchange failure does not prevent recovery of another strategy.
 
 `start(intervalMs)` uses `setInterval`, prevents overlapping polling cycles with an internal boolean, starts one immediate recovery pass, and returns a stop function that clears the interval. It does not create any local GTC expiry.
 
-- [ ] **Step 5: Run monitor tests**
+- [x] **Step 5: Run monitor tests**
 
 Run:
 
@@ -1183,7 +1183,7 @@ npm test
 
 Expected: partial, complete, canceled, transient-error, and restart-recovery tests pass.
 
-- [ ] **Step 6: Commit monitoring**
+- [x] **Step 6: Commit monitoring**
 
 ```bash
 git add src/strategy/order-monitor.ts tests/strategy/order-monitor.test.ts
