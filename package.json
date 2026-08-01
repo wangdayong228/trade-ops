@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/src/main.js",
   "engines": {
-    "node": ">=24"
+    "node": ">=20"
   },
   "directories": {
     "doc": "docs"
@@ -23,7 +23,9 @@
     "better-sqlite3": "^12.11.1",
     "ccxt": "^4.5.68",
     "decimal.js": "^10.6.0",
-    "fastify": "^5.10.0"
+    "dotenv": "^17.4.2",
+    "fastify": "^5.10.0",
+    "pino": "^10.3.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
