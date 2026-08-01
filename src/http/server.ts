@@ -23,23 +23,9 @@ import type {
   PreflightResult,
   PreflightService
 } from '../strategy/preflight-service.js';
+import { LOGGER_REDACT_PATHS } from '../logging/logger.js';
 
-export const LOGGER_REDACT_PATHS: readonly string[] = [
-  'req.headers.authorization',
-  'req.headers.cookie',
-  'req.body.apiKey',
-  'req.body.secret',
-  'req.body.password',
-  'req.body.signature',
-  'req.body.credentials.apiKey',
-  'req.body.credentials.secret',
-  'req.body.credentials.password',
-  'req.body.credentials.signature',
-  'req.body.auth.apiKey',
-  'req.body.auth.secret',
-  'req.body.auth.password',
-  'req.body.auth.signature'
-];
+export { LOGGER_REDACT_PATHS } from '../logging/logger.js';
 
 export interface BuildServerDependencies {
   readonly registry: Pick<ExchangeRegistry, 'ids'>;
