@@ -371,17 +371,17 @@ git commit -m "feat: log service lifecycle failures"
 - Produces: `orderEvent(name, order, snapshot?, details?): TradeEvent`
 - Produces: `PinoTradeEventSink`
 
-- [ ] **Step 1: Write failing runtime-allowlist tests**
+- [x] **Step 1: Write failing runtime-allowlist tests**
 
 Build a valid `StrategyOrderRecord`, unsafe-cast extra `apiKey`, `secret`, `rawRequest`, and `rawResponse` fields, pass it through `PinoTradeEventSink`, and assert JSON includes identifiers, request fields, quantities/prices/status while excluding every forbidden key and value. Use a fake logger whose `info()` throws and assert `sink.record(event)` does not throw.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run `npm run build`.
 
 Expected: FAIL because `src/logging/trade-events.ts` does not exist.
 
-- [ ] **Step 3: Define the allowlisted contract**
+- [x] **Step 3: Define the allowlisted contract**
 
 Use this event union:
 
@@ -398,11 +398,11 @@ export type OrderLifecycleEventName =
 
 `TradeEvent` contains only event, strategyId, mode, strategyState, role, exchangeId, symbol, kind, type, side, client/exchange order ID, requested/filled/remaining quantity, price/average price, timeInForce, positionSide, marginMode, status, failureCode, errorType, and errorCode. `mode` and `strategyState` are optional and are passed only where the producer already owns the strategy record; logging must not add repository reads. Define a frozen no-op sink with `record(): void {}`.
 
-- [ ] **Step 4: Implement two runtime allowlists**
+- [x] **Step 4: Implement two runtime allowlists**
 
 `orderEvent` constructs a fresh object by explicitly copying only declared fields; never spread order/request/snapshot/details. `PinoTradeEventSink.record` reconstructs the allowlisted object again before `logger.info(fields, event.event)` and catches logger errors. This protects JavaScript callers and unsafe casts as well as typed callers.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run:
 
