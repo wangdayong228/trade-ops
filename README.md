@@ -4,7 +4,7 @@ trade-ops 是一个只在本机回环地址提供 HTTP 操作界面的跨交易�
 
 ## 运行要求
 
-- Node.js 24 或更高版本。
+- Node.js 20 或更高版本。
 - Bitget 和 OKX 账户均已配置 USDT 现货与 USDT 线性永续合约。
 - 合约账户必须已经处于双向持仓（hedged/long-short）模式；单向持仓模式会在预检阶段被拒绝，服务不会自动切换账户设置。
 - 预检确认的合约保证金模式、双向持仓模式和杠杆是不可变的执行约束。每次执行或恢复入口、以及每一笔真正的新订单提交前，服务都会重新读取合约账户设置；设置未知、发生漂移或无法确认时不会继续创建订单，且服务始终不会自动修改这些设置。
@@ -16,6 +16,7 @@ trade-ops 是一个只在本机回环地址提供 HTTP 操作界面的跨交易�
 
 ```bash
 npm install
+cp .env.example .env
 npm test
 npm run build
 npm start
@@ -45,23 +46,37 @@ npm start
 | `HOST` | `127.0.0.1` | 只接受数字形式 `127.0.0.1` 或 `::1`。不接受 `localhost`、主机名、空白、`0.0.0.0`、`::` 或任何外部地址。 |
 | `PORT` | `3000` | 只接受规范十进制整数 `1` 到 `65535`；不接受空白、前导零、小数、指数或符号。 |
 
-示例（不要把真实值提交到版本库）：
+本地启动时，先复制示例并只在本机填写真实值：
 
 ```bash
-export TRADING_EXCHANGES=bitget,okx
-export TRADING_BITGET_API_KEY=...
-export TRADING_BITGET_SECRET=...
-export TRADING_BITGET_PASSWORD=...
-export TRADING_OKX_API_KEY=...
-export TRADING_OKX_SECRET=...
-export TRADING_OKX_PASSWORD=...
-export TRADING_DATABASE_PATH=/var/lib/trade-ops/trade-ops.sqlite
-export HOST=127.0.0.1
-export PORT=3000
+cp .env.example .env
+npm run build
 npm start
 ```
 
+默认入口会从启动进程的当前工作目录自动加载可选的 `.env`。已经存在的系统环境变量优先，`.env` 不会覆盖它们；如果所有配置都由进程管理器或 shell 注入，`.env` 不存在也允许继续启动。显式调用 `composeService({ env })` 的测试或嵌入场景不会读取 `.env`。不要把包含真实凭证的 `.env` 提交到版本库。
+
 生产环境应使用专用系统用户和进程管理器注入凭证，不要把凭证写进仓库、SQLite 或普通日志。建议数据库使用绝对路径，例如 `/var/lib/trade-ops/trade-ops.sqlite`；目录仅允许服务用户访问（建议 `0700`），数据库及备份仅允许服务用户读写（建议 `0600`）。备份前停止服务并等待正常关闭，随后把主 SQLite 文件作为一个一致的离线文件备份；不要在仍有 `-wal`/`-shm` 活动写入时只复制主文件。恢复备份前先保留当前数据库的只读副本。
+
+## stdout JSON 日志
+
+服务把启动、HTTP、后台恢复和逐笔订单生命周期记录为一行一条的 Pino JSON，并统一写到 stdout。启动时会记录 `.env` 是否加载、服务开始监听或失败的具体安全原因；正常关闭会记录完整的停止生命周期。
+
+每个新订单及其后续有效状态变化使用以下事件名：
+
+- `order_planned`
+- `order_submit_started`
+- `order_submit_succeeded`
+- `order_submit_uncertain`
+- `order_rejected_before_submit`
+- `order_status_changed`
+- `order_terminal`
+
+交易事件只允许输出策略/订单关联 ID、执行模式与状态、交易所、symbol、订单角色/类型/方向、委托量/成交量/剩余量、限价/成交均价、GTC、仓位方向、保证金模式、订单状态，以及有限的失败码和错误类型/错误码。相同的轮询快照不会重复记录；`closed`、`canceled`、`rejected` 等可靠终态会额外记录 `order_terminal`。
+
+日志绝不应包含 API key、secret、password/passphrase、签名、Authorization/Cookie 头、完整环境变量、HTTP body，或原始 CCXT 请求/响应。错误日志只保留白名单错误摘要，并用 `[Redacted]` 替换当前已加载的六项交易凭证值。日志是旁路行为：stdout 写入失败不会改变 SQLite 状态、触发重试或重复下单。
+
+应用本身不创建日志文件，也不负责保留或轮转。需要持久化时，由 systemd、Docker 或其他进程管理器采集 stdout，并在外部配置访问权限、保留期和轮转策略；不要把日志文件放入仓库。
 
 ## 三种执行模式
 
