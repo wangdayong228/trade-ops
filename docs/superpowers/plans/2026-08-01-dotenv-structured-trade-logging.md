@@ -559,7 +559,7 @@ git commit -m "feat: log monitored trade updates"
 **Interfaces:**
 - Documents Node >=20, automatic optional `.env`, precedence, JSON stdout, event names, safe fields, and external rotation.
 
-- [ ] **Step 1: Update operator startup instructions**
+- [x] **Step 1: Update operator startup instructions**
 
 Replace Node 24 with Node 20 or later and the export block with:
 
@@ -571,11 +571,11 @@ npm start
 
 State that `.env` is loaded from cwd, system variables win, and a missing file is allowed when all values are externally injected.
 
-- [ ] **Step 2: Document stdout JSON trade logs**
+- [x] **Step 2: Document stdout JSON trade logs**
 
 List the seven lifecycle event names, allowlisted IDs/quantities/prices/status fields, forbidden credential/raw-payload fields, and the process manager's responsibility for persistence/rotation.
 
-- [ ] **Step 3: Run focused security and startup regressions**
+- [x] **Step 3: Run focused security and startup regressions**
 
 ```bash
 npm run build
@@ -584,7 +584,7 @@ node --test dist/tests/logging/logger.test.js dist/tests/logging/trade-events.te
 
 Expected: all pass; child-process failure is specific JSON; no seeded credential appears.
 
-- [ ] **Step 4: Run financial-state regressions**
+- [x] **Step 4: Run financial-state regressions**
 
 ```bash
 node --test dist/tests/strategy/hedge-coordinator.test.js dist/tests/strategy/order-monitor.test.js dist/tests/storage/sqlite-repository.test.js dist/tests/acceptance/hedge-opening.test.js
@@ -592,7 +592,7 @@ node --test dist/tests/strategy/hedge-coordinator.test.js dist/tests/strategy/or
 
 Expected: all pass with no order-count, terminal-state, recovery, or topology regression.
 
-- [ ] **Step 5: Run full Node 20 verification**
+- [x] **Step 5: Run full Node 20 verification**
 
 Apply `high-stakes-implementation-testing`, then run:
 
@@ -606,11 +606,11 @@ git status --short --branch
 
 Expected: `v20.x`, zero test failures, build exit 0, empty diff-check output, and only intended changes.
 
-- [ ] **Step 6: Run completion gates and check every plan item**
+- [x] **Step 6: Run completion gates and check every plan item**
 
 Use `pre-verification-check`, `verification-before-completion`, `consistency-check`, and `post-verification-check` in order. Cross-check package/lockfile, README, `.env.example`, logger redactions, event union, every constructor call site, and every checkbox in this plan.
 
-- [ ] **Step 7: Commit documentation**
+- [x] **Step 7: Commit documentation**
 
 ```bash
 git add README.md .env.example
