@@ -172,7 +172,7 @@ git commit -m "feat: load optional dotenv configuration"
 - Produces: `OperationalLog`, `createOperationalLog(logger, secretProvider)`
 - Produces: `LOGGER_REDACT_PATHS`
 
-- [ ] **Step 1: Write failing JSON and secret-replacement tests**
+- [x] **Step 1: Write failing JSON and secret-replacement tests**
 
 Use a Node `Writable` to capture Pino output and assert:
 
@@ -197,13 +197,13 @@ assert.match(JSON.stringify(line), /\[Redacted\]/);
 Add tests proving arbitrary enumerable `request`, `response`, `apiKey`, and `cause` properties are absent, and only the six exact non-empty credential values are returned by `configuredSecretValues`.
 Parse `package.json` in the test and assert the emitted base `version` equals its `version`, preventing the fixed logger field from drifting.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run `npm run build`.
 
 Expected: FAIL because `src/logging/logger.ts` does not exist.
 
-- [ ] **Step 3: Implement public logger contracts**
+- [x] **Step 3: Implement public logger contracts**
 
 Create `src/logging/logger.ts` with:
 
@@ -228,11 +228,11 @@ Define the existing 14 Fastify redact paths as `LOGGER_REDACT_PATHS`. `createApp
 
 `safeError` reads only name/message/code/stack under `try/catch`, replaces every current non-empty secret substring, and never spreads the original object. `createOperationalLog` obtains secrets from its callback for every error and catches logger-write failures so logging remains a side effect only.
 
-- [ ] **Step 4: Move Fastify redact ownership without behavior change**
+- [x] **Step 4: Move Fastify redact ownership without behavior change**
 
 Import and re-export `LOGGER_REDACT_PATHS` from `src/http/server.ts`; delete its local duplicate. Keep its default logger configuration unchanged.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run:
 
@@ -243,7 +243,7 @@ node --test dist/tests/logging/logger.test.js dist/tests/http/server.test.js
 
 Expected: all logger and HTTP tests pass; captured output is JSON and contains no seeded secret.
 
-- [ ] **Step 6: Commit the logger foundation**
+- [x] **Step 6: Commit the logger foundation**
 
 ```bash
 git add src/logging/logger.ts tests/logging/logger.test.ts src/http/server.ts tests/http/server.test.ts
