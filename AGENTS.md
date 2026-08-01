@@ -1,4 +1,4 @@
-# Trade Ops Codex Instructions
+# Trade Ops Codex and Cursor Instructions
 
 ## Existing workflow gates
 
@@ -10,14 +10,18 @@
 ## Delegation policy
 
 - Delegate only when a custom agent's narrow responsibility materially improves evidence, speed, or review quality.
-- Use `context_explorer` for repository paths and execution-flow evidence.
-- Use `source_verifier` for external API semantics, units, precision, status, and documented behavior.
-- Use `test_designer` to create the risk matrix and expected failing tests after plan approval.
-- Use `implementer` only after the expected tests fail for the intended reason.
-- Use `risk_reviewer` for defect-first review of affected paths and money/safety invariants.
-- Use `verifier` for commands and artifact consistency checks.
+- Use Codex `context_explorer` or Cursor `context-explorer` for repository paths and execution-flow evidence.
+- Use Codex `source_verifier` or Cursor `source-verifier` for external API semantics, units, precision, status, and documented behavior.
+- Use Codex `test_designer` or Cursor `test-designer` to create the risk matrix and expected failing tests after plan approval.
+- Use Codex `implementer` or Cursor `implementer` only after the expected tests fail for the intended reason.
+- Use Codex `risk_reviewer` or Cursor `risk-reviewer` for defect-first review of affected paths and money/safety invariants.
+- Use Codex `verifier` or Cursor `verifier` for commands and artifact consistency checks.
 - Read-only agents may run in parallel. Never allow more than one agent to modify source or tests at a time.
 - Custom agents must not spawn additional agents.
+
+## Cursor compatibility
+
+The `.cursor/agents/*.md` agents are native equivalents of the corresponding Codex agents. Read-only behavior in Cursor is an agent constraint, not a Codex sandbox guarantee. The main agent dynamically selects the model and reasoning effort based on current platform capabilities.
 
 ## Dynamic model routing
 
