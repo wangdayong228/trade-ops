@@ -4,6 +4,7 @@ data/
 .env
 .firecrawl/
 .superpowers/
+.worktrees/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
