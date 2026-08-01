@@ -15,6 +15,10 @@ import type {
 } from '../../src/domain/types.js';
 import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
 import { NoOrderSubmittedError } from '../../src/exchanges/exchange-gateway.js';
+import type {
+  TradeEvent,
+  TradeEventSink
+} from '../../src/logging/trade-events.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
 import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
@@ -377,6 +381,7 @@ interface SetupResult {
   readonly contract: TrackingGateway;
   readonly coordinator: HedgeCoordinator;
   readonly strategyId: string;
+  readonly tradeEvents: TradeEvent[];
 }
 
 function setup(
@@ -386,6 +391,7 @@ function setup(
     spot?: TrackingGateway;
     contract?: TrackingGateway;
     preflight?: Partial<PreflightResult>;
+    tradeEvents?: TradeEventSink;
   } = {}
 ): SetupResult {
   const database = new Database(':memory:');
@@ -400,14 +406,21 @@ function setup(
   const preview = preflight(mode, options.preflight);
   contract.accountSettings = { ...preview.accountSettings };
   const strategyId = repository.createPending(preview).id;
+  const tradeEvents: TradeEvent[] = [];
+  const tradeEventSink = options.tradeEvents ?? {
+    record(event: Readonly<TradeEvent>): void {
+      tradeEvents.push(structuredClone(event));
+    }
+  };
 
   return {
     database,
     repository,
     spot,
     contract,
-    coordinator: new HedgeCoordinator(registry, repository),
-    strategyId
+    coordinator: new HedgeCoordinator(registry, repository, tradeEventSink),
+    strategyId,
+    tradeEvents
   };
 }
 
@@ -431,6 +444,235 @@ function assertNoForbiddenSideEffects(...gateways: TrackingGateway[]): void {
     assert.equal(gateway.fetchOrderRequests.length, 0);
   }
 }
+
+const COMPLETE_ORDER_LIFECYCLE = [
+  'order_planned',
+  'order_submit_started',
+  'order_submit_succeeded',
+  'order_status_changed',
+  'order_terminal'
+] as const;
+
+test('fresh market orders emit a complete persisted lifecycle in every mode', async (t) => {
+  for (const mode of [
+    'CONTRACT_FIRST',
+    'SPOT_FIRST',
+    'CONCURRENT'
+  ] as const) {
+    await t.test(mode, async (t) => {
+      const context = setup(t, mode);
+      if (mode !== 'SPOT_FIRST') {
+        context.contract.createResults.push(snapshotFor(
+          context.strategyId,
+          'CONTRACT_MARKET',
+          '1',
+          {
+            filledBaseQuantity: '0',
+            remainingBaseQuantity: '1',
+            averagePrice: null
+          }
+        ));
+      }
+      if (mode !== 'CONTRACT_FIRST') {
+        context.spot.createResults.push(snapshotFor(
+          context.strategyId,
+          'SPOT_MARKET',
+          '1',
+          {
+            filledBaseQuantity: '0',
+            remainingBaseQuantity: '1',
+            averagePrice: null
+          }
+        ));
+      }
+
+      await context.coordinator.confirmAndExecute(context.strategyId);
+
+      const expectedRoles: OrderRole[] = mode === 'CONTRACT_FIRST'
+        ? ['CONTRACT_MARKET']
+        : mode === 'SPOT_FIRST'
+          ? ['SPOT_MARKET']
+          : ['SPOT_MARKET', 'CONTRACT_MARKET'];
+      for (const role of expectedRoles) {
+        const roleEvents = context.tradeEvents.filter(
+          (event) => event.role === role
+        );
+        assert.deepEqual(
+          roleEvents.map(({ event }) => event),
+          COMPLETE_ORDER_LIFECYCLE
+        );
+        const statusEvent = roleEvents[3];
+        assert.ok(statusEvent);
+        assert.equal(statusEvent.strategyId, context.strategyId);
+        assert.equal(statusEvent.mode, mode);
+        assert.equal(statusEvent.strategyState, 'EXECUTING');
+        assert.equal(statusEvent.exchangeId, roleShape(role).exchangeId);
+        assert.equal(statusEvent.symbol, SYMBOL);
+        assert.equal(statusEvent.requestedBaseQuantity, '1');
+        assert.equal(statusEvent.filledBaseQuantity, '0');
+        assert.equal(statusEvent.remainingBaseQuantity, '1');
+        assert.equal(statusEvent.averagePrice, null);
+        assert.equal(statusEvent.status, 'closed');
+        assert.equal(
+          statusEvent.clientOrderId,
+          makeClientOrderId(context.strategyId, role)
+        );
+      }
+      if (mode === 'CONCURRENT') {
+        const plannedIndexes = context.tradeEvents.flatMap((event, index) => (
+          event.event === 'order_planned' ? [index] : []
+        ));
+        const submitIndexes = context.tradeEvents.flatMap((event, index) => (
+          event.event === 'order_submit_started' ? [index] : []
+        ));
+        assert.equal(plannedIndexes.length, 2);
+        assert.equal(submitIndexes.length, 2);
+        assert.ok(Math.max(...plannedIndexes) < Math.min(...submitIndexes));
+      }
+    });
+  }
+});
+
+test('a derived GTC order receives its own complete lifecycle', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.8',
+      remainingBaseQuantity: '0.2',
+      averagePrice: '60000.09'
+    }
+  ));
+  context.spot.quantizedPrices.set('spot:BTC/USDT', '60000.0');
+  context.spot.createResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_HEDGE_GTC',
+    '0.8',
+    { averagePrice: '60000.0' }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const hedgeEvents = context.tradeEvents.filter(
+    ({ role }) => role === 'SPOT_HEDGE_GTC'
+  );
+  assert.deepEqual(
+    hedgeEvents.map(({ event }) => event),
+    COMPLETE_ORDER_LIFECYCLE
+  );
+  assert.equal(hedgeEvents[0]?.requestedBaseQuantity, '0.8');
+  assert.equal(hedgeEvents[0]?.price, '60000.0');
+  assert.equal(hedgeEvents[0]?.timeInForce, 'GTC');
+  assert.equal(hedgeEvents[4]?.status, 'closed');
+  assert.equal(
+    context.repository.getStrategy(context.strategyId).state,
+    'HEDGED'
+  );
+});
+
+test('typed pre-submit rejection emits only a classified rejection event', async (t) => {
+  const contract = new PreSubmissionRejectingGateway('okx', 'all');
+  const context = setup(t, 'CONTRACT_FIRST', { contract });
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.deepEqual(context.tradeEvents.map(({ event }) => event), [
+    'order_planned',
+    'order_submit_started',
+    'order_rejected_before_submit'
+  ]);
+  assert.equal(
+    context.tradeEvents[2]?.failureCode,
+    'ORDER_SUBMISSION_FAILED'
+  );
+  assert.equal(context.tradeEvents[2]?.errorType, 'NoOrderSubmittedError');
+  assert.equal(contract.createdRequests.length, 0);
+});
+
+test('generic create uncertainty is classified without logging its message', async (t) => {
+  const contract = new UnknownSubmissionGateway('okx');
+  const context = setup(t, 'CONTRACT_FIRST', { contract });
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.deepEqual(context.tradeEvents.map(({ event }) => event), [
+    'order_planned',
+    'order_submit_started',
+    'order_submit_uncertain'
+  ]);
+  assert.deepEqual({
+    failureCode: context.tradeEvents[2]?.failureCode,
+    errorType: context.tradeEvents[2]?.errorType,
+    errorCode: context.tradeEvents[2]?.errorCode
+  }, {
+    failureCode: 'ORDER_SUBMISSION_UNKNOWN',
+    errorType: 'Error',
+    errorCode: undefined
+  });
+  assert.doesNotMatch(
+    JSON.stringify(context.tradeEvents),
+    /apiKey|secret|must-never-be-persisted|also-private/
+  );
+  assert.equal(contract.createdRequests.length, 1);
+});
+
+test('recovered intents emit persisted status but no new planning or submission', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  assert.equal(context.repository.claimForExecution(context.strategyId), true);
+  context.repository.planOrder(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    requestFor(context.strategyId, 'CONTRACT_MARKET', '1')
+  );
+  context.contract.seedObservedOrder(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null
+    }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.deepEqual(context.tradeEvents.map(({ event }) => event), [
+    'order_status_changed',
+    'order_terminal'
+  ]);
+  assert.equal(context.contract.createdRequests.length, 0);
+  assert.equal(context.contract.findRequests.length, 1);
+});
+
+test('a throwing trade sink cannot change state or duplicate submission', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST', {
+    tradeEvents: {
+      record(): never {
+        throw new Error('log sink unavailable');
+      }
+    }
+  });
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null
+    }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const strategy = context.repository.getStrategy(context.strategyId);
+  assert.equal(strategy.state, 'FAILED');
+  assert.equal(strategy.failureCode, 'NO_FILL');
+  assert.equal(context.contract.createdRequests.length, 1);
+});
 
 test('coordinator never claims or submits a persisted one-way strategy', async (t) => {
   const context = setup(t, 'CONCURRENT', {
