@@ -47,7 +47,7 @@
 - Produces: `loadEnvironmentFile(options?: LoadEnvironmentFileOptions): 'loaded' | 'missing'`
 - Consumed later by: `run()` in `src/main.ts`
 
-- [ ] **Step 1: Install exact dependencies and lower the runtime floor**
+- [x] **Step 1: Install exact dependencies and lower the runtime floor**
 
 Run:
 
@@ -57,7 +57,7 @@ npm install dotenv@17.4.2 pino@10.3.1
 
 Set the root and lockfile engine declaration to `"node": ">=20"`. Expected: dotenv and Pino are direct dependencies; Pino is deduplicated with Fastify where npm permits.
 
-- [ ] **Step 2: Write the failing environment-loader tests**
+- [x] **Step 2: Write the failing environment-loader tests**
 
 Create `tests/config/environment-loader.test.ts` with these cases:
 
@@ -91,13 +91,13 @@ test('treats only ENOENT as an optional missing file', () => {
 
 Import Node test/assert/fs/os/path helpers, `DotenvConfigOutput`, and the missing production module.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run `npm run build`.
 
 Expected: FAIL because `src/config/environment-loader.ts` does not exist.
 
-- [ ] **Step 4: Implement the minimal loader**
+- [x] **Step 4: Implement the minimal loader**
 
 Create `src/config/environment-loader.ts`:
 
@@ -136,7 +136,7 @@ export function loadEnvironmentFile(
 }
 ```
 
-- [ ] **Step 5: Verify GREEN and template completeness**
+- [x] **Step 5: Verify GREEN and template completeness**
 
 Run:
 
@@ -148,7 +148,7 @@ git diff --check -- package.json package-lock.json .env.example src/config/envir
 
 Expected: build succeeds, loader tests pass, and `.env.example` contains the ten supported safe placeholder keys.
 
-- [ ] **Step 6: Commit the loader**
+- [x] **Step 6: Commit the loader**
 
 ```bash
 git add package.json package-lock.json .env.example src/config/environment-loader.ts tests/config/environment-loader.test.ts
