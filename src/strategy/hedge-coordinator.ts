@@ -1,12 +1,16 @@
 import { Decimal } from 'decimal.js';
 import { makeClientOrderId } from '../domain/client-order-id.js';
 import type {
+  AccountSettings,
   MarketKind,
   OrderRequest,
   OrderRole,
   OrderSnapshot
 } from '../domain/types.js';
-import type { ExchangeGateway } from '../exchanges/exchange-gateway.js';
+import {
+  NoOrderSubmittedError,
+  type ExchangeGateway
+} from '../exchanges/exchange-gateway.js';
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
 import type {
   StrategyFailureCode,
@@ -44,6 +48,13 @@ interface PendingOutcome {
 }
 
 type SubmissionOutcome = SnapshotOutcome | FailureOutcome | PendingOutcome;
+type NewPreparationOutcome = (
+  | { readonly kind: 'prepared'; readonly prepared: PreparedOrder }
+  | FailureOutcome
+  | PendingOutcome
+);
+type ExecutionStateObservation = 'executing' | 'ended' | 'unavailable';
+type ExposureCertainty = 'excluded' | 'possible' | 'unavailable';
 
 interface SnapshotValidation {
   readonly valid: boolean;
@@ -160,6 +171,26 @@ function positiveFillKnown(value: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+function accountSettingsMatch(
+  confirmed: Readonly<AccountSettings>,
+  current: Readonly<AccountSettings>
+): boolean {
+  const confirmedLeverage = parsedDecimal(confirmed.leverage, false);
+  const currentLeverage = parsedDecimal(current.leverage, false);
+  return (
+    confirmed.positionMode === 'hedged'
+    && current.positionMode === 'hedged'
+    && (
+      confirmed.marginMode === 'isolated'
+      || confirmed.marginMode === 'cross'
+    )
+    && current.marginMode === confirmed.marginMode
+    && confirmedLeverage !== null
+    && currentLeverage !== null
+    && confirmedLeverage.eq(currentLeverage)
+  );
 }
 
 function requestMatches(
@@ -322,6 +353,18 @@ export class HedgeCoordinator {
       return;
     }
 
+    const freshSettings = await this.freshSettingsGuard(strategy);
+    if (freshSettings !== null) {
+      if (freshSettings.kind === 'failure') {
+        this.failStrategy(
+          strategy.id,
+          freshSettings.exposureKnown,
+          freshSettings.failureCode
+        );
+      }
+      return;
+    }
+
     switch (strategy.preflight.mode) {
       case 'CONTRACT_FIRST':
         await this.executeSequential(strategy, 'contract', marginMode);
@@ -433,6 +476,25 @@ export class HedgeCoordinator {
     };
   }
 
+  private async prepareNew(
+    strategy: Readonly<StrategyRecord>,
+    role: OrderRole,
+    request: OrderRequest,
+    fallbackExposureKnown = false
+  ): Promise<NewPreparationOutcome> {
+    const freshSettings = await this.freshSettingsGuard(
+      strategy,
+      fallbackExposureKnown
+    );
+    if (freshSettings !== null) {
+      return freshSettings;
+    }
+    return {
+      kind: 'prepared',
+      prepared: this.prepare(strategy, role, request)
+    };
+  }
+
   private orderForRole(
     strategyId: string,
     role: OrderRole
@@ -502,20 +564,6 @@ export class HedgeCoordinator {
       || positiveFillKnown(snapshot)
       || positiveFillKnown(prepared.record.snapshot)
     );
-    let persistedSnapshot = prepared.record.snapshot;
-    try {
-      const persistedOrder = this.repository
-        .listOrders(prepared.record.strategyId)
-        .find((order) => order.id === prepared.record.id);
-      if (persistedOrder === undefined) {
-        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-      }
-      persistedSnapshot = persistedOrder.snapshot;
-      exposureKnown = exposureKnown || positiveFillKnown(persistedSnapshot);
-    } catch {
-      return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-    }
-
     let validation: SnapshotValidation;
     try {
       validation = validateSnapshot(
@@ -529,6 +577,28 @@ export class HedgeCoordinator {
     exposureKnown = exposureKnown || validation.exposureKnown;
     if (!validation.valid) {
       return failed(validation.failureCode, exposureKnown);
+    }
+
+    let persistedSnapshot = prepared.record.snapshot;
+    try {
+      const persistedOrder = this.repository
+        .listOrders(prepared.record.strategyId)
+        .find((order) => order.id === prepared.record.id);
+      if (persistedOrder === undefined) {
+        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
+      }
+      if (
+        persistedOrder.role !== prepared.record.role
+        || persistedOrder.exchangeId !== prepared.record.exchangeId
+        || persistedOrder.clientOrderId !== prepared.record.clientOrderId
+        || !requestMatches(persistedOrder.request, prepared.record.request)
+      ) {
+        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
+      }
+      persistedSnapshot = persistedOrder.snapshot;
+      exposureKnown = exposureKnown || positiveFillKnown(persistedSnapshot);
+    } catch {
+      return pending(exposureKnown);
     }
     if (persistedSnapshot !== null) {
       const persistedFill = parsedDecimal(
@@ -547,7 +617,11 @@ export class HedgeCoordinator {
         return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
       }
     }
-    if (!this.isExecuting(prepared.record.strategyId)) {
+    const executionState = this.executionState(prepared.record.strategyId);
+    if (executionState === 'unavailable') {
+      return pending(exposureKnown);
+    }
+    if (executionState === 'ended') {
       return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
     }
     try {
@@ -573,7 +647,11 @@ export class HedgeCoordinator {
         )?.gt(0) ?? false
       )
     );
-    if (!this.isExecuting(prepared.record.strategyId)) {
+    const executionState = this.executionState(prepared.record.strategyId);
+    if (executionState === 'unavailable') {
+      return pending(persistedExposureKnown);
+    }
+    if (executionState === 'ended') {
       return failed('INCONSISTENT_ORDER_STATE', persistedExposureKnown);
     }
     if (prepared.record.snapshot !== null) {
@@ -595,29 +673,102 @@ export class HedgeCoordinator {
     let snapshot: OrderSnapshot;
     try {
       snapshot = await prepared.gateway.createOrder(prepared.record.request);
-    } catch {
+    } catch (error) {
+      if (error instanceof NoOrderSubmittedError) {
+        return failed('ORDER_SUBMISSION_FAILED', persistedExposureKnown);
+      }
       return this.lookupAndPersist(prepared);
     }
     if (snapshot.status === 'unknown') {
       const persisted = this.persistSnapshot(prepared, snapshot);
+      if (persisted.kind === 'failure') {
+        return persisted;
+      }
       return this.lookupAndPersist(
         prepared,
-        persisted.kind === 'failure'
+        persisted.kind === 'pending'
           ? persisted.exposureKnown
-          : persisted.kind === 'pending'
-            ? persisted.exposureKnown
-            : positiveFillKnown(snapshot)
+          : positiveFillKnown(snapshot)
       );
     }
     return this.persistSnapshot(prepared, snapshot);
   }
 
   private isExecuting(strategyId: string): boolean {
+    return this.executionState(strategyId) === 'executing';
+  }
+
+  private executionState(strategyId: string): ExecutionStateObservation {
     try {
-      return this.repository.getStrategy(strategyId).state === 'EXECUTING';
+      return this.repository.getStrategy(strategyId).state === 'EXECUTING'
+        ? 'executing'
+        : 'ended';
     } catch {
-      return false;
+      return 'unavailable';
     }
+  }
+
+  private exposureCertainty(
+    strategyId: string,
+    fallbackExposureKnown: boolean
+  ): ExposureCertainty {
+    if (fallbackExposureKnown) {
+      return 'possible';
+    }
+    let orders: StrategyOrderRecord[];
+    try {
+      orders = this.repository.listOrders(strategyId);
+    } catch {
+      return 'unavailable';
+    }
+    if (orders.length === 0) {
+      return 'excluded';
+    }
+    for (const order of orders) {
+      const snapshot = order.snapshot;
+      if (snapshot === null) {
+        return 'possible';
+      }
+      const filled = parsedDecimal(snapshot.filledBaseQuantity, true);
+      if (filled === null || filled.gt(0)) {
+        return 'possible';
+      }
+      if (
+        snapshot.status !== 'closed'
+        && snapshot.status !== 'canceled'
+        && snapshot.status !== 'rejected'
+      ) {
+        return 'possible';
+      }
+    }
+    return 'excluded';
+  }
+
+  private async freshSettingsGuard(
+    strategy: Readonly<StrategyRecord>,
+    fallbackExposureKnown = false
+  ): Promise<FailureOutcome | PendingOutcome | null> {
+    const contractGateway = this.registry.get(strategy.contractExchangeId);
+    let current: AccountSettings;
+    try {
+      current = await contractGateway.fetchAccountSettings(strategy.symbol);
+    } catch {
+      return pending(fallbackExposureKnown);
+    }
+    if (accountSettingsMatch(strategy.preflight.accountSettings, current)) {
+      return null;
+    }
+    const exposure = this.exposureCertainty(
+      strategy.id,
+      fallbackExposureKnown
+    );
+    if (exposure === 'unavailable') {
+      return pending(fallbackExposureKnown);
+    }
+    return failed(
+      'INCONSISTENT_ORDER_STATE',
+      exposure === 'possible'
+    );
   }
 
   private failStrategy(
@@ -744,9 +895,27 @@ export class HedgeCoordinator {
       firstLeg,
       marginMode
     );
-    const first = existingFirst === undefined
-      ? this.prepare(strategy, firstRole, expectedFirstRequest)
-      : this.prepareExisting(strategy, existingFirst);
+    let first: PreparedOrder;
+    if (existingFirst === undefined) {
+      const preparation = await this.prepareNew(
+        strategy,
+        firstRole,
+        expectedFirstRequest
+      );
+      if (preparation.kind !== 'prepared') {
+        if (preparation.kind === 'failure') {
+          this.failStrategy(
+            strategy.id,
+            preparation.exposureKnown,
+            preparation.failureCode
+          );
+        }
+        return;
+      }
+      first = preparation.prepared;
+    } else {
+      first = this.prepareExisting(strategy, existingFirst);
+    }
     const firstOutcome = await this.submit(first);
     if (firstOutcome.kind === 'pending') {
       return;
@@ -842,7 +1011,7 @@ export class HedgeCoordinator {
       this.failStrategy(strategy.id, true, 'ORDER_RECONCILIATION_FAILED');
       return;
     }
-    const second = this.prepare(
+    const secondPreparation = await this.prepareNew(
       strategy,
       secondRole,
       this.hedgeRequest(
@@ -851,8 +1020,20 @@ export class HedgeCoordinator {
         targetQuantity,
         price,
         marginMode
-      )
+      ),
+      true
     );
+    if (secondPreparation.kind !== 'prepared') {
+      if (secondPreparation.kind === 'failure') {
+        this.failStrategy(
+          strategy.id,
+          secondPreparation.exposureKnown,
+          secondPreparation.failureCode
+        );
+      }
+      return;
+    }
+    const second = secondPreparation.prepared;
     const secondOutcome = await this.submit(second);
     this.finishHedge(strategy.id, targetQuantity, secondOutcome);
   }
@@ -937,6 +1118,25 @@ export class HedgeCoordinator {
       );
       return;
     }
+    const newOrderSettings = await Promise.all([
+      this.freshSettingsGuard(strategy),
+      this.freshSettingsGuard(strategy)
+    ]);
+    const settingsFailure = newOrderSettings.find(
+      (outcome): outcome is FailureOutcome => outcome?.kind === 'failure'
+    );
+    if (settingsFailure !== undefined) {
+      this.failStrategy(
+        strategy.id,
+        settingsFailure.exposureKnown,
+        settingsFailure.failureCode
+      );
+      return;
+    }
+    if (newOrderSettings.some((outcome) => outcome?.kind === 'pending')) {
+      return;
+    }
+
     const spot = this.prepare(
       strategy,
       'SPOT_MARKET',
@@ -976,9 +1176,6 @@ export class HedgeCoordinator {
     const outcomes = settled.map((result) => (
       (result as PromiseFulfilledResult<SubmissionOutcome>).value
     ));
-    if (outcomes.some((outcome) => outcome.kind === 'pending')) {
-      return;
-    }
     const submissionFailure = outcomes.find(
       (outcome): outcome is FailureOutcome => outcome.kind === 'failure'
     );
@@ -988,18 +1185,23 @@ export class HedgeCoordinator {
         return;
       }
       const exposureKnown = outcomes.some((outcome) => (
-        outcome.kind === 'snapshot'
-          ? (
+        outcome.kind === 'pending'
+          ? true
+          : outcome.kind === 'snapshot'
+            ? (
             parsedDecimal(outcome.snapshot.filledBaseQuantity, true)?.gt(0)
             ?? false
-          )
-          : outcome.exposureKnown
+            )
+            : outcome.exposureKnown
       ));
       this.failStrategy(
         strategy.id,
         exposureKnown,
         submissionFailure.failureCode
       );
+      return;
+    }
+    if (outcomes.some((outcome) => outcome.kind === 'pending')) {
       return;
     }
 
@@ -1045,29 +1247,11 @@ export class HedgeCoordinator {
       );
       return;
     }
-    if (
-      (spotFilled.gt(0) && !positivePrice(spotSnapshot.averagePrice))
-      || (
-        contractFilled.gt(0)
-        && !positivePrice(contractSnapshot.averagePrice)
-      )
-    ) {
-      this.failStrategy(strategy.id, true, 'MISSING_AVERAGE_PRICE');
-      return;
-    }
     if (spotFilled.isZero() && contractFilled.isZero()) {
       if (hedgeOrders.length !== 0) {
         await this.reconcileUnexpectedTopology(strategy, existingOrders);
       } else {
         this.failStrategy(strategy.id, false, 'NO_FILL');
-      }
-      return;
-    }
-    if (spotFilled.isZero() || contractFilled.isZero()) {
-      if (hedgeOrders.length !== 0) {
-        await this.reconcileUnexpectedTopology(strategy, existingOrders);
-      } else {
-        this.failStrategy(strategy.id, true, 'NO_FILL');
       }
       return;
     }
@@ -1088,12 +1272,15 @@ export class HedgeCoordinator {
         ? contractSnapshot.filledBaseQuantity
         : spotSnapshot.filledBaseQuantity
     );
+    if (difference === null) {
+      this.failStrategy(strategy.id, true, 'INCONSISTENT_ORDER_STATE');
+      return;
+    }
     if (
-      difference === null
-      || largerSnapshot.averagePrice === null
+      largerSnapshot.averagePrice === null
       || !positivePrice(largerSnapshot.averagePrice)
     ) {
-      this.failStrategy(strategy.id, true, 'INCONSISTENT_ORDER_STATE');
+      this.failStrategy(strategy.id, true, 'MISSING_AVERAGE_PRICE');
       return;
     }
     const smallerLeg = spotIsLarger ? 'contract' : 'spot';
@@ -1138,7 +1325,7 @@ export class HedgeCoordinator {
       this.failStrategy(strategy.id, true, 'ORDER_RECONCILIATION_FAILED');
       return;
     }
-    const hedge = this.prepare(
+    const hedgePreparation = await this.prepareNew(
       strategy,
       differenceRole,
       this.hedgeRequest(
@@ -1147,8 +1334,20 @@ export class HedgeCoordinator {
         difference,
         price,
         marginMode
-      )
+      ),
+      true
     );
+    if (hedgePreparation.kind !== 'prepared') {
+      if (hedgePreparation.kind === 'failure') {
+        this.failStrategy(
+          strategy.id,
+          hedgePreparation.exposureKnown,
+          hedgePreparation.failureCode
+        );
+      }
+      return;
+    }
+    const hedge = hedgePreparation.prepared;
     const hedgeOutcome = await this.submit(hedge);
     this.finishHedge(strategy.id, difference, hedgeOutcome);
   }

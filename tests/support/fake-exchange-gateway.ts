@@ -6,7 +6,10 @@ import type {
   OrderSnapshot
 } from '../../src/domain/types.js';
 import { decimal } from '../../src/domain/decimal.js';
-import type { ExchangeGateway } from '../../src/exchanges/exchange-gateway.js';
+import {
+  NoOrderSubmittedError,
+  type ExchangeGateway
+} from '../../src/exchanges/exchange-gateway.js';
 
 function marketKey(symbol: string, kind: MarketKind): string {
   return `${kind}:${symbol}`;
@@ -170,8 +173,12 @@ export class FakeExchangeGateway implements ExchangeGateway {
   }
 
   async createOrder(request: OrderRequest): Promise<OrderSnapshot> {
-    validateCreateQuantity(request.baseQuantity);
-    validateCreateMarginMode(request);
+    try {
+      validateCreateQuantity(request.baseQuantity);
+      validateCreateMarginMode(request);
+    } catch {
+      throw new NoOrderSubmittedError();
+    }
     this.createdRequests.push(request);
     const configured = this.createResults.shift();
     if (configured === undefined) {

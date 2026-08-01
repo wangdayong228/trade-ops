@@ -25,6 +25,9 @@ import {
   type CcxtOrder
 } from '../../src/exchanges/ccxt-exchange-gateway.js';
 import {
+  NoOrderSubmittedError
+} from '../../src/exchanges/exchange-gateway.js';
+import {
   buildCreateOrderParams
 } from '../../src/exchanges/exchange-profile.js';
 import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
@@ -200,6 +203,7 @@ class CcxtDouble implements CcxtExchangeLike {
     info: {}
   };
   createResult: CcxtOrder = ccxtOrder();
+  createError: Error | undefined;
   fetchOrderResult: CcxtOrder = ccxtOrder();
   fetchOrderError: unknown;
   openOrders: CcxtOrder[] = [];
@@ -276,6 +280,9 @@ class CcxtDouble implements CcxtExchangeLike {
     };
     this.events.push(`createOrder:${symbol}`);
     this.createCalls.push(call);
+    if (this.createError !== undefined) {
+      throw this.createError;
+    }
     return structuredClone(this.createResult);
   }
 
@@ -348,6 +355,13 @@ function makeGateway(
     gateway: new CcxtExchangeGateway(exchangeId, ccxt),
     ccxt
   };
+}
+
+function isNoOrderSubmitted(error: unknown): boolean {
+  assert(error instanceof NoOrderSubmittedError);
+  assert.equal(error.message, 'order was not submitted');
+  assert.equal(error.code, 'NO_ORDER_SUBMITTED');
+  return true;
 }
 
 function swapRequest(
@@ -845,7 +859,7 @@ test('swap orders fail closed without a confirmed margin mode', async () => {
 
   await assert.rejects(
     gateway.createOrder(request),
-    /swap order requires.*margin mode/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
   assert.equal(ccxt.setMarginModeCalls.length, 0);
@@ -866,9 +880,97 @@ test('spot orders reject a contract margin mode instead of forwarding it', async
 
   await assert.rejects(
     gateway.createOrder(request),
-    /spot order must not include.*margin mode/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('all failures before the CCXT create call use the safe no-order-submitted type', async (t) => {
+  const assertSafePreCallFailure = async (
+    action: () => Promise<unknown>,
+    ccxt: CcxtDouble
+  ): Promise<void> => {
+    await assert.rejects(action, isNoOrderSubmitted);
+    assert.equal(ccxt.createCalls.length, 0);
+  };
+
+  await t.test('request validation', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    const request = swapRequest();
+    delete request.marginMode;
+    await assertSafePreCallFailure(
+      () => gateway.createOrder(request),
+      ccxt
+    );
+  });
+
+  await t.test('market resolution', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    await assertSafePreCallFailure(
+      () => gateway.createOrder(spotRequest({ symbol: 'ETH/USDT' })),
+      ccxt
+    );
+  });
+
+  await t.test('precision conversion', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.amountPrecisionResult = '9';
+    await assertSafePreCallFailure(
+      () => gateway.createOrder(swapRequest()),
+      ccxt
+    );
+  });
+
+  await t.test('minimum amount', async () => {
+    const constrained = okxSpotMarket({
+      precision: { amount: 0.001, price: 0.1 },
+      limits: {
+        amount: { min: 0.01, max: undefined },
+        price: { min: undefined, max: undefined },
+        cost: { min: undefined, max: undefined }
+      }
+    });
+    const { gateway, ccxt } = makeGateway('okx', [constrained]);
+    await assertSafePreCallFailure(
+      () => gateway.createOrder(spotRequest({ baseQuantity: '0.005' })),
+      ccxt
+    );
+  });
+
+  await t.test('ticker lookup', async () => {
+    const { gateway, ccxt } = makeGateway('bitget');
+    ccxt.ticker = {};
+    await assertSafePreCallFailure(
+      () => gateway.createOrder(spotMarketRequest()),
+      ccxt
+    );
+  });
+});
+
+test('actual CCXT create exceptions and post-call normalization failures remain uncertain', async (t) => {
+  await t.test('create exception', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    const createError = new NetworkError('uncertain network create');
+    ccxt.createError = createError;
+
+    await assert.rejects(
+      gateway.createOrder(swapRequest()),
+      (error: unknown) => error === createError
+    );
+    assert.equal(ccxt.createCalls.length, 1);
+  });
+
+  await t.test('normalization exception', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.createResult = ccxtOrder({ id: undefined });
+
+    await assert.rejects(gateway.createOrder(swapRequest()), (error: unknown) => {
+      assert(error instanceof Error);
+      assert.equal(error instanceof NoOrderSubmittedError, false);
+      return true;
+    });
+    assert.equal(ccxt.createCalls.length, 1);
+  });
 });
 
 test('formats amount and price immediately before submission', async () => {
@@ -899,7 +1001,7 @@ test('rejects precision output that changes the pre-normalized base quantity', a
 
   await assert.rejects(
     gateway.createOrder(swapRequest()),
-    /amount precision changed/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -921,7 +1023,7 @@ for (const [label, baseQuantity] of [
 
     await assert.rejects(
       gateway.createOrder(spotRequest({ baseQuantity })),
-      new RegExp(`${label} base amount`)
+      isNoOrderSubmitted
     );
     assert.equal(ccxt.createCalls.length, 0);
   });
@@ -940,7 +1042,7 @@ test('uses the formatted limit price to block a sub-minimum quote notional', asy
 
   await assert.rejects(
     gateway.createOrder(spotRequest({ price: '65000' })),
-    /minimum quote notional/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -958,7 +1060,7 @@ test('blocks a Bitget spot market buy below quote minimum using its conversion a
 
   await assert.rejects(
     gateway.createOrder(spotMarketRequest()),
-    /minimum quote notional/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -976,7 +1078,7 @@ test('uses bid before last to block a market sell below quote minimum', async ()
 
   await assert.rejects(
     gateway.createOrder(spotMarketRequest('sell')),
-    /minimum quote notional/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -1044,7 +1146,7 @@ test('blocks a create above the maximum quote notional', async () => {
 
   await assert.rejects(
     gateway.createOrder(spotRequest()),
-    /maximum quote notional/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -1062,7 +1164,7 @@ test('blocks a constrained market order when no usable quote is available', asyn
 
   await assert.rejects(
     gateway.createOrder(spotMarketRequest('sell')),
-    /finite positive.*bid or last/
+    isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -1141,7 +1243,7 @@ for (const ticker of [
         baseQuantity: '0.01',
         clientOrderId: 'clientorderid0000000000000000001'
       }),
-      /finite positive ticker ask or last/
+      isNoOrderSubmitted
     );
     assert.equal(ccxt.createCalls.length, 0);
   });
@@ -1281,6 +1383,50 @@ test('reads OKX position mode and an existing short position without changing th
   );
 });
 
+test('keeps a flat OKX hedged account fail-closed without inventing margin mode or leverage', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  ccxt.positionMode = {
+    info: { posMode: 'long_short_mode' },
+    hedged: true
+  };
+  ccxt.positions = [];
+
+  assert.deepEqual(await gateway.fetchAccountSettings('BTC/USDT'), {
+    marginMode: 'unknown',
+    positionMode: 'hedged',
+    leverage: null
+  });
+  assert.equal(
+    ccxt.events.some((event) => event.startsWith('fetchLeverage:')),
+    false
+  );
+  assert.deepEqual(ccxt.setMarginModeCalls, []);
+});
+
+test('keeps a flat OKX zero-contract short row fail-closed', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  ccxt.positionMode = {
+    info: { posMode: 'long_short_mode' },
+    hedged: true
+  };
+  ccxt.positions = [{
+    symbol: 'BTC/USDT:USDT',
+    side: 'short',
+    contracts: 0,
+    contractSize: 0.001,
+    marginMode: 'cross',
+    hedged: true,
+    leverage: 5,
+    info: {}
+  }];
+
+  assert.deepEqual(await gateway.fetchAccountSettings('BTC/USDT'), {
+    marginMode: 'unknown',
+    positionMode: 'hedged',
+    leverage: null
+  });
+});
+
 test('uses the OKX short-side settings when hedged sides differ', async () => {
   const { gateway, ccxt } = makeGateway('okx');
   ccxt.positionMode = {
@@ -1290,12 +1436,14 @@ test('uses the OKX short-side settings when hedged sides differ', async () => {
   ccxt.positions = [{
     symbol: 'BTC/USDT:USDT',
     side: 'long',
+    contracts: 2,
     marginMode: 'cross',
     leverage: 3,
     info: {}
   }, {
     symbol: 'BTC/USDT:USDT',
     side: 'short',
+    contracts: 1,
     marginMode: 'isolated',
     leverage: 5,
     info: {}

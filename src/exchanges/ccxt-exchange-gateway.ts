@@ -20,6 +20,7 @@ import type {
 } from '../domain/types.js';
 import {
   exchangeAmountToBase,
+  NoOrderSubmittedError,
   type ExchangeGateway
 } from './exchange-gateway.js';
 import type { ExchangeProfile } from './exchange-profile.js';
@@ -136,6 +137,14 @@ interface NormalizationContext {
   request?: OrderRequest;
   exchangeOrderId?: string;
   clientOrderId?: string;
+}
+
+interface PreparedCcxtOrder {
+  readonly market: CcxtMarket;
+  readonly rules: MarketRules;
+  readonly formattedAmount: string;
+  readonly submissionPrice: string | undefined;
+  readonly params: Record<string, unknown>;
 }
 
 function supportedExchangeId(exchangeId: string): SupportedExchangeId {
@@ -798,6 +807,31 @@ export class CcxtExchangeGateway implements ExchangeGateway {
   }
 
   async createOrder(request: OrderRequest): Promise<OrderSnapshot> {
+    let prepared: PreparedCcxtOrder;
+    try {
+      prepared = await this.prepareCreateOrder(request);
+    } catch {
+      throw new NoOrderSubmittedError();
+    }
+    const order = await this.exchange.createOrder(
+      prepared.market.symbol,
+      request.type,
+      request.side,
+      prepared.formattedAmount as unknown as number,
+      prepared.submissionPrice as unknown as number | undefined,
+      prepared.params
+    );
+    return this.normalizeOrder(
+      order,
+      prepared.market,
+      prepared.rules,
+      { request }
+    );
+  }
+
+  private async prepareCreateOrder(
+    request: OrderRequest
+  ): Promise<PreparedCcxtOrder> {
     if (
       request.kind === 'swap'
       && request.marginMode !== 'isolated'
@@ -877,16 +911,13 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       }
       validateQuoteNotional(baseQuantity, referencePrice, rules);
     }
-    const params = this.profile.buildCreateOrderParams(request);
-    const order = await this.exchange.createOrder(
-      market.symbol,
-      request.type,
-      request.side,
-      validFormattedAmount as unknown as number,
-      submissionPrice as unknown as number | undefined,
-      params
-    );
-    return this.normalizeOrder(order, market, rules, { request });
+    return {
+      market,
+      rules,
+      formattedAmount: validFormattedAmount,
+      submissionPrice,
+      params: this.profile.buildCreateOrderParams(request)
+    };
   }
 
   async fetchOrder(

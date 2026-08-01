@@ -41,6 +41,28 @@ function positionMarginMode(
   return 'unknown';
 }
 
+function isOpenPosition(
+  position: Record<string, unknown>,
+  exchangeSymbol: string
+): boolean {
+  if (position.symbol !== exchangeSymbol) {
+    return false;
+  }
+  const { contracts } = position;
+  if (
+    (typeof contracts !== 'number' && typeof contracts !== 'string')
+    || contracts === ''
+  ) {
+    return false;
+  }
+  try {
+    const parsed = decimal(String(contracts));
+    return parsed.isFinite() && parsed.gt(0);
+  } catch {
+    return false;
+  }
+}
+
 function oneValue<T>(
   values: readonly T[],
   field: string
@@ -95,12 +117,15 @@ export class OkxProfile implements ExchangeProfile {
       exchange.fetchPositionMode(exchangeSymbol),
       exchange.fetchPositions([exchangeSymbol])
     ]);
-    const shortPositions = positions.filter(
+    const openPositions = positions.filter((position) => (
+      isOpenPosition(position, exchangeSymbol)
+    ));
+    const shortPositions = openPositions.filter(
       (position) => position.side === 'short'
     );
     const relevantPositions = mode.hedged === true
       ? shortPositions
-      : positions;
+      : openPositions;
     const marginModes = relevantPositions
       .map(positionMarginMode)
       .filter((value) => value !== 'unknown');

@@ -1106,8 +1106,7 @@ export class OrderMonitor {
       && strategy.mode === 'CONCURRENT'
       && gtcOrders.length === 0
       && marketsConfirmed
-      && totals.spot.gt(0)
-      && totals.contract.gt(0)
+      && hasPositiveExposure(totals)
       && !totals.spot.eq(totals.contract)
     ) {
       return;

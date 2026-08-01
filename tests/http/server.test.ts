@@ -2189,7 +2189,7 @@ test('operator UI renders equal canceled-positive concurrent markets as HEDGED',
     setBrowserOrderSnapshot(order, {
       filledBaseQuantity: '0.6',
       remainingBaseQuantity: '0.4',
-      averagePrice: '60000',
+      averagePrice: null,
       status: 'canceled'
     });
   }
@@ -2207,6 +2207,118 @@ test('operator UI renders equal canceled-positive concurrent markets as HEDGED',
   assert.equal(browser.element('spot-actual-fill').textContent, '0.6');
   assert.equal(browser.element('contract-actual-fill').textContent, '0.6');
   assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI trusts a concurrent difference when only the larger market has an average', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174015';
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    mode: 'CONCURRENT',
+    state: 'WAITING_HEDGE'
+  });
+  const spot = browserOrderResponse(
+    strategyId,
+    'SPOT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174015'
+  );
+  setBrowserOrderSnapshot(spot, {
+    filledBaseQuantity: '0.7',
+    remainingBaseQuantity: '0.3',
+    averagePrice: '61234',
+    status: 'canceled'
+  });
+  const contract = browserOrderResponse(
+    strategyId,
+    'CONTRACT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174016'
+  );
+  setBrowserOrderSnapshot(contract, {
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '1',
+    averagePrice: null,
+    status: 'canceled'
+  });
+  const hedge = browserOrderResponse(
+    strategyId,
+    'CONTRACT_HEDGE_GTC',
+    '423e4567-e89b-42d3-a456-426614174017',
+    '0.7'
+  );
+  setBrowserOrderSnapshot(hedge, {
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '0.7',
+    averagePrice: null,
+    status: 'open'
+  });
+  status.orders = [spot, contract, hedge];
+  setBrowserActualFills(status, '0.7', '0', '0.7');
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url) => {
+    assert.equal(url, `/api/hedges/${strategyId}`);
+    return browserResponse(200, status);
+  });
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(browser.element('strategy-state').textContent, 'WAITING_HEDGE');
+  assert.equal(browser.element('spot-actual-fill').textContent, '0.7');
+  assert.equal(browser.element('contract-actual-fill').textContent, '0');
+});
+
+test('operator UI rejects a concurrent difference when the larger market average is missing', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174018';
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    mode: 'CONCURRENT',
+    state: 'WAITING_HEDGE'
+  });
+  const spot = browserOrderResponse(
+    strategyId,
+    'SPOT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174018'
+  );
+  setBrowserOrderSnapshot(spot, {
+    filledBaseQuantity: '0.7',
+    remainingBaseQuantity: '0.3',
+    averagePrice: null,
+    status: 'closed'
+  });
+  const contract = browserOrderResponse(
+    strategyId,
+    'CONTRACT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174019'
+  );
+  setBrowserOrderSnapshot(contract, {
+    filledBaseQuantity: '0.2',
+    remainingBaseQuantity: '0.8',
+    averagePrice: '61235',
+    status: 'closed'
+  });
+  const hedge = browserOrderResponse(
+    strategyId,
+    'CONTRACT_HEDGE_GTC',
+    '423e4567-e89b-42d3-a456-426614174020',
+    '0.5'
+  );
+  setBrowserOrderSnapshot(hedge, {
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '0.5',
+    averagePrice: null,
+    status: 'open'
+  });
+  status.orders = [spot, contract, hedge];
+  setBrowserActualFills(status, '0.7', '0.2', '0.5');
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async () => browserResponse(200, status));
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('refresh-button').disabled, true);
 });
 
 test('operator UI rejects a one-way preflight response as non-actionable', async () => {

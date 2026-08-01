@@ -28,6 +28,15 @@ export interface ExchangeGateway {
   ): Promise<OrderSnapshot | null>;
 }
 
+export class NoOrderSubmittedError extends Error {
+  readonly code = 'NO_ORDER_SUBMITTED';
+
+  constructor() {
+    super('order was not submitted');
+    this.name = 'NoOrderSubmittedError';
+  }
+}
+
 function parsedDecimal(value: string, field: string): Decimal {
   try {
     return decimal(value);

@@ -359,6 +359,19 @@ test('fails closed when margin or position mode is unknown', async () => {
   }
 });
 
+test('rejects flat OKX-style hedged settings when margin mode and leverage are not observable', async () => {
+  await assert.rejects(
+    setup({
+      accountSettings: {
+        marginMode: 'unknown',
+        positionMode: 'hedged',
+        leverage: null
+      }
+    }).service.run(input()),
+    /confirmed account settings/
+  );
+});
+
 test('rejects one-way contract accounts before returning a persistable preview', async () => {
   const { service } = setup({
     accountSettings: {

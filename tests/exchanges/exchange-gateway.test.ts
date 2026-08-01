@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   baseToExchangeAmount,
-  exchangeAmountToBase
+  exchangeAmountToBase,
+  NoOrderSubmittedError
 } from '../../src/exchanges/exchange-gateway.js';
 import type {
   MarketRules,
@@ -13,6 +14,12 @@ import type {
 } from '../../src/domain/types.js';
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 import { order } from '../support/order-fixtures.js';
+
+function isNoOrderSubmitted(error: unknown): boolean {
+  assert(error instanceof NoOrderSubmittedError);
+  assert.equal(error.message, 'order was not submitted');
+  return true;
+}
 
 test('converts perpetual contracts to and from base quantity', () => {
   assert.equal(baseToExchangeAmount('0.015', '0.001'), '15');
@@ -249,7 +256,7 @@ test('fake gateway rejects unsafe create quantities before submission side effec
         baseQuantity,
         clientOrderId: `invalid-${baseQuantity}`
       }),
-      /OrderRequest\.baseQuantity/
+      isNoOrderSubmitted
     );
 
     assert.deepEqual(gateway.createdRequests, []);
@@ -449,7 +456,7 @@ test('fake gateway rejects swap orders without a confirmed margin mode', async (
 
   await assert.rejects(
     gateway.createOrder(request),
-    /swap order requires.*margin mode/
+    isNoOrderSubmitted
   );
   assert.deepEqual(gateway.createdRequests, []);
 });

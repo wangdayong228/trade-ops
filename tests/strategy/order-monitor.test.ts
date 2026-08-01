@@ -259,6 +259,11 @@ function fixture(t: TestContext): Fixture {
   const repository = new SqliteStrategyRepository(database);
   const spot = new MonitorGateway('bitget');
   const contract = new MonitorGateway('okx');
+  contract.accountSettings = {
+    marginMode: 'cross',
+    positionMode: 'hedged',
+    leverage: '2'
+  };
   const registry = new ExchangeRegistry(new Map([
     ['bitget', spot],
     ['okx', contract]
@@ -777,6 +782,159 @@ test('restart monitor preserves an executable concurrent difference topology for
   ).confirmAndExecute(strategy.id);
   assert.equal(f.contract.createdRequests.length, 1);
   assert.equal(f.spot.createdRequests.length, 0);
+});
+
+test('restart monitor continues a reliable concurrent positive-zero topology exactly once', async (t) => {
+  for (const positiveStatus of ['closed', 'canceled'] as const) {
+    await t.test(positiveStatus, async (t) => {
+      const f = fixture(t);
+      const strategy = createStrategy(f.repository, 'CONCURRENT');
+      planOrder(
+        f.repository,
+        strategy.id,
+        'SPOT_MARKET',
+        '1',
+        snapshotFor(
+          strategy.id,
+          'SPOT_MARKET',
+          '1',
+          '0.7',
+          '0.3',
+          positiveStatus,
+          { averagePrice: '61111' }
+        )
+      );
+      planOrder(
+        f.repository,
+        strategy.id,
+        'CONTRACT_MARKET',
+        '1',
+        snapshotFor(
+          strategy.id,
+          'CONTRACT_MARKET',
+          '1',
+          '0',
+          '1',
+          'canceled',
+          { averagePrice: null }
+        )
+      );
+      f.contract.createResults.push(snapshotFor(
+        strategy.id,
+        'CONTRACT_HEDGE_GTC',
+        '0.7',
+        '0',
+        '0.7',
+        'open',
+        { averagePrice: null }
+      ));
+      const coordinator = new HedgeCoordinator(f.registry, f.repository);
+      const monitor = new OrderMonitor(
+        f.registry,
+        f.repository,
+        coordinator
+      );
+
+      await monitor.recover();
+
+      assert.equal(f.repository.getStrategy(strategy.id).state, 'WAITING_HEDGE');
+      assert.equal(f.contract.createdRequests.length, 1);
+      assert.equal(f.contract.createdRequests[0]?.baseQuantity, '0.7');
+      assert.equal(f.contract.createdRequests[0]?.price, '61111');
+      await monitor.recover();
+      assert.equal(f.contract.createdRequests.length, 1);
+      assert.equal(f.spot.createdRequests.length, 0);
+    });
+  }
+});
+
+test('restart reconciliation uses topology-dependent concurrent averages', async (t) => {
+  await t.test('equal positive terminals need no averages', async (t) => {
+    const f = fixture(t);
+    const strategy = createStrategy(f.repository, 'CONCURRENT');
+    for (const [role, status] of [
+      ['SPOT_MARKET', 'closed'],
+      ['CONTRACT_MARKET', 'canceled']
+    ] as const) {
+      planOrder(
+        f.repository,
+        strategy.id,
+        role,
+        '1',
+        snapshotFor(
+          strategy.id,
+          role,
+          '1',
+          '0.6',
+          '0.4',
+          status,
+          { averagePrice: null }
+        )
+      );
+    }
+
+    await new OrderMonitor(f.registry, f.repository)
+      .reconcileStrategy(strategy.id);
+
+    assert.equal(f.repository.getStrategy(strategy.id).state, 'HEDGED');
+    assertNoCreates(f);
+  });
+
+  await t.test('unequal terminals need only the larger average', async (t) => {
+    const f = fixture(t);
+    const strategy = createStrategy(f.repository, 'CONCURRENT');
+    planOrder(
+      f.repository,
+      strategy.id,
+      'SPOT_MARKET',
+      '1',
+      snapshotFor(
+        strategy.id,
+        'SPOT_MARKET',
+        '1',
+        '0.8',
+        '0.2',
+        'canceled',
+        { averagePrice: '61234' }
+      )
+    );
+    planOrder(
+      f.repository,
+      strategy.id,
+      'CONTRACT_MARKET',
+      '1',
+      snapshotFor(
+        strategy.id,
+        'CONTRACT_MARKET',
+        '1',
+        '0.5',
+        '0.5',
+        'closed',
+        { averagePrice: null }
+      )
+    );
+    f.contract.createResults.push(snapshotFor(
+      strategy.id,
+      'CONTRACT_HEDGE_GTC',
+      '0.3',
+      '0',
+      '0.3',
+      'open',
+      { averagePrice: null }
+    ));
+    const coordinator = new HedgeCoordinator(f.registry, f.repository);
+
+    await new OrderMonitor(
+      f.registry,
+      f.repository,
+      coordinator
+    ).recover();
+
+    assert.equal(f.repository.getStrategy(strategy.id).state, 'WAITING_HEDGE');
+    assert.equal(f.contract.createdRequests.length, 1);
+    assert.equal(f.contract.createdRequests[0]?.baseQuantity, '0.3');
+    assert.equal(f.contract.createdRequests[0]?.price, '61234');
+  });
 });
 
 test('start automatically continues a terminal sequential market exactly once', async (t) => {

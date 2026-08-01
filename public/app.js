@@ -927,14 +927,12 @@ function isTrustedSequentialFirst(order) {
   );
 }
 
-function isTrustedConcurrentMarket(order) {
+function isReliableTerminalConcurrentMarket(order) {
   const snapshot = order?.snapshot;
   return (
     snapshot !== null
     && snapshot !== undefined
     && (snapshot.status === 'closed' || snapshot.status === 'canceled')
-    && compareDecimals(snapshot.filledBaseQuantity, '0') > 0
-    && snapshot.averagePrice !== null
   );
 }
 
@@ -1012,14 +1010,18 @@ function orderExecutionMatchesStrategy(strategy, orders, actualFills) {
     return (
       strategy.state !== 'HEDGED'
       || (
-        isTrustedConcurrentMarket(spot)
-        && isTrustedConcurrentMarket(contract)
+        isReliableTerminalConcurrentMarket(spot)
+        && isReliableTerminalConcurrentMarket(contract)
+        && compareDecimals(
+          spot.snapshot.filledBaseQuantity,
+          contract.snapshot.filledBaseQuantity
+        ) === 0
       )
     );
   }
   if (
-    !isTrustedConcurrentMarket(spot)
-    || !isTrustedConcurrentMarket(contract)
+    !isReliableTerminalConcurrentMarket(spot)
+    || !isReliableTerminalConcurrentMarket(contract)
   ) {
     return false;
   }
@@ -1033,8 +1035,10 @@ function orderExecutionMatchesStrategy(strategy, orders, actualFills) {
   const expectedRole = fillComparison > 0
     ? 'CONTRACT_HEDGE_GTC'
     : 'SPOT_HEDGE_GTC';
+  const largerMarket = fillComparison > 0 ? spot : contract;
   return (
     hedge.role === expectedRole
+    && largerMarket.snapshot.averagePrice !== null
     && decimalPartsEqual(
       absoluteDecimalDifference(
         decimalParts(spot.snapshot.filledBaseQuantity),
