@@ -3,16 +3,26 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import type {
+  FastifyBaseLogger,
   FastifyInstance,
   FastifyListenOptions,
   FastifyServerOptions
 } from 'fastify';
+import type { Logger } from 'pino';
+import { loadEnvironmentFile } from './config/environment-loader.js';
 import type { ExchangeCredentials } from './config/exchange-credentials.js';
 import { loadExchangeCredentials } from './config/exchange-credentials.js';
 import { CcxtExchangeGateway } from './exchanges/ccxt-exchange-gateway.js';
 import type { ExchangeGateway } from './exchanges/exchange-gateway.js';
 import { ExchangeRegistry } from './exchanges/exchange-registry.js';
 import { buildServer } from './http/server.js';
+import {
+  configuredSecretValues,
+  createAppLogger,
+  createOperationalLog,
+  type OperationalFields,
+  type OperationalLog
+} from './logging/logger.js';
 import { SqliteStrategyRepository } from './storage/sqlite-strategy-repository.js';
 import { HedgeCoordinator } from './strategy/hedge-coordinator.js';
 import { OrderMonitor } from './strategy/order-monitor.js';
@@ -43,6 +53,8 @@ export interface ComposeServiceOptions {
   readonly databaseFactory?: DatabaseFactory;
   readonly clock?: Clock;
   readonly logger?: FastifyServerOptions['logger'];
+  readonly loggerInstance?: Logger;
+  readonly operationalLog?: OperationalLog;
   readonly publicDirectory?: string;
 }
 
@@ -61,6 +73,8 @@ export interface RunnableComposition {
   readonly config: {
     readonly host: '127.0.0.1' | '::1';
     readonly port: number;
+    readonly databasePath?: string;
+    readonly exchangeIds?: readonly string[];
   };
   readonly monitor: {
     start(intervalMs: number): () => void;
@@ -93,6 +107,7 @@ export interface StartServiceOptions {
     server: RunnableComposition['server'],
     options: FastifyListenOptions
   ) => Promise<unknown>;
+  readonly operationalLog?: OperationalLog;
 }
 
 export interface StartedService<T extends RunnableComposition> {
@@ -112,6 +127,22 @@ const DEFAULT_DATABASE_PATH = './data/trade-ops.sqlite';
 const DEFAULT_HOST: RuntimeConfig['host'] = '127.0.0.1';
 const DEFAULT_PORT = 3000;
 const MONITOR_INTERVAL_MS = 5000;
+
+export interface ResolvedRuntimeEnvironment {
+  readonly env: NodeJS.ProcessEnv;
+  readonly fileStatus: 'loaded' | 'missing' | 'skipped';
+}
+
+export function resolveRuntimeEnvironment(
+  explicitEnv: NodeJS.ProcessEnv | undefined,
+  load: typeof loadEnvironmentFile = loadEnvironmentFile
+): ResolvedRuntimeEnvironment {
+  if (explicitEnv !== undefined) {
+    return { env: explicitEnv, fileStatus: 'skipped' };
+  }
+  const fileStatus = load({ processEnv: process.env });
+  return { env: process.env, fileStatus };
+}
 
 function invalidConfiguration(field: string): never {
   throw new Error(`invalid ${field} configuration`);
@@ -248,12 +279,22 @@ export function composeService(
     const preflightService = new PreflightService(registry, clock);
     const coordinator = new HedgeCoordinator(registry, repository);
     const monitor = new OrderMonitor(registry, repository, coordinator);
+    const operationalLog = options.operationalLog
+      ?? (options.loggerInstance === undefined
+        ? undefined
+        : createOperationalLog(
+            options.loggerInstance,
+            () => configuredSecretValues(env)
+          ));
     const server = buildServer({
       registry,
       preflightService,
       repository,
       coordinator,
-      ...(options.logger === undefined ? {} : { logger: options.logger }),
+      ...(options.loggerInstance === undefined
+        ? (options.logger === undefined ? {} : { logger: options.logger })
+        : { loggerInstance: options.loggerInstance as FastifyBaseLogger }),
+      ...(operationalLog === undefined ? {} : { operationalLog }),
       ...(options.publicDirectory === undefined
         ? {}
         : { publicDirectory: options.publicDirectory })
@@ -290,6 +331,17 @@ export async function startService<T extends RunnableComposition>(
 ): Promise<StartedService<T>> {
   const signalTarget = options.signalTarget ?? processSignalTarget();
   const listen = options.listen ?? defaultListen;
+  const operationalLog = options.operationalLog;
+  const runtimeFields: Readonly<OperationalFields> = {
+    host: composition.config.host,
+    port: composition.config.port,
+    ...(composition.config.databasePath === undefined
+      ? {}
+      : { databasePath: composition.config.databasePath }),
+    ...(composition.config.exchangeIds === undefined
+      ? {}
+      : { exchangeIds: composition.config.exchangeIds })
+  };
   let signalsInstalled = false;
   let shutdownPromise: Promise<void> | null = null;
 
@@ -321,12 +373,17 @@ export async function startService<T extends RunnableComposition>(
     }
     removeSignalListeners();
     if (firstError !== undefined) {
+      operationalLog?.error('service_stop_failed', firstError, runtimeFields);
       throw firstError;
     }
+    operationalLog?.info('service_stopped', runtimeFields);
   };
 
   const shutdown = (): Promise<void> => {
-    shutdownPromise ??= closeResources();
+    if (shutdownPromise === null) {
+      operationalLog?.info('service_stopping', runtimeFields);
+      shutdownPromise = closeResources();
+    }
     return shutdownPromise;
   };
 
@@ -341,13 +398,16 @@ export async function startService<T extends RunnableComposition>(
   signalTarget.on('SIGTERM', handleSignal);
   signalsInstalled = true;
   try {
+    operationalLog?.info('service_starting', runtimeFields);
     composition.monitor.start(MONITOR_INTERVAL_MS);
     await listen(composition.server, {
       host: composition.config.host,
       port: composition.config.port
     });
+    operationalLog?.info('service_started', runtimeFields);
     return { composition, shutdown };
   } catch (startupError) {
+    operationalLog?.error('service_start_failed', startupError, runtimeFields);
     try {
       await shutdown();
     } catch {
@@ -360,8 +420,26 @@ export async function startService<T extends RunnableComposition>(
 export async function run(
   options: RunOptions = {}
 ): Promise<StartedService<ServiceComposition>> {
-  const composition = composeService(options);
-  return startService(composition, options);
+  const runtime = resolveRuntimeEnvironment(options.env);
+  const operationalLog = options.operationalLog
+    ?? (options.loggerInstance === undefined
+      ? undefined
+      : createOperationalLog(
+          options.loggerInstance,
+          () => configuredSecretValues(runtime.env)
+        ));
+  if (runtime.fileStatus === 'loaded') {
+    operationalLog?.info('environment_loaded');
+  } else if (runtime.fileStatus === 'missing') {
+    operationalLog?.info('environment_file_missing');
+  }
+  const resolvedOptions = {
+    ...options,
+    env: runtime.env,
+    ...(operationalLog === undefined ? {} : { operationalLog })
+  };
+  const composition = composeService(resolvedOptions);
+  return startService(composition, resolvedOptions);
 }
 
 export function isEntrypoint(
@@ -373,8 +451,14 @@ export function isEntrypoint(
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) {
-  void run().catch(() => {
-    process.exitCode = 1;
-    console.error('trade-ops service startup failed');
-  });
+  const logger = createAppLogger();
+  const operations = createOperationalLog(
+    logger,
+    () => configuredSecretValues(process.env)
+  );
+  void run({ loggerInstance: logger, operationalLog: operations })
+    .catch((error) => {
+      process.exitCode = 1;
+      operations.fatal('service_startup_failed', error);
+    });
 }

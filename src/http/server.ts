@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import staticPlugin from '@fastify/static';
 import { Decimal } from 'decimal.js';
 import Fastify, {
+  type FastifyBaseLogger,
   type FastifyInstance,
   type FastifyServerOptions
 } from 'fastify';
@@ -23,7 +24,10 @@ import type {
   PreflightResult,
   PreflightService
 } from '../strategy/preflight-service.js';
-import { LOGGER_REDACT_PATHS } from '../logging/logger.js';
+import {
+  LOGGER_REDACT_PATHS,
+  type OperationalLog
+} from '../logging/logger.js';
 
 export { LOGGER_REDACT_PATHS } from '../logging/logger.js';
 
@@ -33,6 +37,8 @@ export interface BuildServerDependencies {
   readonly repository: StrategyRepository;
   readonly coordinator: Pick<HedgeCoordinator, 'confirmAndExecute'>;
   readonly logger?: FastifyServerOptions['logger'];
+  readonly loggerInstance?: FastifyBaseLogger;
+  readonly operationalLog?: OperationalLog;
   readonly publicDirectory?: string;
 }
 
@@ -446,10 +452,15 @@ function matchingLoopbackOrigin(
 export function buildServer(
   dependencies: BuildServerDependencies
 ): FastifyInstance {
+  const loggerOptions = dependencies.loggerInstance === undefined
+    ? {
+        logger: dependencies.logger ?? {
+          redact: [...LOGGER_REDACT_PATHS]
+        }
+      }
+    : { loggerInstance: dependencies.loggerInstance };
   const app = Fastify({
-    logger: dependencies.logger ?? {
-      redact: [...LOGGER_REDACT_PATHS]
-    },
+    ...loggerOptions,
     ajv: {
       customOptions: {
         coerceTypes: false,
@@ -470,8 +481,12 @@ export function buildServer(
       setImmediate(resolveTask);
     })
       .then(async () => dependencies.coordinator.confirmAndExecute(strategyId))
-      .catch(() => {
-        app.log.error('Background hedge execution failed');
+      .catch((error: unknown) => {
+        dependencies.operationalLog?.error(
+          'background_confirmation_failed',
+          error,
+          { strategyId }
+        );
       })
       .finally(() => {
         queuedStrategyIds.delete(strategyId);
@@ -532,7 +547,7 @@ export function buildServer(
     await Promise.allSettled([...backgroundTasks]);
   });
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (error instanceof StrategyNotFoundError) {
       void reply.status(404).send({
         code: 'STRATEGY_NOT_FOUND',
@@ -550,7 +565,15 @@ export function buildServer(
       });
       return;
     }
-    app.log.error('Unhandled HTTP request failure');
+    dependencies.operationalLog?.error(
+      'unhandled_http_request_failure',
+      error,
+      {
+        requestId: request.id,
+        method: request.method,
+        url: request.url
+      }
+    );
     void reply.status(500).send({
       code: 'INTERNAL_ERROR',
       message: 'Internal server error'

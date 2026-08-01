@@ -1,17 +1,23 @@
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import {
   composeService,
   loadRuntimeConfig,
+  resolveRuntimeEnvironment,
   startService
 } from '../src/main.js';
+import type {
+  OperationalFields,
+  OperationalLog
+} from '../src/logging/logger.js';
 import { FakeExchangeGateway } from './support/fake-exchange-gateway.js';
 
 const VALID_ENV = {
@@ -278,6 +284,27 @@ class SignalTarget extends EventEmitter {
   exitCode: number | undefined;
 }
 
+interface CapturedOperation {
+  readonly level: 'info' | 'error' | 'fatal';
+  readonly event: string;
+  readonly error?: unknown;
+  readonly fields: Readonly<OperationalFields> | undefined;
+}
+
+function captureOperationalLog(entries: CapturedOperation[]): OperationalLog {
+  return {
+    info(event, fields): void {
+      entries.push({ level: 'info', event, fields });
+    },
+    error(event, error, fields): void {
+      entries.push({ level: 'error', event, error, fields });
+    },
+    fatal(event, error, fields): void {
+      entries.push({ level: 'fatal', event, error, fields });
+    }
+  };
+}
+
 function runnableFixture(events: string[]) {
   let monitorStarts = 0;
   let monitorStops = 0;
@@ -287,7 +314,9 @@ function runnableFixture(events: string[]) {
     composition: {
       config: {
         host: '127.0.0.1' as const,
-        port: 3000
+        port: 3000,
+        databasePath: './fixture.sqlite',
+        exchangeIds: ['bitget', 'okx']
       },
       monitor: {
         start(intervalMs: number): () => void {
@@ -324,6 +353,157 @@ function runnableFixture(events: string[]) {
     })
   };
 }
+
+test('explicit runtime environments skip dotenv loading and preserve identity', () => {
+  const explicitEnv: NodeJS.ProcessEnv = {};
+  let loaderCalls = 0;
+
+  const resolved = resolveRuntimeEnvironment(explicitEnv, () => {
+    loaderCalls += 1;
+    return 'loaded';
+  });
+
+  assert.equal(resolved.env, explicitEnv);
+  assert.equal(resolved.fileStatus, 'skipped');
+  assert.equal(loaderCalls, 0);
+});
+
+test('logs one successful service lifecycle with safe runtime fields', async () => {
+  const events: string[] = [];
+  const operations: CapturedOperation[] = [];
+  const fixture = runnableFixture(events);
+  const started = await startService(fixture.composition, {
+    signalTarget: new SignalTarget(),
+    operationalLog: captureOperationalLog(operations),
+    listen: async () => {
+      events.push('listen');
+    }
+  });
+
+  await started.shutdown();
+  await started.shutdown();
+
+  assert.deepEqual(operations.map(({ event }) => event), [
+    'service_starting',
+    'service_started',
+    'service_stopping',
+    'service_stopped'
+  ]);
+  for (const operation of operations) {
+    assert.deepEqual(operation.fields, {
+      host: '127.0.0.1',
+      port: 3000,
+      databasePath: './fixture.sqlite',
+      exchangeIds: ['bitget', 'okx']
+    });
+  }
+});
+
+test('listen failures are logged before idempotent cleanup', async () => {
+  const events: string[] = [];
+  const operations: CapturedOperation[] = [];
+  const fixture = runnableFixture(events);
+  const failure = new Error('address unavailable');
+
+  await assert.rejects(
+    startService(fixture.composition, {
+      signalTarget: new SignalTarget(),
+      operationalLog: captureOperationalLog(operations),
+      listen: async () => {
+        throw failure;
+      }
+    }),
+    (error: unknown) => error === failure
+  );
+
+  assert.deepEqual(operations.map(({ event }) => event), [
+    'service_starting',
+    'service_start_failed',
+    'service_stopping',
+    'service_stopped'
+  ]);
+  assert.equal(operations[1]?.error, failure);
+});
+
+interface ChildResult {
+  readonly code: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+function runEntrypoint(cwd: string): Promise<ChildResult> {
+  const entrypoint = resolve(process.cwd(), 'dist/src/main.js');
+  return new Promise((resolveChild, rejectChild) => {
+    const child = spawn(process.execPath, [entrypoint], {
+      cwd,
+      env: process.env.PATH === undefined ? {} : { PATH: process.env.PATH },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once('error', rejectChild);
+    child.once('close', (code) => {
+      resolveChild({ code, stdout, stderr });
+    });
+  });
+}
+
+function parseJsonLines(output: string): Array<Record<string, unknown>> {
+  return output.trim().split('\n').filter(Boolean).map((line) => (
+    JSON.parse(line) as Record<string, unknown>
+  ));
+}
+
+test('entrypoint loads dotenv and logs a safe actionable startup failure', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'trade-ops-entrypoint-env-'));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  await writeFile(
+    join(cwd, '.env'),
+    'TRADING_EXCHANGES=bitget,okx\n',
+    { mode: 0o600 }
+  );
+
+  const result = await runEntrypoint(cwd);
+  const lines = parseJsonLines(result.stdout);
+
+  assert.equal(result.code, 1);
+  assert.equal(result.stderr, '');
+  assert.deepEqual(lines.map(({ event }) => event), [
+    'environment_loaded',
+    'service_startup_failed'
+  ]);
+  assert.deepEqual(lines[1]?.error, {
+    type: 'Error',
+    message: 'missing credentials for configured exchange bitget',
+    stack: (lines[1]?.error as Record<string, unknown>)?.stack
+  });
+  assert.doesNotMatch(result.stdout, /trade-ops service startup failed/);
+});
+
+test('entrypoint reports a missing environment file before invalid config', async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'trade-ops-entrypoint-missing-'));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+
+  const result = await runEntrypoint(cwd);
+  const lines = parseJsonLines(result.stdout);
+  const failure = lines[1]?.error as Record<string, unknown> | undefined;
+
+  assert.equal(result.code, 1);
+  assert.equal(result.stderr, '');
+  assert.deepEqual(lines.map(({ event }) => event), [
+    'environment_file_missing',
+    'service_startup_failed'
+  ]);
+  assert.equal(failure?.message, 'invalid TRADING_EXCHANGES configuration');
+});
 
 test('starts monitoring before loopback listen and installs each signal once', async () => {
   const events: string[] = [];
@@ -414,6 +594,7 @@ test('a signal during listen is owned by the same idempotent shutdown', async ()
 
 test('repeated signals remain owned until gated shutdown completes', async () => {
   const events: string[] = [];
+  const operations: CapturedOperation[] = [];
   const fixture = runnableFixture(events);
   const signals = new SignalTarget();
   let monitorStopCalls = 0;
@@ -428,6 +609,7 @@ test('repeated signals remain owned until gated shutdown completes', async () =>
   };
   const started = await startService(fixture.composition, {
     signalTarget: signals,
+    operationalLog: captureOperationalLog(operations),
     listen: async () => {
       events.push('listen');
     }
@@ -466,6 +648,12 @@ test('repeated signals remain owned until gated shutdown completes', async () =>
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
   assert.equal(signals.exitCode, 0);
+  assert.deepEqual(operations.map(({ event }) => event), [
+    'service_starting',
+    'service_started',
+    'service_stopping',
+    'service_stopped'
+  ]);
 });
 
 test('listen failure stops monitoring and closes server and database', async () => {
@@ -503,6 +691,7 @@ test('listen failure stops monitoring and closes server and database', async () 
 
 test('shutdown still closes SQLite when Fastify close fails', async () => {
   const events: string[] = [];
+  const operations: CapturedOperation[] = [];
   const fixture = runnableFixture(events);
   fixture.composition.server.close = async () => {
     events.push('server.close');
@@ -510,6 +699,7 @@ test('shutdown still closes SQLite when Fastify close fails', async () => {
   };
   const started = await startService(fixture.composition, {
     signalTarget: new SignalTarget(),
+    operationalLog: captureOperationalLog(operations),
     listen: async () => {
       events.push('listen');
     }
@@ -526,4 +716,14 @@ test('shutdown still closes SQLite when Fastify close fails', async () => {
     'server.close',
     'database.close'
   ]);
+  assert.deepEqual(operations.map(({ event }) => event), [
+    'service_starting',
+    'service_started',
+    'service_stopping',
+    'service_stop_failed'
+  ]);
+  assert.equal(
+    (operations[3]?.error as Error | undefined)?.message,
+    'server close failed'
+  );
 });
