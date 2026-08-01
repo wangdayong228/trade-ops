@@ -1425,11 +1425,11 @@ git commit -m "feat: deliver cross-exchange hedge opening"
 
 ## Final Verification Gate
 
-- [ ] Run `npm test` and confirm every test passes.
-- [ ] Run `npm run build` and confirm strict TypeScript compilation succeeds.
-- [ ] Inspect `git status --short` and confirm no generated `dist/`, SQLite database, credential file, or unrelated file is staged.
-- [ ] Confirm logs and SQLite rows contain no API key, secret, password, or request signature.
-- [ ] Confirm every strategy order role is unique and duplicate confirmation cannot create a second order.
-- [ ] Confirm all three UI execution modes map to the matching coordinator branch.
-- [ ] Confirm no path automatically cancels, reprices, resubmits, rolls back, or closes a GTC hedge.
-- [ ] Confirm `HEDGED` requires equal, positive base fills produced by this strategy’s orders.
+- [x] Run `npm test` and confirm every test passes.
+- [x] Run `npm run build` and confirm strict TypeScript compilation succeeds.
+- [x] Inspect `git status --short` and confirm no generated `dist/`, SQLite database, credential file, or unrelated file is staged.
+- [x] Confirm logs and SQLite rows contain no API key, secret, password, or request signature.
+- [x] Confirm every strategy order role is unique and duplicate confirmation cannot create a second order.
+- [x] Confirm all three UI execution modes map to the matching coordinator branch.
+- [x] Confirm no path automatically cancels, reprices, resubmits, rolls back, or closes a GTC hedge.
+- [x] Confirm `HEDGED` requires equal, positive base fills produced by this strategy’s orders.
