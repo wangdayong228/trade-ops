@@ -294,7 +294,8 @@ export function composeService(
       ?? (options.loggerInstance === undefined
         ? NOOP_TRADE_EVENT_SINK
         : new PinoTradeEventSink(
-            options.loggerInstance.child({ component: 'trade' })
+            options.loggerInstance.child({ component: 'trade' }),
+            () => configuredSecretValues(env)
           ));
     const coordinator = new HedgeCoordinator(
       registry,

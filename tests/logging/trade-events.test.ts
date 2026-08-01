@@ -197,3 +197,23 @@ test('trade logging failures and the no-op sink never propagate', () => {
   assert.doesNotThrow(() => NOOP_TRADE_EVENT_SINK.record(event));
   assert.equal(Object.isFrozen(NOOP_TRADE_EVENT_SINK), true);
 });
+
+test('Pino trade output replaces credential values inside error classifications', () => {
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+  const sink = new PinoTradeEventSink(
+    logger,
+    () => ['credential-value']
+  );
+  const event = orderEvent('order_submit_uncertain', ORDER, null, {
+    failureCode: 'ORDER_SUBMISSION_UNKNOWN',
+    errorType: 'ExchangeError-credential-value',
+    errorCode: 'credential-value'
+  });
+
+  sink.record(event);
+
+  const line = output.join('');
+  assert.doesNotMatch(line, /credential-value/);
+  assert.match(line, /\[Redacted\]/);
+});

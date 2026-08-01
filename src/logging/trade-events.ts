@@ -133,7 +133,20 @@ export function orderEvent(
   return output;
 }
 
-function allowlistedEvent(event: Readonly<TradeEvent>): Record<string, unknown> {
+function redactText(value: string, secrets: readonly string[]): string {
+  let redacted = value;
+  for (const secret of secrets) {
+    if (secret.length !== 0) {
+      redacted = redacted.replaceAll(secret, '[Redacted]');
+    }
+  }
+  return redacted;
+}
+
+function allowlistedEvent(
+  event: Readonly<TradeEvent>,
+  secrets: readonly string[]
+): Record<string, unknown> {
   const output: Record<string, unknown> = {
     event: event.event,
     strategyId: event.strategyId,
@@ -176,21 +189,33 @@ function allowlistedEvent(event: Readonly<TradeEvent>): Record<string, unknown> 
   if (event.failureCode !== undefined) {
     output.failureCode = event.failureCode;
   }
-  if (event.errorType !== undefined) output.errorType = event.errorType;
-  if (event.errorCode !== undefined) output.errorCode = event.errorCode;
+  if (event.errorType !== undefined) {
+    output.errorType = redactText(event.errorType, secrets);
+  }
+  if (event.errorCode !== undefined) {
+    output.errorCode = redactText(event.errorCode, secrets);
+  }
   return output;
 }
 
 export class PinoTradeEventSink implements TradeEventSink {
   readonly #logger: Pick<Logger, 'info'>;
+  readonly #secretProvider: () => readonly string[];
 
-  constructor(logger: Pick<Logger, 'info'>) {
+  constructor(
+    logger: Pick<Logger, 'info'>,
+    secretProvider: () => readonly string[] = () => []
+  ) {
     this.#logger = logger;
+    this.#secretProvider = secretProvider;
   }
 
   record(event: Readonly<TradeEvent>): void {
     try {
-      this.#logger.info(allowlistedEvent(event), event.event);
+      this.#logger.info(
+        allowlistedEvent(event, this.#secretProvider()),
+        event.event
+      );
     } catch {
       // Logging is never allowed to change order execution behavior.
     }
