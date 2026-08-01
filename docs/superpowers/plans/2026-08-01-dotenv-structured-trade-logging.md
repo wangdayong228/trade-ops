@@ -430,11 +430,11 @@ git commit -m "feat: define safe trade lifecycle events"
 - Changes constructor to: `new HedgeCoordinator(registry, repository, tradeEvents?)`
 - Existing two-argument construction remains valid through `NOOP_TRADE_EVENT_SINK`.
 
-- [ ] **Step 1: Add a capturing sink to the coordinator fixture**
+- [x] **Step 1: Add a capturing sink to the coordinator fixture**
 
 Add `tradeEvents?: TradeEventSink` to setup options, store `structuredClone(event)` in a test sink, and pass it as the optional third constructor argument.
 
-- [ ] **Step 2: Write failing successful lifecycle tests**
+- [x] **Step 2: Write failing successful lifecycle tests**
 
 Table-drive `CONTRACT_FIRST`, `SPOT_FIRST`, and `CONCURRENT` so every mode proves that each fresh market order emits the lifecycle. For one persisted terminal market order assert:
 
@@ -450,11 +450,11 @@ assert.deepEqual(events.map(({ event }) => event), [
 
 Assert all correlation, mode/state, and normalized quantity/price/status fields. In concurrent mode, assert both `order_planned` events precede either submit-start event. Add a filled sequential first leg that derives a GTC and assert the GTC receives its own full planned/submit/result/status lifecycle.
 
-- [ ] **Step 3: Write failing boundary and side-effect tests**
+- [x] **Step 3: Write failing boundary and side-effect tests**
 
 Assert `NoOrderSubmittedError` emits `order_rejected_before_submit`/`ORDER_SUBMISSION_FAILED`; a generic create error emits `order_submit_uncertain`/`ORDER_SUBMISSION_UNKNOWN`; recovered intent emits no new planned/submit-started event; a throwing sink preserves strategy state and exact create count.
 
-- [ ] **Step 4: Run RED**
+- [x] **Step 4: Run RED**
 
 Run:
 
@@ -465,15 +465,15 @@ node --test dist/tests/strategy/hedge-coordinator.test.js
 
 Expected: new event assertions fail while existing execution assertions remain unchanged.
 
-- [ ] **Step 5: Emit planning and submission events at exact boundaries**
+- [x] **Step 5: Emit planning and submission events at exact boundaries**
 
 Add optional sink dependency. Emit planned only after `planOrder` returns; after atomic planning emit both returned records before submitting either. Emit submit-started immediately before `gateway.createOrder`. In catches emit only the typed failure code plus error name/code, never raw error/message/object.
 
-- [ ] **Step 6: Emit persisted result/status/terminal events**
+- [x] **Step 6: Emit persisted result/status/terminal events**
 
 Add `source: 'submission' | 'lookup'` to `persistSnapshot`. Immediately after `attachOrderSnapshot` succeeds, emit submit-succeeded for submission source, then status-changed, then terminal for closed/canceled/rejected. All earlier returns emit none. Direct create paths pass submission; lookup paths pass lookup.
 
-- [ ] **Step 7: Verify GREEN and commit**
+- [x] **Step 7: Verify GREEN and commit**
 
 Run:
 
