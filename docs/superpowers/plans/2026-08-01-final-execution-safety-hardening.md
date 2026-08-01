@@ -125,6 +125,17 @@
 - [x] Prioritize a concurrent typed failure over an uncertain companion and terminalize possible exposure without retrying either persisted role.
 - [x] Return malformed direct `unknown` snapshot failures before lookup recovery can mask them.
 
+## Review Follow-up: Open Exposure and Atomic Concurrent Planning
+
+- [x] Add a coordinator regression for typed rejection plus a direct `open`/zero-fill companion and verify RED as `FAILED` instead of `HEDGE_INCOMPLETE`.
+- [x] Classify a non-terminal direct companion snapshot as possible exposure and verify the focused rejection tests GREEN.
+- [x] Add a SQLite regression that fails the second concurrent intent and verify RED while the atomic batch API is absent.
+- [x] Add a coordinator regression proving the old two-call path leaves one planned spot intent after the second insert fails.
+- [x] Add the explicit all-or-nothing `planOrdersAtomically` repository contract and implement it with one outer SQLite transaction.
+- [x] Use one atomic planning call only for fresh concurrent market intents; retain lookup-only behavior when recovery finds one persisted role.
+- [x] Verify rollback leaves no order, retry creates each leg once, and the existing single-role recovery regression remains GREEN.
+- [x] Re-run storage, coordinator, monitor, HTTP/browser, full test, build, and diff checks after the follow-up changes.
+
 ## Final Verification
 
 - [x] Run formatting/type build checks used by the repository.

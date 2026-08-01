@@ -526,6 +526,40 @@ test('plans one order for each valid strategy role', (t) => {
   assert.equal(repository.listOrders(id).length, 4);
 });
 
+test('rolls back every order when atomic planning fails on a later intent', (t) => {
+  const { database, repository } = setup(t);
+  const strategyId = repository.createPending(preflight({
+    mode: 'CONCURRENT'
+  })).id;
+  database.exec(`
+    CREATE TRIGGER fail_contract_plan
+    BEFORE INSERT ON strategy_orders
+    WHEN NEW.role = 'CONTRACT_MARKET'
+    BEGIN
+      SELECT RAISE(ABORT, 'second plan failed');
+    END;
+  `);
+  let planningError: unknown;
+  try {
+    repository.planOrdersAtomically(strategyId, [
+      {
+        role: 'SPOT_MARKET',
+        request: requestFor(strategyId, 'SPOT_MARKET')
+      },
+      {
+        role: 'CONTRACT_MARKET',
+        request: requestFor(strategyId, 'CONTRACT_MARKET')
+      }
+    ]);
+  } catch (error) {
+    planningError = error;
+  }
+
+  assert.ok(planningError instanceof Error);
+  assert.match(planningError.message, /second plan failed/);
+  assert.deepEqual(repository.listOrders(strategyId), []);
+});
+
 test('rejects duplicate roles and client IDs that do not belong to the saved role', (t) => {
   const { repository } = setup(t);
   const id = repository.createPending(preflight()).id;

@@ -17,6 +17,7 @@ import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
 import type {
   StrategyFailureCode,
+  StrategyOrderPlan,
   StrategyOrderRecord,
   StrategyRecord,
   StrategyRepository
@@ -387,6 +388,13 @@ class RepositoryProxy implements StrategyRepository {
     request: OrderRequest
   ): StrategyOrderRecord {
     return this.target.planOrder(strategyId, role, request);
+  }
+
+  planOrdersAtomically(
+    strategyId: string,
+    plans: readonly Readonly<StrategyOrderPlan>[]
+  ): StrategyOrderRecord[] {
+    return this.target.planOrdersAtomically(strategyId, plans);
   }
 
   attachOrderSnapshot(

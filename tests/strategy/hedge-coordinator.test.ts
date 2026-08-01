@@ -1554,6 +1554,37 @@ test('concurrent typed rejection with uncertain companion terminalizes possible 
   assert.equal(contract.findRequests.length, 1);
 });
 
+test('concurrent typed rejection with an open zero-fill companion is incomplete', async (t) => {
+  const spot = new PreSubmissionRejectingGateway('bitget', 'all');
+  const context = setup(t, 'CONCURRENT', { spot });
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const strategy = context.repository.getStrategy(context.strategyId);
+  const contractOrder = context.repository.listOrders(context.strategyId).find(
+    (order) => order.role === 'CONTRACT_MARKET'
+  );
+  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
+  assert.equal(strategy.failureCode, 'ORDER_SUBMISSION_FAILED');
+  assert.equal(contractOrder?.snapshot?.status, 'open');
+  assert.equal(contractOrder?.snapshot?.filledBaseQuantity, '0');
+  assert.equal(spot.createdRequests.length, 0);
+  assert.equal(spot.findRequests.length, 0);
+  assert.equal(context.contract.createdRequests.length, 1);
+});
+
 test('a typed no-order-submitted too-small derived difference becomes incomplete without lookup', async (t) => {
   const spot = new PreSubmissionRejectingGateway('bitget', 'limit');
   const context = setup(t, 'CONTRACT_FIRST', { spot });
@@ -2097,6 +2128,51 @@ test('concurrent mode preplans both intents before racing exact equal fills', as
   assert.equal(context.contract.createdRequests.length, 1);
   assert.equal(context.spot.createdRequests[0]?.baseQuantity, exactQuantity);
   assert.equal(context.contract.createdRequests[0]?.baseQuantity, exactQuantity);
+  assertNoForbiddenSideEffects(context.spot, context.contract);
+});
+
+test('concurrent planning failure leaves no orphan and later creates each leg once', async (t) => {
+  const context = setup(t, 'CONCURRENT');
+  context.database.exec(`
+    CREATE TRIGGER fail_contract_plan
+    BEFORE INSERT ON strategy_orders
+    WHEN NEW.role = 'CONTRACT_MARKET'
+    BEGIN
+      SELECT RAISE(ABORT, 'second plan failed');
+    END;
+  `);
+  context.spot.createResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_MARKET',
+    '1'
+  ));
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1'
+  ));
+
+  await assert.rejects(
+    context.coordinator.confirmAndExecute(context.strategyId),
+    /second plan failed/
+  );
+
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.deepEqual(context.repository.listOrders(context.strategyId), []);
+  assert.equal(context.spot.createdRequests.length, 0);
+  assert.equal(context.contract.createdRequests.length, 0);
+
+  context.database.exec('DROP TRIGGER fail_contract_plan');
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const orders = context.repository.listOrders(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'HEDGED');
+  assert.deepEqual(
+    orders.map((order) => order.role).sort(),
+    ['CONTRACT_MARKET', 'SPOT_MARKET']
+  );
+  assert.equal(context.spot.createdRequests.length, 1);
+  assert.equal(context.contract.createdRequests.length, 1);
   assertNoForbiddenSideEffects(context.spot, context.contract);
 });
 

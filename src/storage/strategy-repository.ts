@@ -57,6 +57,11 @@ export interface StrategyOrderRecord {
   readonly updatedAt: string;
 }
 
+export interface StrategyOrderPlan {
+  readonly role: OrderRole;
+  readonly request: OrderRequest;
+}
+
 export interface StrategyRepository {
   createPending(preflight: PreflightResult): StrategyRecord;
   getStrategy(id: string): StrategyRecord;
@@ -66,6 +71,11 @@ export interface StrategyRepository {
     role: OrderRole,
     request: OrderRequest
   ): StrategyOrderRecord;
+  /** Persists every plan in one transaction, or persists none of them. */
+  planOrdersAtomically(
+    strategyId: string,
+    plans: readonly Readonly<StrategyOrderPlan>[]
+  ): StrategyOrderRecord[];
   attachOrderSnapshot(
     strategyOrderId: string,
     snapshot: OrderSnapshot

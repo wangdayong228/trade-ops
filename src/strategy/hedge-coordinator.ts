@@ -173,6 +173,19 @@ function positiveFillKnown(value: unknown): boolean {
   }
 }
 
+function snapshotExposurePossible(snapshot: Readonly<OrderSnapshot>): boolean {
+  const filled = parsedDecimal(snapshot.filledBaseQuantity, true);
+  return (
+    filled === null
+    || filled.gt(0)
+    || (
+      snapshot.status !== 'closed'
+      && snapshot.status !== 'canceled'
+      && snapshot.status !== 'rejected'
+    )
+  );
+}
+
 function accountSettingsMatch(
   confirmed: Readonly<AccountSettings>,
   current: Readonly<AccountSettings>
@@ -476,6 +489,21 @@ export class HedgeCoordinator {
     };
   }
 
+  private preparePlanned(
+    strategy: Readonly<StrategyRecord>,
+    role: OrderRole,
+    request: OrderRequest,
+    order: Readonly<StrategyOrderRecord>
+  ): PreparedOrder {
+    if (order.role !== role || !requestMatches(order.request, request)) {
+      throw new Error('atomically planned order does not match execution role');
+    }
+    return {
+      ...this.prepareExisting(strategy, order),
+      existedBeforePreparation: false
+    };
+  }
+
   private async prepareNew(
     strategy: Readonly<StrategyRecord>,
     role: OrderRole,
@@ -729,15 +757,7 @@ export class HedgeCoordinator {
       if (snapshot === null) {
         return 'possible';
       }
-      const filled = parsedDecimal(snapshot.filledBaseQuantity, true);
-      if (filled === null || filled.gt(0)) {
-        return 'possible';
-      }
-      if (
-        snapshot.status !== 'closed'
-        && snapshot.status !== 'canceled'
-        && snapshot.status !== 'rejected'
-      ) {
+      if (snapshotExposurePossible(snapshot)) {
         return 'possible';
       }
     }
@@ -1137,16 +1157,50 @@ export class HedgeCoordinator {
       return;
     }
 
-    const spot = this.prepare(
-      strategy,
-      'SPOT_MARKET',
-      this.marketRequest(strategy, 'spot', marginMode)
-    );
-    const contract = this.prepare(
-      strategy,
-      'CONTRACT_MARKET',
-      this.marketRequest(strategy, 'contract', marginMode)
-    );
+    let spot: PreparedOrder;
+    let contract: PreparedOrder;
+    if (recovering && marketOrders.length === 2) {
+      const spotRecord = marketOrders.find(
+        (order) => order.role === 'SPOT_MARKET'
+      );
+      const contractRecord = marketOrders.find(
+        (order) => order.role === 'CONTRACT_MARKET'
+      );
+      if (spotRecord === undefined || contractRecord === undefined) {
+        await this.reconcileUnexpectedTopology(strategy, marketOrders);
+        return;
+      }
+      spot = this.prepareExisting(strategy, spotRecord);
+      contract = this.prepareExisting(strategy, contractRecord);
+    } else {
+      if (!this.isExecuting(strategy.id)) {
+        throw new Error('strategy execution ended before order planning');
+      }
+      const spotRequest = this.marketRequest(strategy, 'spot', marginMode);
+      const contractRequest = this.marketRequest(strategy, 'contract', marginMode);
+      const [spotRecord, contractRecord] = this.repository.planOrdersAtomically(
+        strategy.id,
+        [
+          { role: 'SPOT_MARKET', request: spotRequest },
+          { role: 'CONTRACT_MARKET', request: contractRequest }
+        ]
+      );
+      if (spotRecord === undefined || contractRecord === undefined) {
+        throw new Error('atomic concurrent planning did not return both roles');
+      }
+      spot = this.preparePlanned(
+        strategy,
+        'SPOT_MARKET',
+        spotRequest,
+        spotRecord
+      );
+      contract = this.preparePlanned(
+        strategy,
+        'CONTRACT_MARKET',
+        contractRequest,
+        contractRecord
+      );
+    }
 
     const settled = await Promise.allSettled([
       this.submit(spot),
@@ -1188,10 +1242,7 @@ export class HedgeCoordinator {
         outcome.kind === 'pending'
           ? true
           : outcome.kind === 'snapshot'
-            ? (
-            parsedDecimal(outcome.snapshot.filledBaseQuantity, true)?.gt(0)
-            ?? false
-            )
+            ? snapshotExposurePossible(outcome.snapshot)
             : outcome.exposureKnown
       ));
       this.failStrategy(

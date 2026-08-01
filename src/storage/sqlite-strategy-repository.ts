@@ -18,6 +18,7 @@ import type { PreflightResult } from '../strategy/preflight-service.js';
 import { SQLITE_STRATEGY_SCHEMA } from './schema.js';
 import type {
   StrategyFailureCode,
+  StrategyOrderPlan,
   StrategyOrderRecord,
   StrategyOrderStatus,
   StrategyRecord,
@@ -999,6 +1000,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
   private readonly updateOrderSnapshot;
   private readonly selectEvents;
   private readonly planOrderTransaction;
+  private readonly planOrdersAtomicallyTransaction;
   private readonly attachSnapshotTransaction;
 
   constructor(
@@ -1106,6 +1108,14 @@ export class SqliteStrategyRepository implements StrategyRepository {
       role: OrderRole,
       request: OrderRequest
     ) => this.planOrderInsideTransaction(strategyId, role, request));
+    this.planOrdersAtomicallyTransaction = this.database.transaction((
+      strategyId: string,
+      plans: readonly Readonly<StrategyOrderPlan>[]
+    ) => plans.map((plan) => this.planOrderInsideTransaction(
+      strategyId,
+      plan.role,
+      plan.request
+    )));
     this.attachSnapshotTransaction = this.database.transaction((
       strategyOrderId: string,
       snapshot: OrderSnapshot
@@ -1156,6 +1166,13 @@ export class SqliteStrategyRepository implements StrategyRepository {
     request: OrderRequest
   ): StrategyOrderRecord {
     return this.planOrderTransaction(strategyId, role, request);
+  }
+
+  planOrdersAtomically(
+    strategyId: string,
+    plans: readonly Readonly<StrategyOrderPlan>[]
+  ): StrategyOrderRecord[] {
+    return this.planOrdersAtomicallyTransaction(strategyId, plans);
   }
 
   attachOrderSnapshot(
