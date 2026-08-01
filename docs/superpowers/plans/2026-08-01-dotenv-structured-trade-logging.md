@@ -504,15 +504,15 @@ git commit -m "feat: log coordinator order lifecycle"
 - Existing two- and three-argument calls remain valid.
 - Adds: `ComposeServiceOptions.tradeEvents?: TradeEventSink`
 
-- [ ] **Step 1: Write failing monitor event tests**
+- [x] **Step 1: Write failing monitor event tests**
 
 Inject a capturing fourth argument. Extend partial-GTC coverage to assert one status-changed event with fill `0.4` and no terminal; reconcile the same snapshot again and assert no new event. Extend full-terminal coverage to assert status-changed followed by terminal. A throwing sink must not prevent persistence/classification.
 
-- [ ] **Step 2: Write failing recovery error tests**
+- [x] **Step 2: Write failing recovery error tests**
 
 Inject an operational fifth argument. A per-strategy failure records `strategy_recovery_failed` with strategyId; an interval-level rejection records `monitor_recovery_failed`; a later interval still runs.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -523,15 +523,15 @@ node --test dist/tests/strategy/order-monitor.test.js
 
 Expected: new logging assertions fail.
 
-- [ ] **Step 4: Emit only persisted, changed snapshots**
+- [x] **Step 4: Emit only persisted, changed snapshots**
 
 After the existing `sameSnapshot` gate and successful `attachOrderSnapshot`, emit status-changed and, for closed/canceled/rejected, terminal. Keep identical polls silent. Log the two currently swallowed recovery catches through `OperationalLog.error`; do not log successful or unchanged polls.
 
-- [ ] **Step 5: Compose shared sinks**
+- [x] **Step 5: Compose shared sinks**
 
 In `composeService`, create one `PinoTradeEventSink(loggerInstance.child({ component: 'trade' }))` when a root logger exists, otherwise use the no-op sink. Pass the same sink to coordinator and monitor, the operational facade to monitor/HTTP, and the same root instance to Fastify.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 Run:
 
