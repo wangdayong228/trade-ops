@@ -110,7 +110,7 @@ test(
     spot.quantizedPrices.set(`spot:${SYMBOL}`, '60010');
     contract.accountSettings = {
       marginMode: 'isolated',
-      positionMode: 'one-way',
+      positionMode: 'hedged',
       leverage: '2'
     };
     const gatewayFactory = (exchangeId: string) => (
@@ -325,7 +325,7 @@ test(
 );
 
 test(
-  'restarted Web flow loads EXECUTING and confirms only the missing intent',
+  'restarted monitor automatically continues only the persisted sequential intent',
   async (t) => {
     const directory = await mkdtemp(join(tmpdir(), 'trade-ops-resume-'));
     const databasePath = join(directory, 'trade-ops.sqlite');
@@ -430,15 +430,10 @@ test(
       ['CONTRACT_MARKET']
     );
 
-    const confirmed = await restarted.server.inject({
-      method: 'POST',
-      url: `/api/hedges/${strategyId}/confirm`,
-      headers: LOCAL_HEADERS,
-      payload: { riskAcknowledged: true }
-    });
-    assert.equal(confirmed.statusCode, 202);
-    assert.deepEqual(confirmed.json(), { accepted: true });
+    await restarted.monitor.recover();
     await waitForState(restarted.repository, strategyId, 'HEDGED');
+
+    await restarted.monitor.recover();
 
     assert.equal(contract.createdRequests.length, 0);
     assert.equal(spot.createdRequests.length, 1);

@@ -40,6 +40,10 @@ interface ExposureTotals {
   readonly contract: Decimal;
 }
 
+export interface ExecutionContinuation {
+  confirmAndExecute(strategyId: string): Promise<void>;
+}
+
 const RECOVERABLE_STATES = new Set<StrategyState>([
   'EXECUTING',
   'WAITING_HEDGE'
@@ -578,6 +582,47 @@ function orderNeedsObservation(order: Readonly<StrategyOrderRecord>): boolean {
   );
 }
 
+function reliableMarketTerminal(
+  order: Readonly<StrategyOrderRecord>
+): boolean {
+  return (
+    MARKET_ROLES.has(order.role)
+    && order.snapshot !== null
+    && (
+      order.snapshot.status === 'closed'
+      || order.snapshot.status === 'canceled'
+    )
+  );
+}
+
+function continuationTopologyIsReady(
+  strategy: Readonly<StrategyRecord>,
+  orders: readonly StrategyOrderRecord[]
+): boolean {
+  if (
+    strategy.state !== 'EXECUTING'
+    || !topologyIsValid(strategy, orders)
+    || orders.some((order) => !requestMatchesRole(strategy, order))
+    || orders.some((order) => GTC_ROLES.has(order.role))
+    || orders.some((order) => !reliableMarketTerminal(order))
+  ) {
+    return false;
+  }
+  const roles = new Set(orders.map((order) => order.role));
+  switch (strategy.mode) {
+    case 'CONTRACT_FIRST':
+      return orders.length === 1 && roles.has('CONTRACT_MARKET');
+    case 'SPOT_FIRST':
+      return orders.length === 1 && roles.has('SPOT_MARKET');
+    case 'CONCURRENT':
+      return (
+        orders.length === 2
+        && roles.has('SPOT_MARKET')
+        && roles.has('CONTRACT_MARKET')
+      );
+  }
+}
+
 function safeState(
   repository: StrategyRepository,
   strategyId: string
@@ -597,7 +642,8 @@ export class OrderMonitor {
 
   constructor(
     private readonly registry: ExchangeRegistry,
-    private readonly repository: StrategyRepository
+    private readonly repository: StrategyRepository,
+    private readonly executionContinuation?: ExecutionContinuation
   ) {}
 
   async reconcileStrategy(strategyId: string): Promise<void> {
@@ -693,10 +739,28 @@ export class OrderMonitor {
     if (!tryAcquireStrategyOperation(strategyId)) {
       return;
     }
+    let shouldContinue = false;
     try {
       await this.reconcileStrategyOnce(strategyId);
+      shouldContinue = this.executionCanContinue(strategyId);
     } finally {
       releaseStrategyOperation(strategyId);
+    }
+    if (shouldContinue) {
+      await this.executionContinuation?.confirmAndExecute(strategyId);
+    }
+  }
+
+  private executionCanContinue(strategyId: string): boolean {
+    if (this.executionContinuation === undefined) {
+      return false;
+    }
+    try {
+      const strategy = this.repository.getStrategy(strategyId);
+      const orders = this.repository.listOrders(strategyId);
+      return continuationTopologyIsReady(strategy, orders);
+    } catch {
+      return false;
     }
   }
 
@@ -790,11 +854,6 @@ export class OrderMonitor {
           observation.candidate
         );
       } catch {
-        this.transitionIncomplete(
-          strategy.id,
-          initialState,
-          'INCONSISTENT_ORDER_STATE'
-        );
         return;
       }
       if (safeState(this.repository, strategy.id) !== initialState) {
@@ -927,12 +986,51 @@ export class OrderMonitor {
       );
       return;
     }
-    const unsafeMarket = orders.some((order) => (
+    const nonterminalMarket = orders.some((order) => (
+      MARKET_ROLES.has(order.role)
+      && (
+        order.snapshot === null
+        || order.snapshot.status === 'open'
+        || order.snapshot.status === 'unknown'
+      )
+    ));
+    if (nonterminalMarket) {
+      if (initialState !== 'EXECUTING') {
+        this.transitionIncomplete(
+          strategy.id,
+          initialState,
+          'INCONSISTENT_ORDER_STATE'
+        );
+      }
+      return;
+    }
+    const rejectedMarket = orders.some((order) => (
+      MARKET_ROLES.has(order.role)
+      && order.snapshot?.status === 'rejected'
+    ));
+    if (rejectedMarket) {
+      if (hasPositiveExposure(totals)) {
+        this.transitionIncomplete(
+          strategy.id,
+          initialState,
+          'INCONSISTENT_ORDER_STATE'
+        );
+      } else {
+        this.transitionFailed(
+          strategy.id,
+          initialState,
+          'ORDER_SUBMISSION_FAILED'
+        );
+      }
+      return;
+    }
+    const invalidMarketTerminal = orders.some((order) => (
       MARKET_ROLES.has(order.role)
       && order.snapshot !== null
       && order.snapshot.status !== 'closed'
+      && order.snapshot.status !== 'canceled'
     ));
-    if (unsafeMarket && hasPositiveExposure(totals)) {
+    if (invalidMarketTerminal) {
       this.transitionIncomplete(
         strategy.id,
         initialState,
@@ -990,7 +1088,10 @@ export class OrderMonitor {
 
     const marketsConfirmed = orders
       .filter((order) => MARKET_ROLES.has(order.role))
-      .every((order) => order.snapshot?.status === 'closed');
+      .every((order) => (
+        order.snapshot?.status === 'closed'
+        || order.snapshot?.status === 'canceled'
+      ));
     if (
       marketsConfirmed
       && totals.spot.gt(0)
@@ -1047,12 +1148,29 @@ export class OrderMonitor {
     );
   }
 
+  private transitionFailed(
+    strategyId: string,
+    initialState: RecoverableState,
+    failureCode: StrategyFailureCode
+  ): void {
+    if (initialState !== 'EXECUTING') {
+      this.transitionIncomplete(strategyId, initialState, failureCode);
+      return;
+    }
+    this.transitionTerminal(
+      strategyId,
+      initialState,
+      'FAILED',
+      failureCode
+    );
+  }
+
   private transitionTerminal(
     strategyId: string,
     initialState: RecoverableState,
     target: Extract<
       StrategyState,
-      'WAITING_HEDGE' | 'HEDGED' | 'HEDGE_INCOMPLETE'
+      'WAITING_HEDGE' | 'HEDGED' | 'HEDGE_INCOMPLETE' | 'FAILED'
     >,
     failureCode?: StrategyFailureCode
   ): void {

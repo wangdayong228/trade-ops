@@ -76,7 +76,7 @@ function preflight(
     },
     accountSettings: {
       marginMode: 'isolated',
-      positionMode: 'one-way',
+      positionMode: 'hedged',
       leverage: '2'
     },
     spotFreeUsdt: '100000',
@@ -311,7 +311,7 @@ function browserPreflightResponse(
       riskAcknowledgementRequired: true,
       accountSettings: {
         marginMode: 'isolated',
-        positionMode: 'one-way',
+        positionMode: 'hedged',
         leverage: '2'
       },
       spotMarket: {
@@ -2117,6 +2117,116 @@ test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgeme
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
+test('operator UI loads and actually confirms a concurrent single-market recovery intent', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174009';
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    mode: 'CONCURRENT',
+    state: 'EXECUTING'
+  });
+  const plannedIntent = browserOrderResponse(strategyId, 'SPOT_MARKET');
+  plannedIntent.exchangeOrderId = null;
+  plannedIntent.snapshot = null;
+  plannedIntent.status = 'planned';
+  status.orders = [plannedIntent];
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url, options) => {
+    if (url === `/api/hedges/${strategyId}`) {
+      assert.equal(options, undefined);
+      return browserResponse(200, status);
+    }
+    if (url === `/api/hedges/${strategyId}/confirm`) {
+      assert.equal(options?.method, 'POST');
+      assert.equal(
+        options?.body,
+        JSON.stringify({ riskAcknowledged: true })
+      );
+      return browserResponse(202, { accepted: true });
+    }
+    throw new Error(`unexpected single-intent URL: ${url}`);
+  });
+
+  await browser.element('resume-form').emit('submit');
+  assert.equal(browser.element('strategy-state').textContent, 'EXECUTING');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  assert.equal(browser.element('confirm-button').disabled, false);
+  await browser.element('confirm-button').emit('click');
+
+  assert.equal(
+    browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
+    1
+  );
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI renders equal canceled-positive concurrent markets as HEDGED', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174010';
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    mode: 'CONCURRENT',
+    state: 'HEDGED'
+  });
+  const spot = browserOrderResponse(
+    strategyId,
+    'SPOT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174010'
+  );
+  const contract = browserOrderResponse(
+    strategyId,
+    'CONTRACT_MARKET',
+    '423e4567-e89b-42d3-a456-426614174011'
+  );
+  for (const order of [spot, contract]) {
+    setBrowserOrderSnapshot(order, {
+      filledBaseQuantity: '0.6',
+      remainingBaseQuantity: '0.4',
+      averagePrice: '60000',
+      status: 'canceled'
+    });
+  }
+  status.orders = [spot, contract];
+  setBrowserActualFills(status, '0.6', '0.6', '0');
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url) => {
+    assert.equal(url, `/api/hedges/${strategyId}`);
+    return browserResponse(200, status);
+  });
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(browser.element('strategy-state').textContent, 'HEDGED');
+  assert.equal(browser.element('spot-actual-fill').textContent, '0.6');
+  assert.equal(browser.element('contract-actual-fill').textContent, '0.6');
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI rejects a one-way preflight response as non-actionable', async () => {
+  const browser = await browserHarness();
+  const body = browserPreflightResponse();
+  const preview = body.preflight as Record<string, unknown>;
+  (preview.accountSettings as Record<string, unknown>).positionMode = 'one-way';
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/preflight');
+    return browserResponse(201, body);
+  });
+
+  await browser.element('preflight-form').emit('submit');
+
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, true);
+});
+
 test('operator UI loads WAITING_HEDGE for observation without enabling confirmation', async () => {
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174001';
@@ -2276,12 +2386,6 @@ test('operator UI rejects every malformed full status DTO before enabling confir
       mutate(body) {
         setMode(body, 'SPOT_FIRST');
         oneOrder(body, 'CONTRACT_MARKET');
-      }
-    },
-    {
-      name: 'concurrent execution contains only one market role',
-      mutate(body) {
-        oneOrder(body, 'SPOT_MARKET');
       }
     },
     {
@@ -2942,7 +3046,9 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       ['CONTRACT_FIRST', ['CONTRACT_MARKET']],
       ['SPOT_FIRST', []],
       ['SPOT_FIRST', ['SPOT_MARKET']],
-      ['CONCURRENT', []]
+      ['CONCURRENT', []],
+      ['CONCURRENT', ['SPOT_MARKET']],
+      ['CONCURRENT', ['CONTRACT_MARKET']]
     ] as const).map(([mode, roles]) => ({
       name: `executing ${mode} with ${roles.join(',') || 'no orders'}`,
       mode,

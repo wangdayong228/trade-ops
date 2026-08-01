@@ -347,6 +347,156 @@ function exactProduct(
   return product.toFixed();
 }
 
+function exactAggregate(
+  values: readonly string[],
+  field: string
+): string | null {
+  if (values.length === 0) {
+    return null;
+  }
+  const parsed = values.map((value) => decimal(value));
+  const highestExponent = Math.max(...parsed.map((value) => value.e));
+  const lowestSignificantExponent = Math.min(...parsed.map(
+    (value) => value.e - value.sd() + 1
+  ));
+  const carryDigits = Math.ceil(Math.log10(values.length + 1));
+  const requiredPrecision =
+    highestExponent - lowestSignificantExponent + carryDigits + 4;
+  if (
+    !Number.isSafeInteger(requiredPrecision)
+    || requiredPrecision <= 0
+    || requiredPrecision > 1_000_000
+  ) {
+    throw new Error(`${field} precision exceeds supported bounds`);
+  }
+  const ExactDecimal = Decimal.clone({
+    precision: Math.max(Decimal.precision, requiredPrecision),
+    rounding: Decimal.ROUND_DOWN
+  });
+  let total = new ExactDecimal(0);
+  for (const value of values) {
+    total = total.plus(value);
+  }
+  return total.isFinite() && total.gt(0) ? total.toFixed() : null;
+}
+
+function exactPositiveQuotient(
+  numerator: string,
+  denominator: string,
+  field: string
+): string | null {
+  const numeratorValue = decimal(numerator);
+  const denominatorValue = decimal(denominator);
+  const requiredPrecision = Math.max(
+    80,
+    numeratorValue.sd() + denominatorValue.sd() + 40
+  );
+  if (
+    !Number.isSafeInteger(requiredPrecision)
+    || requiredPrecision > 1_000_000
+  ) {
+    throw new Error(`${field} precision exceeds supported bounds`);
+  }
+  const ExactDecimal = Decimal.clone({
+    precision: requiredPrecision,
+    rounding: Decimal.ROUND_DOWN
+  });
+  const quotient = new ExactDecimal(numerator).div(denominator);
+  return quotient.isFinite() && quotient.gt(0) ? quotient.toFixed() : null;
+}
+
+function tradeRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function averageFromTrades(
+  order: Readonly<CcxtOrder>,
+  market: Readonly<CcxtMarket>,
+  rules: Readonly<MarketRules>,
+  side: OrderSide,
+  filledExchangeAmount: string,
+  filledBaseQuantity: string
+): string | null {
+  if (!Array.isArray(order.trades) || order.trades.length === 0) {
+    return null;
+  }
+  const amounts: string[] = [];
+  const costs: string[] = [];
+  try {
+    for (const value of order.trades) {
+      const trade = tradeRecord(value);
+      if (
+        trade === null
+        || trade.order !== order.id
+        || trade.symbol !== market.symbol
+        || trade.side !== side
+      ) {
+        return null;
+      }
+      amounts.push(decimalString(trade.amount, 'trade amount'));
+      costs.push(decimalString(trade.cost, 'trade cost'));
+    }
+    const totalAmount = exactAggregate(amounts, 'trade amount total');
+    const totalCost = exactAggregate(costs, 'trade cost total');
+    if (
+      totalAmount === null
+      || totalCost === null
+      || !decimal(totalAmount).eq(filledExchangeAmount)
+      || (
+        rules.kind === 'swap'
+        && !decimal(
+          exchangeAmountToBase(totalAmount, rules.contractSize)
+        ).eq(filledBaseQuantity)
+      )
+    ) {
+      return null;
+    }
+    return exactPositiveQuotient(
+      totalCost,
+      filledBaseQuantity,
+      'trade average price'
+    );
+  } catch {
+    return null;
+  }
+}
+
+function fallbackActualAverage(
+  order: Readonly<CcxtOrder>,
+  market: Readonly<CcxtMarket>,
+  rules: Readonly<MarketRules>,
+  side: OrderSide,
+  filledExchangeAmount: string,
+  filledBaseQuantity: string
+): string | null {
+  if (!decimal(filledBaseQuantity).gt(0)) {
+    return null;
+  }
+  try {
+    const cost = decimalString(order.cost, 'order cost');
+    const fromCost = exactPositiveQuotient(
+      cost,
+      filledBaseQuantity,
+      'order average price'
+    );
+    if (fromCost !== null) {
+      return fromCost;
+    }
+  } catch {
+    // A missing or invalid aggregate cost can still be recovered from trades.
+  }
+  return averageFromTrades(
+    order,
+    market,
+    rules,
+    side,
+    filledExchangeAmount,
+    filledBaseQuantity
+  );
+}
+
 function validateBaseAmount(
   baseQuantity: string,
   rules: MarketRules
@@ -921,7 +1071,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       : remainingExchangeAmount;
 
     let averagePrice: string | null = null;
-    if (order.average !== undefined) {
+    if (order.average !== undefined && order.average !== null) {
       const average = decimalString(
         order.average,
         'average price',
@@ -929,11 +1079,25 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       );
       if (decimal(average).gt(0)) {
         averagePrice = average;
-      } else if (decimal(filledBaseQuantity).gt(0)) {
-        throw new Error(
-          'malformed order response: filled order has no positive average'
+      } else {
+        averagePrice = fallbackActualAverage(
+          order,
+          market,
+          rules,
+          side,
+          filledExchangeAmount,
+          filledBaseQuantity
         );
       }
+    } else {
+      averagePrice = fallbackActualAverage(
+        order,
+        market,
+        rules,
+        side,
+        filledExchangeAmount,
+        filledBaseQuantity
+      );
     }
 
     return {

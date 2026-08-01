@@ -122,12 +122,9 @@ function confirmedAccountSettings(settings: AccountSettings): {
       'confirmed account settings require isolated or cross margin mode'
     );
   }
-  if (
-    settings.positionMode !== 'one-way'
-    && settings.positionMode !== 'hedged'
-  ) {
+  if (settings.positionMode !== 'hedged') {
     throw new Error(
-      'confirmed account settings require one-way or hedged position mode'
+      'confirmed account settings require hedged position mode'
     );
   }
   const leverage = positiveDecimal(settings.leverage, 'contract leverage');

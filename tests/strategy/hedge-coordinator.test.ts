@@ -16,6 +16,7 @@ import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
 import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
+import { OrderMonitor } from '../../src/strategy/order-monitor.js';
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
@@ -400,6 +401,28 @@ function assertNoForbiddenSideEffects(...gateways: TrackingGateway[]): void {
   }
 }
 
+test('coordinator never claims or submits a persisted one-way strategy', async (t) => {
+  const context = setup(t, 'CONCURRENT', {
+    preflight: {
+      accountSettings: {
+        marginMode: 'cross',
+        positionMode: 'one-way',
+        leverage: '2'
+      }
+    }
+  });
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.equal(
+    context.repository.getStrategy(context.strategyId).state,
+    'PENDING_CONFIRMATION'
+  );
+  assert.equal(context.repository.listOrders(context.strategyId).length, 0);
+  assert.equal(context.spot.createdRequests.length, 0);
+  assert.equal(context.contract.createdRequests.length, 0);
+});
+
 test('contract-first hedges only the actual partial fill with a quantized spot GTC', async (t) => {
   const context = setup(t, 'CONTRACT_FIRST');
   context.contract.createResults.push(snapshotFor(
@@ -481,7 +504,7 @@ test('spot-first sends a fully persisted SHORT GTC using the confirmed isolated 
     preflight: {
       accountSettings: {
         marginMode: 'isolated',
-        positionMode: 'one-way',
+        positionMode: 'hedged',
         leverage: '3'
       }
     }
@@ -522,6 +545,370 @@ test('spot-first sends a fully persisted SHORT GTC using the confirmed isolated 
     Object.hasOwn(context.spot.createdRequests[0] ?? {}, 'marginMode'),
     false
   );
+});
+
+test('sequential open market remains executing until terminal observation then hedges once', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+  context.contract.fetchResults.set('contract_market-order', [
+    snapshotFor(context.strategyId, 'CONTRACT_MARKET', '1', {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6',
+      averagePrice: '60002',
+      status: 'open',
+      updatedAt: '2026-07-26T00:02:00.000Z'
+    }),
+    snapshotFor(context.strategyId, 'CONTRACT_MARKET', '1', {
+      filledBaseQuantity: '0.7',
+      remainingBaseQuantity: '0.3',
+      averagePrice: '60003',
+      status: 'closed',
+      updatedAt: '2026-07-26T00:03:00.000Z'
+    })
+  ]);
+  context.spot.createResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_HEDGE_GTC',
+    '0.7',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '0.7',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+  const monitor = new OrderMonitor(
+    new ExchangeRegistry(new Map([
+      ['bitget', context.spot],
+      ['okx', context.contract]
+    ])),
+    context.repository
+  );
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.spot.createdRequests.length, 0);
+
+  await monitor.reconcileStrategy(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.spot.createdRequests.length, 0);
+
+  await monitor.reconcileStrategy(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.spot.createdRequests.length, 0);
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.contract.createdRequests.length, 1);
+  assert.equal(context.spot.createdRequests.length, 1);
+  assert.equal(context.spot.createdRequests[0]?.baseQuantity, '0.7');
+  assert.equal(context.spot.createdRequests[0]?.price, '60003');
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'WAITING_HEDGE');
+});
+
+test('concurrent open markets progress asynchronously without an early GTC or terminal state', async (t) => {
+  const context = setup(t, 'CONCURRENT');
+  context.spot.createResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.2',
+      remainingBaseQuantity: '0.8',
+      averagePrice: '60000',
+      status: 'open'
+    }
+  ));
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+  context.spot.fetchResults.set('spot_market-order', [
+    snapshotFor(context.strategyId, 'SPOT_MARKET', '1', {
+      filledBaseQuantity: '0.8',
+      remainingBaseQuantity: '0.2',
+      averagePrice: '60001',
+      status: 'closed',
+      updatedAt: '2026-07-26T00:02:00.000Z'
+    })
+  ]);
+  context.contract.fetchResults.set('contract_market-order', [
+    snapshotFor(context.strategyId, 'CONTRACT_MARKET', '1', {
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0.6',
+      averagePrice: '60002',
+      status: 'open',
+      updatedAt: '2026-07-26T00:02:00.000Z'
+    }),
+    snapshotFor(context.strategyId, 'CONTRACT_MARKET', '1', {
+      filledBaseQuantity: '0.6',
+      remainingBaseQuantity: '0.4',
+      averagePrice: '60003',
+      status: 'canceled',
+      updatedAt: '2026-07-26T00:03:00.000Z'
+    })
+  ]);
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_HEDGE_GTC',
+    '0.2',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '0.2',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+  const monitor = new OrderMonitor(
+    new ExchangeRegistry(new Map([
+      ['bitget', context.spot],
+      ['okx', context.contract]
+    ])),
+    context.repository
+  );
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+
+  await monitor.reconcileStrategy(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+
+  await monitor.reconcileStrategy(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.spot.createdRequests.length, 1);
+  assert.equal(context.contract.createdRequests.length, 2);
+  assert.equal(context.contract.createdRequests[1]?.type, 'limit');
+  assert.equal(context.contract.createdRequests[1]?.baseQuantity, '0.2');
+  assert.equal(context.contract.createdRequests[1]?.price, '60001');
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'WAITING_HEDGE');
+});
+
+test('create side effect plus transient lookup error remains recoverable and never recreates', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  const marketClientId = makeClientOrderId(context.strategyId, 'CONTRACT_MARKET');
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+  context.contract.createErrors.set(
+    marketClientId,
+    new Error('timeout apiKey=must-never-escape')
+  );
+  const originalFind = context.contract.findOrderByClientId.bind(context.contract);
+  let lookupCount = 0;
+  context.contract.findOrderByClientId = async (clientOrderId, symbol, kind) => {
+    lookupCount += 1;
+    if (lookupCount === 1) {
+      context.contract.findRequests.push({ clientOrderId, symbol, kind });
+      throw new Error('lookup secret=must-never-escape');
+    }
+    return originalFind(clientOrderId, symbol, kind);
+  };
+  const monitor = new OrderMonitor(
+    new ExchangeRegistry(new Map([
+      ['bitget', context.spot],
+      ['okx', context.contract]
+    ])),
+    context.repository
+  );
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.repository.getStrategy(context.strategyId).failureCode, null);
+  assert.equal(context.contract.createdRequests.length, 1);
+
+  await monitor.reconcileStrategy(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.contract.createdRequests.length, 1);
+  assert.equal(context.repository.listOrders(context.strategyId)[0]?.status, 'open');
+  assert.doesNotMatch(
+    JSON.stringify(context.database.prepare('SELECT * FROM strategies').all()),
+    /must-never-escape/
+  );
+});
+
+test('create snapshot attach failure remains executing for monitor recovery by client id', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+  const originalAttach = context.repository.attachOrderSnapshot.bind(context.repository);
+  let failAttach = true;
+  context.repository.attachOrderSnapshot = (orderId, snapshot) => {
+    if (failAttach) {
+      failAttach = false;
+      throw new Error('sqlite password=must-never-escape');
+    }
+    originalAttach(orderId, snapshot);
+  };
+  const monitor = new OrderMonitor(
+    new ExchangeRegistry(new Map([
+      ['bitget', context.spot],
+      ['okx', context.contract]
+    ])),
+    context.repository
+  );
+
+  await assert.doesNotReject(
+    context.coordinator.confirmAndExecute(context.strategyId)
+  );
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.repository.getStrategy(context.strategyId).failureCode, null);
+  assert.equal(context.contract.createdRequests.length, 1);
+
+  await monitor.reconcileStrategy(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.contract.createdRequests.length, 1);
+  assert.equal(context.repository.listOrders(context.strategyId)[0]?.status, 'open');
+  assert.doesNotMatch(
+    JSON.stringify(context.database.prepare('SELECT * FROM strategies').all()),
+    /must-never-escape/
+  );
+});
+
+test('sequential canceled-positive market hedges the exact reliable fill', async (t) => {
+  const context = setup(t, 'CONTRACT_FIRST');
+  context.contract.createResults.push(snapshotFor(
+    context.strategyId,
+    'CONTRACT_MARKET',
+    '1',
+    {
+      filledBaseQuantity: '0.35',
+      remainingBaseQuantity: '0.65',
+      averagePrice: '60004',
+      status: 'canceled'
+    }
+  ));
+  context.spot.createResults.push(snapshotFor(
+    context.strategyId,
+    'SPOT_HEDGE_GTC',
+    '0.35',
+    {
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '0.35',
+      averagePrice: null,
+      status: 'open'
+    }
+  ));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  assert.equal(context.spot.createdRequests[0]?.baseQuantity, '0.35');
+  assert.equal(context.spot.createdRequests[0]?.price, '60004');
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'WAITING_HEDGE');
+});
+
+test('concurrent canceled-positive markets hedge the exact difference or finish equal', async (t) => {
+  await t.test('difference', async (t) => {
+    const context = setup(t, 'CONCURRENT');
+    context.spot.createResults.push(snapshotFor(
+      context.strategyId,
+      'SPOT_MARKET',
+      '1',
+      {
+        filledBaseQuantity: '0.8',
+        remainingBaseQuantity: '0.2',
+        averagePrice: '60005',
+        status: 'closed'
+      }
+    ));
+    context.contract.createResults.push(snapshotFor(
+      context.strategyId,
+      'CONTRACT_MARKET',
+      '1',
+      {
+        filledBaseQuantity: '0.55',
+        remainingBaseQuantity: '0.45',
+        averagePrice: '60006',
+        status: 'canceled'
+      }
+    ));
+    context.contract.createResults.push(snapshotFor(
+      context.strategyId,
+      'CONTRACT_HEDGE_GTC',
+      '0.25',
+      {
+        filledBaseQuantity: '0',
+        remainingBaseQuantity: '0.25',
+        averagePrice: null,
+        status: 'open'
+      }
+    ));
+
+    await context.coordinator.confirmAndExecute(context.strategyId);
+
+    assert.equal(context.contract.createdRequests[1]?.baseQuantity, '0.25');
+    assert.equal(context.contract.createdRequests[1]?.price, '60005');
+    assert.equal(context.repository.getStrategy(context.strategyId).state, 'WAITING_HEDGE');
+  });
+
+  await t.test('equal', async (t) => {
+    const context = setup(t, 'CONCURRENT');
+    context.spot.createResults.push(snapshotFor(
+      context.strategyId,
+      'SPOT_MARKET',
+      '1',
+      {
+        filledBaseQuantity: '0.65',
+        remainingBaseQuantity: '0.35',
+        averagePrice: '60005',
+        status: 'canceled'
+      }
+    ));
+    context.contract.createResults.push(snapshotFor(
+      context.strategyId,
+      'CONTRACT_MARKET',
+      '1',
+      {
+        filledBaseQuantity: '0.65',
+        remainingBaseQuantity: '0.35',
+        averagePrice: '60006',
+        status: 'closed'
+      }
+    ));
+
+    await context.coordinator.confirmAndExecute(context.strategyId);
+
+    assert.equal(context.repository.getStrategy(context.strategyId).state, 'HEDGED');
+    assert.equal(context.spot.createdRequests.length, 1);
+    assert.equal(context.contract.createdRequests.length, 1);
+  });
 });
 
 test('sequential first-leg zero fill fails without submitting a hedge', async (t) => {
@@ -566,7 +953,10 @@ test('sequential rejected or canceled zero-fill market legs fail closed', async 
 
       const strategy = context.repository.getStrategy(context.strategyId);
       assert.equal(strategy.state, 'FAILED');
-      assert.equal(strategy.failureCode, 'NO_FILL');
+      assert.equal(
+        strategy.failureCode,
+        status === 'rejected' ? 'ORDER_SUBMISSION_FAILED' : 'NO_FILL'
+      );
       assert.equal(context.contract.createdRequests.length, 0);
     });
   }
@@ -673,15 +1063,15 @@ test('create timeout reconciles by stable client id and never resubmits the role
   );
 });
 
-test('unknown first-leg submission not found by client id fails without retry', async (t) => {
+test('unknown first-leg submission not found by client id stays recoverable without retry', async (t) => {
   const contract = new UnknownSubmissionGateway('okx');
   const context = setup(t, 'CONTRACT_FIRST', { contract });
 
   await context.coordinator.confirmAndExecute(context.strategyId);
 
   const strategy = context.repository.getStrategy(context.strategyId);
-  assert.equal(strategy.state, 'FAILED');
-  assert.equal(strategy.failureCode, 'ORDER_SUBMISSION_UNKNOWN');
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
   assert.equal(contract.createdRequests.length, 1);
   assert.equal(contract.findRequests.length, 1);
   assert.equal(context.spot.createdRequests.length, 0);
@@ -693,7 +1083,7 @@ test('unknown first-leg submission not found by client id fails without retry', 
   );
 });
 
-test('unknown hedge submission after exposure becomes incomplete without retry', async (t) => {
+test('unknown hedge submission after exposure stays recoverable without retry', async (t) => {
   const spot = new UnknownSubmissionGateway('bitget');
   const context = setup(t, 'CONTRACT_FIRST', { spot });
   context.contract.createResults.push(snapshotFor(
@@ -705,13 +1095,13 @@ test('unknown hedge submission after exposure becomes incomplete without retry',
   await context.coordinator.confirmAndExecute(context.strategyId);
 
   const strategy = context.repository.getStrategy(context.strategyId);
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'ORDER_SUBMISSION_UNKNOWN');
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
   assert.equal(spot.createdRequests.length, 1);
   assert.equal(spot.findRequests.length, 1);
 });
 
-test('direct unknown result keeps its known fill exposure when lookup finds nothing', async (t) => {
+test('direct unknown result keeps its known fill recoverable when lookup finds nothing', async (t) => {
   const contract = new UnknownStatusGateway('okx');
   const context = setup(t, 'CONTRACT_FIRST', { contract });
   contract.result = snapshotFor(
@@ -729,8 +1119,8 @@ test('direct unknown result keeps its known fill exposure when lookup finds noth
   await context.coordinator.confirmAndExecute(context.strategyId);
 
   const strategy = context.repository.getStrategy(context.strategyId);
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'ORDER_NOT_FOUND');
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
   assert.equal(contract.createdRequests.length, 1);
   assert.equal(contract.findRequests.length, 1);
   assert.equal(context.spot.createdRequests.length, 0);
@@ -927,7 +1317,7 @@ test('candidate positive fill remains known before repository reload failures', 
   });
 });
 
-test('attach failure after a persisted positive unknown fill never downgrades exposure', async (t) => {
+test('attach failure after a persisted positive unknown fill stays recoverable', async (t) => {
   const contract = new UnknownStatusGateway('okx');
   const context = setup(t, 'CONTRACT_FIRST', { contract });
   contract.result = snapshotFor(
@@ -966,22 +1356,14 @@ test('attach failure after a persisted positive unknown fill never downgrades ex
     originalAttach(orderId, snapshot);
   };
 
-  let rejected: unknown;
-  await assert.rejects(
-    context.coordinator.confirmAndExecute(context.strategyId),
-    (error) => {
-      rejected = error;
-      return true;
-    }
+  await assert.doesNotReject(
+    context.coordinator.confirmAndExecute(context.strategyId)
   );
 
-  assert.ok(rejected instanceof Error);
-  assert.equal(rejected.message, 'order snapshot persistence failed');
-  assert.doesNotMatch(String(rejected), /second-attach-integrity-failure/);
   const strategy = context.repository.getStrategy(context.strategyId);
   const order = context.repository.listOrders(context.strategyId)[0];
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
   assert.equal(order?.snapshot?.filledBaseQuantity, '0.4');
   assert.equal(context.repository.listOrderEvents(order!.id).length, 1);
   assert.equal(attachCalls, 2);
@@ -1016,7 +1398,7 @@ test('direct unknown result is durable before its required lookup completes', as
   }
   assert.equal(
     context.repository.getStrategy(context.strategyId).state,
-    'HEDGE_INCOMPLETE'
+    'EXECUTING'
   );
   assert.equal(contract.createdRequests.length, 1);
 });
@@ -1289,7 +1671,10 @@ test('concurrent rejection or cancellation with opposite exposure never submits 
 
       const strategy = context.repository.getStrategy(context.strategyId);
       assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-      assert.equal(strategy.failureCode, 'NO_FILL');
+      assert.equal(
+        strategy.failureCode,
+        status === 'rejected' ? 'INCONSISTENT_ORDER_STATE' : 'NO_FILL'
+      );
       assert.equal(context.repository.listOrders(context.strategyId).length, 2);
       assert.equal(context.spot.createdRequests.length, 1);
       assert.equal(context.contract.createdRequests.length, 1);
@@ -1328,7 +1713,7 @@ test('concurrent positive fill with missing average fails incomplete before diff
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
 });
 
-test('concurrent missing average takes precedence over another unknown submission', async (t) => {
+test('concurrent unknown submission defers missing-average classification', async (t) => {
   const spot = new UnknownSubmissionGateway('bitget');
   const context = setup(t, 'CONCURRENT', { spot });
   context.contract.createResults.push(snapshotFor(
@@ -1345,12 +1730,12 @@ test('concurrent missing average takes precedence over another unknown submissio
   await context.coordinator.confirmAndExecute(context.strategyId);
 
   const strategy = context.repository.getStrategy(context.strategyId);
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'MISSING_AVERAGE_PRICE');
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
 });
 
-test('rejected concurrent outcome carries positive exposure across a transient safe-transition failure', async (t) => {
+test('concurrent attach failure preserves both intents without terminal transition', async (t) => {
   const spot = new DirectResultGateway('bitget');
   const contract = new DirectResultGateway('okx');
   const context = setup(t, 'CONCURRENT', { spot, contract });
@@ -1396,25 +1781,16 @@ test('rejected concurrent outcome carries positive exposure across a transient s
     }
     return originalTransition(...args);
   };
-  let rejected: unknown;
-
-  await assert.rejects(
-    context.coordinator.confirmAndExecute(context.strategyId),
-    (error) => {
-      rejected = error;
-      return true;
-    }
+  await assert.doesNotReject(
+    context.coordinator.confirmAndExecute(context.strategyId)
   );
 
-  assert.ok(rejected instanceof Error);
-  assert.equal(rejected.message, 'order snapshot persistence failed');
-  assert.doesNotMatch(String(rejected), /apiKey|must-never-escape/);
   const strategy = context.repository.getStrategy(context.strategyId);
   const [spotOrder, contractOrder] = context.repository.listOrders(
     context.strategyId
   );
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
   assert.equal(spotOrder?.snapshot, null);
   assert.deepEqual(
     context.repository.listOrderEvents(spotOrder!.id),
@@ -1425,15 +1801,19 @@ test('rejected concurrent outcome carries positive exposure across a transient s
     context.repository.listOrderEvents(contractOrder!.id).length,
     1
   );
-  assert.equal(transitionCalls, 2);
+  assert.equal(transitionCalls, 0);
   assert.equal(spot.createdRequests.length, 1);
   assert.equal(contract.createdRequests.length, 1);
   assert.equal(spot.findRequests.length, 0);
   assert.equal(contract.findRequests.length, 0);
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
+  assert.doesNotMatch(
+    JSON.stringify(context.database.prepare('SELECT * FROM strategies').all()),
+    /apiKey|must-never-escape/
+  );
 });
 
-test('concurrent safe-transition errors never replace the fixed exposure carrier', async (t) => {
+test('concurrent attach failure never invokes a terminal transition', async (t) => {
   const spot = new DirectResultGateway('bitget');
   const contract = new DirectResultGateway('okx');
   const context = setup(t, 'CONCURRENT', { spot, contract });
@@ -1473,32 +1853,15 @@ test('concurrent safe-transition errors never replace the fixed exposure carrier
     transitionCalls += 1;
     throw new Error('transition secret=must-never-escape');
   };
-  let rejected: unknown;
-
-  await assert.rejects(
-    context.coordinator.confirmAndExecute(context.strategyId),
-    (error) => {
-      rejected = error;
-      return true;
-    }
+  await assert.doesNotReject(
+    context.coordinator.confirmAndExecute(context.strategyId)
   );
 
-  assert.ok(rejected instanceof Error);
-  assert.equal(rejected.name, 'SubmissionPersistenceError');
-  assert.equal(rejected.message, 'order snapshot persistence failed');
-  assert.doesNotMatch(
-    [
-      String(rejected),
-      String(rejected.stack),
-      JSON.stringify(rejected)
-    ].join('\n'),
-    /secret|must-never-escape/
-  );
   assert.equal(
     context.repository.getStrategy(context.strategyId).state,
     'EXECUTING'
   );
-  assert.equal(transitionCalls, 3);
+  assert.equal(transitionCalls, 0);
   assert.equal(spot.createdRequests.length, 1);
   assert.equal(contract.createdRequests.length, 1);
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
@@ -1518,11 +1881,11 @@ test('concurrent safe-transition errors never replace the fixed exposure carrier
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
   assert.equal(
     context.repository.getStrategy(context.strategyId).failureCode,
-    'ORDER_NOT_FOUND'
+    null
   );
 });
 
-test('repository snapshot failure uses a safe carrier and retries its safe transition', async (t) => {
+test('repository snapshot failure preserves a recoverable intent without transition', async (t) => {
   const context = setup(t, 'CONTRACT_FIRST');
   const repositoryFailure = new Error(
     'repository-integrity-failure secret=must-never-escape'
@@ -1553,26 +1916,22 @@ test('repository snapshot failure uses a safe carrier and retries its safe trans
     '1'
   ));
 
-  let rejected: unknown;
-  await assert.rejects(
-    context.coordinator.confirmAndExecute(context.strategyId),
-    (error) => {
-      rejected = error;
-      return true;
-    }
+  await assert.doesNotReject(
+    context.coordinator.confirmAndExecute(context.strategyId)
   );
 
-  assert.ok(rejected instanceof Error);
-  assert.equal(rejected.message, 'order snapshot persistence failed');
-  assert.doesNotMatch(String(rejected), /secret|must-never-escape/);
   const strategy = context.repository.getStrategy(context.strategyId);
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
-  assert.equal(transitionCalls, 2);
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
+  assert.equal(transitionCalls, 0);
   assert.equal(context.spot.createdRequests.length, 0);
+  assert.doesNotMatch(
+    JSON.stringify(context.database.prepare('SELECT * FROM strategies').all()),
+    /secret|must-never-escape/
+  );
 });
 
-test('sequential safe-transition errors never replace the fixed exposure carrier', async (t) => {
+test('sequential attach failure never invokes a terminal transition', async (t) => {
   const context = setup(t, 'CONTRACT_FIRST');
   context.contract.createResults.push(snapshotFor(
     context.strategyId,
@@ -1597,32 +1956,15 @@ test('sequential safe-transition errors never replace the fixed exposure carrier
     transitionCalls += 1;
     throw new Error('transition secret=must-never-escape');
   };
-  let rejected: unknown;
-
-  await assert.rejects(
-    context.coordinator.confirmAndExecute(context.strategyId),
-    (error) => {
-      rejected = error;
-      return true;
-    }
+  await assert.doesNotReject(
+    context.coordinator.confirmAndExecute(context.strategyId)
   );
 
-  assert.ok(rejected instanceof Error);
-  assert.equal(rejected.name, 'SubmissionPersistenceError');
-  assert.equal(rejected.message, 'order snapshot persistence failed');
-  assert.doesNotMatch(
-    [
-      String(rejected),
-      String(rejected.stack),
-      JSON.stringify(rejected)
-    ].join('\n'),
-    /secret|must-never-escape/
-  );
   assert.equal(
     context.repository.getStrategy(context.strategyId).state,
     'EXECUTING'
   );
-  assert.equal(transitionCalls, 2);
+  assert.equal(transitionCalls, 0);
   assert.equal(context.contract.createdRequests.length, 1);
   assert.equal(context.spot.createdRequests.length, 0);
   assert.equal(context.repository.listOrders(context.strategyId).length, 1);
@@ -1646,7 +1988,7 @@ test('sequential safe-transition errors never replace the fixed exposure carrier
   assert.equal(context.repository.listOrders(context.strategyId).length, 1);
   assert.equal(
     context.repository.getStrategy(context.strategyId).failureCode,
-    'ORDER_NOT_FOUND'
+    null
   );
 });
 
@@ -1977,7 +2319,7 @@ test('concurrent equal-fill restart never declares hedged with an extra hedge ro
   assert.equal(context.contract.createdRequests.length, 0);
 });
 
-test('concurrent market lookup failures still reconcile a persisted hedge exactly once', async (t) => {
+test('concurrent market lookup failures leave a persisted hedge untouched and recoverable', async (t) => {
   const context = setup(t, 'CONCURRENT');
   assert.equal(
     context.repository.claimForExecution(context.strategyId),
@@ -2007,10 +2349,16 @@ test('concurrent market lookup failures still reconcile a persisted hedge exactl
   await context.coordinator.confirmAndExecute(context.strategyId);
 
   const strategy = context.repository.getStrategy(context.strategyId);
-  assert.equal(strategy.state, 'HEDGE_INCOMPLETE');
-  assert.equal(strategy.failureCode, 'INCONSISTENT_ORDER_STATE');
-  assert.equal(context.spot.findRequests.length, 2);
+  assert.equal(strategy.state, 'EXECUTING');
+  assert.equal(strategy.failureCode, null);
+  assert.equal(context.spot.findRequests.length, 1);
   assert.equal(context.contract.findRequests.length, 1);
+  assert.equal(
+    context.repository.listOrders(context.strategyId).find(
+      (order) => order.role === 'SPOT_HEDGE_GTC'
+    )?.snapshot,
+    null
+  );
   assert.equal(context.spot.createdRequests.length, 0);
   assert.equal(context.contract.createdRequests.length, 0);
 });

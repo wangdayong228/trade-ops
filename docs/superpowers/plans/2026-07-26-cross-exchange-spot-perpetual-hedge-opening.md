@@ -4,7 +4,7 @@
 
 **Goal:** Build an operator-confirmed service that buys spot and opens an equal USDT-margined perpetual short across user-selected exchanges in concurrent, contract-first, or spot-first mode.
 
-**Architecture:** A strict TypeScript domain layer owns decimal normalization and strategy state, while CCXT gateways hide exchange-specific spot and perpetual details. A single hedge coordinator persists intent before submission, SQLite enforces idempotency, and an order monitor reconciles GTC fills across restarts. A small Fastify API and framework-free browser page expose preflight, explicit mode selection, confirmation, and status.
+**Architecture:** A strict TypeScript domain layer owns decimal normalization and strategy state, while CCXT gateways hide exchange-specific spot and perpetual details. A single hedge coordinator persists intent before submission, SQLite enforces idempotency, and an order monitor reconciles submitted orders across restarts before delegating complete reliable market terminals back to that coordinator. A small Fastify API and framework-free browser page expose preflight, explicit mode selection, confirmation, and status.
 
 **Tech Stack:** Node.js 24 LTS, TypeScript with strict checking, CCXT, Decimal.js, SQLite through `better-sqlite3`, Fastify, `@fastify/static`, Node.js built-in test runner.
 
@@ -12,18 +12,20 @@
 
 - Only same-base, `USDT`-quoted spot and USDT-margined perpetual markets are supported.
 - The first release supports only Bitget and OKX; either may provide the spot or perpetual leg, but the two legs must use different exchanges.
-- The system reads and displays the current margin mode, position mode, and leverage; it never changes them.
+- The system reads and displays the current margin mode, position mode, and leverage; it never changes them. This release requires hedged/long-short position mode and rejects one-way or unknown mode before persistence or submission.
 - Order price, quantity, contract-size, and fill-difference calculations use Decimal.js, never JavaScript `number` arithmetic.
 - Fees do not change the second-leg price.
 - Execution mode is always explicitly selected; there is no automatic mode fallback.
 - Sequential modes submit a market first leg and one GTC second leg at the first leg’s actual average price.
 - Concurrent mode submits both market legs together and places one GTC difference order on the smaller side at the larger side’s average price.
-- A partially filled first market order defines the actual hedge target; the service does not chase the original requested quantity.
+- An `open` market order, including a zero or partial fill, remains `EXECUTING`; only a reliable `closed` or `canceled` terminal snapshot defines the actual hedge target. A canceled-positive market fill is handled as the real partial fill, and the service does not chase the original requested quantity.
 - GTC orders have no local expiry and are never automatically canceled, repriced, resubmitted, rolled back, or closed.
 - SQLite is the only persistence service and the first release runs as one application process.
 - API credentials are never stored in SQLite or logs and must not have withdrawal permission.
 - Client order IDs are deterministic 32-character lowercase alphanumeric digests of strategy ID plus order role; literal `${strategyId}:${role}` values must never be sent to an exchange.
-- Bitget spot market buys use a fresh ask price, falling back to last price, to convert requested base quantity into Bitget's quote-cost request; the actual base fill remains the hedge target, and missing reference prices block submission.
+- Bitget spot market buys use a fresh ask price, falling back to last price, to convert requested base quantity into Bitget's quote-cost request; this conversion price is never used as actual average. A missing or syntactically valid zero-sentinel actual average falls back only to unit-correct `cost / filled` or complete identity-consistent trades; negative/non-numeric averages reject. The actual base fill remains the hedge target, and missing reference prices block submission.
+- An uncertain create side effect, transient lookup failure, or local snapshot-attach failure preserves the deterministic intent in `EXECUTING`; recovery finds the same external order and never retry-creates that role.
+- Once lookup-only monitoring has attached a complete reliable terminal market topology with no GTC, it releases the strategy-operation owner and invokes the same coordinator to continue exactly once. Incomplete concurrent, planned, open, and unknown topologies never trigger creation.
 - Closing the hedge is outside this plan.
 
 ---
@@ -48,7 +50,7 @@ src/exchanges/profiles/bitget-profile.ts  Bitget client-id, GTC, and position pa
 src/exchanges/profiles/okx-profile.ts     OKX client-id, GTC, and position parameters
 src/strategy/preflight-service.ts         market/account validation and preview
 src/strategy/hedge-coordinator.ts         three execution modes and idempotent submission
-src/strategy/order-monitor.ts             GTC reconciliation and restart recovery
+src/strategy/order-monitor.ts             lookup-only reconciliation, restart recovery, and safe coordinator continuation
 src/storage/schema.ts                     SQLite schema
 src/storage/strategy-repository.ts        persistence interface
 src/storage/sqlite-strategy-repository.ts SQLite implementation and transactions
@@ -449,7 +451,7 @@ export class FakeExchangeGateway implements ExchangeGateway {
   freeUsdt = '100000';
   accountSettings: AccountSettings = {
     marginMode: 'isolated',
-    positionMode: 'one-way',
+    positionMode: 'hedged',
     leverage: '2'
   };
 
@@ -709,7 +711,7 @@ test('returns normalized quantity and current contract settings', async () => {
   assert.equal(result.effectiveBaseQuantity, '1');
   assert.deepEqual(result.accountSettings, {
     marginMode: 'isolated',
-    positionMode: 'one-way',
+    positionMode: 'hedged',
     leverage: '2'
   });
   assert.equal(result.riskAcknowledgementRequired, true);
@@ -1037,27 +1039,9 @@ Add a private `submit` method with this sequence:
 4. Persist the returned snapshot.
 5. On a timeout or unknown result, call `gateway.findOrderByClientId`.
 6. Persist a found order; never submit the same role again.
-7. If no order can be found, transition to `FAILED` when nothing filled or `HEDGE_INCOMPLETE` when exposure already exists.
+7. If lookup is temporarily unavailable or no order is found yet, preserve the planned intent and `EXECUTING` state for later recovery; never retry-create that role. Only reliable rejected or invalid outcomes may fail closed according to known exposure.
 
-The public method starts with:
-
-```ts
-async confirmAndExecute(strategyId: string): Promise<void> {
-  if (!this.repository.claimForExecution(strategyId)) return;
-  const strategy = this.repository.getStrategy(strategyId);
-  switch (strategy.preflight.mode) {
-    case 'CONTRACT_FIRST':
-      await this.executeSequential(strategy, 'contract');
-      return;
-    case 'SPOT_FIRST':
-      await this.executeSequential(strategy, 'spot');
-      return;
-    case 'CONCURRENT':
-      await this.executeConcurrent(strategy);
-      return;
-  }
-}
-```
+The public method first acquires the in-process strategy operation owner, reads the strategy, rejects any non-hedged account snapshot before claiming or submitting, and claims only `PENDING_CONFIRMATION`. A persisted `EXECUTING` strategy enters lookup-only recovery for every existing intent. It always releases the operation owner in `finally`.
 
 - [x] **Step 5: Implement sequential execution**
 
@@ -1071,7 +1055,7 @@ Do not submit the second leg if no reliable average price exists.
 
 - [x] **Step 6: Implement concurrent execution**
 
-Submit both planned market orders with `Promise.allSettled`, reconcile unknown submissions by client ID, and compare normalized filled base quantities using Decimal.js.
+Submit both planned market orders with `Promise.allSettled`, reconcile unknown submissions by client ID, and keep `EXECUTING` until both market orders have reliable `closed` or `canceled` terminal snapshots. Only then compare normalized filled base quantities using Decimal.js.
 
 - Equal and positive: transition to `HEDGED`.
 - Both zero: transition to `FAILED`.
@@ -1169,7 +1153,7 @@ Expected: FAIL because `OrderMonitor` does not exist.
 
 - [x] **Step 4: Implement recovery and scheduling**
 
-`recover()` calls `listRecoverable()` and reconciles each strategy independently so one exchange failure does not prevent recovery of another strategy.
+`recover()` calls `listRecoverable()` and reconciles each strategy independently so one exchange failure does not prevent recovery of another strategy. After reconciliation, an injected coordinator continuation is eligible only for an `EXECUTING` strategy with the exact submitted market topology, every market at `closed/canceled`, and no GTC. The monitor computes this while owning the strategy operation, releases ownership, then calls the coordinator; the monitor itself never calls `createOrder`. Zero/single incomplete concurrent intents and `planned/open/unknown` snapshots remain lookup-only.
 
 `start(intervalMs)` uses `setInterval`, prevents overlapping polling cycles with an internal boolean, starts one immediate recovery pass, and returns a stop function that clears the interval. It does not create any local GTC expiry.
 

@@ -58,7 +58,7 @@ function preflight(
     },
     accountSettings: {
       marginMode: 'isolated',
-      positionMode: 'one-way',
+      positionMode: 'hedged',
       leverage: '2'
     },
     spotFreeUsdt: '100000',

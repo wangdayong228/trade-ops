@@ -112,7 +112,7 @@ export class FakeExchangeGateway implements ExchangeGateway {
   freeUsdt = '100000';
   accountSettings: AccountSettings = {
     marginMode: 'isolated',
-    positionMode: 'one-way',
+    positionMode: 'hedged',
     leverage: '2'
   };
 

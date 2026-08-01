@@ -247,7 +247,7 @@ export function composeService(
     const repository = new SqliteStrategyRepository(database, clock);
     const preflightService = new PreflightService(registry, clock);
     const coordinator = new HedgeCoordinator(registry, repository);
-    const monitor = new OrderMonitor(registry, repository);
+    const monitor = new OrderMonitor(registry, repository, coordinator);
     const server = buildServer({
       registry,
       preflightService,

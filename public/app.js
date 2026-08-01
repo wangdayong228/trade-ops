@@ -403,8 +403,8 @@ function validatedPreview(value, expectedInput) {
   if (!['isolated', 'cross'].includes(marginMode)) {
     throw new Error('invalid margin mode');
   }
-  if (!['one-way', 'hedged'].includes(positionMode)) {
-    throw new Error('invalid position mode');
+  if (positionMode !== 'hedged') {
+    throw new Error('hedged position mode is required');
   }
   const leverage = positiveDecimalString(accountSettings.leverage);
   if (preview.riskAcknowledgementRequired !== true) {
@@ -848,7 +848,15 @@ function orderTopologyMatchesStrategy(strategy, orders) {
     return true;
   }
   if (strategy.state === 'EXECUTING') {
-    return roles.size === 0 || hasBothMarkets;
+    return (
+      hasBothMarkets
+      || (
+        hedgeCount === 0
+        && [...roles].every((role) => (
+          role === 'SPOT_MARKET' || role === 'CONTRACT_MARKET'
+        ))
+      )
+    );
   }
   if (strategy.state === 'WAITING_HEDGE') {
     return hasBothMarkets && hedgeCount === 1;
@@ -924,7 +932,7 @@ function isTrustedConcurrentMarket(order) {
   return (
     snapshot !== null
     && snapshot !== undefined
-    && snapshot.status === 'closed'
+    && (snapshot.status === 'closed' || snapshot.status === 'canceled')
     && compareDecimals(snapshot.filledBaseQuantity, '0') > 0
     && snapshot.averagePrice !== null
   );

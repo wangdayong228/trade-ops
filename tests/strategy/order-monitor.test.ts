@@ -779,6 +779,214 @@ test('restart monitor preserves an executable concurrent difference topology for
   assert.equal(f.spot.createdRequests.length, 0);
 });
 
+test('start automatically continues a terminal sequential market exactly once', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(f.repository, 'CONTRACT_FIRST');
+  const market = planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0', '1', 'open')
+  );
+  f.contract.scriptedFetches.set(market.exchangeOrderId as string, [
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '1', '0', 'closed', {
+      updatedAt: SECOND_UPDATE
+    })
+  ]);
+  const hedge = snapshotFor(
+    strategy.id,
+    'SPOT_HEDGE_GTC',
+    '1',
+    '0',
+    '1',
+    'open',
+    { updatedAt: SECOND_UPDATE }
+  );
+  f.spot.createResults.push(hedge);
+  f.spot.scriptedFetches.set(hedge.exchangeOrderId, [hedge, hedge]);
+  installManualIntervals(t);
+  const coordinator = new HedgeCoordinator(f.registry, f.repository);
+  const monitor = new OrderMonitor(
+    f.registry,
+    f.repository,
+    coordinator
+  );
+
+  monitor.start(10);
+  await monitor.stop();
+
+  assert.equal(f.repository.getStrategy(strategy.id).state, 'WAITING_HEDGE');
+  assert.equal(f.spot.createdRequests.length, 1);
+  assert.equal(f.contract.createdRequests.length, 0);
+  await monitor.recover();
+  await monitor.recover();
+  assert.equal(f.spot.createdRequests.length, 1);
+  assert.equal(
+    f.repository.listOrders(strategy.id).filter(
+      (order) => order.role === 'SPOT_HEDGE_GTC'
+    ).length,
+    1
+  );
+});
+
+test('concurrent asynchronous market terminals create one difference GTC after both settle', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(f.repository, 'CONCURRENT');
+  const spot = planOrder(
+    f.repository,
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '0', '1', 'open')
+  );
+  const contract = planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0', '1', 'open')
+  );
+  const spotTerminal = snapshotFor(
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    '1',
+    '0',
+    'closed',
+    { updatedAt: SECOND_UPDATE }
+  );
+  const contractTerminal = snapshotFor(
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    '0.9',
+    '0.1',
+    'closed',
+    { updatedAt: SECOND_UPDATE }
+  );
+  let resolveSpot: ((snapshot: OrderSnapshot) => void) | undefined;
+  let resolveContract: ((snapshot: OrderSnapshot) => void) | undefined;
+  const spotGate = new Promise<OrderSnapshot>((resolve) => {
+    resolveSpot = resolve;
+  });
+  const contractGate = new Promise<OrderSnapshot>((resolve) => {
+    resolveContract = resolve;
+  });
+  t.after(() => {
+    resolveSpot?.(spotTerminal);
+    resolveContract?.(contractTerminal);
+  });
+  f.spot.fetchOrder = async (
+    exchangeOrderId: string
+  ): Promise<OrderSnapshot> => {
+    assert.equal(exchangeOrderId, spot.exchangeOrderId);
+    return spotGate;
+  };
+  const difference = snapshotFor(
+    strategy.id,
+    'CONTRACT_HEDGE_GTC',
+    '0.1',
+    '0',
+    '0.1',
+    'open',
+    { updatedAt: SECOND_UPDATE }
+  );
+  f.contract.fetchOrder = async (
+    exchangeOrderId: string
+  ): Promise<OrderSnapshot> => {
+    if (exchangeOrderId === contract.exchangeOrderId) {
+      return contractGate;
+    }
+    assert.equal(exchangeOrderId, difference.exchangeOrderId);
+    return difference;
+  };
+  f.contract.createResults.push(difference);
+  const coordinator = new HedgeCoordinator(f.registry, f.repository);
+  const monitor = new OrderMonitor(
+    f.registry,
+    f.repository,
+    coordinator
+  );
+
+  const recovery = monitor.recover();
+  resolveSpot?.(spotTerminal);
+  await flushMicrotasks();
+  assert.equal(f.contract.createdRequests.length, 0);
+  resolveContract?.(contractTerminal);
+  await recovery;
+
+  assert.equal(f.repository.getStrategy(strategy.id).state, 'WAITING_HEDGE');
+  assert.equal(f.contract.createdRequests.length, 1);
+  assert.equal(f.contract.createdRequests[0]?.baseQuantity, '0.1');
+  assert.equal(f.spot.createdRequests.length, 0);
+  await monitor.recover();
+  await monitor.recover();
+  assert.equal(f.contract.createdRequests.length, 1);
+  assert.equal(
+    f.repository.listOrders(strategy.id).filter(
+      (order) => order.role === 'CONTRACT_HEDGE_GTC'
+    ).length,
+    1
+  );
+});
+
+test('does not continue incomplete, planned, or open market intent topologies', async (t) => {
+  const f = fixture(t);
+  const incomplete = createStrategy(f.repository, 'CONCURRENT');
+  const incompleteOrder = planOrder(
+    f.repository,
+    incomplete.id,
+    'SPOT_MARKET',
+    '1'
+  );
+  f.spot.scriptedFinds.set(incompleteOrder.clientOrderId, [
+    snapshotFor(incomplete.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+  ]);
+  const planned = createStrategy(f.repository, 'CONTRACT_FIRST');
+  const plannedOrder = planOrder(
+    f.repository,
+    planned.id,
+    'CONTRACT_MARKET',
+    '1'
+  );
+  f.contract.scriptedFinds.set(plannedOrder.clientOrderId, [null]);
+  const nonterminal = createStrategy(f.repository, 'CONCURRENT');
+  planOrder(
+    f.repository,
+    nonterminal.id,
+    'SPOT_MARKET',
+    '1',
+    snapshotFor(nonterminal.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+  );
+  const openOrder = planOrder(
+    f.repository,
+    nonterminal.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(nonterminal.id, 'CONTRACT_MARKET', '1', '0', '1', 'open')
+  );
+  f.contract.scriptedFetches.set(openOrder.exchangeOrderId as string, [
+    snapshotFor(nonterminal.id, 'CONTRACT_MARKET', '1', '0', '1', 'open', {
+      updatedAt: SECOND_UPDATE
+    })
+  ]);
+  const continued: string[] = [];
+  const monitor = new OrderMonitor(f.registry, f.repository, {
+    async confirmAndExecute(strategyId: string): Promise<void> {
+      continued.push(strategyId);
+    }
+  });
+
+  await monitor.recover();
+
+  assert.deepEqual(continued, []);
+  for (const strategy of [incomplete, planned, nonterminal]) {
+    assert.equal(f.repository.getStrategy(strategy.id).state, 'EXECUTING');
+  }
+  assertNoCreates(f);
+});
+
 test('keeps coordinator-continuable missing-GTC topologies executing', async (t) => {
   const f = fixture(t);
   const contractFirst = createStrategy(f.repository, 'CONTRACT_FIRST');
@@ -1409,7 +1617,7 @@ test('isolates recovery failures between strategies', async (t) => {
   assertNoCreates(f);
 });
 
-test('marks attach failure incomplete without leaking the raw repository error', async (t) => {
+test('preserves the current state when snapshot attachment temporarily fails', async (t) => {
   const f = fixture(t);
   const strategy = createStrategy(
     f.repository,
@@ -1452,8 +1660,8 @@ test('marks attach failure incomplete without leaking the raw repository error',
       failureCode: f.repository.getStrategy(strategy.id).failureCode
     },
     {
-      state: 'HEDGE_INCOMPLETE',
-      failureCode: 'INCONSISTENT_ORDER_STATE'
+      state: 'WAITING_HEDGE',
+      failureCode: null
     }
   );
   assert.equal(f.repository.listOrderEvents(gtc.id).length, 1);
@@ -1553,15 +1761,15 @@ test('keeps the first attachment and stops before the third when the second atta
     .reconcileStrategy(strategy.id);
 
   assert.deepEqual(repository.attachmentAttempts, [spot.id, contract.id]);
-  assert.deepEqual(repository.transitionTargets, ['HEDGE_INCOMPLETE']);
+  assert.deepEqual(repository.transitionTargets, []);
   assert.deepEqual(
     {
       state: f.repository.getStrategy(strategy.id).state,
       failureCode: f.repository.getStrategy(strategy.id).failureCode
     },
     {
-      state: 'HEDGE_INCOMPLETE',
-      failureCode: 'INCONSISTENT_ORDER_STATE'
+      state: 'WAITING_HEDGE',
+      failureCode: null
     }
   );
   const latest = new Map(

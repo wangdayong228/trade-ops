@@ -133,7 +133,7 @@ function ccxtOrder(overrides: Partial<CcxtOrder> = {}): CcxtOrder {
     timeInForce: 'GTC',
     side: 'buy',
     price: 60000,
-    average: undefined,
+    average: 60000,
     amount: 0.01,
     filled: 0,
     remaining: 0.01,
@@ -782,8 +782,7 @@ function buildLockedAdapterOrderRequest(
 
 for (const exchangeId of ['bitget', 'okx'] as const) {
   for (const marginMode of ['cross', 'isolated'] as const) {
-    for (const hedged of [false, true] as const) {
-      test(`${exchangeId} preserves ${marginMode} margin for a ${hedged ? 'hedged' : 'one-way'} opening short`, async () => {
+    test(`${exchangeId} preserves ${marginMode} margin for a hedged opening short`, async () => {
         const { gateway, ccxt } = makeGateway(exchangeId);
         const exchangeAmount = exchangeId === 'bitget' ? 0.01 : 10;
         ccxt.createResult = ccxtOrder({
@@ -797,7 +796,7 @@ for (const exchangeId of ['bitget', 'okx'] as const) {
 
         await gateway.createOrder(swapRequest({
           marginMode,
-          ...(hedged ? { positionSide: 'SHORT' } : {})
+          positionSide: 'SHORT'
         }));
 
         const params = ccxt.createCalls[0]?.params;
@@ -807,8 +806,8 @@ for (const exchangeId of ['bitget', 'okx'] as const) {
           reduceOnly: false,
           marginMode,
           ...(exchangeId === 'bitget'
-            ? hedged ? { hedged: true } : { oneWayMode: true }
-            : { positionSide: hedged ? 'short' : 'net' })
+            ? { hedged: true }
+            : { positionSide: 'short' })
         });
         assert.equal(ccxt.setMarginModeCalls.length, 0);
 
@@ -825,18 +824,17 @@ for (const exchangeId of ['bitget', 'okx'] as const) {
           assert.equal(lockedRequest.force, 'GTC');
           assert.equal(
             lockedRequest.tradeSide,
-            hedged ? 'Open' : undefined
+            'Open'
           );
         } else {
           assert.equal(lockedRequest.tdMode, marginMode);
           assert.equal(lockedRequest.ordType, 'limit');
           assert.equal(
             lockedRequest.posSide,
-            hedged ? 'short' : 'net'
+            'short'
           );
         }
       });
-    }
   }
 }
 
@@ -1404,6 +1402,240 @@ test('order snapshot status maps rejected and unknown CCXT statuses without losi
     );
     assert.equal(snapshot.status, normalizedStatus);
     assert.equal(snapshot.exchangeOrderId, 'exchange-order-1');
+  }
+});
+
+test('derives Bitget spot actual average from execution cost instead of submission conversion price', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.ticker = { ask: '70000', last: '69000' };
+  const result = ccxtOrder({
+    id: 'spot-market-cost',
+    clientOrderId: 'clientorderid0000000000000000001',
+    symbol: 'BTC/USDT',
+    type: 'market',
+    side: 'buy',
+    amount: '0.01',
+    filled: '0.01',
+    remaining: '0',
+    average: undefined,
+    cost: '600.01234567890123456789',
+    status: 'closed'
+  });
+  result.average = null as never;
+  ccxt.createResult = result;
+
+  const request = spotRequest({ type: 'market' });
+  delete request.price;
+  const snapshot = await gateway.createOrder(request);
+
+  assert.equal(snapshot.averagePrice, '60001.234567890123456789');
+  assert.equal(ccxt.createCalls[0]?.price, '70000');
+  assert.notEqual(snapshot.averagePrice, ccxt.createCalls[0]?.price);
+});
+
+test('derives USDT-linear swap actual average using contract-size-adjusted filled base', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  ccxt.createResult = ccxtOrder({
+    id: 'swap-market-cost',
+    clientOrderId: 'clientorderid0000000000000000001',
+    symbol: 'BTC/USDT:USDT',
+    type: 'market',
+    side: 'sell',
+    amount: '10',
+    filled: '4',
+    remaining: '6',
+    average: undefined,
+    cost: '240.004',
+    status: 'canceled'
+  });
+
+  const request = swapRequest({
+    type: 'market',
+    positionSide: 'SHORT'
+  });
+  delete request.price;
+  const snapshot = await gateway.createOrder(request);
+
+  assert.equal(snapshot.filledBaseQuantity, '0.004');
+  assert.equal(snapshot.averagePrice, '60001');
+});
+
+test('derives an exact weighted actual average from complete identity-consistent trades', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.createResult = ccxtOrder({
+    id: 'spot-market-trades',
+    clientOrderId: 'clientorderid0000000000000000001',
+    symbol: 'BTC/USDT',
+    type: 'market',
+    side: 'buy',
+    amount: '0.01',
+    filled: '0.01',
+    remaining: '0',
+    average: undefined,
+    cost: undefined,
+    trades: [
+      {
+        order: 'spot-market-trades',
+        symbol: 'BTC/USDT',
+        side: 'buy',
+        amount: '0.004',
+        cost: '240.00000000000000000004'
+      },
+      {
+        order: 'spot-market-trades',
+        symbol: 'BTC/USDT',
+        side: 'buy',
+        amount: '0.006',
+        cost: '360.01234567890123456786'
+      }
+    ]
+  });
+
+  const request = spotRequest({ type: 'market' });
+  delete request.price;
+  const snapshot = await gateway.createOrder(request);
+
+  assert.equal(snapshot.averagePrice, '60001.23456789012345679');
+});
+
+test('treats zero average as unavailable and derives the actual average from reliable evidence', async (t) => {
+  for (const [name, order, expected] of [
+    ['cost', {
+      average: 0,
+      cost: '600.01234567890123456789',
+      trades: []
+    }, '60001.234567890123456789'],
+    ['trades', {
+      average: '0',
+      cost: undefined,
+      trades: [{
+        order: 'spot-market-zero-average',
+        symbol: 'BTC/USDT',
+        side: 'buy',
+        amount: '0.01',
+        cost: '600.02'
+      }]
+    }, '60002']
+  ] as const) {
+    await t.test(name, async () => {
+      const { gateway, ccxt } = makeGateway('bitget');
+      ccxt.createResult = ccxtOrder({
+        id: 'spot-market-zero-average',
+        clientOrderId: 'clientorderid0000000000000000001',
+        symbol: 'BTC/USDT',
+        type: 'market',
+        side: 'buy',
+        amount: '0.01',
+        filled: '0.01',
+        remaining: '0',
+        status: 'closed',
+        ...structuredClone(order),
+        trades: [...structuredClone(order.trades)] as unknown[]
+      });
+
+      const request = spotRequest({ type: 'market' });
+      delete request.price;
+      const snapshot = await gateway.createOrder(request);
+
+      assert.equal(snapshot.averagePrice, expected);
+    });
+  }
+});
+
+test('preserves a missing actual average when zero sentinel has no reliable fallback', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.createResult = ccxtOrder({
+    symbol: 'BTC/USDT',
+    type: 'market',
+    side: 'buy',
+    amount: '0.01',
+    filled: '0.01',
+    remaining: '0',
+    average: 0,
+    cost: undefined,
+    trades: [],
+    status: 'closed'
+  });
+
+  const request = spotRequest({ type: 'market' });
+  delete request.price;
+  const snapshot = await gateway.createOrder(request);
+
+  assert.equal(snapshot.averagePrice, null);
+});
+
+test('rejects negative or non-numeric average instead of falling back', async (t) => {
+  for (const average of [-1, 'not-a-decimal'] as const) {
+    await t.test(String(average), async () => {
+      const { gateway, ccxt } = makeGateway('bitget');
+      ccxt.createResult = ccxtOrder({
+        symbol: 'BTC/USDT',
+        type: 'market',
+        side: 'buy',
+        amount: '0.01',
+        filled: '0.01',
+        remaining: '0',
+        average,
+        cost: '600',
+        status: 'closed'
+      });
+
+      const request = spotRequest({ type: 'market' });
+      delete request.price;
+      await assert.rejects(
+        gateway.createOrder(request),
+        /average price/
+      );
+    });
+  }
+});
+
+test('leaves actual average missing for incomplete or identity-mismatched trades', async (t) => {
+  for (const [name, trades] of [
+    ['incomplete', [{
+      order: 'spot-market-trades',
+      symbol: 'BTC/USDT',
+      side: 'buy',
+      amount: '0.009',
+      cost: '540'
+    }]],
+    ['wrong-order', [{
+      order: 'different-order',
+      symbol: 'BTC/USDT',
+      side: 'buy',
+      amount: '0.01',
+      cost: '600'
+    }]],
+    ['malformed', [{
+      order: 'spot-market-trades',
+      symbol: 'BTC/USDT',
+      side: 'buy',
+      amount: '0.01',
+      cost: 'not-a-decimal'
+    }]]
+  ] as const) {
+    await t.test(name, async () => {
+      const { gateway, ccxt } = makeGateway('bitget');
+      ccxt.createResult = ccxtOrder({
+        id: 'spot-market-trades',
+        clientOrderId: 'clientorderid0000000000000000001',
+        symbol: 'BTC/USDT',
+        type: 'market',
+        side: 'buy',
+        amount: '0.01',
+        filled: '0.01',
+        remaining: '0',
+        average: undefined,
+        cost: undefined,
+        trades: [...structuredClone(trades)] as unknown[]
+      });
+
+      const request = spotRequest({ type: 'market' });
+      delete request.price;
+      const snapshot = await gateway.createOrder(request);
+
+      assert.equal(snapshot.averagePrice, null);
+    });
   }
 });
 

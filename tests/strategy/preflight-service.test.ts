@@ -134,7 +134,7 @@ function setup(options: {
   contract.freeUsdt = options.contractFreeUsdt ?? '60';
   contract.accountSettings = options.accountSettings ?? {
     marginMode: 'isolated',
-    positionMode: 'one-way',
+    positionMode: 'hedged',
     leverage: '2'
   };
   return {
@@ -155,7 +155,7 @@ test('returns normalized quantity and a confirmed preview snapshot', async () =>
   assert.equal(result.effectiveBaseQuantity, '1');
   assert.deepEqual(result.accountSettings, {
     marginMode: 'isolated',
-    positionMode: 'one-way',
+    positionMode: 'hedged',
     leverage: '2'
   });
   assert.equal(result.spotFreeUsdt, '100');
@@ -343,7 +343,7 @@ test('fails closed when margin or position mode is unknown', async () => {
   for (const accountSettings of [
     {
       marginMode: 'unknown',
-      positionMode: 'one-way',
+      positionMode: 'hedged',
       leverage: '2'
     },
     {
@@ -359,13 +359,28 @@ test('fails closed when margin or position mode is unknown', async () => {
   }
 });
 
+test('rejects one-way contract accounts before returning a persistable preview', async () => {
+  const { service } = setup({
+    accountSettings: {
+      marginMode: 'isolated',
+      positionMode: 'one-way',
+      leverage: '2'
+    }
+  });
+
+  await assert.rejects(
+    service.run(input()),
+    /hedged position mode/
+  );
+});
+
 test('fails closed when leverage is missing, non-finite, zero, or negative', async () => {
   for (const leverage of [null, 'NaN', 'Infinity', '0', '-1']) {
     await assert.rejects(
       setup({
         accountSettings: {
           marginMode: 'isolated',
-          positionMode: 'one-way',
+          positionMode: 'hedged',
           leverage
         }
       }).service.run(input()),
