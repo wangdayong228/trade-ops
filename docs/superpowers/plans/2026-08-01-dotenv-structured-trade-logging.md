@@ -268,7 +268,7 @@ git commit -m "feat: add safe structured logger"
 - Adds: `BuildServerDependencies.operationalLog?: OperationalLog`
 - Produces: `resolveRuntimeEnvironment(explicitEnv, load?): { env; fileStatus }`
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 Extend the existing runnable fixture and assert one successful lifecycle, including host, port, database path, and exchange IDs when the fixture supplies them:
 
@@ -283,7 +283,7 @@ assert.deepEqual(logEvents, [
 
 Assert repeated signals/shutdown calls do not duplicate stopping/stopped events, and a listen failure logs `service_start_failed` before existing cleanup.
 
-- [ ] **Step 2: Write the safe child-process startup regression**
+- [x] **Step 2: Write the safe child-process startup regression**
 
 Create a temporary cwd containing only `TRADING_EXCHANGES=bitget,okx` in `.env`. Spawn the absolute `dist/src/main.js` with safe minimal environment and capture stdout/stderr. Assert exit code 1, each stdout line parses as JSON, `environment_loaded` exists, and `service_startup_failed.error.message` equals `missing credentials for configured exchange bitget`.
 
@@ -291,7 +291,7 @@ Add a second temporary cwd without `.env` and assert `environment_file_missing` 
 
 This must fail before gateway/database construction and must never use the workspace `.env`.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -302,15 +302,15 @@ node --test dist/tests/main.test.js
 
 Expected: new tests fail because the entrypoint neither loads `.env` nor emits lifecycle JSON.
 
-- [ ] **Step 4: Load dotenv only in the default run path**
+- [x] **Step 4: Load dotenv only in the default run path**
 
 Implement `resolveRuntimeEnvironment`: when explicit env exists, return it unchanged with `fileStatus: 'skipped'`; otherwise call the injectable loader once against `process.env` and return its loaded/missing status. `run` logs only loaded/missing statuses and passes the resolved env explicitly to `composeService`.
 
-- [ ] **Step 5: Add lifecycle events without changing resource ownership**
+- [x] **Step 5: Add lifecycle events without changing resource ownership**
 
 In `startService`, log `service_starting` before monitor start, `service_started` after listen resolves, `service_stopping` exactly when the idempotent shutdown promise is created, and `service_stopped` after all three resources close. Extend `RunnableComposition.config` with optional `databasePath` and `exchangeIds` fields so real compositions log them while existing fixtures may omit them. If cleanup preserves an error, log `service_stop_failed` and rethrow the same first error.
 
-- [ ] **Step 6: Share one logger with Fastify**
+- [x] **Step 6: Share one logger with Fastify**
 
 Build Fastify with exactly one logger option:
 
@@ -331,7 +331,7 @@ const app = Fastify({
 
 Replace the background confirmation and unhandled HTTP fixed-message logs with `OperationalLog.error`, including `strategyId` or request ID/method/URL, never the raw error object.
 
-- [ ] **Step 7: Replace the opaque entrypoint catch**
+- [x] **Step 7: Replace the opaque entrypoint catch**
 
 Create Pino before `run`, pass it and the operational facade through options, then catch with:
 
@@ -342,7 +342,7 @@ operations.fatal('service_startup_failed', error);
 
 The facade's secret-provider callback must read current `process.env` after dotenv loading; do not capture a pre-load array.
 
-- [ ] **Step 8: Verify GREEN and commit**
+- [x] **Step 8: Verify GREEN and commit**
 
 Run:
 
