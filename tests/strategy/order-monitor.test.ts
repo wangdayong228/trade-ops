@@ -14,6 +14,14 @@ import type {
   StrategyState
 } from '../../src/domain/types.js';
 import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
+import type {
+  OperationalFields,
+  OperationalLog
+} from '../../src/logging/logger.js';
+import type {
+  TradeEvent,
+  TradeEventSink
+} from '../../src/logging/trade-events.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
 import type {
   StrategyFailureCode,
@@ -314,6 +322,32 @@ function assertNoCreates(f: Fixture): void {
   assert.equal(f.contract.createdRequests.length, 0);
 }
 
+function captureTradeEvents(events: TradeEvent[]): TradeEventSink {
+  return {
+    record(event): void {
+      events.push(structuredClone(event));
+    }
+  };
+}
+
+interface CapturedOperationalError {
+  readonly event: string;
+  readonly error: unknown;
+  readonly fields: Readonly<OperationalFields> | undefined;
+}
+
+function captureOperationalErrors(
+  errors: CapturedOperationalError[]
+): OperationalLog {
+  return {
+    info(): void {},
+    error(event, error, fields): void {
+      errors.push({ event, error, fields });
+    },
+    fatal(): void {}
+  };
+}
+
 async function flushMicrotasks(): Promise<void> {
   for (let index = 0; index < 12; index += 1) {
     await Promise.resolve();
@@ -430,6 +464,7 @@ class RepositoryProxy implements StrategyRepository {
 
 test('keeps waiting after a partial GTC fill', async (t) => {
   const f = fixture(t);
+  const tradeEvents: TradeEvent[] = [];
   const strategy = createStrategy(
     f.repository,
     'CONTRACT_FIRST',
@@ -449,14 +484,27 @@ test('keeps waiting after a partial GTC fill', async (t) => {
     '1',
     snapshotFor(strategy.id, 'SPOT_HEDGE_GTC', '1', '0', '1', 'open')
   );
-  f.spot.scriptedFetches.set(gtc.exchangeOrderId as string, [
-    snapshotFor(strategy.id, 'SPOT_HEDGE_GTC', '1', '0.4', '0.6', 'open', {
+  const partial = snapshotFor(
+    strategy.id,
+    'SPOT_HEDGE_GTC',
+    '1',
+    '0.4',
+    '0.6',
+    'open',
+    {
       updatedAt: SECOND_UPDATE
-    })
-  ]);
+    }
+  );
+  f.spot.scriptedFetches.set(gtc.exchangeOrderId as string, [partial, partial]);
 
-  await new OrderMonitor(f.registry, f.repository)
-    .reconcileStrategy(strategy.id);
+  const monitor = new OrderMonitor(
+    f.registry,
+    f.repository,
+    undefined,
+    captureTradeEvents(tradeEvents)
+  );
+  await monitor.reconcileStrategy(strategy.id);
+  await monitor.reconcileStrategy(strategy.id);
 
   assert.equal(f.repository.getStrategy(strategy.id).state, 'WAITING_HEDGE');
   assert.equal(
@@ -465,11 +513,17 @@ test('keeps waiting after a partial GTC fill', async (t) => {
     )?.snapshot?.filledBaseQuantity,
     '0.4'
   );
+  assert.deepEqual(tradeEvents.map(({ event }) => event), [
+    'order_status_changed'
+  ]);
+  assert.equal(tradeEvents[0]?.filledBaseQuantity, '0.4');
+  assert.equal(tradeEvents[0]?.status, 'open');
   assertNoCreates(f);
 });
 
 test('marks a strategy hedged only after a full terminal GTC matches exposure', async (t) => {
   const f = fixture(t);
+  const tradeEvents: TradeEvent[] = [];
   const strategy = createStrategy(
     f.repository,
     'CONTRACT_FIRST',
@@ -495,11 +549,69 @@ test('marks a strategy hedged only after a full terminal GTC matches exposure', 
     })
   ]);
 
-  await new OrderMonitor(f.registry, f.repository)
-    .reconcileStrategy(strategy.id);
+  await new OrderMonitor(
+    f.registry,
+    f.repository,
+    undefined,
+    captureTradeEvents(tradeEvents)
+  ).reconcileStrategy(strategy.id);
 
   assert.equal(f.repository.getStrategy(strategy.id).state, 'HEDGED');
+  assert.deepEqual(tradeEvents.map(({ event }) => event), [
+    'order_status_changed',
+    'order_terminal'
+  ]);
+  assert.equal(tradeEvents[1]?.filledBaseQuantity, '1');
+  assert.equal(tradeEvents[1]?.remainingBaseQuantity, '0');
+  assert.equal(tradeEvents[1]?.status, 'closed');
   assertNoCreates(f);
+});
+
+test('a throwing monitor trade sink cannot block persistence or classification', async (t) => {
+  const f = fixture(t);
+  const strategy = createStrategy(
+    f.repository,
+    'CONTRACT_FIRST',
+    'WAITING_HEDGE'
+  );
+  planOrder(
+    f.repository,
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '1', '0', 'closed')
+  );
+  const gtc = planOrder(
+    f.repository,
+    strategy.id,
+    'SPOT_HEDGE_GTC',
+    '1',
+    snapshotFor(strategy.id, 'SPOT_HEDGE_GTC', '1', '0', '1', 'open')
+  );
+  f.spot.scriptedFetches.set(gtc.exchangeOrderId as string, [
+    snapshotFor(strategy.id, 'SPOT_HEDGE_GTC', '1', '1', '0', 'closed', {
+      updatedAt: SECOND_UPDATE
+    })
+  ]);
+
+  await new OrderMonitor(
+    f.registry,
+    f.repository,
+    undefined,
+    {
+      record(): never {
+        throw new Error('log sink unavailable');
+      }
+    }
+  ).reconcileStrategy(strategy.id);
+
+  assert.equal(f.repository.getStrategy(strategy.id).state, 'HEDGED');
+  assert.equal(
+    f.repository.listOrders(strategy.id).find(
+      (order) => order.role === 'SPOT_HEDGE_GTC'
+    )?.snapshot?.filledBaseQuantity,
+    '1'
+  );
 });
 
 test('marks an externally canceled GTC incomplete with a safe code', async (t) => {
@@ -1725,6 +1837,7 @@ test('defensively rejects a persisted swap request with the wrong confirmed marg
 
 test('isolates recovery failures between strategies', async (t) => {
   const f = fixture(t);
+  const operationalErrors: CapturedOperationalError[] = [];
   const failedLookup = createStrategy(
     f.repository,
     'CONTRACT_FIRST',
@@ -1772,14 +1885,38 @@ test('isolates recovery failures between strategies', async (t) => {
       updatedAt: SECOND_UPDATE
     })
   ]);
+  class FailedStrategyRepository extends RepositoryProxy {
+    override getStrategy(id: string): StrategyRecord {
+      if (id === failedLookup.id) {
+        throw new Error('repository secret=never-store-this');
+      }
+      return super.getStrategy(id);
+    }
+  }
+  const repository = new FailedStrategyRepository(f.repository);
 
-  await new OrderMonitor(f.registry, f.repository).recover();
+  await new OrderMonitor(
+    f.registry,
+    repository,
+    undefined,
+    undefined,
+    captureOperationalErrors(operationalErrors)
+  ).recover();
 
   assert.equal(
     f.repository.getStrategy(failedLookup.id).state,
     'WAITING_HEDGE'
   );
   assert.equal(f.repository.getStrategy(successful.id).state, 'HEDGED');
+  assert.equal(operationalErrors.length, 1);
+  assert.equal(operationalErrors[0]?.event, 'strategy_recovery_failed');
+  assert.deepEqual(operationalErrors[0]?.fields, {
+    strategyId: failedLookup.id
+  });
+  assert.equal(
+    (operationalErrors[0]?.error as Error | undefined)?.message,
+    'repository secret=never-store-this'
+  );
   assertNoCreates(f);
 });
 
@@ -2346,6 +2483,7 @@ test('stop clears scheduling and waits for the immediate recovery to settle', as
 
 test('a rejected immediate recovery does not cause an unhandled rejection or stop later rounds', async (t) => {
   const f = fixture(t);
+  const operationalErrors: CapturedOperationalError[] = [];
   const strategy = createStrategy(
     f.repository,
     'CONTRACT_FIRST',
@@ -2384,7 +2522,13 @@ test('a rejected immediate recovery does not cause an unhandled rejection or sto
   const repository = new FailOnceRecoveryRepository(f.repository);
   const clock = installManualIntervals(t);
 
-  const stop = new OrderMonitor(f.registry, repository).start(10);
+  const stop = new OrderMonitor(
+    f.registry,
+    repository,
+    undefined,
+    undefined,
+    captureOperationalErrors(operationalErrors)
+  ).start(10);
   await flushMicrotasks();
   assert.equal(repository.calls, 1);
   clock.tick();
@@ -2392,6 +2536,13 @@ test('a rejected immediate recovery does not cause an unhandled rejection or sto
 
   assert.equal(repository.calls, 2);
   assert.equal(f.repository.getStrategy(strategy.id).state, 'HEDGED');
+  assert.equal(operationalErrors.length, 1);
+  assert.equal(operationalErrors[0]?.event, 'monitor_recovery_failed');
+  assert.equal(
+    (operationalErrors[0]?.error as Error | undefined)?.message,
+    'database secret=must-not-be-logged'
+  );
+  assert.equal(operationalErrors[0]?.fields, undefined);
   stop();
   assertNoCreates(f);
 });

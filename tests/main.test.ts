@@ -258,6 +258,24 @@ test('production CCXT gateway construction performs no startup market load', asy
   assert.equal(composition.repository.listRecoverable().length, 0);
 });
 
+test('composition shares one injected trade sink with coordinator and monitor', async (t) => {
+  const tradeEvents = { record(): void {} };
+  const composition = composeService({
+    env: VALID_ENV,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    databaseFactory: () => new Database(':memory:'),
+    tradeEvents,
+    logger: false
+  });
+  t.after(async () => {
+    await composition.server.close();
+    composition.database.close();
+  });
+
+  assert.equal(Reflect.get(composition.coordinator, 'tradeEvents'), tradeEvents);
+  assert.equal(Reflect.get(composition.monitor, 'tradeEvents'), tradeEvents);
+});
+
 test('creates the database parent directory during normal composition', async (t) => {
   const temporaryDirectory = await mkdtemp(join(tmpdir(), 'trade-ops-main-'));
   const databasePath = join(temporaryDirectory, 'nested', 'trade-ops.sqlite');

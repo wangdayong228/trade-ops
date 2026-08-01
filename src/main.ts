@@ -23,6 +23,11 @@ import {
   type OperationalFields,
   type OperationalLog
 } from './logging/logger.js';
+import {
+  NOOP_TRADE_EVENT_SINK,
+  PinoTradeEventSink,
+  type TradeEventSink
+} from './logging/trade-events.js';
 import { SqliteStrategyRepository } from './storage/sqlite-strategy-repository.js';
 import { HedgeCoordinator } from './strategy/hedge-coordinator.js';
 import { OrderMonitor } from './strategy/order-monitor.js';
@@ -55,6 +60,7 @@ export interface ComposeServiceOptions {
   readonly logger?: FastifyServerOptions['logger'];
   readonly loggerInstance?: Logger;
   readonly operationalLog?: OperationalLog;
+  readonly tradeEvents?: TradeEventSink;
   readonly publicDirectory?: string;
 }
 
@@ -277,8 +283,6 @@ export function composeService(
     const clock = options.clock ?? (() => new Date());
     const repository = new SqliteStrategyRepository(database, clock);
     const preflightService = new PreflightService(registry, clock);
-    const coordinator = new HedgeCoordinator(registry, repository);
-    const monitor = new OrderMonitor(registry, repository, coordinator);
     const operationalLog = options.operationalLog
       ?? (options.loggerInstance === undefined
         ? undefined
@@ -286,6 +290,24 @@ export function composeService(
             options.loggerInstance,
             () => configuredSecretValues(env)
           ));
+    const tradeEvents = options.tradeEvents
+      ?? (options.loggerInstance === undefined
+        ? NOOP_TRADE_EVENT_SINK
+        : new PinoTradeEventSink(
+            options.loggerInstance.child({ component: 'trade' })
+          ));
+    const coordinator = new HedgeCoordinator(
+      registry,
+      repository,
+      tradeEvents
+    );
+    const monitor = new OrderMonitor(
+      registry,
+      repository,
+      coordinator,
+      tradeEvents,
+      operationalLog
+    );
     const server = buildServer({
       registry,
       preflightService,
