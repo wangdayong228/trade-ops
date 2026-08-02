@@ -47,7 +47,7 @@
 - Produces: `loadEnvironmentFile(options?: LoadEnvironmentFileOptions): 'loaded' | 'missing'`
 - Consumed later by: `run()` in `src/main.ts`
 
-- [ ] **Step 1: Install exact dependencies and lower the runtime floor**
+- [x] **Step 1: Install exact dependencies and lower the runtime floor**
 
 Run:
 
@@ -57,7 +57,7 @@ npm install dotenv@17.4.2 pino@10.3.1
 
 Set the root and lockfile engine declaration to `"node": ">=20"`. Expected: dotenv and Pino are direct dependencies; Pino is deduplicated with Fastify where npm permits.
 
-- [ ] **Step 2: Write the failing environment-loader tests**
+- [x] **Step 2: Write the failing environment-loader tests**
 
 Create `tests/config/environment-loader.test.ts` with these cases:
 
@@ -91,13 +91,13 @@ test('treats only ENOENT as an optional missing file', () => {
 
 Import Node test/assert/fs/os/path helpers, `DotenvConfigOutput`, and the missing production module.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run `npm run build`.
 
 Expected: FAIL because `src/config/environment-loader.ts` does not exist.
 
-- [ ] **Step 4: Implement the minimal loader**
+- [x] **Step 4: Implement the minimal loader**
 
 Create `src/config/environment-loader.ts`:
 
@@ -136,7 +136,7 @@ export function loadEnvironmentFile(
 }
 ```
 
-- [ ] **Step 5: Verify GREEN and template completeness**
+- [x] **Step 5: Verify GREEN and template completeness**
 
 Run:
 
@@ -148,7 +148,7 @@ git diff --check -- package.json package-lock.json .env.example src/config/envir
 
 Expected: build succeeds, loader tests pass, and `.env.example` contains the ten supported safe placeholder keys.
 
-- [ ] **Step 6: Commit the loader**
+- [x] **Step 6: Commit the loader**
 
 ```bash
 git add package.json package-lock.json .env.example src/config/environment-loader.ts tests/config/environment-loader.test.ts
@@ -172,7 +172,7 @@ git commit -m "feat: load optional dotenv configuration"
 - Produces: `OperationalLog`, `createOperationalLog(logger, secretProvider)`
 - Produces: `LOGGER_REDACT_PATHS`
 
-- [ ] **Step 1: Write failing JSON and secret-replacement tests**
+- [x] **Step 1: Write failing JSON and secret-replacement tests**
 
 Use a Node `Writable` to capture Pino output and assert:
 
@@ -197,13 +197,13 @@ assert.match(JSON.stringify(line), /\[Redacted\]/);
 Add tests proving arbitrary enumerable `request`, `response`, `apiKey`, and `cause` properties are absent, and only the six exact non-empty credential values are returned by `configuredSecretValues`.
 Parse `package.json` in the test and assert the emitted base `version` equals its `version`, preventing the fixed logger field from drifting.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run `npm run build`.
 
 Expected: FAIL because `src/logging/logger.ts` does not exist.
 
-- [ ] **Step 3: Implement public logger contracts**
+- [x] **Step 3: Implement public logger contracts**
 
 Create `src/logging/logger.ts` with:
 
@@ -228,11 +228,11 @@ Define the existing 14 Fastify redact paths as `LOGGER_REDACT_PATHS`. `createApp
 
 `safeError` reads only name/message/code/stack under `try/catch`, replaces every current non-empty secret substring, and never spreads the original object. `createOperationalLog` obtains secrets from its callback for every error and catches logger-write failures so logging remains a side effect only.
 
-- [ ] **Step 4: Move Fastify redact ownership without behavior change**
+- [x] **Step 4: Move Fastify redact ownership without behavior change**
 
 Import and re-export `LOGGER_REDACT_PATHS` from `src/http/server.ts`; delete its local duplicate. Keep its default logger configuration unchanged.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run:
 
@@ -243,7 +243,7 @@ node --test dist/tests/logging/logger.test.js dist/tests/http/server.test.js
 
 Expected: all logger and HTTP tests pass; captured output is JSON and contains no seeded secret.
 
-- [ ] **Step 6: Commit the logger foundation**
+- [x] **Step 6: Commit the logger foundation**
 
 ```bash
 git add src/logging/logger.ts tests/logging/logger.test.ts src/http/server.ts tests/http/server.test.ts
@@ -268,7 +268,7 @@ git commit -m "feat: add safe structured logger"
 - Adds: `BuildServerDependencies.operationalLog?: OperationalLog`
 - Produces: `resolveRuntimeEnvironment(explicitEnv, load?): { env; fileStatus }`
 
-- [ ] **Step 1: Write failing lifecycle tests**
+- [x] **Step 1: Write failing lifecycle tests**
 
 Extend the existing runnable fixture and assert one successful lifecycle, including host, port, database path, and exchange IDs when the fixture supplies them:
 
@@ -283,7 +283,7 @@ assert.deepEqual(logEvents, [
 
 Assert repeated signals/shutdown calls do not duplicate stopping/stopped events, and a listen failure logs `service_start_failed` before existing cleanup.
 
-- [ ] **Step 2: Write the safe child-process startup regression**
+- [x] **Step 2: Write the safe child-process startup regression**
 
 Create a temporary cwd containing only `TRADING_EXCHANGES=bitget,okx` in `.env`. Spawn the absolute `dist/src/main.js` with safe minimal environment and capture stdout/stderr. Assert exit code 1, each stdout line parses as JSON, `environment_loaded` exists, and `service_startup_failed.error.message` equals `missing credentials for configured exchange bitget`.
 
@@ -291,7 +291,7 @@ Add a second temporary cwd without `.env` and assert `environment_file_missing` 
 
 This must fail before gateway/database construction and must never use the workspace `.env`.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -302,15 +302,15 @@ node --test dist/tests/main.test.js
 
 Expected: new tests fail because the entrypoint neither loads `.env` nor emits lifecycle JSON.
 
-- [ ] **Step 4: Load dotenv only in the default run path**
+- [x] **Step 4: Load dotenv only in the default run path**
 
 Implement `resolveRuntimeEnvironment`: when explicit env exists, return it unchanged with `fileStatus: 'skipped'`; otherwise call the injectable loader once against `process.env` and return its loaded/missing status. `run` logs only loaded/missing statuses and passes the resolved env explicitly to `composeService`.
 
-- [ ] **Step 5: Add lifecycle events without changing resource ownership**
+- [x] **Step 5: Add lifecycle events without changing resource ownership**
 
 In `startService`, log `service_starting` before monitor start, `service_started` after listen resolves, `service_stopping` exactly when the idempotent shutdown promise is created, and `service_stopped` after all three resources close. Extend `RunnableComposition.config` with optional `databasePath` and `exchangeIds` fields so real compositions log them while existing fixtures may omit them. If cleanup preserves an error, log `service_stop_failed` and rethrow the same first error.
 
-- [ ] **Step 6: Share one logger with Fastify**
+- [x] **Step 6: Share one logger with Fastify**
 
 Build Fastify with exactly one logger option:
 
@@ -331,7 +331,7 @@ const app = Fastify({
 
 Replace the background confirmation and unhandled HTTP fixed-message logs with `OperationalLog.error`, including `strategyId` or request ID/method/URL, never the raw error object.
 
-- [ ] **Step 7: Replace the opaque entrypoint catch**
+- [x] **Step 7: Replace the opaque entrypoint catch**
 
 Create Pino before `run`, pass it and the operational facade through options, then catch with:
 
@@ -342,7 +342,7 @@ operations.fatal('service_startup_failed', error);
 
 The facade's secret-provider callback must read current `process.env` after dotenv loading; do not capture a pre-load array.
 
-- [ ] **Step 8: Verify GREEN and commit**
+- [x] **Step 8: Verify GREEN and commit**
 
 Run:
 
@@ -371,17 +371,17 @@ git commit -m "feat: log service lifecycle failures"
 - Produces: `orderEvent(name, order, snapshot?, details?): TradeEvent`
 - Produces: `PinoTradeEventSink`
 
-- [ ] **Step 1: Write failing runtime-allowlist tests**
+- [x] **Step 1: Write failing runtime-allowlist tests**
 
 Build a valid `StrategyOrderRecord`, unsafe-cast extra `apiKey`, `secret`, `rawRequest`, and `rawResponse` fields, pass it through `PinoTradeEventSink`, and assert JSON includes identifiers, request fields, quantities/prices/status while excluding every forbidden key and value. Use a fake logger whose `info()` throws and assert `sink.record(event)` does not throw.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run `npm run build`.
 
 Expected: FAIL because `src/logging/trade-events.ts` does not exist.
 
-- [ ] **Step 3: Define the allowlisted contract**
+- [x] **Step 3: Define the allowlisted contract**
 
 Use this event union:
 
@@ -398,11 +398,11 @@ export type OrderLifecycleEventName =
 
 `TradeEvent` contains only event, strategyId, mode, strategyState, role, exchangeId, symbol, kind, type, side, client/exchange order ID, requested/filled/remaining quantity, price/average price, timeInForce, positionSide, marginMode, status, failureCode, errorType, and errorCode. `mode` and `strategyState` are optional and are passed only where the producer already owns the strategy record; logging must not add repository reads. Define a frozen no-op sink with `record(): void {}`.
 
-- [ ] **Step 4: Implement two runtime allowlists**
+- [x] **Step 4: Implement two runtime allowlists**
 
 `orderEvent` constructs a fresh object by explicitly copying only declared fields; never spread order/request/snapshot/details. `PinoTradeEventSink.record` reconstructs the allowlisted object again before `logger.info(fields, event.event)` and catches logger errors. This protects JavaScript callers and unsafe casts as well as typed callers.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run:
 
@@ -430,11 +430,11 @@ git commit -m "feat: define safe trade lifecycle events"
 - Changes constructor to: `new HedgeCoordinator(registry, repository, tradeEvents?)`
 - Existing two-argument construction remains valid through `NOOP_TRADE_EVENT_SINK`.
 
-- [ ] **Step 1: Add a capturing sink to the coordinator fixture**
+- [x] **Step 1: Add a capturing sink to the coordinator fixture**
 
 Add `tradeEvents?: TradeEventSink` to setup options, store `structuredClone(event)` in a test sink, and pass it as the optional third constructor argument.
 
-- [ ] **Step 2: Write failing successful lifecycle tests**
+- [x] **Step 2: Write failing successful lifecycle tests**
 
 Table-drive `CONTRACT_FIRST`, `SPOT_FIRST`, and `CONCURRENT` so every mode proves that each fresh market order emits the lifecycle. For one persisted terminal market order assert:
 
@@ -450,11 +450,11 @@ assert.deepEqual(events.map(({ event }) => event), [
 
 Assert all correlation, mode/state, and normalized quantity/price/status fields. In concurrent mode, assert both `order_planned` events precede either submit-start event. Add a filled sequential first leg that derives a GTC and assert the GTC receives its own full planned/submit/result/status lifecycle.
 
-- [ ] **Step 3: Write failing boundary and side-effect tests**
+- [x] **Step 3: Write failing boundary and side-effect tests**
 
 Assert `NoOrderSubmittedError` emits `order_rejected_before_submit`/`ORDER_SUBMISSION_FAILED`; a generic create error emits `order_submit_uncertain`/`ORDER_SUBMISSION_UNKNOWN`; recovered intent emits no new planned/submit-started event; a throwing sink preserves strategy state and exact create count.
 
-- [ ] **Step 4: Run RED**
+- [x] **Step 4: Run RED**
 
 Run:
 
@@ -465,15 +465,15 @@ node --test dist/tests/strategy/hedge-coordinator.test.js
 
 Expected: new event assertions fail while existing execution assertions remain unchanged.
 
-- [ ] **Step 5: Emit planning and submission events at exact boundaries**
+- [x] **Step 5: Emit planning and submission events at exact boundaries**
 
 Add optional sink dependency. Emit planned only after `planOrder` returns; after atomic planning emit both returned records before submitting either. Emit submit-started immediately before `gateway.createOrder`. In catches emit only the typed failure code plus error name/code, never raw error/message/object.
 
-- [ ] **Step 6: Emit persisted result/status/terminal events**
+- [x] **Step 6: Emit persisted result/status/terminal events**
 
 Add `source: 'submission' | 'lookup'` to `persistSnapshot`. Immediately after `attachOrderSnapshot` succeeds, emit submit-succeeded for submission source, then status-changed, then terminal for closed/canceled/rejected. All earlier returns emit none. Direct create paths pass submission; lookup paths pass lookup.
 
-- [ ] **Step 7: Verify GREEN and commit**
+- [x] **Step 7: Verify GREEN and commit**
 
 Run:
 
@@ -504,15 +504,15 @@ git commit -m "feat: log coordinator order lifecycle"
 - Existing two- and three-argument calls remain valid.
 - Adds: `ComposeServiceOptions.tradeEvents?: TradeEventSink`
 
-- [ ] **Step 1: Write failing monitor event tests**
+- [x] **Step 1: Write failing monitor event tests**
 
 Inject a capturing fourth argument. Extend partial-GTC coverage to assert one status-changed event with fill `0.4` and no terminal; reconcile the same snapshot again and assert no new event. Extend full-terminal coverage to assert status-changed followed by terminal. A throwing sink must not prevent persistence/classification.
 
-- [ ] **Step 2: Write failing recovery error tests**
+- [x] **Step 2: Write failing recovery error tests**
 
 Inject an operational fifth argument. A per-strategy failure records `strategy_recovery_failed` with strategyId; an interval-level rejection records `monitor_recovery_failed`; a later interval still runs.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -523,15 +523,15 @@ node --test dist/tests/strategy/order-monitor.test.js
 
 Expected: new logging assertions fail.
 
-- [ ] **Step 4: Emit only persisted, changed snapshots**
+- [x] **Step 4: Emit only persisted, changed snapshots**
 
 After the existing `sameSnapshot` gate and successful `attachOrderSnapshot`, emit status-changed and, for closed/canceled/rejected, terminal. Keep identical polls silent. Log the two currently swallowed recovery catches through `OperationalLog.error`; do not log successful or unchanged polls.
 
-- [ ] **Step 5: Compose shared sinks**
+- [x] **Step 5: Compose shared sinks**
 
 In `composeService`, create one `PinoTradeEventSink(loggerInstance.child({ component: 'trade' }))` when a root logger exists, otherwise use the no-op sink. Pass the same sink to coordinator and monitor, the operational facade to monitor/HTTP, and the same root instance to Fastify.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 Run:
 
@@ -559,7 +559,7 @@ git commit -m "feat: log monitored trade updates"
 **Interfaces:**
 - Documents Node >=20, automatic optional `.env`, precedence, JSON stdout, event names, safe fields, and external rotation.
 
-- [ ] **Step 1: Update operator startup instructions**
+- [x] **Step 1: Update operator startup instructions**
 
 Replace Node 24 with Node 20 or later and the export block with:
 
@@ -571,11 +571,11 @@ npm start
 
 State that `.env` is loaded from cwd, system variables win, and a missing file is allowed when all values are externally injected.
 
-- [ ] **Step 2: Document stdout JSON trade logs**
+- [x] **Step 2: Document stdout JSON trade logs**
 
 List the seven lifecycle event names, allowlisted IDs/quantities/prices/status fields, forbidden credential/raw-payload fields, and the process manager's responsibility for persistence/rotation.
 
-- [ ] **Step 3: Run focused security and startup regressions**
+- [x] **Step 3: Run focused security and startup regressions**
 
 ```bash
 npm run build
@@ -584,7 +584,7 @@ node --test dist/tests/logging/logger.test.js dist/tests/logging/trade-events.te
 
 Expected: all pass; child-process failure is specific JSON; no seeded credential appears.
 
-- [ ] **Step 4: Run financial-state regressions**
+- [x] **Step 4: Run financial-state regressions**
 
 ```bash
 node --test dist/tests/strategy/hedge-coordinator.test.js dist/tests/strategy/order-monitor.test.js dist/tests/storage/sqlite-repository.test.js dist/tests/acceptance/hedge-opening.test.js
@@ -592,7 +592,7 @@ node --test dist/tests/strategy/hedge-coordinator.test.js dist/tests/strategy/or
 
 Expected: all pass with no order-count, terminal-state, recovery, or topology regression.
 
-- [ ] **Step 5: Run full Node 20 verification**
+- [x] **Step 5: Run full Node 20 verification**
 
 Apply `high-stakes-implementation-testing`, then run:
 
@@ -606,11 +606,11 @@ git status --short --branch
 
 Expected: `v20.x`, zero test failures, build exit 0, empty diff-check output, and only intended changes.
 
-- [ ] **Step 6: Run completion gates and check every plan item**
+- [x] **Step 6: Run completion gates and check every plan item**
 
 Use `pre-verification-check`, `verification-before-completion`, `consistency-check`, and `post-verification-check` in order. Cross-check package/lockfile, README, `.env.example`, logger redactions, event union, every constructor call site, and every checkbox in this plan.
 
-- [ ] **Step 7: Commit documentation**
+- [x] **Step 7: Commit documentation**
 
 ```bash
 git add README.md .env.example

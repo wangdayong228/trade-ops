@@ -18,6 +18,10 @@ import {
   buildServer,
   LOGGER_REDACT_PATHS
 } from '../../src/http/server.js';
+import type {
+  OperationalFields,
+  OperationalLog
+} from '../../src/logging/logger.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
 import type {
   PreflightInput,
@@ -35,6 +39,24 @@ const LOCAL_HEADERS = {
   host: 'localhost:80',
   origin: 'http://localhost:80'
 } as const;
+
+interface CapturedOperationalError {
+  readonly event: string;
+  readonly error: unknown;
+  readonly fields: Readonly<OperationalFields> | undefined;
+}
+
+function captureOperationalErrors(
+  entries: CapturedOperationalError[]
+): OperationalLog {
+  return {
+    info(): void {},
+    error(event, error, fields): void {
+      entries.push({ event, error, fields });
+    },
+    fatal(): void {}
+  };
+}
 
 function preflight(
   overrides: Partial<PreflightResult> = {}
@@ -104,6 +126,7 @@ function setup(
       input: PreflightInput
     ) => Promise<PreflightResult>;
     readonly confirmAndExecute?: (strategyId: string) => Promise<void>;
+    readonly operationalLog?: OperationalLog;
   } = {}
 ): Fixture {
   const database = new Database(':memory:');
@@ -128,6 +151,9 @@ function setup(
         await options.confirmAndExecute?.(strategyId);
       }
     },
+    ...(options.operationalLog === undefined
+      ? {}
+      : { operationalLog: options.operationalLog }),
     logger: false
   });
   t.after(async () => {
@@ -1410,11 +1436,13 @@ test('confirmation is an idempotent 202 for terminal strategies without new exec
 });
 
 test('background coordinator rejection is caught and server close drains queued work', async (t) => {
+  const loggedErrors: CapturedOperationalError[] = [];
   let releaseExecution: (() => void) | undefined;
   const executionGate = new Promise<void>((resolve) => {
     releaseExecution = resolve;
   });
   const fixture = setup(t, {
+    operationalLog: captureOperationalErrors(loggedErrors),
     confirmAndExecute: async () => {
       await executionGate;
       throw new Error('secret rejection detail LEAK-ME-NOT');
@@ -1448,6 +1476,13 @@ test('background coordinator rejection is caught and server close drains queued 
   await flushImmediate();
   process.removeListener('unhandledRejection', onUnhandled);
   assert.equal(unhandledReason, undefined);
+  assert.equal(loggedErrors.length, 1);
+  assert.equal(loggedErrors[0]?.event, 'background_confirmation_failed');
+  assert.equal(
+    (loggedErrors[0]?.error as Error | undefined)?.message,
+    'secret rejection detail LEAK-ME-NOT'
+  );
+  assert.deepEqual(loggedErrors[0]?.fields, { strategyId: strategy.id });
 });
 
 test('status uses only latest snapshots and preserves exact high precision fills', async (t) => {
@@ -1560,6 +1595,7 @@ test('status reports zero actual fills for orders without snapshots', async (t) 
 });
 
 test('status returns typed 404 and tampered repository failures return safe 500', async (t) => {
+  const loggedErrors: CapturedOperationalError[] = [];
   const first = setup(t);
   const missing = await first.server.inject({
     method: 'GET',
@@ -1579,11 +1615,14 @@ test('status returns typed 404 and tampered repository failures return safe 500'
       return Reflect.get(target, property, receiver);
     }
   });
-  const second = setup(t, { repository: tamperedRepository });
+  const second = setup(t, {
+    repository: tamperedRepository,
+    operationalLog: captureOperationalErrors(loggedErrors)
+  });
 
   const tampered = await second.server.inject({
     method: 'GET',
-    url: `/api/hedges/${existing.id}`,
+    url: `/api/hedges/${existing.id}?apiKey=unconfigured-token`,
     headers: LOCAL_HEADERS
   });
 
@@ -1593,6 +1632,59 @@ test('status returns typed 404 and tampered repository failures return safe 500'
     message: 'Internal server error'
   });
   assert.doesNotMatch(tampered.body, /LEAK-ME-NOT|sqlite row secret/);
+  assert.equal(loggedErrors.length, 1);
+  assert.equal(loggedErrors[0]?.event, 'unhandled_http_request_failure');
+  assert.equal(
+    (loggedErrors[0]?.error as Error | undefined)?.message,
+    'sqlite row secret LEAK-ME-NOT'
+  );
+  assert.deepEqual(loggedErrors[0]?.fields, {
+    requestId: loggedErrors[0]?.fields?.requestId,
+    method: 'GET',
+    url: `/api/hedges/${existing.id}`
+  });
+  assert.equal(typeof loggedErrors[0]?.fields?.requestId, 'string');
+  assert.doesNotMatch(
+    JSON.stringify(loggedErrors[0]?.fields),
+    /unconfigured-token|apiKey/
+  );
+});
+
+test('a throwing operational log cannot replace an HTTP 500 response', async (t) => {
+  const first = setup(t);
+  const existing = first.repository.createPending(preflight());
+  const tamperedRepository = new Proxy(first.repository, {
+    get(target, property, receiver) {
+      if (property === 'getStrategy') {
+        return (): never => {
+          throw new Error('repository failed');
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  const second = setup(t, {
+    repository: tamperedRepository,
+    operationalLog: {
+      info(): void {},
+      error(): never {
+        throw new Error('logging unavailable');
+      },
+      fatal(): void {}
+    }
+  });
+
+  const response = await second.server.inject({
+    method: 'GET',
+    url: `/api/hedges/${existing.id}`,
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(response.json(), {
+    code: 'INTERNAL_ERROR',
+    message: 'Internal server error'
+  });
 });
 
 test('logger configuration redacts headers, direct secrets, and common nested credentials', () => {

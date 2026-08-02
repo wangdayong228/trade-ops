@@ -7,6 +7,16 @@ import type {
   StrategyState
 } from '../domain/types.js';
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
+import {
+  nonThrowingOperationalLog,
+  type OperationalLog
+} from '../logging/logger.js';
+import {
+  NOOP_TRADE_EVENT_SINK,
+  nonThrowingTradeEventSink,
+  orderEvent,
+  type TradeEventSink
+} from '../logging/trade-events.js';
 import type {
   StrategyFailureCode,
   StrategyOrderRecord,
@@ -634,17 +644,53 @@ function safeState(
   }
 }
 
+function terminalOrderStatus(status: OrderSnapshot['status']): boolean {
+  return status === 'closed' || status === 'canceled' || status === 'rejected';
+}
+
 export class OrderMonitor {
   private readonly activeReconciliations = new Map<string, Promise<void>>();
   private activeRecovery: Promise<void> | null = null;
   private activeTimer: ReturnType<typeof setInterval> | null = null;
   private activeStop: (() => void) | null = null;
+  private readonly tradeEvents: TradeEventSink;
+  private readonly operationalLog: OperationalLog | undefined;
 
   constructor(
     private readonly registry: ExchangeRegistry,
     private readonly repository: StrategyRepository,
-    private readonly executionContinuation?: ExecutionContinuation
-  ) {}
+    private readonly executionContinuation?: ExecutionContinuation,
+    tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK,
+    operationalLog?: OperationalLog
+  ) {
+    this.tradeEvents = nonThrowingTradeEventSink(tradeEvents);
+    this.operationalLog = nonThrowingOperationalLog(operationalLog);
+  }
+
+  private recordObservedSnapshot(
+    strategy: Readonly<StrategyRecord>,
+    order: Readonly<StrategyOrderRecord>,
+    snapshot: Readonly<OrderSnapshot>
+  ): void {
+    try {
+      this.tradeEvents.record(orderEvent(
+        'order_status_changed',
+        order,
+        snapshot,
+        { mode: strategy.mode, strategyState: strategy.state }
+      ));
+      if (terminalOrderStatus(snapshot.status)) {
+        this.tradeEvents.record(orderEvent(
+          'order_terminal',
+          order,
+          snapshot,
+          { mode: strategy.mode, strategyState: strategy.state }
+        ));
+      }
+    } catch {
+      // Logging is never allowed to change monitoring behavior.
+    }
+  }
 
   async reconcileStrategy(strategyId: string): Promise<void> {
     const active = this.activeReconciliations.get(strategyId);
@@ -694,8 +740,9 @@ export class OrderMonitor {
     }
     let stopped = false;
     const run = (): void => {
-      void this.recover().catch(() => {
-        // A later interval must still run, without retaining or logging the cause.
+      void this.recover().catch((error: unknown) => {
+        this.operationalLog?.error('monitor_recovery_failed', error);
+        // A later interval must still run.
       });
     };
     const timer = setInterval(run, intervalMs);
@@ -729,8 +776,12 @@ export class OrderMonitor {
     for (const strategy of strategies) {
       try {
         await this.reconcileStrategy(strategy.id);
-      } catch {
-        // Recovery of one strategy must not retain or expose its raw cause.
+      } catch (error) {
+        this.operationalLog?.error(
+          'strategy_recovery_failed',
+          error,
+          { strategyId: strategy.id }
+        );
       }
     }
   }
@@ -856,6 +907,11 @@ export class OrderMonitor {
       } catch {
         return;
       }
+      this.recordObservedSnapshot(
+        strategy,
+        observation.order,
+        observation.candidate
+      );
       if (safeState(this.repository, strategy.id) !== initialState) {
         return;
       }

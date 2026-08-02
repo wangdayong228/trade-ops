@@ -12,6 +12,14 @@ import {
   type ExchangeGateway
 } from '../exchanges/exchange-gateway.js';
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
+import {
+  NOOP_TRADE_EVENT_SINK,
+  nonThrowingTradeEventSink,
+  orderEvent,
+  type OrderEventDetails,
+  type OrderLifecycleEventName,
+  type TradeEventSink
+} from '../logging/trade-events.js';
 import type {
   StrategyFailureCode,
   StrategyOrderRecord,
@@ -29,6 +37,7 @@ interface PreparedOrder {
   readonly gateway: ExchangeGateway;
   readonly record: StrategyOrderRecord;
   readonly existedBeforePreparation: boolean;
+  readonly strategy: Pick<StrategyRecord, 'mode' | 'state'>;
 }
 
 interface SnapshotOutcome {
@@ -325,11 +334,81 @@ function reliableMarketTerminal(snapshot: Readonly<OrderSnapshot>): boolean {
   return snapshot.status === 'closed' || snapshot.status === 'canceled';
 }
 
+function terminalOrderStatus(status: OrderSnapshot['status']): boolean {
+  return status === 'closed' || status === 'canceled' || status === 'rejected';
+}
+
+function safeStringProperty(
+  value: unknown,
+  property: string
+): string | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  try {
+    const candidate = Reflect.get(value, property);
+    return typeof candidate === 'string' ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class HedgeCoordinator {
+  private readonly tradeEvents: TradeEventSink;
+
   constructor(
     private readonly registry: ExchangeRegistry,
-    private readonly repository: StrategyRepository
-  ) {}
+    private readonly repository: StrategyRepository,
+    tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK
+  ) {
+    this.tradeEvents = nonThrowingTradeEventSink(tradeEvents);
+  }
+
+  private recordOrderEvent(
+    name: OrderLifecycleEventName,
+    prepared: Readonly<PreparedOrder>,
+    snapshot?: Readonly<OrderSnapshot> | null,
+    details: Readonly<OrderEventDetails> = {}
+  ): void {
+    try {
+      this.tradeEvents.record(orderEvent(
+        name,
+        prepared.record,
+        snapshot,
+        {
+          mode: prepared.strategy.mode,
+          strategyState: prepared.strategy.state,
+          ...(details.failureCode === undefined
+            ? {}
+            : { failureCode: details.failureCode }),
+          ...(details.errorType === undefined
+            ? {}
+            : { errorType: details.errorType }),
+          ...(details.errorCode === undefined
+            ? {}
+            : { errorCode: details.errorCode })
+        }
+      ));
+    } catch {
+      // Logging is never allowed to change order execution behavior.
+    }
+  }
+
+  private recordSubmissionFailure(
+    name: 'order_rejected_before_submit' | 'order_submit_uncertain',
+    prepared: Readonly<PreparedOrder>,
+    failureCode: 'ORDER_SUBMISSION_FAILED' | 'ORDER_SUBMISSION_UNKNOWN',
+    error: unknown
+  ): void {
+    const errorCode = safeStringProperty(error, 'code');
+    this.recordOrderEvent(name, prepared, null, {
+      failureCode,
+      errorType: safeStringProperty(error, 'name') ?? 'UnknownError',
+      ...(errorCode === undefined
+        ? {}
+        : { errorCode })
+    });
+  }
 
   async confirmAndExecute(strategyId: string): Promise<void> {
     if (!tryAcquireStrategyOperation(strategyId)) {
@@ -460,17 +539,21 @@ export class HedgeCoordinator {
       return {
         gateway,
         record: existingOrder,
-        existedBeforePreparation: true
+        existedBeforePreparation: true,
+        strategy
       };
     }
     if (!this.isExecuting(strategy.id)) {
       throw new Error('strategy execution ended before order planning');
     }
-    return {
+    const prepared: PreparedOrder = {
       gateway,
       record: this.repository.planOrder(strategy.id, role, request),
-      existedBeforePreparation: false
+      existedBeforePreparation: false,
+      strategy
     };
+    this.recordOrderEvent('order_planned', prepared);
+    return prepared;
   }
 
   private prepareExisting(
@@ -485,7 +568,8 @@ export class HedgeCoordinator {
     return {
       gateway,
       record: order,
-      existedBeforePreparation: true
+      existedBeforePreparation: true,
+      strategy
     };
   }
 
@@ -579,12 +663,18 @@ export class HedgeCoordinator {
     if (found === null) {
       return pending(fallbackExposureKnown);
     }
-    return this.persistSnapshot(prepared, found, fallbackExposureKnown);
+    return this.persistSnapshot(
+      prepared,
+      found,
+      'lookup',
+      fallbackExposureKnown
+    );
   }
 
   private persistSnapshot(
     prepared: Readonly<PreparedOrder>,
     snapshot: OrderSnapshot,
+    source: 'submission' | 'lookup',
     fallbackExposureKnown = false
   ): SubmissionOutcome {
     let exposureKnown = (
@@ -657,6 +747,13 @@ export class HedgeCoordinator {
     } catch {
       return pending(exposureKnown);
     }
+    if (source === 'submission') {
+      this.recordOrderEvent('order_submit_succeeded', prepared, snapshot);
+    }
+    this.recordOrderEvent('order_status_changed', prepared, snapshot);
+    if (terminalOrderStatus(snapshot.status)) {
+      this.recordOrderEvent('order_terminal', prepared, snapshot);
+    }
     if (snapshot.status === 'unknown') {
       return pending(exposureKnown);
     }
@@ -699,16 +796,33 @@ export class HedgeCoordinator {
     }
 
     let snapshot: OrderSnapshot;
+    this.recordOrderEvent('order_submit_started', prepared, null);
     try {
       snapshot = await prepared.gateway.createOrder(prepared.record.request);
     } catch (error) {
       if (error instanceof NoOrderSubmittedError) {
+        this.recordSubmissionFailure(
+          'order_rejected_before_submit',
+          prepared,
+          'ORDER_SUBMISSION_FAILED',
+          error
+        );
         return failed('ORDER_SUBMISSION_FAILED', persistedExposureKnown);
       }
+      this.recordSubmissionFailure(
+        'order_submit_uncertain',
+        prepared,
+        'ORDER_SUBMISSION_UNKNOWN',
+        error
+      );
       return this.lookupAndPersist(prepared);
     }
     if (snapshot.status === 'unknown') {
-      const persisted = this.persistSnapshot(prepared, snapshot);
+      const persisted = this.persistSnapshot(
+        prepared,
+        snapshot,
+        'submission'
+      );
       if (persisted.kind === 'failure') {
         return persisted;
       }
@@ -719,7 +833,7 @@ export class HedgeCoordinator {
           : positiveFillKnown(snapshot)
       );
     }
-    return this.persistSnapshot(prepared, snapshot);
+    return this.persistSnapshot(prepared, snapshot, 'submission');
   }
 
   private isExecuting(strategyId: string): boolean {
@@ -1200,6 +1314,8 @@ export class HedgeCoordinator {
         contractRequest,
         contractRecord
       );
+      this.recordOrderEvent('order_planned', spot);
+      this.recordOrderEvent('order_planned', contract);
     }
 
     const settled = await Promise.allSettled([
