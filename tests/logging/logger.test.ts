@@ -10,6 +10,7 @@ import {
   configuredSecretValues,
   createAppLogger,
   createOperationalLog,
+  nonThrowingOperationalLog,
   safeError
 } from '../../src/logging/logger.js';
 
@@ -41,6 +42,45 @@ test('writes JSON and replaces configured secrets in errors', () => {
   assert.equal(line.phase, 'configuration');
   assert.doesNotMatch(JSON.stringify(line), /api-key-value|secret-value/);
   assert.match(JSON.stringify(line), /\[Redacted\]/);
+});
+
+test('replaces configured secrets in non-error operational fields', () => {
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+  const operations = createOperationalLog(
+    logger,
+    () => ['api-key-value', 'secret-value']
+  );
+
+  operations.info('service_starting', {
+    databasePath: '/data/secret-value.sqlite',
+    exchangeIds: ['bitget', 'api-key-value'],
+    url: '/api/hedges/failure?apiKey=unconfigured-token'
+  });
+
+  const line = JSON.parse(output.join('').trim()) as Record<string, unknown>;
+  assert.equal(line.url, '/api/hedges/failure');
+  assert.doesNotMatch(
+    JSON.stringify(line),
+    /api-key-value|secret-value|unconfigured-token/
+  );
+  assert.match(JSON.stringify(line), /\[Redacted\]/);
+});
+
+test('redacts Fastify request URLs before Pino serialization', () => {
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+
+  logger.info({
+    event: 'request_probe',
+    req: { url: '/api/hedges/failure?apiKey=must-not-appear' }
+  });
+
+  const line = JSON.parse(output.join('').trim()) as {
+    req: { url: string };
+  };
+  assert.equal(line.req.url, '[Redacted]');
+  assert.doesNotMatch(JSON.stringify(line), /must-not-appear/);
 });
 
 test('safe errors exclude arbitrary enumerable fields and nested causes', () => {
@@ -119,4 +159,37 @@ test('operational logging failures never propagate', () => {
   assert.doesNotThrow(() => operations.info('service_starting'));
   assert.doesNotThrow(() => operations.error('service_failed', new Error()));
   assert.doesNotThrow(() => operations.fatal('service_failed', new Error()));
+});
+
+test('injected async operational failures never become unhandled', async () => {
+  const failure = new Error('async logging unavailable');
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown): void => {
+    unhandled = reason;
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const operations = nonThrowingOperationalLog({
+      async info(): Promise<void> {
+        throw failure;
+      },
+      async error(): Promise<void> {
+        throw failure;
+      },
+      async fatal(): Promise<void> {
+        throw failure;
+      }
+    });
+
+    operations?.info('service_starting');
+    operations?.error('service_failed', failure);
+    operations?.fatal('service_failed', failure);
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
+    assert.equal(unhandled, undefined);
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
 });

@@ -26,6 +26,8 @@ import type {
 } from '../strategy/preflight-service.js';
 import {
   LOGGER_REDACT_PATHS,
+  nonThrowingOperationalLog,
+  requestPathForLog,
   type OperationalLog
 } from '../logging/logger.js';
 
@@ -468,6 +470,9 @@ export function buildServer(
       }
     }
   });
+  const operationalLog = nonThrowingOperationalLog(
+    dependencies.operationalLog
+  );
   const queuedStrategyIds = new Set<string>();
   const backgroundTasks = new Set<Promise<void>>();
 
@@ -482,7 +487,7 @@ export function buildServer(
     })
       .then(async () => dependencies.coordinator.confirmAndExecute(strategyId))
       .catch((error: unknown) => {
-        dependencies.operationalLog?.error(
+        operationalLog?.error(
           'background_confirmation_failed',
           error,
           { strategyId }
@@ -565,13 +570,13 @@ export function buildServer(
       });
       return;
     }
-    dependencies.operationalLog?.error(
+    operationalLog?.error(
       'unhandled_http_request_failure',
       error,
       {
         requestId: request.id,
         method: request.method,
-        url: request.url
+        url: requestPathForLog(request.url)
       }
     );
     void reply.status(500).send({

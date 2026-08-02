@@ -648,10 +648,17 @@ test('recovered intents emit persisted status but no new planning or submission'
 });
 
 test('a throwing trade sink cannot change state or duplicate submission', async (t) => {
+  const failure = new Error('log sink unavailable');
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown): void => {
+    unhandled = reason;
+  };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.removeListener('unhandledRejection', onUnhandled));
   const context = setup(t, 'CONTRACT_FIRST', {
     tradeEvents: {
-      record(): never {
-        throw new Error('log sink unavailable');
+      async record(): Promise<void> {
+        throw failure;
       }
     }
   });
@@ -667,11 +674,15 @@ test('a throwing trade sink cannot change state or duplicate submission', async 
   ));
 
   await context.coordinator.confirmAndExecute(context.strategyId);
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
 
   const strategy = context.repository.getStrategy(context.strategyId);
   assert.equal(strategy.state, 'FAILED');
   assert.equal(strategy.failureCode, 'NO_FILL');
   assert.equal(context.contract.createdRequests.length, 1);
+  assert.equal(unhandled, undefined);
 });
 
 test('coordinator never claims or submits a persisted one-way strategy', async (t) => {

@@ -7,9 +7,13 @@ import type {
   StrategyState
 } from '../domain/types.js';
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
-import type { OperationalLog } from '../logging/logger.js';
+import {
+  nonThrowingOperationalLog,
+  type OperationalLog
+} from '../logging/logger.js';
 import {
   NOOP_TRADE_EVENT_SINK,
+  nonThrowingTradeEventSink,
   orderEvent,
   type TradeEventSink
 } from '../logging/trade-events.js';
@@ -649,14 +653,19 @@ export class OrderMonitor {
   private activeRecovery: Promise<void> | null = null;
   private activeTimer: ReturnType<typeof setInterval> | null = null;
   private activeStop: (() => void) | null = null;
+  private readonly tradeEvents: TradeEventSink;
+  private readonly operationalLog: OperationalLog | undefined;
 
   constructor(
     private readonly registry: ExchangeRegistry,
     private readonly repository: StrategyRepository,
     private readonly executionContinuation?: ExecutionContinuation,
-    private readonly tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK,
-    private readonly operationalLog?: OperationalLog
-  ) {}
+    tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK,
+    operationalLog?: OperationalLog
+  ) {
+    this.tradeEvents = nonThrowingTradeEventSink(tradeEvents);
+    this.operationalLog = nonThrowingOperationalLog(operationalLog);
+  }
 
   private recordObservedSnapshot(
     strategy: Readonly<StrategyRecord>,

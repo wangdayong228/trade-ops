@@ -66,6 +66,32 @@ export const NOOP_TRADE_EVENT_SINK: TradeEventSink = Object.freeze({
   record(_event: Readonly<TradeEvent>): void {}
 });
 
+const NON_THROWING_TRADE_EVENT_SINKS = new WeakMap<
+  TradeEventSink,
+  TradeEventSink
+>();
+
+export function nonThrowingTradeEventSink(
+  sink: TradeEventSink
+): TradeEventSink {
+  const existing = NON_THROWING_TRADE_EVENT_SINKS.get(sink);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const wrapped: TradeEventSink = {
+    record(event): void {
+      try {
+        const result: unknown = sink.record(event);
+        void Promise.resolve(result).catch(() => {});
+      } catch {
+        // Injected logging is never allowed to change order behavior.
+      }
+    }
+  };
+  NON_THROWING_TRADE_EVENT_SINKS.set(sink, wrapped);
+  return wrapped;
+}
+
 type MutableTradeEvent = {
   -readonly [Field in keyof TradeEvent]: TradeEvent[Field];
 };
@@ -193,7 +219,12 @@ function allowlistedEvent(
     output.errorType = redactText(event.errorType, secrets);
   }
   if (event.errorCode !== undefined) {
-    output.errorCode = redactText(event.errorCode, secrets);
+    output.errorCode = event.errorCode;
+  }
+  for (const [field, value] of Object.entries(output)) {
+    if (typeof value === 'string') {
+      output[field] = redactText(value, secrets);
+    }
   }
   return output;
 }
@@ -212,10 +243,12 @@ export class PinoTradeEventSink implements TradeEventSink {
 
   record(event: Readonly<TradeEvent>): void {
     try {
-      this.#logger.info(
-        allowlistedEvent(event, this.#secretProvider()),
-        event.event
+      const output = allowlistedEvent(event, this.#secretProvider());
+      const result: unknown = this.#logger.info(
+        output,
+        String(output.event)
       );
+      void Promise.resolve(result).catch(() => {});
     } catch {
       // Logging is never allowed to change order execution behavior.
     }

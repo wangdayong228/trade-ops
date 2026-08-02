@@ -14,6 +14,7 @@ import {
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
 import {
   NOOP_TRADE_EVENT_SINK,
+  nonThrowingTradeEventSink,
   orderEvent,
   type OrderEventDetails,
   type OrderLifecycleEventName,
@@ -353,11 +354,15 @@ function safeStringProperty(
 }
 
 export class HedgeCoordinator {
+  private readonly tradeEvents: TradeEventSink;
+
   constructor(
     private readonly registry: ExchangeRegistry,
     private readonly repository: StrategyRepository,
-    private readonly tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK
-  ) {}
+    tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK
+  ) {
+    this.tradeEvents = nonThrowingTradeEventSink(tradeEvents);
+  }
 
   private recordOrderEvent(
     name: OrderLifecycleEventName,

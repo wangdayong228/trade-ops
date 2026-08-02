@@ -258,7 +258,7 @@ test('production CCXT gateway construction performs no startup market load', asy
   assert.equal(composition.repository.listRecoverable().length, 0);
 });
 
-test('composition shares one injected trade sink with coordinator and monitor', async (t) => {
+test('composition shares one safe injected trade sink with coordinator and monitor', async (t) => {
   const tradeEvents = { record(): void {} };
   const composition = composeService({
     env: VALID_ENV,
@@ -272,8 +272,10 @@ test('composition shares one injected trade sink with coordinator and monitor', 
     composition.database.close();
   });
 
-  assert.equal(Reflect.get(composition.coordinator, 'tradeEvents'), tradeEvents);
-  assert.equal(Reflect.get(composition.monitor, 'tradeEvents'), tradeEvents);
+  const coordinatorSink = Reflect.get(composition.coordinator, 'tradeEvents');
+  const monitorSink = Reflect.get(composition.monitor, 'tradeEvents');
+  assert.equal(coordinatorSink, monitorSink);
+  assert.notEqual(coordinatorSink, tradeEvents);
 });
 
 test('creates the database parent directory during normal composition', async (t) => {
@@ -567,6 +569,7 @@ test('starts monitoring before loopback listen and installs each signal once', a
 
 test('a signal during listen is owned by the same idempotent shutdown', async () => {
   const events: string[] = [];
+  const operations: CapturedOperation[] = [];
   const fixture = runnableFixture(events);
   const signals = new SignalTarget();
   let finishListen: (() => void) | undefined;
@@ -576,6 +579,7 @@ test('a signal during listen is owned by the same idempotent shutdown', async ()
 
   const starting = startService(fixture.composition, {
     signalTarget: signals,
+    operationalLog: captureOperationalLog(operations),
     listen: async () => {
       events.push('listen');
       await listenGate;
@@ -608,6 +612,44 @@ test('a signal during listen is owned by the same idempotent shutdown', async ()
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
   assert.equal(signals.exitCode, 0);
+  assert.deepEqual(operations.map(({ event }) => event), [
+    'service_starting',
+    'service_stopping',
+    'service_stopped'
+  ]);
+});
+
+test('a throwing operational log cannot interrupt startup or cleanup', async () => {
+  const events: string[] = [];
+  const fixture = runnableFixture(events);
+  const throwingLog: OperationalLog = {
+    info(): never {
+      throw new Error('logging unavailable');
+    },
+    error(): never {
+      throw new Error('logging unavailable');
+    },
+    fatal(): never {
+      throw new Error('logging unavailable');
+    }
+  };
+
+  const started = await startService(fixture.composition, {
+    signalTarget: new SignalTarget(),
+    operationalLog: throwingLog,
+    listen: async () => {
+      events.push('listen');
+    }
+  });
+  await started.shutdown();
+
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
 });
 
 test('repeated signals remain owned until gated shutdown completes', async () => {

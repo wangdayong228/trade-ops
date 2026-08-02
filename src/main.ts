@@ -20,6 +20,7 @@ import {
   configuredSecretValues,
   createAppLogger,
   createOperationalLog,
+  nonThrowingOperationalLog,
   type OperationalFields,
   type OperationalLog
 } from './logging/logger.js';
@@ -283,13 +284,15 @@ export function composeService(
     const clock = options.clock ?? (() => new Date());
     const repository = new SqliteStrategyRepository(database, clock);
     const preflightService = new PreflightService(registry, clock);
-    const operationalLog = options.operationalLog
-      ?? (options.loggerInstance === undefined
-        ? undefined
-        : createOperationalLog(
-            options.loggerInstance,
-            () => configuredSecretValues(env)
-          ));
+    const operationalLog = nonThrowingOperationalLog(
+      options.operationalLog
+        ?? (options.loggerInstance === undefined
+          ? undefined
+          : createOperationalLog(
+              options.loggerInstance,
+              () => configuredSecretValues(env)
+            ))
+    );
     const tradeEvents = options.tradeEvents
       ?? (options.loggerInstance === undefined
         ? NOOP_TRADE_EVENT_SINK
@@ -354,7 +357,7 @@ export async function startService<T extends RunnableComposition>(
 ): Promise<StartedService<T>> {
   const signalTarget = options.signalTarget ?? processSignalTarget();
   const listen = options.listen ?? defaultListen;
-  const operationalLog = options.operationalLog;
+  const operationalLog = nonThrowingOperationalLog(options.operationalLog);
   const runtimeFields: Readonly<OperationalFields> = {
     host: composition.config.host,
     port: composition.config.port,
@@ -427,7 +430,9 @@ export async function startService<T extends RunnableComposition>(
       host: composition.config.host,
       port: composition.config.port
     });
-    operationalLog?.info('service_started', runtimeFields);
+    if (shutdownPromise === null) {
+      operationalLog?.info('service_started', runtimeFields);
+    }
     return { composition, shutdown };
   } catch (startupError) {
     operationalLog?.error('service_start_failed', startupError, runtimeFields);
@@ -444,13 +449,15 @@ export async function run(
   options: RunOptions = {}
 ): Promise<StartedService<ServiceComposition>> {
   const runtime = resolveRuntimeEnvironment(options.env);
-  const operationalLog = options.operationalLog
-    ?? (options.loggerInstance === undefined
-      ? undefined
-      : createOperationalLog(
-          options.loggerInstance,
-          () => configuredSecretValues(runtime.env)
-        ));
+  const operationalLog = nonThrowingOperationalLog(
+    options.operationalLog
+      ?? (options.loggerInstance === undefined
+        ? undefined
+        : createOperationalLog(
+            options.loggerInstance,
+            () => configuredSecretValues(runtime.env)
+          ))
+  );
   if (runtime.fileStatus === 'loaded') {
     operationalLog?.info('environment_loaded');
   } else if (runtime.fileStatus === 'missing') {

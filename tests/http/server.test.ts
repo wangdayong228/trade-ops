@@ -1622,7 +1622,7 @@ test('status returns typed 404 and tampered repository failures return safe 500'
 
   const tampered = await second.server.inject({
     method: 'GET',
-    url: `/api/hedges/${existing.id}`,
+    url: `/api/hedges/${existing.id}?apiKey=unconfigured-token`,
     headers: LOCAL_HEADERS
   });
 
@@ -1644,6 +1644,47 @@ test('status returns typed 404 and tampered repository failures return safe 500'
     url: `/api/hedges/${existing.id}`
   });
   assert.equal(typeof loggedErrors[0]?.fields?.requestId, 'string');
+  assert.doesNotMatch(
+    JSON.stringify(loggedErrors[0]?.fields),
+    /unconfigured-token|apiKey/
+  );
+});
+
+test('a throwing operational log cannot replace an HTTP 500 response', async (t) => {
+  const first = setup(t);
+  const existing = first.repository.createPending(preflight());
+  const tamperedRepository = new Proxy(first.repository, {
+    get(target, property, receiver) {
+      if (property === 'getStrategy') {
+        return (): never => {
+          throw new Error('repository failed');
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  const second = setup(t, {
+    repository: tamperedRepository,
+    operationalLog: {
+      info(): void {},
+      error(): never {
+        throw new Error('logging unavailable');
+      },
+      fatal(): void {}
+    }
+  });
+
+  const response = await second.server.inject({
+    method: 'GET',
+    url: `/api/hedges/${existing.id}`,
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(response.json(), {
+    code: 'INTERNAL_ERROR',
+    message: 'Internal server error'
+  });
 });
 
 test('logger configuration redacts headers, direct secrets, and common nested credentials', () => {

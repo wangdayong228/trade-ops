@@ -217,3 +217,25 @@ test('Pino trade output replaces credential values inside error classifications'
   assert.doesNotMatch(line, /credential-value/);
   assert.match(line, /\[Redacted\]/);
 });
+
+test('Pino trade output replaces credential values in every allowlisted field', () => {
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+  const sink = new PinoTradeEventSink(
+    logger,
+    () => ['credential-value']
+  );
+  const event = {
+    ...orderEvent('order_status_changed', ORDER, SNAPSHOT),
+    strategyId: 'strategy-credential-value',
+    symbol: 'credential-value/USDT',
+    clientOrderId: 'client-credential-value',
+    exchangeOrderId: 'exchange-credential-value'
+  };
+
+  sink.record(event);
+
+  const line = output.join('');
+  assert.doesNotMatch(line, /credential-value/);
+  assert.match(line, /\[Redacted\]/);
+});

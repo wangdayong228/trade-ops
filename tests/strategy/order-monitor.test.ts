@@ -568,6 +568,13 @@ test('marks a strategy hedged only after a full terminal GTC matches exposure', 
 });
 
 test('a throwing monitor trade sink cannot block persistence or classification', async (t) => {
+  const failure = new Error('log sink unavailable');
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown): void => {
+    unhandled = reason;
+  };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.removeListener('unhandledRejection', onUnhandled));
   const f = fixture(t);
   const strategy = createStrategy(
     f.repository,
@@ -599,11 +606,14 @@ test('a throwing monitor trade sink cannot block persistence or classification',
     f.repository,
     undefined,
     {
-      record(): never {
-        throw new Error('log sink unavailable');
+      async record(): Promise<void> {
+        throw failure;
       }
     }
   ).reconcileStrategy(strategy.id);
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
 
   assert.equal(f.repository.getStrategy(strategy.id).state, 'HEDGED');
   assert.equal(
@@ -612,6 +622,7 @@ test('a throwing monitor trade sink cannot block persistence or classification',
     )?.snapshot?.filledBaseQuantity,
     '1'
   );
+  assert.equal(unhandled, undefined);
 });
 
 test('marks an externally canceled GTC incomplete with a safe code', async (t) => {
@@ -1838,6 +1849,14 @@ test('defensively rejects a persisted swap request with the wrong confirmed marg
 test('isolates recovery failures between strategies', async (t) => {
   const f = fixture(t);
   const operationalErrors: CapturedOperationalError[] = [];
+  const throwingOperationalLog: OperationalLog = {
+    info(): void {},
+    error(event, error, fields): never {
+      operationalErrors.push({ event, error, fields });
+      throw new Error('logging unavailable');
+    },
+    fatal(): void {}
+  };
   const failedLookup = createStrategy(
     f.repository,
     'CONTRACT_FIRST',
@@ -1900,7 +1919,7 @@ test('isolates recovery failures between strategies', async (t) => {
     repository,
     undefined,
     undefined,
-    captureOperationalErrors(operationalErrors)
+    throwingOperationalLog
   ).recover();
 
   assert.equal(
