@@ -46,7 +46,7 @@
 - Consumes: `safeError(error, secrets)` from `src/logging/logger.ts`.
 - Produces: `PUBLIC_ERROR_TEXT_LIMIT`, `PublicErrorDetail`, and `publicErrorDetail(error, secrets)`.
 
-- [ ] **Step 1: Write failing serializer tests**
+- [x] **Step 1: Write failing serializer tests**
 
 Create `tests/http/public-error.test.ts` with tests equivalent to:
 
@@ -78,7 +78,7 @@ test('returns only bounded redacted type code and message', () => {
 
 Add cases for a string code, primitive thrown value, getters that throw, non-finite numeric code, empty secret strings, and oversized `name`/`code` fields.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -88,7 +88,7 @@ npm run build
 
 Expected: FAIL because `src/http/public-error.ts` does not exist.
 
-- [ ] **Step 3: Implement the minimal allowlisted serializer**
+- [x] **Step 3: Implement the minimal allowlisted serializer**
 
 Create `src/http/public-error.ts`:
 
@@ -140,7 +140,7 @@ export function publicErrorDetail(
 }
 ```
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run:
 
@@ -152,7 +152,7 @@ git diff --check -- src/http/public-error.ts tests/http/public-error.test.ts
 
 Expected: build succeeds, serializer tests pass, and hostile fields never appear.
 
-- [ ] **Step 5: Commit the serializer**
+- [x] **Step 5: Commit the serializer**
 
 ```bash
 git add src/http/public-error.ts tests/http/public-error.test.ts
@@ -174,7 +174,7 @@ git commit -m "feat(http): serialize detailed public errors"
 - Uses `publicErrorDetail(error, secrets)` from Task 1.
 - Produces JSON failures with `code`, `message`, `requestId`, and optional `error`.
 
-- [ ] **Step 1: Write failing HTTP contract tests**
+- [x] **Step 1: Write failing HTTP contract tests**
 
 Extend the HTTP fixture options with `secretProvider` and pass it to `buildServer`. Replace the fixed preflight assertion with:
 
@@ -218,7 +218,7 @@ Add assertions that validation, forbidden, not-found, and unexpected failures in
 
 In `tests/main.test.ts`, assert a composed server receives a provider that redacts all six values from the explicitly supplied environment.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -229,7 +229,7 @@ node --test dist/tests/http/server.test.js dist/tests/main.test.js
 
 Expected: new response assertions fail because request IDs/details and the provider are absent.
 
-- [ ] **Step 3: Add one safe envelope helper to Fastify**
+- [x] **Step 3: Add one safe envelope helper to Fastify**
 
 In `src/http/server.ts`, add the optional dependency and helpers with these contracts:
 
@@ -267,7 +267,7 @@ function publicHttpError(
 
 Use this helper for the 403 hook, every branch of `setErrorHandler`, and the 422 preflight catch. Catch the preflight error as `catch (error)` rather than discarding it. Never pass an error object directly to `reply.send`.
 
-- [ ] **Step 4: Inject current resolved credentials from composition**
+- [x] **Step 4: Inject current resolved credentials from composition**
 
 In `src/main.ts`, pass:
 
@@ -277,7 +277,7 @@ secretProvider: () => configuredSecretValues(env)
 
 to `buildServer`. Keep the provider dynamic over the resolved `env` object and do not capture a one-time array.
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run:
 
@@ -289,7 +289,7 @@ git diff --check -- src/http/server.ts src/main.ts tests/http/server.test.ts tes
 
 Expected: all focused tests pass; every tested credential/raw field remains absent.
 
-- [ ] **Step 6: Commit the HTTP contract**
+- [x] **Step 6: Commit the HTTP contract**
 
 ```bash
 git add src/http/server.ts src/main.ts tests/http/server.test.ts tests/main.test.ts
@@ -309,7 +309,7 @@ git commit -m "feat(http): return detailed sanitized errors"
 - Produces browser-local `OperatorRequestError`, `requestJson`, `serverFailureMessage`, and `operatorFailureMessage` helpers.
 - Consumes the Task 2 JSON envelope but remains compatible with legacy `{ code, message }` failures.
 
-- [ ] **Step 1: Write failing browser behavior tests**
+- [x] **Step 1: Write failing browser behavior tests**
 
 Add table-driven browser tests for preflight, strategy load, refresh, confirmation, and exchange-list loading. For each action, return:
 
@@ -336,7 +336,7 @@ Add focused cases for:
 - malformed or over-2,000-character server detail;
 - a malformed 2xx success response, which must say `响应校验失败` and clear actionable state.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -347,7 +347,7 @@ node --test dist/tests/http/server.test.js
 
 Expected: browser assertions receive the current fixed Chinese messages.
 
-- [ ] **Step 3: Implement the shared browser request boundary**
+- [x] **Step 3: Implement the shared browser request boundary**
 
 In `public/app.js`, add:
 
@@ -424,7 +424,7 @@ function operatorFailureMessage(operation, error) {
 
 Use `requestJson` in exchange loading, preflight, strategy loading, status refresh, and confirmation. Change each `catch` to retain `error` and pass `operatorFailureMessage(operation, error)` to the existing state-reset/message path. Do not change the existing revision guards, button restoration, or actionable-state rules.
 
-- [ ] **Step 4: Preserve multiline plain text in CSS**
+- [x] **Step 4: Preserve multiline plain text in CSS**
 
 Add to `.message` in `public/styles.css`:
 
@@ -433,7 +433,7 @@ white-space: pre-wrap;
 overflow-wrap: anywhere;
 ```
 
-- [ ] **Step 5: Verify GREEN**
+- [x] **Step 5: Verify GREEN**
 
 Run:
 
@@ -445,7 +445,7 @@ git diff --check -- public/app.js public/styles.css tests/http/server.test.ts
 
 Expected: all browser scenarios show specific multiline details and existing state-safety tests remain green.
 
-- [ ] **Step 6: Commit the browser behavior**
+- [x] **Step 6: Commit the browser behavior**
 
 ```bash
 git add public/app.js public/styles.css tests/http/server.test.ts
@@ -464,11 +464,11 @@ git commit -m "feat(ui): show detailed request failures"
 **Interfaces:**
 - Documents the browser-visible fields and the deliberate redaction boundary.
 
-- [ ] **Step 1: Document detailed local errors**
+- [x] **Step 1: Document detailed local errors**
 
 Add a short README subsection explaining that the local operator UI displays HTTP status, stable code, sanitized original type/code/message, and request ID; credentials, stack traces, and raw CCXT traffic remain excluded. State that asynchronous execution failures are diagnosed from persisted status plus stdout.
 
-- [ ] **Step 2: Run focused security/UI verification**
+- [x] **Step 2: Run focused security/UI verification**
 
 Run:
 
@@ -479,7 +479,7 @@ node --test dist/tests/http/public-error.test.js dist/tests/http/server.test.js 
 
 Expected: all pass with no seeded credential or hostile property in HTTP/browser output.
 
-- [ ] **Step 3: Run full Node 20 verification**
+- [x] **Step 3: Run full Node 20 verification**
 
 Run:
 
@@ -492,11 +492,11 @@ git status --short --branch
 
 Expected: Node `v20.x`, 0 failures, clean diff check, and only intended documentation/plan state remains.
 
-- [ ] **Step 4: Run completion gates and reconcile the plan**
+- [x] **Step 4: Run completion gates and reconcile the plan**
 
 Apply `pre-verification-check`, `verification-before-completion`, `consistency-check`, and `post-verification-check` in order. Re-read the design and this plan, verify every checkbox, and ensure server/browser/README terminology agrees exactly.
 
-- [ ] **Step 5: Commit documentation and completed plan**
+- [x] **Step 5: Commit documentation and completed plan**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-08-03-detailed-operator-errors.md
