@@ -175,6 +175,8 @@ dd {
   min-height: 1.5em;
   margin: 16px 0 0;
   color: #53616c;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .message[data-kind="error"] {

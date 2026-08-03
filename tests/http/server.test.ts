@@ -502,7 +502,9 @@ function browserContractFirstWaitingStatus(
   return status;
 }
 
-async function browserHarness(): Promise<BrowserHarness> {
+async function browserHarness(
+  initialFetch?: BrowserFetch
+): Promise<BrowserHarness> {
   const ids = [
     'spot-exchange',
     'contract-exchange',
@@ -537,12 +539,12 @@ async function browserHarness(): Promise<BrowserHarness> {
   ];
   const elements = new Map(ids.map((id) => [id, new FakeBrowserElement()]));
   const fetchCalls: BrowserHarness['fetchCalls'] = [];
-  let currentFetch: BrowserFetch = async (url) => {
+  let currentFetch: BrowserFetch = initialFetch ?? (async (url) => {
     if (url === '/api/exchanges') {
       return browserResponse(200, { exchanges: ['bitget', 'okx'] });
     }
     throw new Error(`unexpected browser test URL: ${url}`);
-  };
+  });
   const document = {
     querySelector(selector: string): FakeBrowserElement {
       const element = elements.get(selector.replace(/^#/, ''));
@@ -596,6 +598,185 @@ async function browserWithValidPreflight(): Promise<BrowserHarness> {
   await browser.element('preflight-form').emit('submit');
   return browser;
 }
+
+const DETAILED_BROWSER_ERROR = {
+  code: 'PREFLIGHT_REJECTED',
+  message: 'Preflight checks did not pass',
+  requestId: 'req-3',
+  error: {
+    type: 'AuthenticationError',
+    code: '40101',
+    message: '<b>bitget authentication failed</b>'
+  }
+} as const;
+
+function detailedBrowserMessage(operation: string, status: number): string {
+  return [
+    `${operation}失败`,
+    `HTTP ${status} · PREFLIGHT_REJECTED`,
+    'AuthenticationError [40101]: <b>bitget authentication failed</b>',
+    '请求 ID：req-3'
+  ].join('\n');
+}
+
+test('operator UI shows detailed structured preflight failures as plain text', async () => {
+  const browser = await browserHarness();
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/preflight');
+    return browserResponse(422, DETAILED_BROWSER_ERROR);
+  });
+
+  await browser.element('preflight-form').emit('submit');
+
+  assert.equal(
+    browser.element('operator-message').textContent,
+    detailedBrowserMessage('预检', 422)
+  );
+  assert.match(browser.element('operator-message').textContent, /<b>.*<\/b>/);
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI shows detailed structured strategy-load failures', async () => {
+  const browser = await browserHarness();
+  browser.element('resume-strategy-id').value =
+    '123e4567-e89b-42d3-a456-426614174007';
+  browser.setFetch(async () => browserResponse(404, DETAILED_BROWSER_ERROR));
+
+  await browser.element('resume-form').emit('submit');
+
+  assert.equal(
+    browser.element('operator-message').textContent,
+    detailedBrowserMessage('策略加载', 404)
+  );
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI shows detailed structured status-refresh failures', async () => {
+  const browser = await browserWithValidPreflight();
+  browser.setFetch(async () => browserResponse(503, DETAILED_BROWSER_ERROR));
+
+  await browser.element('refresh-button').emit('click');
+
+  assert.equal(
+    browser.element('operator-message').textContent,
+    detailedBrowserMessage('状态刷新', 503)
+  );
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI shows detailed structured confirmation failures', async () => {
+  const browser = await browserWithValidPreflight();
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  browser.setFetch(async () => browserResponse(409, DETAILED_BROWSER_ERROR));
+
+  await browser.element('confirm-button').emit('click');
+
+  assert.equal(
+    browser.element('operator-message').textContent,
+    detailedBrowserMessage('确认', 409)
+  );
+  assert.equal(browser.element('confirm-button').disabled, false);
+});
+
+test('operator UI shows detailed structured exchange-list failures', async () => {
+  const browser = await browserHarness(async (url) => {
+    assert.equal(url, '/api/exchanges');
+    return browserResponse(500, DETAILED_BROWSER_ERROR);
+  });
+
+  assert.equal(
+    browser.element('operator-message').textContent,
+    detailedBrowserMessage('交易所列表加载', 500)
+  );
+});
+
+test('operator UI keeps legacy JSON errors readable', async () => {
+  const browser = await browserHarness();
+  browser.setFetch(async () => browserResponse(422, {
+    code: 'LEGACY_REJECTED',
+    message: 'legacy detailed failure'
+  }));
+
+  await browser.element('preflight-form').emit('submit');
+
+  assert.equal(browser.element('operator-message').textContent, [
+    '预检失败',
+    'HTTP 422 · LEGACY_REJECTED',
+    'legacy detailed failure'
+  ].join('\n'));
+});
+
+test('operator UI distinguishes non-JSON and network failures', async (t) => {
+  await t.test('non-JSON', async () => {
+    const browser = await browserHarness();
+    browser.setFetch(async () => ({
+      status: 502,
+      ok: false,
+      json: async (): Promise<unknown> => {
+        throw new Error('not JSON');
+      }
+    }));
+
+    await browser.element('preflight-form').emit('submit');
+
+    assert.equal(browser.element('operator-message').textContent, [
+      '预检失败',
+      'HTTP 502',
+      '响应不是有效的结构化 JSON 错误'
+    ].join('\n'));
+  });
+
+  await t.test('network', async () => {
+    const browser = await browserHarness();
+    browser.setFetch(async () => {
+      throw new Error('connection refused');
+    });
+
+    await browser.element('preflight-form').emit('submit');
+
+    assert.equal(browser.element('operator-message').textContent, [
+      '预检失败',
+      '网络错误：connection refused'
+    ].join('\n'));
+  });
+});
+
+test('operator UI bounds detailed server errors and labels invalid success responses', async (t) => {
+  await t.test('bounded detail', async () => {
+    const browser = await browserHarness();
+    browser.setFetch(async () => browserResponse(422, {
+      ...DETAILED_BROWSER_ERROR,
+      error: {
+        ...DETAILED_BROWSER_ERROR.error,
+        message: 'x'.repeat(2_100)
+      }
+    }));
+
+    await browser.element('preflight-form').emit('submit');
+
+    const message = browser.element('operator-message').textContent;
+    assert.match(message, /…\[truncated\]/);
+    assert.ok(message.length < 2_200);
+  });
+
+  await t.test('invalid success response', async () => {
+    const browser = await browserHarness();
+    browser.setFetch(async () => browserResponse(201, { invalid: true }));
+
+    await browser.element('preflight-form').emit('submit');
+
+    assert.match(
+      browser.element('operator-message').textContent,
+      /^预检失败\n响应校验失败：/
+    );
+    assert.equal(browser.element('strategy-state').textContent, '—');
+    assert.equal(browser.element('confirm-button').disabled, true);
+  });
+});
 
 test('lists only configured exchange ids', async (t) => {
   const { server } = setup(t);
@@ -2226,7 +2407,7 @@ test('operator UI admits only one confirmation request across a double click', a
   );
   assert.equal(browser.element('confirm-button').disabled, true);
 
-  resolveConfirmation?.(browserResponse(202));
+  resolveConfirmation?.(browserResponse(202, { accepted: true }));
   await Promise.all([firstClick, secondClick]);
   assert.equal(browser.element('confirm-button').disabled, true);
 });

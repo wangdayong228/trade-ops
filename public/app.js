@@ -1227,6 +1227,101 @@ async function responseJson(response) {
   }
 }
 
+const operatorErrorTextLimit = 2000;
+const operatorTruncationSuffix = '…[truncated]';
+
+class OperatorRequestError extends Error {
+  constructor(operatorMessage) {
+    super(operatorMessage);
+    this.operatorMessage = operatorMessage;
+  }
+}
+
+function boundedOperatorText(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return null;
+  }
+  return value.length <= operatorErrorTextLimit
+    ? value
+    : `${value.slice(
+        0,
+        operatorErrorTextLimit - operatorTruncationSuffix.length
+      )}${operatorTruncationSuffix}`;
+}
+
+function caughtOperatorText(error, fallback) {
+  const message = boundedOperatorText(error?.message);
+  if (message !== null) {
+    return message;
+  }
+  try {
+    return boundedOperatorText(String(error)) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function serverFailureMessage(operation, response, body) {
+  const lines = [`${operation}失败`];
+  const code = isRecord(body) ? boundedOperatorText(body.code) : null;
+  lines.push(`HTTP ${response.status}${code === null ? '' : ` · ${code}`}`);
+  const detail = isRecord(body?.error) ? body.error : null;
+  const detailType = boundedOperatorText(detail?.type);
+  const detailMessage = boundedOperatorText(detail?.message);
+  const detailCode = typeof detail?.code === 'number'
+    && Number.isFinite(detail.code)
+    ? String(detail.code)
+    : boundedOperatorText(detail?.code);
+  if (detailType !== null && detailMessage !== null) {
+    lines.push(
+      `${detailType}${detailCode === null ? '' : ` [${detailCode}]`}: ${detailMessage}`
+    );
+  } else {
+    const message = isRecord(body) ? boundedOperatorText(body.message) : null;
+    lines.push(message ?? '响应不是有效的结构化 JSON 错误');
+  }
+  const requestId = isRecord(body)
+    ? boundedOperatorText(body.requestId)
+    : null;
+  if (requestId !== null) {
+    lines.push(`请求 ID：${requestId}`);
+  }
+  return lines.join('\n');
+}
+
+async function requestJson(operation, url, options, expectedStatus) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    throw new OperatorRequestError(
+      `${operation}失败\n网络错误：${caughtOperatorText(error, '未知网络错误')}`
+    );
+  }
+  const body = await responseJson(response);
+  if (response.status !== expectedStatus) {
+    throw new OperatorRequestError(
+      serverFailureMessage(operation, response, body)
+    );
+  }
+  if (body === null) {
+    throw new OperatorRequestError(
+      `${operation}失败\nHTTP ${response.status}\n响应不是有效 JSON`
+    );
+  }
+  return body;
+}
+
+function operatorFailureMessage(operation, error) {
+  if (error instanceof OperatorRequestError) {
+    return error.operatorMessage;
+  }
+  return `${operation}失败\n响应校验失败：${caughtOperatorText(
+    error,
+    '未知响应错误'
+  )}`;
+}
+
 async function refreshStatus() {
   if (
     strategyId === null
@@ -1243,14 +1338,12 @@ async function refreshStatus() {
   loadStrategyButton.disabled = true;
   updateConfirmButton();
   try {
-    const response = await fetch(
+    const body = await requestJson(
+      '状态刷新',
       `/api/hedges/${encodeURIComponent(statusStrategyId)}`,
-      { headers: { accept: 'application/json' } }
+      { headers: { accept: 'application/json' } },
+      200
     );
-    const body = await responseJson(response);
-    if (!response.ok || body === null) {
-      throw new Error('status unavailable');
-    }
     const status = await validatedStatusResponse(
       body,
       statusExpectedInput,
@@ -1268,13 +1361,13 @@ async function refreshStatus() {
     }
     renderStatus(status);
     setMessage('状态已刷新。', 'success');
-  } catch {
+  } catch (error) {
     if (
       statusRevision === inputRevision
       && statusStrategyId === strategyId
     ) {
       resetActionablePreview(
-        '状态响应无效或刷新失败，请重新预检。',
+        operatorFailureMessage('状态刷新', error),
         'error'
       );
     }
@@ -1314,13 +1407,12 @@ resumeForm.addEventListener('submit', async (event) => {
   loadStrategyButton.disabled = true;
   updateConfirmButton();
   try {
-    const response = await fetch(
-      `/api/hedges/${encodeURIComponent(requestedStrategyId)}`
+    const body = await requestJson(
+      '策略加载',
+      `/api/hedges/${encodeURIComponent(requestedStrategyId)}`,
+      undefined,
+      200
     );
-    const body = await responseJson(response);
-    if (!response.ok || body === null) {
-      throw new Error('strategy unavailable');
-    }
     const loaded = await validatedLoadedStatusResponse(
       body,
       requestedStrategyId
@@ -1349,10 +1441,10 @@ resumeForm.addEventListener('submit', async (event) => {
         : '策略已加载，仅供查看。',
       'success'
     );
-  } catch {
+  } catch (error) {
     if (loadRevision === inputRevision) {
       resetActionablePreview(
-        '策略加载失败或响应无效，请检查策略 ID。',
+        operatorFailureMessage('策略加载', error),
         'error'
       );
     }
@@ -1387,18 +1479,19 @@ preflightForm.addEventListener('submit', async (event) => {
   updateConfirmButton();
   setMessage('正在预检，请稍候。');
   try {
-    const response = await fetch('/api/hedges/preflight', {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/json'
+    const body = await requestJson(
+      '预检',
+      '/api/hedges/preflight',
+      {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify(submittedInput)
       },
-      body: JSON.stringify(submittedInput)
-    });
-    const body = await responseJson(response);
-    if (response.status !== 201 || body === null) {
-      throw new Error('preflight rejected');
-    }
+      201
+    );
     const preflight = validatedPreflightResponse(body, submittedInput);
     if (submittedRevision !== inputRevision) {
       return;
@@ -1409,10 +1502,10 @@ preflightForm.addEventListener('submit', async (event) => {
     preflightReady = true;
     refreshButton.disabled = false;
     setMessage('预检完成。请核对快照并确认风险。', 'success');
-  } catch {
+  } catch (error) {
     if (submittedRevision === inputRevision) {
       resetActionablePreview(
-        '预检未通过，请检查参数和账户状态。',
+        operatorFailureMessage('预检', error),
         'error'
       );
     }
@@ -1446,7 +1539,8 @@ confirmButton.addEventListener('click', async () => {
   updateConfirmButton();
   setMessage('正在提交确认。');
   try {
-    const response = await fetch(
+    await requestJson(
+      '确认',
       `/api/hedges/${encodeURIComponent(confirmedStrategyId)}/confirm`,
       {
         method: 'POST',
@@ -1455,11 +1549,9 @@ confirmButton.addEventListener('click', async () => {
           'content-type': 'application/json'
         },
         body: JSON.stringify({ riskAcknowledged: true })
-      }
+      },
+      202
     );
-    if (response.status !== 202) {
-      throw new Error('confirmation rejected');
-    }
     if (
       confirmationRevision !== inputRevision
       || confirmedStrategyId !== strategyId
@@ -1468,13 +1560,13 @@ confirmButton.addEventListener('click', async () => {
     }
     riskAck.checked = false;
     setMessage('确认已受理，正在后台执行', 'success');
-  } catch {
+  } catch (error) {
     if (
       confirmationRevision === inputRevision
       && confirmedStrategyId === strategyId
     ) {
       preflightReady = true;
-      setMessage('确认未受理，请重试或重新预检。', 'error');
+      setMessage(operatorFailureMessage('确认', error), 'error');
     }
   } finally {
     if (
@@ -1494,11 +1586,13 @@ refreshButton.addEventListener('click', refreshStatus);
 
 async function loadExchanges() {
   try {
-    const response = await fetch('/api/exchanges', {
-      headers: { accept: 'application/json' }
-    });
-    const body = await responseJson(response);
-    if (!response.ok || !Array.isArray(body?.exchanges)) {
+    const body = await requestJson(
+      '交易所列表加载',
+      '/api/exchanges',
+      { headers: { accept: 'application/json' } },
+      200
+    );
+    if (!Array.isArray(body?.exchanges)) {
       throw new Error('exchange list unavailable');
     }
     for (const exchangeId of body.exchanges) {
@@ -1509,8 +1603,8 @@ async function loadExchanges() {
         select.append(option);
       }
     }
-  } catch {
-    setMessage('交易所列表加载失败，请刷新页面。', 'error');
+  } catch (error) {
+    setMessage(operatorFailureMessage('交易所列表加载', error), 'error');
   }
 }
 
