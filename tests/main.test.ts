@@ -258,6 +258,53 @@ test('production CCXT gateway construction performs no startup market load', asy
   assert.equal(composition.repository.listRecoverable().length, 0);
 });
 
+test('composition redacts all configured credentials from detailed HTTP errors', async (t) => {
+  const composition = composeService({
+    env: VALID_ENV,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    databaseFactory: () => new Database(':memory:'),
+    logger: false
+  });
+  t.after(async () => {
+    await composition.server.close();
+    composition.database.close();
+  });
+  const credentialMessage = Object.values(VALID_ENV).join(' | ');
+  Reflect.set(composition.preflightService, 'run', async () => {
+    throw new Error(credentialMessage);
+  });
+
+  const response = await composition.server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: {
+      host: 'localhost:80',
+      origin: 'http://localhost:80'
+    },
+    payload: {
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol: 'BTC/USDT',
+      requestedBaseQuantity: '1',
+      mode: 'CONCURRENT'
+    }
+  });
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(response.json().error.message, [
+    'bitget,okx',
+    '[Redacted]',
+    '[Redacted]',
+    '[Redacted]',
+    '[Redacted]',
+    '[Redacted]',
+    '[Redacted]'
+  ].join(' | '));
+  for (const secret of Object.values(VALID_ENV).slice(1)) {
+    assert.doesNotMatch(response.body, new RegExp(secret));
+  }
+});
+
 test('composition shares one safe injected trade sink with coordinator and monitor', async (t) => {
   const tradeEvents = { record(): void {} };
   const composition = composeService({

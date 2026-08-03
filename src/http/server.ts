@@ -30,6 +30,10 @@ import {
   requestPathForLog,
   type OperationalLog
 } from '../logging/logger.js';
+import {
+  publicErrorDetail,
+  type PublicErrorDetail
+} from './public-error.js';
 
 export { LOGGER_REDACT_PATHS } from '../logging/logger.js';
 
@@ -41,6 +45,7 @@ export interface BuildServerDependencies {
   readonly logger?: FastifyServerOptions['logger'];
   readonly loggerInstance?: FastifyBaseLogger;
   readonly operationalLog?: OperationalLog;
+  readonly secretProvider?: () => readonly string[];
   readonly publicDirectory?: string;
 }
 
@@ -388,6 +393,36 @@ function errorProperty(
   }
 }
 
+interface PublicHttpError {
+  readonly code: string;
+  readonly message: string;
+  readonly requestId: string;
+  readonly error?: PublicErrorDetail;
+}
+
+function publicHttpError(
+  requestId: string,
+  code: string,
+  message: string,
+  error: unknown | undefined,
+  secretProvider: (() => readonly string[]) | undefined
+): PublicHttpError {
+  let detail: PublicErrorDetail | undefined;
+  if (error !== undefined && secretProvider !== undefined) {
+    try {
+      detail = publicErrorDetail(error, secretProvider());
+    } catch {
+      detail = undefined;
+    }
+  }
+  return {
+    code,
+    message,
+    requestId,
+    ...(detail === undefined ? {} : { error: detail })
+  };
+}
+
 interface LoopbackAuthority {
   readonly hostname: 'localhost' | '127.0.0.1' | '[::1]';
   readonly port: number;
@@ -528,10 +563,13 @@ export function buildServer(
       )
     );
     if (forbidden) {
-      return reply.status(403).send({
-        code: 'FORBIDDEN',
-        message: 'Request forbidden'
-      });
+      return reply.status(403).send(publicHttpError(
+        request.id,
+        'FORBIDDEN',
+        'Request forbidden',
+        undefined,
+        dependencies.secretProvider
+      ));
     }
   });
 
@@ -554,20 +592,26 @@ export function buildServer(
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof StrategyNotFoundError) {
-      void reply.status(404).send({
-        code: 'STRATEGY_NOT_FOUND',
-        message: 'Strategy not found'
-      });
+      void reply.status(404).send(publicHttpError(
+        request.id,
+        'STRATEGY_NOT_FOUND',
+        'Strategy not found',
+        error,
+        dependencies.secretProvider
+      ));
       return;
     }
     if (
       errorProperty(error, 'validation') !== undefined
       || errorProperty(error, 'code') === 'FST_ERR_CTP_INVALID_JSON_BODY'
     ) {
-      void reply.status(400).send({
-        code: 'INVALID_REQUEST',
-        message: 'Request validation failed'
-      });
+      void reply.status(400).send(publicHttpError(
+        request.id,
+        'INVALID_REQUEST',
+        'Request validation failed',
+        error,
+        dependencies.secretProvider
+      ));
       return;
     }
     operationalLog?.error(
@@ -579,10 +623,13 @@ export function buildServer(
         url: requestPathForLog(request.url)
       }
     );
-    void reply.status(500).send({
-      code: 'INTERNAL_ERROR',
-      message: 'Internal server error'
-    });
+    void reply.status(500).send(publicHttpError(
+      request.id,
+      'INTERNAL_ERROR',
+      'Internal server error',
+      error,
+      dependencies.secretProvider
+    ));
   });
 
   app.get('/api/exchanges', async () => ({
@@ -596,11 +643,14 @@ export function buildServer(
       let preview: PreflightResult;
       try {
         preview = await dependencies.preflightService.run(request.body);
-      } catch {
-        return reply.status(422).send({
-          code: 'PREFLIGHT_REJECTED',
-          message: 'Preflight checks did not pass'
-        });
+      } catch (error) {
+        return reply.status(422).send(publicHttpError(
+          request.id,
+          'PREFLIGHT_REJECTED',
+          'Preflight checks did not pass',
+          error,
+          dependencies.secretProvider
+        ));
       }
       const strategy = dependencies.repository.createPending(preview);
       return reply.status(201).send({

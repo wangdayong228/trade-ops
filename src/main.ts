@@ -317,6 +317,7 @@ export function composeService(
       preflightService,
       repository,
       coordinator,
+      secretProvider: () => configuredSecretValues(env),
       ...(options.loggerInstance === undefined
         ? (options.logger === undefined ? {} : { logger: options.logger })
         : { loggerInstance: options.loggerInstance as FastifyBaseLogger }),

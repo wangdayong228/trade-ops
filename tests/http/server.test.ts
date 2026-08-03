@@ -58,6 +58,18 @@ function captureOperationalErrors(
   };
 }
 
+function assertPublicHttpError(
+  response: { json(): Record<string, unknown> },
+  expected: Readonly<Record<string, unknown>>
+): void {
+  const body = response.json();
+  assert.equal(typeof body.requestId, 'string');
+  assert.deepEqual(body, {
+    ...expected,
+    requestId: body.requestId
+  });
+}
+
 function preflight(
   overrides: Partial<PreflightResult> = {}
 ): PreflightResult {
@@ -127,6 +139,7 @@ function setup(
     ) => Promise<PreflightResult>;
     readonly confirmAndExecute?: (strategyId: string) => Promise<void>;
     readonly operationalLog?: OperationalLog;
+    readonly secretProvider?: () => readonly string[];
   } = {}
 ): Fixture {
   const database = new Database(':memory:');
@@ -154,6 +167,9 @@ function setup(
     ...(options.operationalLog === undefined
       ? {}
       : { operationalLog: options.operationalLog }),
+    ...(options.secretProvider === undefined
+      ? {}
+      : { secretProvider: options.secretProvider }),
     logger: false
   });
   t.after(async () => {
@@ -701,7 +717,7 @@ test('rejects non-loopback and malformed Host before every route boundary', asyn
     ];
     for (const response of await Promise.all(requests)) {
       assert.equal(response.statusCode, 403, `host=${JSON.stringify(host)}`);
-      assert.deepEqual(response.json(), {
+      assertPublicHttpError(response, {
         code: 'FORBIDDEN',
         message: 'Request forbidden'
       });
@@ -797,7 +813,7 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
     ]);
     for (const response of responses) {
       assert.equal(response.statusCode, 403);
-      assert.deepEqual(response.json(), {
+      assertPublicHttpError(response, {
         code: 'FORBIDDEN',
         message: 'Request forbidden'
       });
@@ -890,7 +906,7 @@ test('requires Origin on every POST before any write-path dependency', async (t)
 
   for (const response of [preflightResponse, confirmationResponse]) {
     assert.equal(response.statusCode, 403);
-    assert.deepEqual(response.json(), {
+    assertPublicHttpError(response, {
       code: 'FORBIDDEN',
       message: 'Request forbidden'
     });
@@ -961,7 +977,7 @@ test('requires the local HTTP origin scheme and ignores forwarded protocol', asy
     payload
   });
   assert.equal(wrongScheme.statusCode, 403);
-  assert.deepEqual(wrongScheme.json(), {
+  assertPublicHttpError(wrongScheme, {
     code: 'FORBIDDEN',
     message: 'Request forbidden'
   });
@@ -1044,7 +1060,7 @@ test('preflight rejects missing, extra, secret, malformed, and oversized fields 
       payload
     });
     assert.equal(response.statusCode, 400);
-    assert.deepEqual(response.json(), {
+    assertPublicHttpError(response, {
       code: 'INVALID_REQUEST',
       message: 'Request validation failed'
     });
@@ -1092,7 +1108,7 @@ test('preflight never coerces runtime types for any string field', async (t) => 
         400,
         `${field} accepted ${JSON.stringify(invalidValue)}`
       );
-      assert.deepEqual(response.json(), {
+      assertPublicHttpError(response, {
         code: 'INVALID_REQUEST',
         message: 'Request validation failed'
       });
@@ -1102,10 +1118,61 @@ test('preflight never coerces runtime types for any string field', async (t) => 
   assert.equal(preflightInputs.length, 0);
 });
 
-test('preflight failure returns a fixed response without leaking raw errors', async (t) => {
+test('preflight failure returns detailed sanitized diagnostics', async (t) => {
+  const failure = Object.assign(
+    new Error('bitget credential-value authentication failed'),
+    {
+      name: 'AuthenticationError',
+      code: 401,
+      rawResponse: 'LEAK-ME-NOT'
+    }
+  );
   const { server } = setup(t, {
     runPreflight: async () => {
-      throw new Error('apiKey=LEAK-ME-NOT insufficient account 12345');
+      throw failure;
+    },
+    secretProvider: () => ['credential-value']
+  });
+
+  const response = await server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: LOCAL_HEADERS,
+    payload: {
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol: SYMBOL,
+      requestedBaseQuantity: '1',
+      mode: 'SPOT_FIRST'
+    }
+  });
+
+  assert.equal(response.statusCode, 422);
+  const body = response.json();
+  assert.deepEqual(body, {
+    code: 'PREFLIGHT_REJECTED',
+    message: 'Preflight checks did not pass',
+    requestId: body.requestId,
+    error: {
+      type: 'AuthenticationError',
+      code: 401,
+      message: 'bitget [Redacted] authentication failed'
+    }
+  });
+  assert.equal(typeof body.requestId, 'string');
+  assert.doesNotMatch(
+    response.body,
+    /credential-value|LEAK-ME-NOT|rawResponse|stack/
+  );
+});
+
+test('a failing secret provider omits detail without changing the preflight response', async (t) => {
+  const { server } = setup(t, {
+    runPreflight: async () => {
+      throw new Error('sensitive failure');
+    },
+    secretProvider: () => {
+      throw new Error('secret provider unavailable');
     }
   });
 
@@ -1123,11 +1190,14 @@ test('preflight failure returns a fixed response without leaking raw errors', as
   });
 
   assert.equal(response.statusCode, 422);
-  assert.deepEqual(response.json(), {
+  const body = response.json();
+  assert.deepEqual(body, {
     code: 'PREFLIGHT_REJECTED',
-    message: 'Preflight checks did not pass'
+    message: 'Preflight checks did not pass',
+    requestId: body.requestId
   });
-  assert.doesNotMatch(response.body, /LEAK-ME-NOT|12345/);
+  assert.equal(typeof body.requestId, 'string');
+  assert.doesNotMatch(response.body, /sensitive failure|secret provider/);
 });
 
 test('confirmation requires the exact true risk acknowledgement before queueing', async (t) => {
@@ -1175,7 +1245,7 @@ test('confirmation never coerces acknowledgement runtime types', async (t) => {
       400,
       `accepted ${JSON.stringify(riskAcknowledged)}`
     );
-    assert.deepEqual(response.json(), {
+    assertPublicHttpError(response, {
       code: 'INVALID_REQUEST',
       message: 'Request validation failed'
     });
@@ -1186,8 +1256,10 @@ test('confirmation never coerces acknowledgement runtime types', async (t) => {
   assert.equal(repository.getStrategy(strategy.id).state, 'PENDING_CONFIRMATION');
 });
 
-test('confirmation returns 404 for an unknown strategy without queueing', async (t) => {
-  const { server, getExecutionCount } = setup(t);
+test('confirmation returns detailed 404 for an unknown strategy without queueing', async (t) => {
+  const { server, getExecutionCount } = setup(t, {
+    secretProvider: () => []
+  });
 
   const response = await server.inject({
     method: 'POST',
@@ -1197,9 +1269,13 @@ test('confirmation returns 404 for an unknown strategy without queueing', async 
   });
 
   assert.equal(response.statusCode, 404);
-  assert.deepEqual(response.json(), {
+  assertPublicHttpError(response, {
     code: 'STRATEGY_NOT_FOUND',
-    message: 'Strategy not found'
+    message: 'Strategy not found',
+    error: {
+      type: 'StrategyNotFoundError',
+      message: 'unknown strategy'
+    }
   });
   await flushImmediate();
   assert.equal(getExecutionCount(), 0);
@@ -1617,7 +1693,8 @@ test('status returns typed 404 and tampered repository failures return safe 500'
   });
   const second = setup(t, {
     repository: tamperedRepository,
-    operationalLog: captureOperationalErrors(loggedErrors)
+    operationalLog: captureOperationalErrors(loggedErrors),
+    secretProvider: () => ['LEAK-ME-NOT']
   });
 
   const tampered = await second.server.inject({
@@ -1627,11 +1704,15 @@ test('status returns typed 404 and tampered repository failures return safe 500'
   });
 
   assert.equal(tampered.statusCode, 500);
-  assert.deepEqual(tampered.json(), {
+  assertPublicHttpError(tampered, {
     code: 'INTERNAL_ERROR',
-    message: 'Internal server error'
+    message: 'Internal server error',
+    error: {
+      type: 'Error',
+      message: 'sqlite row secret [Redacted]'
+    }
   });
-  assert.doesNotMatch(tampered.body, /LEAK-ME-NOT|sqlite row secret/);
+  assert.doesNotMatch(tampered.body, /LEAK-ME-NOT|unconfigured-token|apiKey/);
   assert.equal(loggedErrors.length, 1);
   assert.equal(loggedErrors[0]?.event, 'unhandled_http_request_failure');
   assert.equal(
@@ -1681,7 +1762,7 @@ test('a throwing operational log cannot replace an HTTP 500 response', async (t)
   });
 
   assert.equal(response.statusCode, 500);
-  assert.deepEqual(response.json(), {
+  assertPublicHttpError(response, {
     code: 'INTERNAL_ERROR',
     message: 'Internal server error'
   });
