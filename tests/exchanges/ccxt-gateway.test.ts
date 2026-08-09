@@ -122,6 +122,32 @@ function okxSpotMarket(
   });
 }
 
+function classicBitgetSpotMarket(
+  rawMinimum: unknown = '0',
+  unifiedMinimum: unknown = 0,
+  amountStep: unknown = 0.000001,
+  costMinimum: unknown = 1
+): CcxtMarket {
+  return market({
+    info: { minTradeAmount: rawMinimum },
+    precision: {
+      amount: amountStep as CcxtMarket['precision']['amount'],
+      price: 0.1
+    },
+    limits: {
+      amount: {
+        min: unifiedMinimum as CcxtMarket['limits']['amount']['min'],
+        max: 1000
+      },
+      price: { min: 0.1, max: 10000000 },
+      cost: {
+        min: costMinimum as CcxtMarket['limits']['cost']['min'],
+        max: 100000000
+      }
+    }
+  });
+}
+
 function ccxtOrder(overrides: Partial<CcxtOrder> = {}): CcxtOrder {
   return {
     id: 'exchange-order-1',
@@ -468,6 +494,201 @@ for (const exchangeId of ['bitget', 'okx'] as const) {
     }
   });
 }
+
+test('loads an evidenced Bitget Classic spot zero minimum as one amount step', async () => {
+  const { gateway } = makeGateway('bitget', [classicBitgetSpotMarket()]);
+
+  const rules = await gateway.loadMarket('BTC/USDT', 'spot');
+
+  assert.equal(rules.amountStep, '0.000001');
+  assert.equal(rules.minBaseAmount, '0.000001');
+  assert.equal(rules.minQuoteNotional, '1');
+  assert.equal(rules.maxBaseAmount, '1000');
+  assert.equal(rules.maxQuoteNotional, '100000000');
+});
+
+for (const [name, rawMinimum, unifiedMinimum] of [
+  ['number zero', 0, 0],
+  ['negative zero', -0, -0],
+  ['decimal string zero', '0.0', '0.000'],
+  ['exponent string zero', ' 0e10 ', ' -0e-3 ']
+] as const) {
+  test(`accepts Classic exact decimal zero representation: ${name}`, async () => {
+    const { gateway } = makeGateway('bitget', [
+      classicBitgetSpotMarket(rawMinimum, unifiedMinimum)
+    ]);
+    const rules = await gateway.loadMarket('BTC/USDT', 'spot');
+    assert.equal(rules.minBaseAmount, '0.000001');
+    assert.equal(rules.minQuoteNotional, '1');
+  });
+}
+
+test('keeps a positive unified Bitget spot minimum without raw compatibility evidence', async () => {
+  const configured = classicBitgetSpotMarket('not-a-decimal', '0.01');
+  const { gateway } = makeGateway('bitget', [configured]);
+
+  const rules = await gateway.loadMarket('BTC/USDT', 'spot');
+
+  assert.equal(rules.minBaseAmount, '0.01');
+  assert.equal(rules.minQuoteNotional, '1');
+});
+
+test('does not apply Bitget compatibility to OKX spot', async () => {
+  const forged = okxSpotMarket({
+    info: { minTradeAmount: '0' },
+    limits: {
+      amount: { min: 0, max: undefined },
+      price: { min: undefined, max: undefined },
+      cost: { min: 1, max: 100000000 }
+    }
+  });
+  const { gateway } = makeGateway('okx', [forged]);
+
+  await assert.rejects(
+    gateway.loadMarket('BTC/USDT', 'spot'),
+    /minimum amount limit/
+  );
+});
+
+test('does not apply Classic spot compatibility to Bitget swap', async () => {
+  const configured = bitgetSwapMarket({
+    info: { minTradeAmount: '0' },
+    limits: {
+      amount: { min: 0, max: undefined },
+      price: { min: undefined, max: undefined },
+      cost: { min: 5, max: undefined }
+    }
+  });
+  const { gateway } = makeGateway('bitget', [configured]);
+
+  await assert.rejects(
+    gateway.loadMarket('BTC/USDT', 'swap'),
+    /minimum amount limit/
+  );
+});
+
+for (const [name, info] of [
+  ['undefined', undefined],
+  ['null', null],
+  ['array', []],
+  ['string', 'classic'],
+  ['number', 0]
+] as const) {
+  test(`rejects Classic zero minimum when info is ${name}`, async () => {
+    const configured = classicBitgetSpotMarket();
+    configured.info = info;
+    const { gateway } = makeGateway('bitget', [configured]);
+    await assert.rejects(
+      gateway.loadMarket('BTC/USDT', 'spot'),
+      /minimum amount limit/
+    );
+  });
+}
+
+for (const [name, rawMinimum] of [
+  ['missing', undefined],
+  ['null', null],
+  ['empty', ''],
+  ['whitespace', '   '],
+  ['boolean', false],
+  ['object', {}],
+  ['array', []],
+  ['negative', -1],
+  ['positive', 1],
+  ['NaN number', Number.NaN],
+  ['infinite number', Number.POSITIVE_INFINITY],
+  ['NaN string', 'NaN'],
+  ['infinite string', 'Infinity'],
+  ['malformed string', 'zero']
+] as const) {
+  test(`rejects Classic unified zero with raw minimum ${name}`, async () => {
+    const configured = classicBitgetSpotMarket(rawMinimum);
+    if (name === 'missing') {
+      delete (configured.info as Record<string, unknown>).minTradeAmount;
+    }
+    const { gateway } = makeGateway('bitget', [configured]);
+    await assert.rejects(
+      gateway.loadMarket('BTC/USDT', 'spot'),
+      /minimum amount limit/
+    );
+  });
+}
+
+const invalidDecimalMetadata: ReadonlyArray<[string, unknown]> = [
+  ['missing', undefined],
+  ['empty', ''],
+  ['negative', -1],
+  ['NaN number', Number.NaN],
+  ['infinite number', Number.POSITIVE_INFINITY],
+  ['NaN string', 'NaN'],
+  ['infinite string', 'Infinity'],
+  ['malformed string', 'invalid']
+];
+
+for (const [name, unifiedMinimum] of invalidDecimalMetadata) {
+  test(`rejects invalid unified Classic amount minimum: ${name}`, async () => {
+    const configured = classicBitgetSpotMarket('0', unifiedMinimum);
+    if (name === 'missing') {
+      configured.limits.amount.min = undefined;
+    }
+    const { gateway } = makeGateway('bitget', [configured]);
+    await assert.rejects(gateway.loadMarket('BTC/USDT', 'spot'));
+  });
+}
+
+for (const [name, amountStep] of [
+  ...invalidDecimalMetadata,
+  ['zero', 0] as const
+]) {
+  test(`rejects Classic compatibility with invalid amount step: ${name}`, async () => {
+    const configured = classicBitgetSpotMarket('0', 0, amountStep);
+    if (name === 'missing') {
+      configured.precision.amount = undefined;
+    }
+    const { gateway } = makeGateway('bitget', [configured]);
+    await assert.rejects(
+      gateway.loadMarket('BTC/USDT', 'spot'),
+      /amount precision/
+    );
+  });
+}
+
+for (const [name, costMinimum] of [
+  ...invalidDecimalMetadata,
+  ['zero', 0] as const
+]) {
+  test(`rejects Classic compatibility with invalid quote minimum: ${name}`, async () => {
+    const configured = classicBitgetSpotMarket(
+      '0',
+      0,
+      0.000001,
+      costMinimum
+    );
+    if (name === 'missing') {
+      configured.limits.cost.min = undefined;
+    }
+    const { gateway } = makeGateway('bitget', [configured]);
+    if (name === 'missing') {
+      await assert.rejects(gateway.loadMarket('BTC/USDT', 'spot'));
+    } else {
+      await assert.rejects(
+        gateway.loadMarket('BTC/USDT', 'spot'),
+        /minimum quote notional/
+      );
+    }
+  });
+}
+
+test('rejects a compatible Classic minimum when maximum amount is below its step', async () => {
+  const configured = classicBitgetSpotMarket();
+  configured.limits.amount.max = '0.0000001';
+  const { gateway } = makeGateway('bitget', [configured]);
+
+  await assert.rejects(
+    gateway.loadMarket('BTC/USDT', 'spot'),
+    /invalid base amount range/
+  );
+});
 
 test('creates deterministic 32-character lowercase alphanumeric client ids', () => {
   const id = makeClientOrderId('strategy-uuid', 'CONTRACT_HEDGE_GTC');
@@ -1004,6 +1225,117 @@ test('rejects precision output that changes the pre-normalized base quantity', a
     isNoOrderSubmitted
   );
   assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('keeps pre-submit amount and notional guards for compatible Classic spot', async (t) => {
+  await t.test('below one amount step', async () => {
+    const { gateway, ccxt } = makeGateway('bitget', [
+      classicBitgetSpotMarket()
+    ]);
+
+    await assert.rejects(
+      gateway.createOrder(spotRequest({
+        baseQuantity: '0.0000001',
+        price: '10000000'
+      })),
+      isNoOrderSubmitted
+    );
+    assert.equal(ccxt.createCalls.length, 0);
+  });
+
+  await t.test('not exactly representable at the amount step', async () => {
+    const { gateway, ccxt } = makeGateway('bitget', [
+      classicBitgetSpotMarket()
+    ]);
+    ccxt.amountPrecisionResult = '0.000001';
+
+    await assert.rejects(
+      gateway.createOrder(spotRequest({
+        baseQuantity: '0.0000015',
+        price: '1000000'
+      })),
+      isNoOrderSubmitted
+    );
+    assert.equal(ccxt.createCalls.length, 0);
+  });
+
+  await t.test('at one step but below minimum quote notional', async () => {
+    const { gateway, ccxt } = makeGateway('bitget', [
+      classicBitgetSpotMarket()
+    ]);
+
+    await assert.rejects(
+      gateway.createOrder(spotRequest({
+        baseQuantity: '0.000001',
+        price: '100'
+      })),
+      isNoOrderSubmitted
+    );
+    assert.equal(ccxt.createCalls.length, 0);
+  });
+});
+
+test('submits an eligible compatible Classic spot order with unchanged parameters', async () => {
+  const { gateway, ccxt } = makeGateway('bitget', [
+    classicBitgetSpotMarket()
+  ]);
+  ccxt.createResult = ccxtOrder({
+    symbol: 'BTC/USDT',
+    type: 'limit',
+    side: 'buy',
+    amount: '0.00002',
+    filled: '0',
+    remaining: '0.00002'
+  });
+
+  await gateway.createOrder(spotRequest({
+    baseQuantity: '0.00002',
+    price: '60000'
+  }));
+
+  assert.deepEqual(ccxt.createCalls, [{
+    symbol: 'BTC/USDT',
+    type: 'limit',
+    side: 'buy',
+    amount: '0.00002',
+    price: '60000',
+    params: {
+      clientOrderId: 'clientorderid0000000000000000001',
+      timeInForce: 'GTC'
+    }
+  }]);
+});
+
+test('submits exactly one compatible Classic spot amount step at the quote minimum', async () => {
+  const { gateway, ccxt } = makeGateway('bitget', [
+    classicBitgetSpotMarket()
+  ]);
+  ccxt.createResult = ccxtOrder({
+    symbol: 'BTC/USDT',
+    type: 'limit',
+    side: 'buy',
+    price: '1000000',
+    amount: '0.000001',
+    filled: '0',
+    remaining: '0.000001'
+  });
+
+  await gateway.createOrder(spotRequest({
+    baseQuantity: '0.000001',
+    price: '1000000'
+  }));
+
+  assert.deepEqual(ccxt.createCalls, [{
+    symbol: 'BTC/USDT',
+    type: 'limit',
+    side: 'buy',
+    amount: '0.000001',
+    price: '1000000',
+    params: {
+      clientOrderId: 'clientorderid0000000000000000001',
+      timeInForce: 'GTC'
+    }
+  }]);
 });
 
 for (const [label, baseQuantity] of [

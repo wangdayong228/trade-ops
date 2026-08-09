@@ -203,6 +203,47 @@ function decimalString(
   return parsed.toFixed();
 }
 
+function exactFiniteDecimalZero(value: unknown): boolean {
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    return false;
+  }
+  const text = String(value).trim();
+  if (text === '') {
+    return false;
+  }
+  try {
+    const parsed = decimal(text);
+    return parsed.isFinite() && parsed.eq(0);
+  } catch {
+    return false;
+  }
+}
+
+function classicBitgetSpotMinimumAmount(
+  exchangeId: SupportedExchangeId,
+  kind: MarketKind,
+  selected: Readonly<CcxtMarket>,
+  amountStep: string,
+  minQuoteNotional: string | undefined
+): string | undefined {
+  if (
+    exchangeId !== 'bitget'
+    || kind !== 'spot'
+    || selected.quote !== 'USDT'
+    || minQuoteNotional === undefined
+    || !exactFiniteDecimalZero(selected.limits.amount.min)
+    || typeof selected.info !== 'object'
+    || selected.info === null
+    || Array.isArray(selected.info)
+  ) {
+    return undefined;
+  }
+  const info = selected.info as Record<string, unknown>;
+  return exactFiniteDecimalZero(info.minTradeAmount)
+    ? amountStep
+    : undefined;
+}
+
 function optionalDecimalString(
   value: unknown,
   field: string
@@ -676,7 +717,20 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       selected.precision.price,
       'price precision'
     );
-    const minimumAmount = decimalString(
+    const minQuoteNotional = selected.limits.cost.min === undefined
+      ? undefined
+      : decimalString(
+        selected.limits.cost.min,
+        'minimum quote notional'
+      );
+    const compatibleMinimumAmount = classicBitgetSpotMinimumAmount(
+      this.exchangeId,
+      kind,
+      selected,
+      amountStep,
+      minQuoteNotional
+    );
+    const minimumAmount = compatibleMinimumAmount ?? decimalString(
       selected.limits.amount.min,
       'minimum amount limit'
     );
@@ -702,12 +756,6 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     ) {
       throw new Error('invalid base amount range');
     }
-    const minQuoteNotional = selected.limits.cost.min === undefined
-      ? undefined
-      : decimalString(
-        selected.limits.cost.min,
-        'minimum quote notional'
-      );
     const maxQuoteNotional = selected.limits.cost.max === undefined
       ? undefined
       : decimalString(
