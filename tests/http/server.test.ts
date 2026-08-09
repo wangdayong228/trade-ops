@@ -3,10 +3,12 @@
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { Writable } from 'node:stream';
 import test, { type TestContext } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import Database from 'better-sqlite3';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
 import type {
   OrderRequest,
@@ -18,9 +20,10 @@ import {
   buildServer,
   LOGGER_REDACT_PATHS
 } from '../../src/http/server.js';
-import type {
-  OperationalFields,
-  OperationalLog
+import {
+  createAppLogger,
+  type OperationalFields,
+  type OperationalLog
 } from '../../src/logging/logger.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
 import type {
@@ -56,6 +59,67 @@ function captureOperationalErrors(
     },
     fatal(): void {}
   };
+}
+
+
+function completionCapture(): {
+  readonly logger: FastifyBaseLogger;
+  readonly lines: () => Array<Record<string, unknown>>;
+} {
+  const output: string[] = [];
+  const destination = new Writable({
+    write(chunk, _encoding, callback) {
+      output.push(String(chunk));
+      callback();
+    }
+  });
+  return {
+    logger: createAppLogger(destination),
+    lines: () => output.join('').trim().split('\n')
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+  };
+}
+
+function completionLines(lines: readonly Record<string, unknown>[]): Array<Record<string, unknown>> {
+  return lines.filter((line) => line.msg === 'request completed');
+}
+
+function completionForStatus(lines: readonly Record<string, unknown>[], statusCode: number): Record<string, unknown> {
+  const matches = completionLines(lines).filter((line) => (line.res as { statusCode?: number } | undefined)?.statusCode === statusCode);
+  assert.equal(matches.length, 1, `expected one completion for ${statusCode}`);
+  return matches[0] as Record<string, unknown>;
+}
+
+
+
+function faultingCompletionLogger(
+  mode: 'throw' | 'reject'
+): FastifyBaseLogger {
+  const destination = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
+  });
+  const wrap = (logger: FastifyBaseLogger): FastifyBaseLogger => new Proxy(logger, {
+    get(target, property, receiver) {
+      if (property === 'child') {
+        return (...args: unknown[]) => wrap(
+          Reflect.apply(target.child, target, args) as FastifyBaseLogger
+        );
+      }
+      if (property === 'info' || property === 'warn' || property === 'error') {
+        return mode === 'throw'
+          ? (): never => { throw new Error('completion logger unavailable'); }
+          : (): Promise<never> => Promise.reject(
+              new Error('completion logger unavailable')
+            );
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  return wrap(createAppLogger(destination));
 }
 
 function assertPublicHttpError(
@@ -140,6 +204,7 @@ function setup(
     readonly confirmAndExecute?: (strategyId: string) => Promise<void>;
     readonly operationalLog?: OperationalLog;
     readonly secretProvider?: () => readonly string[];
+    readonly loggerInstance?: FastifyBaseLogger;
   } = {}
 ): Fixture {
   const database = new Database(':memory:');
@@ -170,7 +235,9 @@ function setup(
     ...(options.secretProvider === undefined
       ? {}
       : { secretProvider: options.secretProvider }),
-    logger: false
+    ...(options.loggerInstance === undefined
+      ? { logger: false as const }
+      : { loggerInstance: options.loggerInstance })
   });
   t.after(async () => {
     await server.close();
@@ -1693,12 +1760,14 @@ test('confirmation is an idempotent 202 for terminal strategies without new exec
 });
 
 test('background coordinator rejection is caught and server close drains queued work', async (t) => {
+  const capture = completionCapture();
   const loggedErrors: CapturedOperationalError[] = [];
   let releaseExecution: (() => void) | undefined;
   const executionGate = new Promise<void>((resolve) => {
     releaseExecution = resolve;
   });
   const fixture = setup(t, {
+    loggerInstance: capture.logger,
     operationalLog: captureOperationalErrors(loggedErrors),
     confirmAndExecute: async () => {
       await executionGate;
@@ -1719,6 +1788,11 @@ test('background coordinator rejection is caught and server close drains queued 
     payload: { riskAcknowledged: true }
   });
   assert.equal(response.statusCode, 202);
+  const completion = completionForStatus(capture.lines(), 202);
+  assert.equal(completion.level, 30);
+  assert.equal(completion.httpError, undefined);
+  assert.equal(completion.httpRequest, undefined);
+  assert.equal(completionLines(capture.lines()).length, 1);
   await flushImmediate();
 
   let closeFinished = false;
@@ -1894,21 +1968,9 @@ test('status returns typed 404 and tampered repository failures return safe 500'
     }
   });
   assert.doesNotMatch(tampered.body, /LEAK-ME-NOT|unconfigured-token|apiKey/);
-  assert.equal(loggedErrors.length, 1);
-  assert.equal(loggedErrors[0]?.event, 'unhandled_http_request_failure');
-  assert.equal(
-    (loggedErrors[0]?.error as Error | undefined)?.message,
-    'sqlite row secret LEAK-ME-NOT'
-  );
-  assert.deepEqual(loggedErrors[0]?.fields, {
-    requestId: loggedErrors[0]?.fields?.requestId,
-    method: 'GET',
-    url: `/api/hedges/${existing.id}`
-  });
-  assert.equal(typeof loggedErrors[0]?.fields?.requestId, 'string');
-  assert.doesNotMatch(
-    JSON.stringify(loggedErrors[0]?.fields),
-    /unconfigured-token|apiKey/
+  assert.deepEqual(
+    loggedErrors.filter((entry) => entry.event === 'unhandled_http_request_failure'),
+    []
   );
 });
 
@@ -4018,4 +4080,680 @@ test('missing strategies use the typed repository error', (t) => {
     () => repository.getStrategy('missing-strategy'),
     StrategyNotFoundError
   );
+});
+
+test('one status-aware completion log is emitted for success redirect and failures', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  server.get('/test/completion-200', async () => ({ ok: true }));
+  server.get('/test/completion-302', async (_request, reply) => reply.redirect('/test/completion-200'));
+  server.post('/test/completion-418', async (_request, reply) => reply.status(418).send({ responseSecret: 'must-not-be-logged' }));
+  server.post('/test/completion-503', async (_request, reply) => reply.status(503).send({ responseSecret: 'must-not-be-logged' }));
+  const url418 = '/test/completion-418?repeat=one&repeat=two&encoded=a%2Fb';
+  const responses = await Promise.all([
+    server.inject({ method: 'GET', url: '/test/completion-200', headers: { host: 'localhost:80' } }),
+    server.inject({ method: 'GET', url: '/test/completion-302', headers: { host: 'localhost:80' } }),
+    server.inject({
+      method: 'POST',
+      url: url418,
+      headers: {
+        ...LOCAL_HEADERS,
+        authorization: 'AUTHORIZATION-HEADER-SENTINEL',
+        cookie: 'COOKIE-HEADER-SENTINEL=1',
+        'x-forwarded-host': 'FORWARDED-HOST-HEADER-SENTINEL'
+      },
+      payload: { passwordHint: 'ordinary', nested: ['value'] }
+    }),
+    server.inject({ method: 'POST', url: '/test/completion-503', headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' }, payload: 'null' })
+  ]);
+  assert.deepEqual(responses.map((response) => response.statusCode), [200, 302, 418, 503]);
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, 4);
+  assert.equal(new Set(completions.map((line) => line.reqId)).size, 4);
+  for (const status of [200, 302]) {
+    const line = completionForStatus(completions, status);
+    assert.equal(line.level, 30);
+    assert.equal(line.httpError, undefined);
+    assert.equal(line.httpRequest, undefined);
+  }
+  for (const status of [418, 503]) {
+    const line = completionForStatus(completions, status);
+    assert.equal(line.level, status === 418 ? 40 : 50);
+    assert.deepEqual(line.httpError, { code: 'HTTP_ERROR', message: `HTTP request failed with status ${status}` });
+    assert.deepEqual(Object.keys(line.httpRequest as object).sort(), ['body', 'method', 'originalByteLength', 'truncated', 'url']);
+  }
+  assert.equal((completionForStatus(completions, 418).httpRequest as Record<string, unknown>).url, url418);
+  const serializedCompletions = JSON.stringify(completions);
+  assert.doesNotMatch(
+    serializedCompletions,
+    /AUTHORIZATION-HEADER-SENTINEL|COOKIE-HEADER-SENTINEL|FORWARDED-HOST-HEADER-SENTINEL|must-not-be-logged/
+  );
+  for (const status of [418, 503]) {
+    assert.equal(
+      Object.hasOwn(completionForStatus(completions, status).httpRequest as object, 'headers'),
+      false
+    );
+  }
+});
+
+test('completion captures valid body invalid JSON and stable known errors', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, {
+    loggerInstance: capture.logger,
+    runPreflight: async () => {
+      throw Object.assign(new Error('authentication failed'), {
+        name: 'AuthenticationError',
+        code: '40101',
+        extra: 'ERROR-EXTRA-SENTINEL',
+        validation: [{ message: 'VALIDATION-ARRAY-SENTINEL' }]
+      });
+    }
+  });
+  const validBody = { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'SPOT_FIRST' };
+  const valid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?dryRun=false', headers: LOCAL_HEADERS, payload: validBody });
+  const invalidText = '{"symbol":"RAW-INVALID"';
+  const invalid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?source=raw', headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' }, payload: invalidText });
+  assert.equal(valid.statusCode, 422);
+  assert.equal(invalid.statusCode, 400);
+  const completions = completionLines(capture.lines());
+  const preflightLine = completionForStatus(completions, 422);
+  assert.notEqual(preflightLine.httpError, undefined);
+  const loggedError = preflightLine.httpError as { error: { stack: string } };
+  assert.deepEqual(preflightLine.httpError, {
+    code: 'PREFLIGHT_REJECTED', message: 'Preflight checks did not pass',
+    error: { type: 'AuthenticationError', message: 'authentication failed', code: '40101', stack: loggedError.error.stack }
+  });
+  assert.deepEqual((preflightLine.httpRequest as Record<string, unknown>).body, validBody);
+  assert.equal((preflightLine.httpRequest as Record<string, unknown>).url, '/api/hedges/preflight?dryRun=false');
+  const invalidLine = completionForStatus(completions, 400);
+  assert.deepEqual(invalidLine.httpError, { code: 'INVALID_REQUEST', message: 'Request validation failed' });
+  assert.equal((invalidLine.httpRequest as Record<string, unknown>).body, invalidText);
+  assert.deepEqual(Object.keys(loggedError.error).sort(), [
+    'code',
+    'message',
+    'stack',
+    'type'
+  ]);
+  assert.equal(Object.hasOwn(loggedError.error, 'validation'), false);
+  assert.doesNotMatch(
+    JSON.stringify(completions),
+    /ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL/
+  );
+});
+
+test('completion redacts configured exact overlapping secrets across URL body and error', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, {
+    loggerInstance: capture.logger, secretProvider: () => ['abc', '', 'abc123', 'abc']
+  });
+  server.post('/test/secret-abc123', async () => {
+    throw Object.assign(new Error('token abc123 and abc'), { code: 'abc123' });
+  });
+  const response = await server.inject({
+    method: 'POST', url: '/test/secret-abc123?token=abc123&ordinary=passwordHint', headers: LOCAL_HEADERS,
+    payload: { abc123key: 'abc and abc123' }
+  });
+  assert.equal(response.statusCode, 500);
+  const serialized = JSON.stringify(completionForStatus(capture.lines(), 500));
+  assert.doesNotMatch(serialized, /abc123|(?<![A-Za-z])abc(?![A-Za-z])/);
+  assert.match(serialized, /\[Redacted\]/);
+  assert.match(serialized, /passwordHint/);
+});
+
+test('completion body metadata observes 8192 8193 and UTF-8 boundaries after redaction', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger, secretProvider: () => ['S'.repeat(9000)] });
+  server.post('/test/body-limit', async (_request, reply) => reply.status(418).send({ failed: true }));
+  for (const value of ['x'.repeat(8180), 'x'.repeat(8181), `${'x'.repeat(8179)}界`, 'S'.repeat(9000)]) {
+    const response = await server.inject({ method: 'POST', url: '/test/body-limit', headers: LOCAL_HEADERS, payload: { value } });
+    assert.equal(response.statusCode, 418);
+  }
+  const requests = completionLines(capture.lines()).filter((line) => (line.res as { statusCode: number }).statusCode === 418).map((line) => line.httpRequest as Record<string, unknown>);
+  assert.equal(requests.length, 4);
+  assert.deepEqual({ truncated: requests[0]?.truncated, bytes: requests[0]?.originalByteLength }, { truncated: false, bytes: 8192 });
+  assert.deepEqual({ truncated: requests[1]?.truncated, bytes: requests[1]?.originalByteLength }, { truncated: true, bytes: 8193 });
+  assert.equal(typeof requests[2]?.body, 'string');
+  assert.equal(Buffer.byteLength(requests[2]?.body as string, 'utf8') <= 8192, true);
+  assert.equal((requests[2]?.body as string).includes('\uFFFD'), false);
+  assert.deepEqual(requests[3]?.body, { value: '[Redacted]' });
+  assert.equal(requests[3]?.truncated, false);
+  assert.equal(requests[3]?.originalByteLength, Buffer.byteLength('{"value":"[Redacted]"}', 'utf8'));
+});
+
+test('completion request state remains isolated across concurrent failures', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger, secretProvider: () => ['secret-one', 'secret-two'] });
+  let releaseOne: (() => void) | undefined;
+  let releaseTwo: (() => void) | undefined;
+  const gateOne = new Promise<void>((resolve) => { releaseOne = resolve; });
+  const gateTwo = new Promise<void>((resolve) => { releaseTwo = resolve; });
+  server.post('/test/concurrent-one', async (_request, reply) => { await gateOne; return reply.status(418).send(); });
+  server.post('/test/concurrent-two', async (_request, reply) => { await gateTwo; return reply.status(503).send(); });
+  const first = server.inject({ method: 'POST', url: '/test/concurrent-one?id=one', headers: LOCAL_HEADERS, payload: { marker: 'body-one-secret-one' } });
+  const second = server.inject({ method: 'POST', url: '/test/concurrent-two?id=two', headers: LOCAL_HEADERS, payload: { marker: 'body-two-secret-two' } });
+  releaseTwo?.(); await second; releaseOne?.(); await first;
+  const one = completionForStatus(capture.lines(), 418);
+  const two = completionForStatus(capture.lines(), 503);
+  assert.match(JSON.stringify(one), /one/);
+  assert.doesNotMatch(JSON.stringify(one), /two|secret-one/);
+  assert.match(JSON.stringify(two), /two/);
+  assert.doesNotMatch(JSON.stringify(two), /one|secret-two/);
+});
+
+test('completion safely degrades when secret provider fails and failed preflight does not persist', async (t) => {
+  const capture = completionCapture();
+  let preflightRuns = 0;
+  const { server, repository } = setup(t, {
+    loggerInstance: capture.logger,
+    secretProvider: () => { throw new Error('provider-secret'); },
+    runPreflight: async () => { preflightRuns += 1; throw new Error('payload-secret'); }
+  });
+  const before = repository.listRecoverable().length;
+  const response = await server.inject({
+    method: 'POST', url: '/api/hedges/preflight?token=url-secret', headers: LOCAL_HEADERS,
+    payload: { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'SPOT_FIRST' }
+  });
+  assert.equal(response.statusCode, 422);
+  assert.equal(preflightRuns, 1);
+  assert.equal(repository.listRecoverable().length, before);
+  const line = completionForStatus(capture.lines(), 422);
+  assert.deepEqual(line.httpError, { code: 'PREFLIGHT_REJECTED', message: 'Preflight checks did not pass' });
+  assert.deepEqual(line.httpRequest, { method: '[Unavailable]', url: '[Unavailable]', body: '[Unavailable]', truncated: false, originalByteLength: Buffer.byteLength('[Unavailable]', 'utf8') });
+  assert.doesNotMatch(JSON.stringify(line), /provider-secret|payload-secret|url-secret/);
+});
+
+test('forbidden completion excludes hostile headers and records stable request data', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  const response = await server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight?visible=query-value',
+    headers: {
+      host: 'HOST-HEADER-SENTINEL.invalid',
+      origin: 'https://ORIGIN-HEADER-SENTINEL.invalid',
+      authorization: 'AUTH-HEADER-SENTINEL',
+      cookie: 'COOKIE-HEADER-SENTINEL=1'
+    },
+    payload: { visible: 'body-value' }
+  });
+  assert.equal(response.statusCode, 403);
+  const line = completionForStatus(capture.lines(), 403);
+  assert.equal(line.level, 40);
+  assert.deepEqual(line.httpError, { code: 'FORBIDDEN', message: 'Request forbidden' });
+  const snapshot = line.httpRequest as Record<string, unknown>;
+  assert.equal(snapshot.method, 'POST');
+  assert.equal(snapshot.url, '/api/hedges/preflight?visible=query-value');
+  assert.equal(snapshot.body, null);
+  assert.equal(Object.hasOwn(snapshot, 'headers'), false);
+  assert.doesNotMatch(
+    JSON.stringify(line),
+    /HOST-HEADER|ORIGIN-HEADER|AUTH-HEADER|COOKIE-HEADER|body-value/
+  );
+});
+
+
+test('HTTP safety boundary rejects invalid Host and unsafe Origin before invalid JSON parsing', async (t) => {
+  const database = new Database(':memory:');
+  const targetRepository = new SqliteStrategyRepository(database);
+  let repositoryCalls = 0;
+  const repository = new Proxy<StrategyRepository>(targetRepository, {
+    get(target, property) {
+      const value = Reflect.get(target, property);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        repositoryCalls += 1;
+        return Reflect.apply(value, target, args);
+      };
+    }
+  });
+  t.after(() => database.close());
+  const capture = completionCapture();
+  const fixture = setup(t, { repository, loggerInstance: capture.logger });
+  const malformedJson = '{"symbol":"ATTACKER-BODY-SENTINEL"';
+  const requests = [
+    {
+      label: 'invalid Host',
+      headers: {
+        host: 'INVALID-HOST-SENTINEL.invalid',
+        origin: 'https://UNSAFE-ORIGIN-SENTINEL.invalid',
+        'content-type': 'application/json'
+      }
+    },
+    {
+      label: 'unsafe Origin',
+      headers: {
+        host: 'localhost:80',
+        origin: 'https://UNSAFE-ORIGIN-SENTINEL.invalid',
+        'content-type': 'application/json'
+      }
+    },
+    {
+      label: 'missing Origin',
+      headers: {
+        host: 'localhost:80',
+        'content-type': 'application/json'
+      }
+    }
+  ] as const;
+
+  for (const request of requests) {
+    const response = await fixture.server.inject({
+      method: 'POST',
+      url: `/api/hedges/preflight?case=${encodeURIComponent(request.label)}`,
+      headers: request.headers,
+      payload: malformedJson
+    });
+    assert.equal(response.statusCode, 403, request.label);
+    assertPublicHttpError(response, {
+      code: 'FORBIDDEN',
+      message: 'Request forbidden'
+    });
+  }
+
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(repositoryCalls, 0);
+  assert.equal(fixture.getExecutionCount(), 0);
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, requests.length);
+  for (const completion of completions) {
+    assert.equal(completion.level, 40);
+    assert.deepEqual(completion.httpError, {
+      code: 'FORBIDDEN',
+      message: 'Request forbidden'
+    });
+    const snapshot = completion.httpRequest as Record<string, unknown>;
+    assert.equal(snapshot.method, 'POST');
+    assert.equal(
+      snapshot.body === null,
+      true
+    );
+  }
+  assert.doesNotMatch(
+    JSON.stringify(completions),
+    /ATTACKER-BODY-SENTINEL|INVALID-HOST-SENTINEL|UNSAFE-ORIGIN-SENTINEL/
+  );
+});
+
+test('HTTP safety boundary rejects invalid Host before Fastify body limit', async (t) => {
+  const database = new Database(':memory:');
+  const targetRepository = new SqliteStrategyRepository(database);
+  let repositoryCalls = 0;
+  const repository = new Proxy<StrategyRepository>(targetRepository, {
+    get(target, property) {
+      const value = Reflect.get(target, property);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        repositoryCalls += 1;
+        return Reflect.apply(value, target, args);
+      };
+    }
+  });
+  t.after(() => database.close());
+  const capture = completionCapture();
+  const fixture = setup(t, { repository, loggerInstance: capture.logger });
+  const oversizedPayload = JSON.stringify({
+    attackerData: 'x'.repeat(1_048_576)
+  });
+
+  const response = await fixture.server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight?case=oversized',
+    headers: {
+      host: 'INVALID-HOST-LIMIT-SENTINEL.invalid',
+      origin: 'https://UNSAFE-ORIGIN-LIMIT-SENTINEL.invalid',
+      'content-type': 'application/json'
+    },
+    payload: oversizedPayload
+  });
+
+  assert.equal(response.statusCode, 403);
+  assertPublicHttpError(response, {
+    code: 'FORBIDDEN',
+    message: 'Request forbidden'
+  });
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(repositoryCalls, 0);
+  assert.equal(fixture.getExecutionCount(), 0);
+  const completion = completionForStatus(capture.lines(), 403);
+  assert.equal(completion.level, 40);
+  assert.deepEqual(completion.httpError, {
+    code: 'FORBIDDEN',
+    message: 'Request forbidden'
+  });
+  const snapshot = completion.httpRequest as Record<string, unknown>;
+  assert.equal(snapshot.method, 'POST');
+  assert.equal(
+    snapshot.body === null,
+    true
+  );
+  assert.doesNotMatch(
+    JSON.stringify(completion),
+    /INVALID-HOST-LIMIT-SENTINEL|UNSAFE-ORIGIN-LIMIT-SENTINEL/
+  );
+});
+
+
+test('raw request capture has an independent 1 MiB limit below a route body limit', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  let handlerCalls = 0;
+  server.post(
+    '/test/raw-capture-limit',
+    { bodyLimit: 2_097_152 },
+    async () => {
+      handlerCalls += 1;
+      return { unexpected: true };
+    }
+  );
+  const url = '/test/raw-capture-limit?source=malformed';
+  const payloadSentinel = 'RAW-CAPTURE-LIMIT-PAYLOAD-SENTINEL';
+  const malformedJson = `{"sentinel":"${payloadSentinel}","padding":"${'x'.repeat(1_100_000)}`;
+  assert.equal(Buffer.byteLength(malformedJson, 'utf8') > 1_048_576, true);
+  assert.equal(Buffer.byteLength(malformedJson, 'utf8') < 2_097_152, true);
+
+  const response = await server.inject({
+    method: 'POST',
+    url,
+    headers: {
+      ...LOCAL_HEADERS,
+      'content-type': 'application/json'
+    },
+    payload: malformedJson
+  });
+
+  assert.equal(response.statusCode, 400);
+  assertPublicHttpError(response, {
+    code: 'INVALID_REQUEST',
+    message: 'Request validation failed'
+  });
+  assert.equal(handlerCalls, 0);
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, 1);
+  const completion = completionForStatus(completions, 400);
+  assert.equal(completion.level, 40);
+  assert.deepEqual(completion.httpError, {
+    code: 'INVALID_REQUEST',
+    message: 'Request validation failed'
+  });
+  const snapshot = completion.httpRequest as Record<string, unknown>;
+  assert.equal(snapshot.method, 'POST');
+  assert.equal(snapshot.url, url);
+  assert.equal(snapshot.body, '[Unavailable]');
+  assert.equal(snapshot.truncated, false);
+  assert.equal(
+    snapshot.originalByteLength,
+    Buffer.byteLength('[Unavailable]', 'utf8')
+  );
+  assert.doesNotMatch(JSON.stringify(completion), new RegExp(payloadSentinel));
+});
+
+
+test('body observation preserves parsed JSON values and no-body behavior', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  const seen: unknown[] = [];
+  server.post('/test/parser-values', async (request, reply) => {
+    seen.push(request.body);
+    return reply.status(418).send({ failed: true });
+  });
+  const cases: Array<{ payload?: string; expected: unknown }> = [
+    { payload: '{"object":true}', expected: { object: true } },
+    { payload: '["array",2]', expected: ['array', 2] },
+    { payload: '"string"', expected: 'string' },
+    { payload: '42', expected: 42 },
+    { payload: 'true', expected: true },
+    { payload: 'null', expected: null },
+    { expected: undefined }
+  ];
+  for (const entry of cases) {
+    const response = await server.inject({
+      method: 'POST',
+      url: '/test/parser-values',
+      headers: entry.payload === undefined
+        ? LOCAL_HEADERS
+        : { ...LOCAL_HEADERS, 'content-type': 'application/json' },
+      ...(entry.payload === undefined ? {} : { payload: entry.payload })
+    });
+    assert.equal(response.statusCode, 418);
+  }
+  assert.deepEqual(seen, cases.map(({ expected }) => expected));
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, cases.length);
+  assert.deepEqual(
+    completions.map((line) => (line.httpRequest as Record<string, unknown>).body),
+    [{ object: true }, ['array', 2], 'string', 42, true, null, null]
+  );
+});
+
+test('large valid JSON uses parsed body even after raw capture budget is exceeded', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  let parsedBody: unknown;
+  server.post('/test/large-parsed', { bodyLimit: 2_097_152 }, async (request, reply) => {
+    parsedBody = request.body;
+    return reply.status(418).send({ failed: true });
+  });
+  const sentinel = 'PARSED-LARGE-BODY-SENTINEL';
+  const payload = JSON.stringify({ sentinel, padding: 'x'.repeat(1_100_000) });
+  const response = await server.inject({
+    method: 'POST', url: '/test/large-parsed?kind=valid',
+    headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' }, payload
+  });
+  assert.equal(response.statusCode, 418);
+  assert.equal((parsedBody as { sentinel: string }).sentinel, sentinel);
+  const snapshot = completionForStatus(capture.lines(), 418).httpRequest as Record<string, unknown>;
+  assert.equal(snapshot.body === '[Unavailable]', false);
+  assert.equal(snapshot.truncated, true);
+  assert.equal(snapshot.originalByteLength, Buffer.byteLength(payload, 'utf8'));
+  assert.equal(typeof snapshot.body, 'string');
+  assert.match(snapshot.body as string, /PARSED-LARGE-BODY-SENTINEL/);
+});
+
+test('known and fallback HTTP failures emit stable completion summaries', async (t) => {
+  const capture = completionCapture();
+  const loggedErrors: CapturedOperationalError[] = [];
+  const fixture = setup(t, {
+    loggerInstance: capture.logger,
+    operationalLog: captureOperationalErrors(loggedErrors)
+  });
+  fixture.server.get('/test/internal-completion', async () => {
+    throw Object.assign(new Error('internal failure'), { privateValue: 'ERROR-PRIVATE-SENTINEL' });
+  });
+  const schemaBody = { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'INVALID_MODE' };
+  const schema = await fixture.server.inject({ method: 'POST', url: '/api/hedges/preflight?kind=schema', headers: LOCAL_HEADERS, payload: schemaBody });
+  const business = await fixture.server.inject({ method: 'GET', url: '/api/hedges/missing-business', headers: { host: 'localhost:80' } });
+  const framework = await fixture.server.inject({ method: 'GET', url: '/missing-framework?kind=404', headers: { host: 'localhost:80' } });
+  const internal = await fixture.server.inject({ method: 'GET', url: '/test/internal-completion?kind=500', headers: { host: 'localhost:80' } });
+  assert.deepEqual([schema.statusCode, business.statusCode, framework.statusCode, internal.statusCode], [400, 404, 404, 500]);
+  const lines = completionLines(capture.lines());
+  const byUrl = (url: string): Record<string, unknown> => {
+    const matches = lines.filter((line) => (line.httpRequest as { url?: string } | undefined)?.url === url);
+    assert.equal(matches.length, 1);
+    return matches[0] as Record<string, unknown>;
+  };
+  const schemaLine = byUrl('/api/hedges/preflight?kind=schema');
+  assert.deepEqual((schemaLine.httpRequest as Record<string, unknown>).body, schemaBody);
+  assert.deepEqual(schemaLine.httpError, { code: 'INVALID_REQUEST', message: 'Request validation failed' });
+  assert.deepEqual(byUrl('/api/hedges/missing-business').httpError, {
+    code: 'STRATEGY_NOT_FOUND', message: 'Strategy not found',
+    error: (byUrl('/api/hedges/missing-business').httpError as { error: unknown }).error
+  });
+  assert.deepEqual(byUrl('/missing-framework?kind=404').httpError, {
+    code: 'HTTP_ERROR', message: 'HTTP request failed with status 404'
+  });
+  const internalLine = byUrl('/test/internal-completion?kind=500');
+  assert.equal(internalLine.level, 50);
+  assert.equal((internalLine.httpError as { code: string }).code, 'INTERNAL_ERROR');
+  assert.equal(Object.hasOwn(schemaLine.httpError as object, 'validation'), false);
+  assert.equal(
+    Object.hasOwn((schemaLine.httpError as { error?: object }).error ?? {}, 'validation'),
+    false
+  );
+  assert.doesNotMatch(JSON.stringify(lines), /ERROR-PRIVATE-SENTINEL/);
+  assert.equal(loggedErrors.some(({ event }) => event === 'unhandled_http_request_failure'), false);
+});
+
+test('completion redacts every reachable URL body raw-body and error string surface', async (t) => {
+  const capture = completionCapture();
+  const secrets = ['PATHSECRET', 'QUERYSECRET', 'KEYSECRET', 'VALUESECRET', 'RAWSECRET', 'ERRORSECRET', 'CODESECRET'];
+  const { server } = setup(t, { loggerInstance: capture.logger, secretProvider: () => secrets });
+  server.post('/test/redaction/:path', async () => {
+    const error = Object.assign(new Error('message ERRORSECRET'), { code: 'CODESECRET' });
+    error.stack = 'Error: ERRORSECRET stack';
+    throw error;
+  });
+  const structured = await server.inject({
+    method: 'POST',
+    url: '/test/redaction/PATHSECRET?QUERYSECRET=VALUESECRET',
+    headers: LOCAL_HEADERS,
+    payload: { KEYSECRET: { nested: 'VALUESECRET', values: ['PATHSECRET'] } }
+  });
+  const raw = await server.inject({
+    method: 'POST', url: '/api/hedges/preflight?raw=RAWSECRET',
+    headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' },
+    payload: '{"raw":"RAWSECRET"'
+  });
+  assert.deepEqual([structured.statusCode, raw.statusCode], [500, 400]);
+  const serialized = JSON.stringify(completionLines(capture.lines()));
+  for (const secret of secrets) assert.doesNotMatch(serialized, new RegExp(secret));
+  assert.match(serialized, /\[Redacted\]/);
+});
+
+test('concurrent preflight completions correlate response requestId with isolated error URL and body', async (t) => {
+  const capture = completionCapture();
+  let releaseOne: (() => void) | undefined;
+  let releaseTwo: (() => void) | undefined;
+  const gateOne = new Promise<void>((resolve) => { releaseOne = resolve; });
+  const gateTwo = new Promise<void>((resolve) => { releaseTwo = resolve; });
+  const fixture = setup(t, {
+    loggerInstance: capture.logger,
+    runPreflight: async (input) => {
+      if (input.requestedBaseQuantity === '1') {
+        await gateOne;
+        throw new Error('ERROR-ONE');
+      }
+      await gateTwo;
+      throw new Error('ERROR-TWO');
+    }
+  });
+  const payloadFor = (quantity: string) => ({ spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: quantity, mode: 'SPOT_FIRST' });
+  const firstPromise = fixture.server.inject({ method: 'POST', url: '/api/hedges/preflight?case=one', headers: LOCAL_HEADERS, payload: payloadFor('1') });
+  const secondPromise = fixture.server.inject({ method: 'POST', url: '/api/hedges/preflight?case=two', headers: LOCAL_HEADERS, payload: payloadFor('2') });
+  releaseTwo?.(); const second = await secondPromise;
+  releaseOne?.(); const first = await firstPromise;
+  for (const [response, label, quantity, ownError, otherError] of [
+    [first, 'one', '1', 'ERROR-ONE', 'ERROR-TWO'],
+    [second, 'two', '2', 'ERROR-TWO', 'ERROR-ONE']
+  ] as const) {
+    const requestId = response.json().requestId as string;
+    const matches = completionLines(capture.lines()).filter((line) => line.reqId === requestId);
+    assert.equal(matches.length, 1);
+    const line = matches[0] as Record<string, unknown>;
+    assert.equal((line.httpRequest as { url: string }).url, `/api/hedges/preflight?case=${label}`);
+    assert.equal(((line.httpRequest as { body: { requestedBaseQuantity: string } }).body).requestedBaseQuantity, quantity);
+    assert.match(JSON.stringify(line.httpError), new RegExp(ownError));
+    assert.doesNotMatch(JSON.stringify(line), new RegExp(otherError));
+  }
+});
+
+test('HTTP completion logger faults do not change persistence preflight count or background queueing', async (t) => {
+  for (const mode of ['throw', 'reject'] as const) {
+    let preflightRuns = 0;
+    let executionRuns = 0;
+    let unhandled: unknown;
+    const onUnhandled = (reason: unknown): void => { unhandled = reason; };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const database = new Database(':memory:');
+      const targetRepository = new SqliteStrategyRepository(database);
+      let createPendingCalls = 0;
+      const repository = new Proxy<StrategyRepository>(targetRepository, {
+        get(target, property) {
+          const value = Reflect.get(target, property);
+          if (property === 'createPending') {
+            return (...args: unknown[]) => {
+              createPendingCalls += 1;
+              return Reflect.apply(value as (...args: unknown[]) => unknown, target, args);
+            };
+          }
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      });
+      t.after(() => database.close());
+      const fixture = setup(t, {
+        repository,
+        loggerInstance: faultingCompletionLogger(mode),
+        runPreflight: async (input) => {
+          preflightRuns += 1;
+          if (input.requestedBaseQuantity === '2') throw new Error('rejected');
+          return preflight(input);
+        },
+        confirmAndExecute: async () => { executionRuns += 1; }
+      });
+      const created = await fixture.server.inject({ method: 'POST', url: '/api/hedges/preflight', headers: LOCAL_HEADERS, payload: { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'SPOT_FIRST' } });
+      assert.equal(created.statusCode, 201, mode);
+      assert.equal(createPendingCalls, 1, mode);
+      assert.equal(targetRepository.getStrategy(created.json().id).state, 'PENDING_CONFIRMATION', mode);
+      const rejected = await fixture.server.inject({ method: 'POST', url: '/api/hedges/preflight', headers: LOCAL_HEADERS, payload: { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '2', mode: 'SPOT_FIRST' } });
+      assert.equal(rejected.statusCode, 422, mode);
+      assert.equal(preflightRuns, 2, mode);
+      assert.equal(createPendingCalls, 1, mode);
+      const confirmed = await fixture.server.inject({ method: 'POST', url: `/api/hedges/${created.json().id}/confirm`, headers: LOCAL_HEADERS, payload: { riskAcknowledged: true } });
+      assert.equal(confirmed.statusCode, 202, mode);
+      await flushImmediate();
+      assert.equal(executionRuns, 1, mode);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(unhandled, undefined, mode);
+    } finally {
+      process.removeListener('unhandledRejection', onUnhandled);
+    }
+  }
+});
+
+test('hostile parsed body getter safely degrades without invoking attacker code', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  let getterCalls = 0;
+  server.post('/test/hostile-parsed', async (request, reply) => {
+    const hostile = {};
+    Object.defineProperty(hostile, 'secret', {
+      enumerable: true,
+      get(): never {
+        getterCalls += 1;
+        throw new Error('GETTER-SENTINEL');
+      }
+    });
+    (request as unknown as { body: unknown }).body = hostile;
+    return reply.status(418).send({ failed: true });
+  });
+  const response = await server.inject({ method: 'POST', url: '/test/hostile-parsed', headers: LOCAL_HEADERS, payload: { benign: true } });
+  assert.equal(response.statusCode, 418);
+  assert.equal(getterCalls, 0);
+  const snapshot = completionForStatus(capture.lines(), 418).httpRequest as Record<string, unknown>;
+  assert.equal(snapshot.body, null);
+  assert.doesNotMatch(JSON.stringify(snapshot), /GETTER-SENTINEL/);
+});
+
+test('operator docs describe failure request snapshots and safety boundaries', async () => {
+  const documents = await Promise.all([
+    readFile(resolve(process.cwd(), 'README.md'), 'utf8'),
+    readFile(resolve(process.cwd(), 'docs/usage/operator-guide.md'), 'utf8')
+  ]);
+  for (const document of documents) {
+    for (const required of [
+      'request completed', 'httpError', 'httpRequest', 'method', 'url', 'body',
+      'truncated', 'originalByteLength', '1 MiB', '8192', 'headers',
+      '响应 body', 'SQLite', 'unhandled_http_request_failure',
+      'background_confirmation_failed'
+    ]) assert.match(document, new RegExp(required));
+    assert.match(document, /低于.*400.*info|info.*低于.*400/);
+    assert.match(document, /4xx.*warn/);
+    assert.match(document, /5xx.*error/);
+    assert.match(document, /包含 query|含 query/);
+    assert.match(document, /Host\/Origin.*(?:body|parser).*(?:之前|前)/);
+    assert.match(document, /403.*body.*null/);
+    assert.match(document, /路由.*(?:更大|较大).*(?:不会扩大|不会扩展).*(?:1 MiB|观察预算)/);
+    assert.match(document, /配置.*敏感值.*(?:替换|脱敏)/);
+    assert.match(document, /失败.*预检|预检失败/);
+  }
 });

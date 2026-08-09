@@ -72,17 +72,46 @@ function stringProperty(value: unknown, property: string): string | undefined {
   }
 }
 
-function redactText(
+export function nonEmptySecrets(
+  secrets: readonly string[]
+): readonly string[] {
+  return [...new Set(secrets.filter((secret) => secret.length !== 0))]
+    .map((secret, index) => ({ secret, index }))
+    .sort((left, right) => (
+      Buffer.byteLength(right.secret, 'utf8')
+      - Buffer.byteLength(left.secret, 'utf8')
+      || left.index - right.index
+    ))
+    .map(({ secret }) => secret);
+}
+
+export function redactText(
   value: string,
   secrets: readonly string[]
 ): string {
   let redacted = value;
-  for (const secret of secrets) {
-    if (secret.length !== 0) {
-      redacted = redacted.replaceAll(secret, '[Redacted]');
-    }
+  for (const secret of nonEmptySecrets(secrets)) {
+    redacted = redacted.replaceAll(secret, '[Redacted]');
   }
   return redacted;
+}
+
+export function utf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  const bytes = Buffer.from(value, 'utf8');
+  if (bytes.length <= maxBytes) return value;
+  let end = Math.min(maxBytes, bytes.length);
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+export function nonThrowingLogCall(call: () => unknown): void {
+  try {
+    const result = call();
+    void Promise.resolve(result).catch(() => {});
+  } catch {
+    // Logging is never allowed to change service behavior.
+  }
 }
 
 export function requestPathForLog(url: string): string {

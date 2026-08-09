@@ -2,8 +2,10 @@ import { resolve } from 'node:path';
 import staticPlugin from '@fastify/static';
 import { Decimal } from 'decimal.js';
 import Fastify, {
+  LogController,
   type FastifyBaseLogger,
   type FastifyInstance,
+  type FastifyRequest,
   type FastifyServerOptions
 } from 'fastify';
 import type {
@@ -26,10 +28,21 @@ import type {
 } from '../strategy/preflight-service.js';
 import {
   LOGGER_REDACT_PATHS,
+  nonEmptySecrets,
+  nonThrowingLogCall,
   nonThrowingOperationalLog,
-  requestPathForLog,
-  type OperationalLog
+  redactText,
+  safeError,
+  utf8Prefix,
+  type OperationalLog,
+  type SafeError
 } from '../logging/logger.js';
+import {
+  createRequestBodyCapture,
+  createRequestBodyCaptureTransform,
+  RAW_REQUEST_BODY_CAPTURE_LIMIT,
+  type RequestBodyCapture
+} from './request-body-capture.js';
 import {
   publicErrorDetail,
   type PublicErrorDetail
@@ -47,6 +60,106 @@ export interface BuildServerDependencies {
   readonly operationalLog?: OperationalLog;
   readonly secretProvider?: () => readonly string[];
   readonly publicDirectory?: string;
+}
+
+
+
+const HTTP_REQUEST_BODY_LOG_LIMIT = 8192;
+const UNAVAILABLE = '[Unavailable]';
+
+interface HttpErrorForLog {
+  readonly code: string;
+  readonly message: string;
+  readonly error?: SafeError;
+}
+
+interface RequestLogState {
+  readonly method: string;
+  readonly url: string;
+  readonly capture: RequestBodyCapture;
+  bodyObservationAllowed: boolean;
+  httpError?: HttpErrorForLog;
+}
+
+function fallbackHttpError(statusCode: number): HttpErrorForLog {
+  return {
+    code: 'HTTP_ERROR',
+    message: `HTTP request failed with status ${statusCode}`
+  };
+}
+
+function safeJsonValue(
+  value: unknown,
+  secrets: readonly string[],
+  seen = new Set<object>()
+): unknown | undefined {
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') {
+    return Number.isFinite(value as number) || typeof value !== 'number' ? value : null;
+  }
+  if (typeof value === 'string') return redactText(value, secrets);
+  if (typeof value !== 'object') return undefined;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const result: unknown[] = [];
+      for (const item of value) {
+        const safe = safeJsonValue(item, secrets, seen);
+        result.push(safe === undefined ? null : safe);
+      }
+      return result;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !('value' in descriptor)) return undefined;
+      const safe = safeJsonValue(descriptor.value, secrets, seen);
+      if (safe !== undefined) result[redactText(key, secrets)] = safe;
+    }
+    return result;
+  } catch {
+    return undefined;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function bodyForLog(
+  request: FastifyRequest,
+  state: RequestLogState,
+  secrets: readonly string[]
+): { readonly body: unknown; readonly truncated: boolean; readonly originalByteLength: number } {
+  let body: unknown;
+  const parsedBodyAvailable = request.body !== undefined;
+  if (parsedBodyAvailable) {
+    body = safeJsonValue(request.body, secrets);
+    if (body === undefined) body = null;
+  }
+  if (!parsedBodyAvailable && state.bodyObservationAllowed) {
+    const captured = state.capture.result();
+    if (captured.status === 'complete' && captured.byteLength > 0) {
+      body = redactText(captured.body.toString('utf8'), secrets);
+    } else if (captured.status !== 'complete') {
+      body = UNAVAILABLE;
+    }
+  }
+  if (body === undefined) body = null;
+  let serialized: string;
+  try {
+    serialized = typeof body === 'string' ? body : JSON.stringify(body);
+  } catch {
+    body = UNAVAILABLE;
+    serialized = UNAVAILABLE;
+  }
+  const originalByteLength = Buffer.byteLength(serialized, 'utf8');
+  const truncated = originalByteLength > HTTP_REQUEST_BODY_LOG_LIMIT;
+  return {
+    body: truncated ? utf8Prefix(serialized, HTTP_REQUEST_BODY_LOG_LIMIT) : body,
+    truncated,
+    originalByteLength
+  };
 }
 
 const PREFLIGHT_SCHEMA = {
@@ -498,6 +611,8 @@ export function buildServer(
     : { loggerInstance: dependencies.loggerInstance };
   const app = Fastify({
     ...loggerOptions,
+    logController: new LogController({ disableRequestLogging: true }),
+    bodyLimit: RAW_REQUEST_BODY_CAPTURE_LIMIT,
     ajv: {
       customOptions: {
         coerceTypes: false,
@@ -510,6 +625,26 @@ export function buildServer(
   );
   const queuedStrategyIds = new Set<string>();
   const backgroundTasks = new Set<Promise<void>>();
+  const requestLogStates = new WeakMap<FastifyRequest, RequestLogState>();
+
+  function rememberHttpError(
+    request: FastifyRequest,
+    code: string,
+    message: string,
+    error?: unknown
+  ): void {
+    const state = requestLogStates.get(request);
+    if (state === undefined) return;
+    let detail: SafeError | undefined;
+    if (error !== undefined) {
+      try {
+        detail = safeError(error, nonEmptySecrets(dependencies.secretProvider?.() ?? []));
+      } catch {
+        detail = undefined;
+      }
+    }
+    state.httpError = { code, message, ...(detail === undefined ? {} : { error: detail }) };
+  }
 
   function queueConfirmation(strategyId: string): void {
     if (queuedStrategyIds.has(strategyId)) {
@@ -536,6 +671,12 @@ export function buildServer(
   }
 
   app.addHook('onRequest', async (request, reply) => {
+    requestLogStates.set(request, {
+      method: request.method,
+      url: request.url,
+      capture: createRequestBodyCapture(),
+      bodyObservationAllowed: false
+    });
     // This server is the cleartext local-HTTP boundary. Task 9 must bind it
     // only to loopback; proxy headers never upgrade or replace this tuple.
     const requestAuthority = loopbackAuthority(
@@ -563,6 +704,7 @@ export function buildServer(
       )
     );
     if (forbidden) {
+      rememberHttpError(request, 'FORBIDDEN', 'Request forbidden');
       return reply.status(403).send(publicHttpError(
         request.id,
         'FORBIDDEN',
@@ -571,6 +713,63 @@ export function buildServer(
         dependencies.secretProvider
       ));
     }
+    const state = requestLogStates.get(request);
+    if (state !== undefined) state.bodyObservationAllowed = true;
+  });
+
+  app.addHook('preParsing', async (request, _reply, payload) => {
+    const state = requestLogStates.get(request);
+    if (state === undefined || !state.bodyObservationAllowed) return payload;
+    return payload.pipe(createRequestBodyCaptureTransform(state.capture));
+  });
+
+  app.addHook('preValidation', async (request) => {
+    const state = requestLogStates.get(request);
+    if (state !== undefined && request.body !== undefined) {
+      state.capture.release();
+    }
+  });
+
+  app.addHook('onResponse', async (request, reply) => {
+    const state = requestLogStates.get(request);
+    requestLogStates.delete(request);
+    const fields: Record<string, unknown> = {
+      res: reply,
+      responseTime: reply.elapsedTime
+    };
+    const statusCode = reply.statusCode;
+    if (statusCode >= 400) {
+      const stableError = state?.httpError ?? fallbackHttpError(statusCode);
+      try {
+        const secrets = nonEmptySecrets(dependencies.secretProvider?.() ?? []);
+        const requestBody = state === undefined
+          ? { body: UNAVAILABLE, truncated: false, originalByteLength: Buffer.byteLength(UNAVAILABLE, 'utf8') }
+          : bodyForLog(request, state, secrets);
+        fields.httpError = safeJsonValue(stableError, secrets) ?? {
+          code: stableError.code,
+          message: stableError.message
+        };
+        fields.httpRequest = {
+          method: state === undefined ? UNAVAILABLE : redactText(state.method, secrets),
+          url: state === undefined ? UNAVAILABLE : redactText(state.url, secrets),
+          ...requestBody
+        };
+      } catch {
+        fields.httpError = { code: stableError.code, message: stableError.message };
+        fields.httpRequest = {
+          method: UNAVAILABLE,
+          url: UNAVAILABLE,
+          body: UNAVAILABLE,
+          truncated: false,
+          originalByteLength: Buffer.byteLength(UNAVAILABLE, 'utf8')
+        };
+      }
+    }
+    const method = statusCode >= 500 ? request.log.error.bind(request.log)
+      : statusCode >= 400 ? request.log.warn.bind(request.log)
+      : request.log.info.bind(request.log);
+    nonThrowingLogCall(() => method(fields, 'request completed'));
+    state?.capture.release();
   });
 
   app.addHook('onSend', async (request, reply) => {
@@ -592,6 +791,7 @@ export function buildServer(
 
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof StrategyNotFoundError) {
+      rememberHttpError(request, 'STRATEGY_NOT_FOUND', 'Strategy not found', error);
       void reply.status(404).send(publicHttpError(
         request.id,
         'STRATEGY_NOT_FOUND',
@@ -605,6 +805,7 @@ export function buildServer(
       errorProperty(error, 'validation') !== undefined
       || errorProperty(error, 'code') === 'FST_ERR_CTP_INVALID_JSON_BODY'
     ) {
+      rememberHttpError(request, 'INVALID_REQUEST', 'Request validation failed');
       void reply.status(400).send(publicHttpError(
         request.id,
         'INVALID_REQUEST',
@@ -614,15 +815,7 @@ export function buildServer(
       ));
       return;
     }
-    operationalLog?.error(
-      'unhandled_http_request_failure',
-      error,
-      {
-        requestId: request.id,
-        method: request.method,
-        url: requestPathForLog(request.url)
-      }
-    );
+    rememberHttpError(request, 'INTERNAL_ERROR', 'Internal server error', error);
     void reply.status(500).send(publicHttpError(
       request.id,
       'INTERNAL_ERROR',
@@ -644,6 +837,7 @@ export function buildServer(
       try {
         preview = await dependencies.preflightService.run(request.body);
       } catch (error) {
+        rememberHttpError(request, 'PREFLIGHT_REJECTED', 'Preflight checks did not pass', error);
         return reply.status(422).send(publicHttpError(
           request.id,
           'PREFLIGHT_REJECTED',

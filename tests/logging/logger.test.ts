@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import test from 'node:test';
 import type { Logger } from 'pino';
+import * as loggerModule from '../../src/logging/logger.js';
 import {
   configuredSecretValues,
   createAppLogger,
@@ -188,6 +189,49 @@ test('injected async operational failures never become unhandled', async () => {
       setImmediate(resolve);
     });
 
+    assert.equal(unhandled, undefined);
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
+});
+
+test('redact helpers replace exact overlapping configured values longest first', () => {
+  const redactText = (loggerModule as Record<string, unknown>).redactText;
+  assert.equal(typeof redactText, 'function');
+  const redact = redactText as (value: string, secrets: readonly string[]) => string;
+
+  assert.equal(
+    redact('token=abc123&short=abc&again=abc123', ['abc', '', 'abc123', 'abc']),
+    'token=[Redacted]&short=[Redacted]&again=[Redacted]'
+  );
+  assert.equal(redact('ABC abc passwordHint=ordinary', ['abc']), 'ABC [Redacted] passwordHint=ordinary');
+});
+
+test('UTF-8 prefix helper respects 8192 and 8193 byte boundaries', () => {
+  const utf8Prefix = (loggerModule as Record<string, unknown>).utf8Prefix;
+  assert.equal(typeof utf8Prefix, 'function');
+  const prefix = utf8Prefix as (value: string, maxBytes: number) => string;
+  const exact = 'x'.repeat(8192);
+  const over = `${'x'.repeat(8191)}界`;
+
+  assert.equal(prefix(exact, 8192), exact);
+  const limited = prefix(over, 8192);
+  assert.equal(Buffer.byteLength(limited, 'utf8') <= 8192, true);
+  assert.equal(limited.includes('\uFFFD'), false);
+  assert.equal(/[\uD800-\uDBFF]$/.test(limited), false);
+});
+
+test('generic non-throwing log call absorbs sync throws and rejected thenables', async () => {
+  const nonThrowingLogCall = (loggerModule as Record<string, unknown>).nonThrowingLogCall;
+  assert.equal(typeof nonThrowingLogCall, 'function');
+  const call = nonThrowingLogCall as (operation: () => unknown) => void;
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown): void => { unhandled = reason; };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    assert.doesNotThrow(() => call(() => { throw new Error('sync logger failure'); }));
+    call(async () => { throw new Error('async logger failure'); });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(unhandled, undefined);
   } finally {
     process.removeListener('unhandledRejection', onUnhandled);
