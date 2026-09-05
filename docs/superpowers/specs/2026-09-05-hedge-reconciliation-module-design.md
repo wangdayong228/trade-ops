@@ -15,6 +15,7 @@
 - GTC 委托量与补单前市场残差比较；GTC 剩余量与计入其成交后的当前残差比较。
 - 精确残差不可交易时明确结束为未完成，不能舍入后制造不足或过度对冲。
 - 查所快照、提交结论、状态 CAS 和生命周期事件都必须可恢复、幂等且可观察。
+- 每个生产 SQLite 文件必须由单个服务进程独占，避免跨进程在“证据检查”和“状态写入或补单”之间形成竞争窗口。
 
 ## 2. 范围
 
@@ -28,6 +29,8 @@
 - 为本地订单持久化最小提交结论，使“确定未提交”可由对账模块复核；不新增策略状态或订单角色。
 - 新增失败码 `HEDGE_RESIDUAL_NOT_TRADABLE`，表示精确残差不满足目标市场交易约束。
 - 由实际落库查所快照的模块唯一记录该快照对应的状态变化和终态事件。
+- 服务在初始化 schema、构造交易所网关、恢复订单或监听 HTTP 前取得 SQLite 跨进程独占所有权；取得失败则关闭连接并终止启动。
+- README 说明单进程数据库约束、独占期间不可并行检查或备份，以及停止服务后才能由另一个进程接管。
 
 ### 2.2 本期不包含
 
@@ -36,6 +39,8 @@
 - 修改 HTTP/UI、策略状态枚举、订单角色、预检流程或账户设置自动修复。
 - 资金费率之外的对冲形状，例如合约之间的价差或平仓作业。
 - 自动修复非法本地订单拓扑或提交不确定的订单。
+- 多进程 active-active、跨主机共享 SQLite、数据库租约、PID 文件或独立锁文件。
+- 为支持多进程而新增订单证据 revision；本期由数据库文件独占消除跨进程竞争。
 - 扩大已批准原则 spec 的“只修改 code-rules”实施范围；本设计是后续独立实现。
 
 ## 3. 模块合同
@@ -52,6 +57,45 @@
 - 首次读到终态时不查所、不写库，只返回 `observed_state`；首次读到其他状态属于调用合同错误。
 
 监控器、协调器和重启恢复不得在未持锁时调用 `run`。锁只防止当前进程重复执行；所有状态写入仍必须使用仓储 CAS，不能把锁当成数据库写入成功的证明。
+
+单库单进程是本设计的运行时硬约束，不是部署建议。新增 `src/storage/sqlite-process-owner.ts`，导出：
+
+```ts
+export type SqliteOwnershipFailureCode =
+  | 'DATABASE_OWNERSHIP_BUSY'
+  | 'DATABASE_OWNERSHIP_UNAVAILABLE';
+
+export class SqliteOwnershipError extends Error {
+  readonly name = 'SqliteOwnershipError';
+
+  constructor(
+    readonly code: SqliteOwnershipFailureCode,
+    readonly databasePath: string
+  ) {
+    super(code === 'DATABASE_OWNERSHIP_BUSY'
+      ? `SQLite database ownership is busy: ${databasePath}`
+      : `SQLite database exclusive ownership is unavailable: ${databasePath}`);
+  }
+}
+
+export function claimSqliteProcessOwnership(
+  database: Database.Database,
+  databasePath: string
+): void;
+```
+
+`composeService` 的固定顺序为：完整校验配置；创建数据库父目录；用 `timeout: 0` 打开一个尚未执行任何 SQL 的连接；调用 `claimSqliteProcessOwnership`；初始化 WAL/schema 和仓储；再构造交易所网关及其余组件。取得所有权前不得调用任何 gateway 方法、恢复订单、启动监控或监听 HTTP。
+
+`claimSqliteProcessOwnership` 必须按顺序执行：
+
+1. 执行 `PRAGMA main.locking_mode = EXCLUSIVE`，并严格验证返回值为 `exclusive`；只设置 PRAGMA 不算取得所有权。
+2. 执行 `BEGIN EXCLUSIVE; COMMIT`，只有整个调用成功返回才算实际取得所有权。
+3. `SQLITE_BUSY` 或 `SQLITE_LOCKED` 转成 `DATABASE_OWNERSHIP_BUSY`；模式返回值异常或其他无法证明独占的结果转成 `DATABASE_OWNERSHIP_UNAVAILABLE`。错误消息只含固定描述和经过既有日志边界处理的数据库路径，不透传 SQLite 原始消息，也不声称竞争者一定是另一个 trade-ops 进程。
+4. 成功后不提供提前释放 API。同一个连接供仓储使用并持有到服务停止；正常关闭和所有启动失败路径都只在最后调用一次 `database.close()` 释放所有权。
+
+独占模式必须在首次 WAL 访问之前设置。SQLite 明确将“阻止其他进程访问数据库文件”列为 exclusive locking mode 的用途；连接第一次写入后会持有排他锁，直到连接关闭。在首次 WAL 访问前进入独占模式后，WAL 期间保持独占。实现依据为 [SQLite `locking_mode`](https://www.sqlite.org/pragma.html#pragma_locking_mode) 与 [WAL exclusive mode](https://www.sqlite.org/wal.html#use_of_wal_without_shared_memory)。
+
+生产 `TRADING_DATABASE_PATH` 必须是支持 SQLite/VFS 文件锁的本地文件路径；配置校验拒绝 `:memory:` 和 `file:` URI，网络文件系统明确不受支持但不声称能从普通挂载路径可靠检测。`:memory:` 仍只允许测试通过 `databaseFactory` 注入；每个内存连接是独立数据库，不承担跨进程所有权证明。服务独占期间，其他读写工具也会收到锁错误；检查、备份或迁移必须先停止服务。进程异常退出后由操作系统释放文件锁，后继进程再通过同一抢锁流程接管并执行 SQLite 恢复，不维护可能残留的 PID 或锁文件。
 
 ### 3.2 返回结果
 
@@ -319,6 +363,15 @@
 
 新文件：`tests/strategy/hedge-reconciliation.test.ts`。只使用 fake 网关和临时或内存 SQLite，不读取真实凭证，不访问真实交易所。按 TDD 先写预期失败测试，再实现。
 
+另新增 `tests/storage/sqlite-process-owner.test.ts` 与不被测试 glob 直接执行的子进程 fixture。所有权测试只使用临时 SQLite 文件和 fake gateway：
+
+- 只设置 `locking_mode=EXCLUSIVE` 而未启动写事务时，竞争连接仍能读取，证明不能把 PRAGMA 返回值误当成已抢锁。
+- owner 完成 `BEGIN EXCLUSIVE; COMMIT` 后，另一个真实子进程以 `timeout: 0` 抢同一文件必须得到类型化 `DATABASE_OWNERSHIP_BUSY`；它的 gateway 构造、恢复、`monitor.start` 与 `listen` 计数均为零。
+- owner 正常 `close()` 后，新进程可以取得所有权；owner 被 `SIGKILL` 且子进程 `close` 事件已到达后，新进程也可以取得所有权，不使用固定 sleep。
+- locking mode 返回异常、`SQLITE_BUSY`、其他所有权失败、schema 初始化失败和后续组件构造失败都验证错误分类及数据库只关闭一次。
+- 保留“server close 失败仍关闭 SQLite”的测试，并在关闭后验证新连接可以接管。
+- `:memory:` 只作为相互隔离的单元测试数据库；生产配置显式拒绝 `:memory:` 和 `file:` URI，且不构造 gateway 或数据库。网络文件系统限制只做文档与部署约束，因为普通路径不能被可靠分类。
+
 ### 11.1 查所与一致性
 
 - 任一查询失败、找不到或只查回一部分：`pending`；成功且变化的快照已落库，不写终态、不 `need_gtc`。
@@ -357,6 +410,7 @@
 
 - 目标 swap 基础币步长为 `0.003`、残差为 `0.002`，或低于最小量/名义金额：`HEDGE_INCOMPLETE / HEDGE_RESIDUAL_NOT_TRADABLE`，不得舍入或调用 `createOrder`。
 - 超长有效小数仍精确比较；测试前污染共享 `Decimal` 精度不改变结论。
+- 紧凑极端指数在规范十进制展开超过固定资源上限时，及时返回 `pending / EXACT_ARITHMETIC_UNAVAILABLE`；不得调用会展开巨型字符串的 `toFixed()`，测试也不得构造对应的展开字符串或 `BigInt` expected。
 - `NoOrderSubmittedError` 只写订单提交证据；再次 `run` 查证不存在后才由对账模块写终态。
 - 不确定提交错误保持 `pending`，只做 lookup-only，不重复创建。
 - 策略 CAS 返回 `false`、抛错或状态被竞争者改变：不得返回 `written`；必须重读并返回 `observed_state` 或精确 `pending`。
@@ -377,6 +431,7 @@
 - 任一终态或 `need_gtc` 都能从本任务订单证据精确重算，并落入一张互斥决策表。
 - 精确残差不可交易时不会因舍入产生新的暴露，也不会永久落入无原因的 `planned` 等待。
 - 快照与生命周期事件在重复轮询下幂等。
+- 同一生产 SQLite 文件在任一时刻只有一个服务进程能进入 schema、恢复和交易组件初始化；正常关闭或进程崩溃后可以由新进程接管。
 - 所有测试使用 fake 网关与临时数据库，绝不接触真实凭证、真实交易所或真实业务 SQLite。
 
-缺少上述任一约束的终态、跳过查回的失败、未经当次授权的 GTC，或未解释残差的 `HEDGED`，均违反本设计与完全对账原则。
+缺少上述任一约束的终态、跳过查回的失败、未经当次授权的 GTC、未解释残差的 `HEDGED`，或未取得 SQLite 独占所有权便进入恢复和交易组件初始化，均违反本设计与完全对账原则。
