@@ -714,7 +714,7 @@ test('operator UI shows detailed structured strategy-load failures', async () =>
 
   assert.equal(
     browser.element('operator-message').textContent,
-    detailedBrowserMessage('策略加载', 404)
+    detailedBrowserMessage('任务加载', 404)
   );
   assert.equal(browser.element('risk-ack').checked, false);
   assert.equal(browser.element('confirm-button').disabled, true);

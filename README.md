@@ -18,7 +18,7 @@ trade-ops 是一个只在本机回环地址提供 HTTP 操作界面的跨交易�
 - 预检确认的合约保证金模式、双向持仓模式和杠杆是不可变的执行约束。每次执行或恢复入口、以及每一笔真正的新订单提交前，服务都会重新读取合约账户设置；设置未知、发生漂移或无法确认时不会继续创建订单，且服务始终不会自动修改这些设置。
 - OKX 空仓账户即使处于双向持仓模式，也无法唯一证明当前保证金模式和空头杠杆；这种情况下服务按 `unknown` 处理并拒绝预检/执行，不会擅自默认 `cross` 或 `isolated`。需要账户中存在合约数量为正、且可无歧义读取设置的空头仓位；零合约占位行仍视为空仓。
 - 每个 API key 必须具有读取和交易权限，必须关闭提现权限。
-- 服务只能以单进程运行。不得让两个进程、两个容器或两台机器同时打开同一个数据库并执行策略；本期没有跨进程协调能力。
+- 服务只能以单进程运行。不得让两个进程、两个容器或两台机器同时打开同一个数据库并执行对冲任务；本期没有跨进程协调能力。
 
 安装、检查和启动：
 
@@ -80,13 +80,13 @@ npm start
 - `order_status_changed`
 - `order_terminal`
 
-交易事件只允许输出策略/订单关联 ID、执行模式与状态、交易所、symbol、订单角色/类型/方向、委托量/成交量/剩余量、限价/成交均价、GTC、仓位方向、保证金模式、订单状态，以及有限的失败码和错误类型/错误码。相同的轮询快照不会重复记录；`closed`、`canceled`、`rejected` 等可靠终态会额外记录 `order_terminal`。
+交易事件只允许输出对冲任务/订单关联 ID、执行模式与状态、交易所、symbol、订单角色/类型/方向、委托量/成交量/剩余量、限价/成交均价、GTC、仓位方向、保证金模式、订单状态，以及有限的失败码和错误类型/错误码。相同的轮询快照不会重复记录；`closed`、`canceled`、`rejected` 等可靠终态会额外记录 `order_terminal`。
 
 每个完成的 HTTP 请求只记录一条 `request completed`：状态码低于 `400` 时为 `info`，且不带失败请求快照；`4xx` 为 `warn`，`5xx` 为 `error`。失败日志带 `httpError`，以及 `httpRequest` 快照（`method`、包含 query 的 `url`、`body`、`truncated`、`originalByteLength`）。Host/Origin 会在任何 body 观察或 parser 运行前检查；该边界早拒绝的 `403` 不读取或缓存攻击 payload，日志 body 为 `null`。
 
 全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察另有固定 `1 MiB` 安全预算；两者职责不同，路由显式配置更大的解析上限也不会扩大观察预算。若无效 body 超过观察预算且没有可用的 parsed body，日志 body 降级为 `[Unavailable]`，不会记录前缀。最终可记录的完整 body 会先替换当前已配置的敏感值，再按 UTF-8 最多 `8192` 字节截断；`1 MiB` 是原始观察安全预算，`8192` 是最终日志输出上限。任何请求 headers（包括 Authorization/Cookie）和响应 body 都不记录，也不记录原始 CCXT 请求/响应、完整环境变量、任意错误属性或 cause 链；`httpError.error` 只允许经过配置敏感值替换的类型、消息、字符串错误码和 stack。
 
-失败的预检请求不会向 SQLite 写入策略。同步请求失败不会再额外记录 `unhandled_http_request_failure`；确认接口返回 `202` 后的后台执行不属于该 HTTP 完成日志，异步失败仍单独记录 `background_confirmation_failed`。日志是旁路行为：stdout 写入失败不会改变 SQLite 状态、触发重试或重复下单。
+失败的预检请求不会向 SQLite 写入对冲任务。同步请求失败不会再额外记录 `unhandled_http_request_failure`；确认接口返回 `202` 后的后台执行不属于该 HTTP 完成日志，异步失败仍单独记录 `background_confirmation_failed`。日志是旁路行为：stdout 写入失败不会改变 SQLite 状态、触发重试或重复下单。
 
 应用本身不创建日志文件，也不负责保留或轮转。需要持久化时，由 systemd、Docker 或其他进程管理器采集 stdout，并在外部配置访问权限、保留期和轮转策略；不要把日志文件放入仓库。
 
@@ -94,7 +94,7 @@ npm start
 
 ## 执行模式与操作恢复（摘要）
 
-界面提供三种模式：`CONTRACT_FIRST`、`SPOT_FIRST`、`CONCURRENT`。模式语义、GTC 等待、策略状态机、重启后用策略 ID 加载，以及 `HEDGE_INCOMPLETE` 人工处理步骤，见 [操作员使用说明](docs/usage/operator-guide.md)。
+界面提供三种模式：`CONTRACT_FIRST`、`SPOT_FIRST`、`CONCURRENT`。模式语义、GTC 等待、对冲状态机、重启后用对冲任务 ID 加载，以及 `HEDGE_INCOMPLETE` 人工处理步骤，见 [操作员使用说明](docs/usage/operator-guide.md)。
 
 ## 本地 HTTP 安全边界
 

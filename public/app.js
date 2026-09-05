@@ -152,7 +152,7 @@ for (const input of preflightInputs) {
 
 resumeStrategyIdInput.addEventListener('input', () => {
   inputRevision += 1;
-  resetActionablePreview('策略 ID 已变更，请重新加载。');
+  resetActionablePreview('对冲任务 ID 已变更，请重新加载。');
 });
 
 function isRecord(value) {
@@ -1388,7 +1388,7 @@ resumeForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   inputRevision += 1;
   const loadRevision = inputRevision;
-  resetActionablePreview('正在加载已有策略。');
+  resetActionablePreview('正在加载已有对冲任务。');
   let requestedStrategyId;
   try {
     if (!resumeForm.reportValidity()) {
@@ -1398,7 +1398,7 @@ resumeForm.addEventListener('submit', async (event) => {
       resumeStrategyIdInput.value
     );
   } catch {
-    resetActionablePreview('策略 ID 格式无效。', 'error');
+    resetActionablePreview('对冲任务 ID 格式无效。', 'error');
     return;
   }
 
@@ -1408,7 +1408,7 @@ resumeForm.addEventListener('submit', async (event) => {
   updateConfirmButton();
   try {
     const body = await requestJson(
-      '策略加载',
+      '任务加载',
       `/api/hedges/${encodeURIComponent(requestedStrategyId)}`,
       undefined,
       200
@@ -1437,14 +1437,14 @@ resumeForm.addEventListener('submit', async (event) => {
     refreshButton.disabled = false;
     setMessage(
       preflightReady
-        ? '策略已加载。请核对状态并重新确认风险。'
-        : '策略已加载，仅供查看。',
+        ? '对冲任务已加载。请核对状态并重新确认风险。'
+        : '对冲任务已加载，仅供查看。',
       'success'
     );
   } catch (error) {
     if (loadRevision === inputRevision) {
       resetActionablePreview(
-        operatorFailureMessage('策略加载', error),
+        operatorFailureMessage('任务加载', error),
         'error'
       );
     }

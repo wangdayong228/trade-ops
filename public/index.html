@@ -54,12 +54,12 @@
       </section>
 
       <section class="panel" aria-labelledby="resume-title">
-        <h2 id="resume-title">加载已有策略</h2>
-        <p>服务重启后，可用原策略 ID 恢复查看；只有待确认或执行中的策略可以再次确认。</p>
+        <h2 id="resume-title">加载已有对冲任务</h2>
+        <p>服务重启后，可用原对冲任务 ID 恢复查看；只有待确认或执行中的任务可以再次确认。</p>
         <form id="resume-form">
           <div class="form-grid">
             <label>
-              策略 ID
+              对冲任务 ID
               <input
                 id="resume-strategy-id"
                 name="strategyId"
@@ -72,7 +72,7 @@
             </label>
           </div>
           <div class="actions">
-            <button id="load-strategy-button" type="submit">加载策略</button>
+            <button id="load-strategy-button" type="submit">加载任务</button>
           </div>
         </form>
       </section>
@@ -103,8 +103,8 @@
       <section class="panel" aria-labelledby="status-title">
         <h2 id="status-title">执行状态</h2>
         <dl class="metrics">
-          <div><dt>策略 ID</dt><dd id="strategy-id">—</dd></div>
-          <div><dt>策略状态</dt><dd id="strategy-state">—</dd></div>
+          <div><dt>对冲任务 ID</dt><dd id="strategy-id">—</dd></div>
+          <div><dt>对冲状态</dt><dd id="strategy-state">—</dd></div>
           <div><dt>现货实际成交</dt><dd id="spot-actual-fill">0</dd></div>
           <div><dt>合约做空实际成交</dt><dd id="contract-actual-fill">0</dd></div>
           <div><dt>未匹配基础资产数量</dt><dd id="unmatched-quantity">0</dd></div>
