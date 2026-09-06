@@ -79,6 +79,62 @@ export const SQLITE_STRATEGY_ORDERS_TABLE = `
   );
 `;
 
+export const SQLITE_MIGRATED_STRATEGY_ORDERS_TABLE = `
+  CREATE TABLE strategy_orders (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL REFERENCES strategies(id),
+    role TEXT NOT NULL CHECK (role IN (
+      'SPOT_MARKET',
+      'CONTRACT_MARKET',
+      'SPOT_HEDGE_GTC',
+      'CONTRACT_HEDGE_GTC'
+    )),
+    exchange_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL UNIQUE,
+    exchange_order_id TEXT,
+    request_json TEXT NOT NULL,
+    snapshot_json TEXT,
+    status TEXT NOT NULL CHECK (status IN (
+      'planned',
+      'open',
+      'closed',
+      'canceled',
+      'rejected',
+      'unknown'
+    )),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    submission_disposition TEXT NOT NULL DEFAULT 'SUBMISSION_UNCERTAIN' CHECK (
+      submission_disposition IN (
+        'SUBMISSION_UNCERTAIN',
+        'DEFINITELY_NOT_SUBMITTED',
+        'REMOTE_OBSERVED'
+      )
+    ),
+    submission_failure_code TEXT CHECK (
+      submission_failure_code IS NULL
+      OR submission_failure_code IN (
+        'ORDER_SUBMISSION_FAILED',
+        'HEDGE_RESIDUAL_NOT_TRADABLE'
+      )
+    ),
+    UNIQUE(strategy_id, role),
+    CHECK (
+      (
+        status = 'planned'
+        AND snapshot_json IS NULL
+        AND exchange_order_id IS NULL
+      )
+      OR
+      (
+        status <> 'planned'
+        AND snapshot_json IS NOT NULL
+        AND exchange_order_id IS NOT NULL
+      )
+    )
+  );
+`;
+
 export const SQLITE_STRATEGY_SCHEMA = `
   CREATE TABLE strategies (
     id TEXT PRIMARY KEY,

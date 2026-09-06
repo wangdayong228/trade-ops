@@ -798,6 +798,87 @@ test('rejects migrated v1 evidence trigger with a case-changed quoted literal', 
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
+test('rejects migrated v1 schema with an expanded submission failure-code allowlist', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-failure-allowlist-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  database.exec(LEGACY_SCHEMA);
+  seedLegacyExecutingStrategy(database, 'legacy-allowlist-strategy');
+  seedLegacyPlannedOrder(
+    database,
+    'legacy-allowlist-strategy',
+    'legacy-allowlist-order'
+  );
+  new SqliteStrategyRepository(database);
+  const triggerNames = [
+    'strategy_orders_submission_evidence_insert',
+    'strategy_orders_submission_evidence_update'
+  ] as const;
+  const evidenceTriggersBefore = triggerNames.map((name) => ({
+    name,
+    sql: schemaObjectDefinition(database, 'trigger', name)
+  }));
+  const lastAllowedFailureCode = "'HEDGE_RESIDUAL_NOT_TRADABLE'";
+
+  rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+    assert.equal(sql.split(lastAllowedFailureCode).length - 1, 1);
+    return sql.replace(
+      lastAllowedFailureCode,
+      `${lastAllowedFailureCode},\n        'BOGUS_FAILURE'`
+    );
+  });
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = tableDefinition(database, 'strategy_orders');
+  assert.equal(reloadedSql.split("'BOGUS_FAILURE'").length - 1, 1);
+  for (const trigger of evidenceTriggersBefore) {
+    assert.equal(
+      schemaObjectDefinition(database, 'trigger', trigger.name),
+      trigger.sql
+    );
+  }
+  database.exec('SAVEPOINT bogus_failure_code_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET
+        submission_disposition = 'DEFINITELY_NOT_SUBMITTED',
+        submission_failure_code = 'BOGUS_FAILURE'
+      WHERE id = 'legacy-allowlist-order'
+    `).run().changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO bogus_failure_code_probe');
+    database.exec('RELEASE bogus_failure_code_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT singleton, version FROM strategy_schema_metadata
+  `).all(), [{ singleton: 1, version: 2 }]);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = 'legacy-allowlist-order'
+  `).get(), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
 for (const missingForeignKey of [
   {
     name: 'strategy order parent',

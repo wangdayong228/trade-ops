@@ -16,6 +16,7 @@ import type {
 } from '../domain/types.js';
 import type { PreflightResult } from '../strategy/preflight-service.js';
 import {
+  SQLITE_MIGRATED_STRATEGY_ORDERS_TABLE,
   SQLITE_STRATEGY_ORDERS_TABLE,
   SQLITE_STRATEGY_SCHEMA
 } from './schema.js';
@@ -1483,11 +1484,6 @@ function assertV2BusinessSchema(database: Database.Database): void {
           AND failure_code IS NULL)
       )
     `))
-    || !ordersSql.includes("'SUBMISSION_UNCERTAIN'")
-    || !ordersSql.includes("'DEFINITELY_NOT_SUBMITTED'")
-    || !ordersSql.includes("'REMOTE_OBSERVED'")
-    || !ordersSql.includes("'ORDER_SUBMISSION_FAILED'")
-    || !ordersSql.includes("'HEDGE_RESIDUAL_NOT_TRADABLE'")
     || recoverableIndexSql !== canonicalSql(`
       CREATE INDEX strategies_recoverable_idx
       ON strategies(state, created_at)
@@ -1520,6 +1516,8 @@ function assertV2BusinessSchema(database: Database.Database): void {
 
   const hasFreshOrderTable = ordersSql
     === canonicalSql(SQLITE_STRATEGY_ORDERS_TABLE);
+  const hasMigratedOrderTable = ordersSql
+    === canonicalSql(SQLITE_MIGRATED_STRATEGY_ORDERS_TABLE);
   const evidenceInsert = rows.find(({ type, name, tbl_name: table }) => (
     type === 'trigger'
     && name === 'strategy_orders_submission_evidence_insert'
@@ -1536,7 +1534,10 @@ function assertV2BusinessSchema(database: Database.Database): void {
       === canonicalSql(SUBMISSION_EVIDENCE_INSERT_TRIGGER)
     && canonicalSql(evidenceUpdate.sql)
       === canonicalSql(SUBMISSION_EVIDENCE_UPDATE_TRIGGER);
-  if (!hasFreshOrderTable && !hasMigrationEvidenceTriggers) {
+  if (
+    !hasFreshOrderTable
+    && !(hasMigratedOrderTable && hasMigrationEvidenceTriggers)
+  ) {
     throw schemaError();
   }
 }
