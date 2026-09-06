@@ -582,7 +582,7 @@ git commit -m "feat: add settled funding rate sources"
 - Create: `tests/funding-rates/ccxt-funding-rate-source-factory.test.ts`
 - Create: `tests/funding-rates/funding-rate-events.test.ts`
 
-- [ ] **Step 1: 写安全边界红测试**
+- [x] **Step 1: 写安全边界红测试**
 
 factory 测试注入构造器并精确断言两所只收到：
 
@@ -612,7 +612,7 @@ funding_sync_fatal
 
 运行时附加 `apiKey/secret/headers/rawResponse/cause` 必须被双层 allowlist 丢弃；凭证值在 exchange/market/symbol/error/request 字段内必须替换为 `[Redacted]`；多字节错误字段按 UTF-8 安全边界截断；sink 抛错不能传播。持久化 `fundingTaskFailure` 合同及其测试留在创建 repository 合同的 Task 4，不允许 Task 3 提前创建 storage 模块。
 
-- [ ] **Step 2: 确认 RED**
+- [x] **Step 2: 确认 RED**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/ccxt-funding-rate-source-factory.test.js dist/tests/funding-rates/funding-rate-events.test.js
@@ -620,13 +620,13 @@ npm run build && node --test dist/tests/funding-rates/ccxt-funding-rate-source-f
 
 Expected: exit 非 0，新模块缺失。
 
-- [ ] **Step 3: 实现 factory 和事件 sink**
+- [x] **Step 3: 实现 factory 和事件 sink**
 
 生产 factory 直接 `new bitget(options)` / `new okx(options)`，函数签名不接收 credentials 或 env。事件 sink 仿照 `src/logging/trade-events.ts`，但拥有自己的 `FundingRateEvent` 判别联合和 Pino child `component: 'funding-rates'`。
 
 请求 query key 仅允许 `symbol/productType/pageNo/pageSize/instType/instId/after/limit`；每条 API 错误都包含 method、path、query、body=null。错误只从现有 `safeError` 结果挑选 type/message/string code/stack 并再次脱敏，绝不枚举原错误或 cause。
 
-- [ ] **Step 4: 聚焦 GREEN 并提交**
+- [x] **Step 4: 聚焦 GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/ccxt-funding-rate-source-factory.test.js dist/tests/funding-rates/funding-rate-events.test.js
