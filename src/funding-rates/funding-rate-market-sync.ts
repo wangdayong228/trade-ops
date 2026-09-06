@@ -104,13 +104,273 @@ function positiveSafeInteger(value: unknown): value is number {
   return nonNegativeSafeInteger(value) && value > 0;
 }
 
-function sameCursor(value: unknown, expected: FundingPageCursor): boolean {
-  if (typeof value !== 'object' || value === null) return false;
-  const cursor = value as Partial<FundingPageCursor>;
-  if (cursor.exchangeId !== expected.exchangeId) return false;
+type InvalidData = (detail: string) => never;
+
+function ownDataDescriptors(
+  value: unknown,
+  expectedKind: 'object' | 'array',
+  subject: string,
+  invalid: InvalidData
+): ReadonlyMap<string, PropertyDescriptor> {
+  if (typeof value !== 'object' || value === null) {
+    return invalid(`${subject} must be an ${expectedKind}`);
+  }
+
+  let isArray: boolean;
+  let prototype: object | null;
+  let keys: readonly PropertyKey[];
+  try {
+    isArray = Array.isArray(value);
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return invalid(`${subject} could not be inspected`);
+  }
+  if (expectedKind === 'array') {
+    if (!isArray || prototype !== Array.prototype) {
+      return invalid(`${subject} must be an array`);
+    }
+  } else if (isArray || prototype !== Object.prototype) {
+    return invalid(`${subject} must be an object`);
+  }
+
+  const descriptors = new Map<string, PropertyDescriptor>();
+  for (const key of keys) {
+    if (typeof key === 'symbol') {
+      return invalid(`${subject} must not contain symbol properties`);
+    }
+    const stringKey = String(key);
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return invalid(
+        `${subject} property ${JSON.stringify(stringKey)} could not be inspected`
+      );
+    }
+    if (descriptor === undefined) {
+      return invalid(
+        `${subject} property ${JSON.stringify(stringKey)} has no descriptor`
+      );
+    }
+    if (!('value' in descriptor)) {
+      return invalid(
+        `${subject} property ${JSON.stringify(stringKey)} must be an own data property`
+      );
+    }
+    descriptors.set(stringKey, descriptor);
+  }
+  return descriptors;
+}
+
+function requiredOwnDataValue(
+  descriptors: ReadonlyMap<string, PropertyDescriptor>,
+  key: string,
+  subject: string,
+  invalid: InvalidData
+): unknown {
+  const descriptor = descriptors.get(key);
+  if (descriptor === undefined) {
+    return invalid(`${subject} property ${JSON.stringify(key)} is required`);
+  }
+  return descriptor.value;
+}
+
+function invalidCoverageLease(detail: string): never {
+  throw new Error(`invalid coverage lease: ${detail}`);
+}
+
+function identityString(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.trim() === value;
+}
+
+function coverageLeaseSnapshot(value: unknown): CoverageLease {
+  const subject = 'coverage lease';
+  const descriptors = ownDataDescriptors(
+    value,
+    'object',
+    subject,
+    invalidCoverageLease
+  );
+  const exchangeId = requiredOwnDataValue(
+    descriptors,
+    'exchangeId',
+    subject,
+    invalidCoverageLease
+  );
+  const exchangeMarketId = requiredOwnDataValue(
+    descriptors,
+    'exchangeMarketId',
+    subject,
+    invalidCoverageLease
+  );
+  const symbol = requiredOwnDataValue(
+    descriptors,
+    'symbol',
+    subject,
+    invalidCoverageLease
+  );
+  const generation = requiredOwnDataValue(
+    descriptors,
+    'generation',
+    subject,
+    invalidCoverageLease
+  );
+  const kind = requiredOwnDataValue(
+    descriptors,
+    'kind',
+    subject,
+    invalidCoverageLease
+  );
+  const cutoffMs = requiredOwnDataValue(
+    descriptors,
+    'cutoffMs',
+    subject,
+    invalidCoverageLease
+  );
+  const recovered = requiredOwnDataValue(
+    descriptors,
+    'recovered',
+    subject,
+    invalidCoverageLease
+  );
+  const okxResumeAfterMs = requiredOwnDataValue(
+    descriptors,
+    'okxResumeAfterMs',
+    subject,
+    invalidCoverageLease
+  );
+  const requiredBitgetBoundaryMs = requiredOwnDataValue(
+    descriptors,
+    'requiredBitgetBoundaryMs',
+    subject,
+    invalidCoverageLease
+  );
+
+  if (exchangeId !== 'bitget' && exchangeId !== 'okx') {
+    return invalidCoverageLease('exchangeId must be bitget or okx');
+  }
+  if (!identityString(exchangeMarketId)) {
+    return invalidCoverageLease('exchangeMarketId must be a non-empty identity string');
+  }
+  if (!identityString(symbol)) {
+    return invalidCoverageLease('symbol must be a non-empty identity string');
+  }
+  if (!nonNegativeSafeInteger(generation)) {
+    return invalidCoverageLease('generation must be a non-negative safe integer');
+  }
+  if (
+    kind !== 'INITIAL'
+    && kind !== 'PERIODIC'
+    && kind !== 'INACTIVE_FINAL'
+    && kind !== 'REACTIVATION'
+  ) {
+    return invalidCoverageLease('kind is not supported');
+  }
+  if (!nonNegativeSafeInteger(cutoffMs)) {
+    return invalidCoverageLease('cutoffMs must be a non-negative safe integer');
+  }
+  if (typeof recovered !== 'boolean') {
+    return invalidCoverageLease('recovered must be a boolean');
+  }
+
+  if (exchangeId === 'bitget') {
+    if (okxResumeAfterMs !== null) {
+      return invalidCoverageLease('Bitget okxResumeAfterMs must be null');
+    }
+    if (
+      requiredBitgetBoundaryMs !== null
+      && !nonNegativeSafeInteger(requiredBitgetBoundaryMs)
+    ) {
+      return invalidCoverageLease(
+        'Bitget requiredBitgetBoundaryMs must be null or a non-negative safe integer'
+      );
+    }
+    return Object.freeze({
+      exchangeId,
+      exchangeMarketId,
+      symbol,
+      generation,
+      kind,
+      cutoffMs,
+      recovered,
+      okxResumeAfterMs,
+      requiredBitgetBoundaryMs
+    });
+  }
+
+  if (requiredBitgetBoundaryMs !== null) {
+    return invalidCoverageLease('OKX requiredBitgetBoundaryMs must be null');
+  }
+  if (okxResumeAfterMs !== null && !nonNegativeSafeInteger(okxResumeAfterMs)) {
+    return invalidCoverageLease(
+      'OKX okxResumeAfterMs must be null or a non-negative safe integer'
+    );
+  }
+  return Object.freeze({
+    exchangeId,
+    exchangeMarketId,
+    symbol,
+    generation,
+    kind,
+    cutoffMs,
+    recovered,
+    okxResumeAfterMs,
+    requiredBitgetBoundaryMs
+  });
+}
+
+type CursorSnapshot =
+  | { readonly exchangeId: 'bitget'; readonly pageNo: unknown }
+  | { readonly exchangeId: 'okx'; readonly afterMs: unknown }
+  | { readonly exchangeId: null };
+
+interface FundingPageSnapshot {
+  readonly cursor: CursorSnapshot;
+  readonly records: readonly SettledFundingRate[];
+  readonly nextCursor: CursorSnapshot | null;
+  readonly recoveryAnchorMs: unknown;
+}
+
+function pageInvalid(lease: CoverageLease): InvalidData {
+  return (detail) => sourceResponseInvalid(lease, detail);
+}
+
+function cursorSnapshot(
+  value: unknown,
+  lease: CoverageLease,
+  subject: string
+): CursorSnapshot {
+  const invalid = pageInvalid(lease);
+  const descriptors = ownDataDescriptors(value, 'object', subject, invalid);
+  const exchangeId = requiredOwnDataValue(
+    descriptors,
+    'exchangeId',
+    subject,
+    invalid
+  );
+  if (exchangeId === 'bitget') {
+    return Object.freeze({
+      exchangeId,
+      pageNo: requiredOwnDataValue(descriptors, 'pageNo', subject, invalid)
+    });
+  }
+  if (exchangeId === 'okx') {
+    return Object.freeze({
+      exchangeId,
+      afterMs: requiredOwnDataValue(descriptors, 'afterMs', subject, invalid)
+    });
+  }
+  return Object.freeze({ exchangeId: null });
+}
+
+function sameCursor(value: CursorSnapshot, expected: FundingPageCursor): boolean {
+  if (value.exchangeId !== expected.exchangeId) return false;
   return expected.exchangeId === 'bitget'
-    ? cursor.exchangeId === 'bitget' && cursor.pageNo === expected.pageNo
-    : cursor.exchangeId === 'okx' && cursor.afterMs === expected.afterMs;
+    ? value.exchangeId === 'bitget' && value.pageNo === expected.pageNo
+    : value.exchangeId === 'okx' && value.afterMs === expected.afterMs;
 }
 
 function sameRecord(
@@ -131,52 +391,112 @@ function normalizedPageRecords(
   lease: CoverageLease,
   maximumRecords: number
 ): readonly SettledFundingRate[] {
-  if (!Array.isArray(value)) {
-    return sourceResponseInvalid(lease, 'records must be an array');
+  const invalid = pageInvalid(lease);
+  const subject = 'records';
+  const descriptors = ownDataDescriptors(value, 'array', subject, invalid);
+  const length = requiredOwnDataValue(
+    descriptors,
+    'length',
+    subject,
+    invalid
+  );
+  if (!nonNegativeSafeInteger(length)) {
+    return sourceResponseInvalid(lease, 'records length must be a safe integer');
   }
-  if (value.length > maximumRecords) {
+  if (length > maximumRecords) {
     return sourceResponseInvalid(
       lease,
-      `record count ${value.length} exceeds page size ${maximumRecords}`
+      `record count ${length} exceeds page size ${maximumRecords}`
     );
   }
 
   const byTimestamp = new Map<number, SettledFundingRate>();
-  for (const valueRecord of value) {
-    if (typeof valueRecord !== 'object' || valueRecord === null) {
-      return sourceResponseInvalid(lease, 'record must be an object');
-    }
-    const record = valueRecord as Partial<SettledFundingRate>;
+  for (let index = 0; index < length; index += 1) {
+    const recordSubject = `records[${index}]`;
+    const valueRecord = requiredOwnDataValue(
+      descriptors,
+      String(index),
+      subject,
+      invalid
+    );
+    const recordDescriptors = ownDataDescriptors(
+      valueRecord,
+      'object',
+      recordSubject,
+      invalid
+    );
+    const exchangeId = requiredOwnDataValue(
+      recordDescriptors,
+      'exchangeId',
+      recordSubject,
+      invalid
+    );
+    const exchangeMarketId = requiredOwnDataValue(
+      recordDescriptors,
+      'exchangeMarketId',
+      recordSubject,
+      invalid
+    );
+    const symbol = requiredOwnDataValue(
+      recordDescriptors,
+      'symbol',
+      recordSubject,
+      invalid
+    );
+    const fundingTimestampMs = requiredOwnDataValue(
+      recordDescriptors,
+      'fundingTimestampMs',
+      recordSubject,
+      invalid
+    );
+    const fundingRate = requiredOwnDataValue(
+      recordDescriptors,
+      'fundingRate',
+      recordSubject,
+      invalid
+    );
+    const rawJson = requiredOwnDataValue(
+      recordDescriptors,
+      'rawJson',
+      recordSubject,
+      invalid
+    );
+    const contentHash = requiredOwnDataValue(
+      recordDescriptors,
+      'contentHash',
+      recordSubject,
+      invalid
+    );
     if (
-      record.exchangeId !== lease.exchangeId
-      || record.exchangeMarketId !== lease.exchangeMarketId
-      || record.symbol !== lease.symbol
+      exchangeId !== lease.exchangeId
+      || exchangeMarketId !== lease.exchangeMarketId
+      || symbol !== lease.symbol
     ) {
       return sourceResponseInvalid(lease, 'record market identity mismatch');
     }
-    if (!nonNegativeSafeInteger(record.fundingTimestampMs)) {
+    if (!nonNegativeSafeInteger(fundingTimestampMs)) {
       return sourceResponseInvalid(lease, 'record timestamp must be a safe integer');
     }
-    if (typeof record.rawJson !== 'string') {
+    if (typeof rawJson !== 'string') {
       return sourceResponseInvalid(lease, 'record raw_json must be JSON text');
     }
 
     let raw: unknown;
     let normalized: SettledFundingRate;
     try {
-      raw = JSON.parse(record.rawJson);
+      raw = JSON.parse(rawJson);
       normalized = settledFundingRate(
         lease,
-        record.fundingRate,
-        record.fundingTimestampMs,
+        fundingRate,
+        fundingTimestampMs,
         raw
       );
     } catch {
       return sourceResponseInvalid(lease, 'record normalization failed');
     }
     if (
-      normalized.rawJson !== record.rawJson
-      || normalized.contentHash !== record.contentHash
+      normalized.rawJson !== rawJson
+      || normalized.contentHash !== contentHash
     ) {
       return sourceResponseInvalid(lease, 'record canonical content mismatch');
     }
@@ -187,16 +507,53 @@ function normalizedPageRecords(
     }
     byTimestamp.set(normalized.fundingTimestampMs, normalized);
   }
-  return [...byTimestamp.values()].sort(
-    (left, right) => right.fundingTimestampMs - left.fundingTimestampMs
+  return Object.freeze(
+    [...byTimestamp.values()].sort(
+      (left, right) => right.fundingTimestampMs - left.fundingTimestampMs
+    )
   );
 }
 
-function fundingPage(value: unknown, lease: CoverageLease): FundingRatePage {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return sourceResponseInvalid(lease, 'response must be a page object');
-  }
-  return value as FundingRatePage;
+function fundingPage(
+  value: unknown,
+  lease: CoverageLease,
+  pageSize: number
+): FundingPageSnapshot {
+  const invalid = pageInvalid(lease);
+  const subject = 'response';
+  const descriptors = ownDataDescriptors(value, 'object', subject, invalid);
+  const cursorValue = requiredOwnDataValue(
+    descriptors,
+    'cursor',
+    subject,
+    invalid
+  );
+  const recordsValue = requiredOwnDataValue(
+    descriptors,
+    'records',
+    subject,
+    invalid
+  );
+  const nextCursorValue = requiredOwnDataValue(
+    descriptors,
+    'nextCursor',
+    subject,
+    invalid
+  );
+  const recoveryAnchorMs = requiredOwnDataValue(
+    descriptors,
+    'recoveryAnchorMs',
+    subject,
+    invalid
+  );
+  return Object.freeze({
+    cursor: cursorSnapshot(cursorValue, lease, 'response cursor'),
+    records: normalizedPageRecords(recordsValue, lease, pageSize),
+    nextCursor: nextCursorValue === null
+      ? null
+      : cursorSnapshot(nextCursorValue, lease, 'response next cursor'),
+    recoveryAnchorMs
+  });
 }
 
 function validateBitgetPage(
@@ -205,7 +562,7 @@ function validateBitgetPage(
   requestedPageNo: number,
   pageSize: number
 ): ValidatedBitgetPage {
-  const page = fundingPage(value, lease);
+  const page = fundingPage(value, lease, pageSize);
   const requestedCursor = {
     exchangeId: 'bitget',
     pageNo: requestedPageNo
@@ -213,7 +570,7 @@ function validateBitgetPage(
   if (!sameCursor(page.cursor, requestedCursor)) {
     return sourceResponseInvalid(lease, 'response cursor does not match request');
   }
-  const records = normalizedPageRecords(page.records, lease, pageSize);
+  const { records } = page;
   if (page.recoveryAnchorMs !== null) {
     return sourceResponseInvalid(lease, 'Bitget page carried a recovery anchor');
   }
@@ -260,7 +617,7 @@ function validateOkxPage(
   requestedAfterMs: number | null,
   pageSize: number
 ): ValidatedOkxPage {
-  const page = fundingPage(value, lease);
+  const page = fundingPage(value, lease, pageSize);
   const requestedCursor = {
     exchangeId: 'okx',
     afterMs: requestedAfterMs
@@ -268,7 +625,7 @@ function validateOkxPage(
   if (!sameCursor(page.cursor, requestedCursor)) {
     return sourceResponseInvalid(lease, 'response cursor does not match request');
   }
-  const records = normalizedPageRecords(page.records, lease, pageSize);
+  const { records } = page;
   if (records.length === 0) {
     if (page.nextCursor !== null || page.recoveryAnchorMs !== null) {
       return sourceResponseInvalid(
@@ -333,10 +690,45 @@ function validateOkxPage(
   };
 }
 
+function diagnosticPageRequest(
+  lease: CoverageLease,
+  cursor: FundingPageCursor
+): FundingRequestMetadata {
+  if (cursor.exchangeId === 'bitget') {
+    return {
+      method: 'GET',
+      path: '/api/v2/mix/market/history-fund-rate',
+      query: {
+        symbol: lease.exchangeMarketId,
+        productType: 'USDT-FUTURES',
+        pageNo: cursor.pageNo,
+        pageSize: 100
+      },
+      body: null
+    };
+  }
+  return {
+    method: 'GET',
+    path: '/api/v5/public/funding-rate-history',
+    query: cursor.afterMs === null
+      ? {
+          instId: lease.exchangeMarketId,
+          limit: 400
+        }
+      : {
+          instId: lease.exchangeMarketId,
+          after: String(cursor.afterMs),
+          limit: 400
+        },
+    body: null
+  };
+}
+
 class CoveragePageTask implements FundingPageTask {
   readonly key: string;
   readonly category: 'backfill' | 'reconcile';
   private finished = false;
+  private running = false;
   private bitgetRound: 1 | 2 | 3 = 1;
   private bitgetPageNo = 1;
   private previousBitgetEmptyPageNo: number | null = null;
@@ -377,49 +769,57 @@ class CoveragePageTask implements FundingPageTask {
   }
 
   async runNextPage(): Promise<PageTaskResult> {
-    if (this.finished) return 'done';
-    if (!this.repository.isCoverageLeaseCurrent(this.lease)) {
-      this.finished = true;
-      return 'done';
+    if (this.running) {
+      throw new Error(`funding page task ${this.key} is already running`);
     }
-
-    const cursor = this.currentCursor();
-    let request: FundingRequestMetadata;
+    this.running = true;
     try {
-      request = this.source.pageRequest(this.lease, cursor);
-    } catch (error) {
-      return this.finishWithFailure(
-        'SOURCE_RESPONSE_INVALID',
-        cursor,
-        null,
-        error
-      );
-    }
+      if (this.finished) return 'done';
+      if (!this.repository.isCoverageLeaseCurrent(this.lease)) {
+        this.finished = true;
+        return 'done';
+      }
 
-    let page: FundingRatePage;
-    try {
-      page = await this.requestExecutor.execute(
-        request,
-        () => this.source.fetchPage(this.lease, cursor)
-      );
-    } catch (error) {
-      return this.finishWithFailure(
-        'SOURCE_RESPONSE_INVALID',
-        cursor,
-        request,
-        error
-      );
-    }
+      const cursor = this.currentCursor();
+      let request: FundingRequestMetadata;
+      try {
+        request = this.source.pageRequest(this.lease, cursor);
+      } catch (error) {
+        return this.finishWithFailure(
+          'SOURCE_RESPONSE_INVALID',
+          cursor,
+          diagnosticPageRequest(this.lease, cursor),
+          error
+        );
+      }
 
-    if (this.lease.exchangeId === 'bitget') {
-      return this.runBitgetPage(
-        this.lease,
-        page,
-        cursor,
-        request
-      );
+      let page: FundingRatePage;
+      try {
+        page = await this.requestExecutor.execute(
+          request,
+          () => this.source.fetchPage(this.lease, cursor)
+        );
+      } catch (error) {
+        return this.finishWithFailure(
+          'SOURCE_RESPONSE_INVALID',
+          cursor,
+          request,
+          error
+        );
+      }
+
+      if (this.lease.exchangeId === 'bitget') {
+        return this.runBitgetPage(
+          this.lease,
+          page,
+          cursor,
+          request
+        );
+      }
+      return this.runOkxPage(this.lease, page, cursor, request);
+    } finally {
+      this.running = false;
     }
-    return this.runOkxPage(this.lease, page, cursor, request);
   }
 
   private runBitgetPage(
@@ -738,8 +1138,8 @@ class CoveragePageTask implements FundingPageTask {
 
   private currentCursor(): FundingPageCursor {
     return this.lease.exchangeId === 'bitget'
-      ? { exchangeId: 'bitget', pageNo: this.bitgetPageNo }
-      : { exchangeId: 'okx', afterMs: this.okxAfterMs };
+      ? Object.freeze({ exchangeId: 'bitget', pageNo: this.bitgetPageNo })
+      : Object.freeze({ exchangeId: 'okx', afterMs: this.okxAfterMs });
   }
 
   private recordEvent(input: FundingRateEventInput): void {
@@ -774,10 +1174,11 @@ export class FundingRateMarketSync {
   }
 
   createCoverageTask(lease: CoverageLease): FundingPageTask {
-    if (lease.exchangeId !== this.sourceExchangeId) {
+    const snapshot = coverageLeaseSnapshot(lease);
+    if (snapshot.exchangeId !== this.sourceExchangeId) {
       throw new Error(
         `funding source and coverage lease exchange identity mismatch: `
-        + `expected ${this.sourceExchangeId}, actual ${lease.exchangeId}`
+        + `expected ${this.sourceExchangeId}, actual ${snapshot.exchangeId}`
       );
     }
     return new CoveragePageTask(
@@ -787,7 +1188,7 @@ export class FundingRateMarketSync {
       this.options.requestExecutor,
       this.events,
       this.options.now,
-      lease
+      snapshot
     );
   }
 }

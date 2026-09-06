@@ -21,7 +21,8 @@ import type {
   FundingPageCursor,
   FundingRatePage,
   FundingRateSource,
-  FundingRequestExecutor
+  FundingRequestExecutor,
+  FundingRequestMetadata
 } from '../../src/funding-rates/funding-rate-source.js';
 import {
   fundingTaskFailure,
@@ -302,6 +303,15 @@ async function drainTask(
   assert.fail(`funding page task exceeded ${maximumPages} pages`);
 }
 
+async function promiseError(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
 function stateFor(
   repository: FundingRateRepository,
   market: FundingMarketIdentity
@@ -408,6 +418,23 @@ function seedCaughtUpBitget(
 
 function pageCursors(source: FakeFundingRateSource): FundingPageCursor[] {
   return source.fetchCalls.map(({ cursor }) => cursor);
+}
+
+function throwingOwnAccessor<ObjectType extends object>(
+  value: ObjectType,
+  property: keyof ObjectType,
+  onRead: () => void
+): ObjectType {
+  const output = { ...value };
+  Object.defineProperty(output, property, {
+    configurable: true,
+    enumerable: true,
+    get(): never {
+      onRead();
+      throw new Error(`synthetic ${String(property)} accessor execution`);
+    }
+  });
+  return output;
 }
 
 test('Bitget advances one page per run and completes only after two explicit empty pages', async (t) => {
@@ -1231,6 +1258,466 @@ test('event sink failures cannot reverse a successful coverage transition', asyn
   assert.equal(await task.runNextPage(), 'done');
   assert.ok(eventCalls > 0);
   assert.equal(stateFor(repository, OKX_MARKET).coverageStatus, 'CAUGHT_UP');
+});
+
+interface SingleFlightCase {
+  readonly name: string;
+  readonly market: FundingMarketIdentity;
+  readonly steps: (
+    gate: FakeAsyncGate
+  ) => readonly FakeFundingPageStep[];
+  readonly continuation: readonly ('requeue' | 'done')[];
+}
+
+const singleFlightCases: readonly SingleFlightCase[] = [
+  {
+    name: 'Bitget empty then empty',
+    market: BITGET_MARKET,
+    steps: (gate) => [{
+      ...bitgetStep(BITGET_MARKET, 1, []),
+      parseGate: gate
+    }, bitgetStep(BITGET_MARKET, 1, [])],
+    continuation: ['done']
+  },
+  {
+    name: 'Bitget non-empty then empty',
+    market: BITGET_MARKET,
+    steps: (gate) => {
+      const record = fundingRecord(BITGET_MARKET, 79);
+      return [{
+        ...bitgetStep(BITGET_MARKET, 1, [record]),
+        parseGate: gate
+      },
+      bitgetStep(BITGET_MARKET, 2, []),
+      bitgetStep(BITGET_MARKET, 1, [record]),
+      bitgetStep(BITGET_MARKET, 2, [])];
+    },
+    continuation: ['requeue', 'requeue', 'done']
+  },
+  {
+    name: 'OKX non-empty then empty',
+    market: OKX_MARKET,
+    steps: (gate) => [{
+      ...okxStep(OKX_MARKET, null, [fundingRecord(OKX_MARKET, 79)]),
+      parseGate: gate
+    }, okxStep(OKX_MARKET, 79, [])],
+    continuation: ['done']
+  }
+];
+
+for (const singleFlightCase of singleFlightCases) {
+  test(`${singleFlightCase.name} rejects a concurrent run without an extra request or commit`, async (t) => {
+    const { repository: target } = setupRepository(t, [singleFlightCase.market]);
+    const repository = new ObservedFundingRateRepository(target);
+    const lease = startCoverage(repository, singleFlightCase.market, 'INITIAL', 100);
+    const gate = new FakeAsyncGate();
+    const source = new FakeFundingRateSource(
+      singleFlightCase.market.exchangeId,
+      singleFlightCase.steps(gate)
+    );
+    const executor = new FakeFundingRequestExecutor();
+    const task = coverageTask(source, repository, executor, lease);
+
+    const first = task.runNextPage();
+    await gate.entered;
+    const concurrentErrorPromise = promiseError(task.runNextPage());
+    await Promise.resolve();
+    await Promise.resolve();
+    const callsWhileFirstIsPaused = {
+      pageRequests: source.pageRequestCalls.length,
+      fetches: source.fetchCalls.length,
+      executions: executor.calls.length,
+      commits: repository.coverageCommits.length
+    };
+    gate.release();
+    const [firstResult, concurrentError] = await Promise.all([
+      first,
+      concurrentErrorPromise
+    ]);
+    const continuation = concurrentError instanceof Error
+      ? await drainTask(task)
+      : null;
+
+    assert.ok(concurrentError instanceof Error);
+    assert.match(concurrentError.message, /already running/i);
+    assert.deepEqual(callsWhileFirstIsPaused, {
+      pageRequests: 1,
+      fetches: 1,
+      executions: 1,
+      commits: 0
+    });
+    assert.equal(firstResult, 'requeue');
+    assert.deepEqual(continuation, singleFlightCase.continuation);
+    assert.equal(
+      stateFor(repository, singleFlightCase.market).coverageStatus,
+      'CAUGHT_UP'
+    );
+  });
+}
+
+test('mutating a caller-owned lease cannot turn an old response into a current-generation write', async (t) => {
+  const { database, repository } = setupRepository(t, [OKX_MARKET]);
+  const oldLease = startCoverage(repository, OKX_MARKET, 'INITIAL', 100);
+  const gate = new FakeAsyncGate();
+  const source = new FakeFundingRateSource('okx', [{
+    ...okxStep(OKX_MARKET, null, [fundingRecord(OKX_MARKET, 79)]),
+    parseGate: gate
+  }]);
+  const task = coverageTask(
+    source,
+    repository,
+    new FakeFundingRequestExecutor(),
+    oldLease
+  );
+
+  const pending = task.runNextPage();
+  await gate.entered;
+  const newLease = startCoverage(repository, OKX_MARKET, 'PERIODIC', 101);
+  Object.assign(oldLease, newLease);
+  const before = persistenceSnapshot(database);
+  gate.release();
+
+  assert.equal(await pending, 'done');
+  assert.equal(persistenceSnapshot(database), before);
+  assert.equal(repository.listHistory(OKX_MARKET).length, 0);
+  const state = stateFor(repository, OKX_MARKET);
+  assert.equal(state.coverageGeneration, newLease.generation);
+  assert.equal(state.coverageStatus, 'BACKFILLING');
+  assert.equal(state.coverageErrorCode, null);
+});
+
+test('createCoverageTask rejects a lease accessor without executing it', (t) => {
+  const { repository } = setupRepository(t, [BITGET_MARKET]);
+  const lease = startCoverage(repository, BITGET_MARKET);
+  let getterCalls = 0;
+  const hostileLease = throwingOwnAccessor(
+    { ...lease },
+    'generation',
+    () => { getterCalls += 1; }
+  ) as CoverageLease;
+  const source = new FakeFundingRateSource('bitget', []);
+  const sync = new FundingRateMarketSync({
+    source,
+    repository,
+    requestExecutor: new FakeFundingRequestExecutor(),
+    events: NOOP_FUNDING_RATE_EVENT_SINK,
+    now: () => new Date(NOW.getTime())
+  });
+  let error: unknown = null;
+
+  try {
+    sync.createCoverageTask(hostileLease);
+  } catch (caught) {
+    error = caught;
+  }
+
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /coverage lease|accessor|data property/i);
+  assert.equal(getterCalls, 0);
+  assert.equal(source.pageRequestCalls.length, 0);
+  assert.equal(source.fetchCalls.length, 0);
+});
+
+interface HostilePageCase {
+  readonly name: string;
+  readonly market: FundingMarketIdentity;
+  readonly page: (
+    record: SettledFundingRate,
+    onRead: () => void
+  ) => FundingRatePage;
+}
+
+const hostilePageCases: readonly HostilePageCase[] = [
+  {
+    name: 'Bitget top-level cursor accessor',
+    market: BITGET_MARKET,
+    page: (record, onRead) => throwingOwnAccessor(
+      fakeBitgetPage(1, [record]),
+      'cursor',
+      onRead
+    )
+  },
+  {
+    name: 'OKX top-level records accessor',
+    market: OKX_MARKET,
+    page: (record, onRead) => throwingOwnAccessor(
+      fakeOkxPage(null, [record]),
+      'records',
+      onRead
+    )
+  },
+  {
+    name: 'Bitget top-level recovery anchor accessor',
+    market: BITGET_MARKET,
+    page: (record, onRead) => throwingOwnAccessor(
+      fakeBitgetPage(1, [record]),
+      'recoveryAnchorMs',
+      onRead
+    )
+  },
+  {
+    name: 'OKX top-level next cursor accessor',
+    market: OKX_MARKET,
+    page: (record, onRead) => throwingOwnAccessor(
+      fakeOkxPage(null, [record]),
+      'nextCursor',
+      onRead
+    )
+  },
+  {
+    name: 'Bitget response cursor page number accessor',
+    market: BITGET_MARKET,
+    page: (record, onRead) => ({
+      ...fakeBitgetPage(1, [record]),
+      cursor: throwingOwnAccessor(
+        { exchangeId: 'bitget', pageNo: 1 } as const,
+        'pageNo',
+        onRead
+      )
+    })
+  },
+  {
+    name: 'OKX next cursor after accessor',
+    market: OKX_MARKET,
+    page: (record, onRead) => ({
+      ...fakeOkxPage(null, [record]),
+      nextCursor: throwingOwnAccessor(
+        { exchangeId: 'okx', afterMs: record.fundingTimestampMs } as const,
+        'afterMs',
+        onRead
+      )
+    })
+  },
+  {
+    name: 'Bitget records element accessor',
+    market: BITGET_MARKET,
+    page: (record, onRead) => {
+      const records = [record];
+      Object.defineProperty(records, 0, {
+        configurable: true,
+        enumerable: true,
+        get(): never {
+          onRead();
+          throw new Error('synthetic records element accessor execution');
+        }
+      });
+      return { ...fakeBitgetPage(1, [record]), records };
+    }
+  },
+  {
+    name: 'OKX record timestamp accessor',
+    market: OKX_MARKET,
+    page: (record, onRead) => ({
+      ...fakeOkxPage(null, [record]),
+      records: [throwingOwnAccessor(
+        { ...record },
+        'fundingTimestampMs',
+        onRead
+      )]
+    })
+  }
+];
+
+for (const hostilePageCase of hostilePageCases) {
+  test(`${hostilePageCase.name} is rejected without executing the getter`, async (t) => {
+    const { repository: target } = setupRepository(t, [hostilePageCase.market]);
+    const repository = new ObservedFundingRateRepository(target);
+    const lease = startCoverage(repository, hostilePageCase.market, 'INITIAL', 100);
+    const record = fundingRecord(hostilePageCase.market, 79);
+    let getterCalls = 0;
+    const cursor: FundingPageCursor = hostilePageCase.market.exchangeId === 'bitget'
+      ? { exchangeId: 'bitget', pageNo: 1 }
+      : { exchangeId: 'okx', afterMs: null };
+    const source = new FakeFundingRateSource(
+      hostilePageCase.market.exchangeId,
+      [{
+        marketId: hostilePageCase.market.exchangeMarketId,
+        cursor,
+        page: hostilePageCase.page(record, () => { getterCalls += 1; })
+      }]
+    );
+    const task = coverageTask(
+      source,
+      repository,
+      new FakeFundingRequestExecutor(),
+      lease
+    );
+
+    assert.equal(await task.runNextPage(), 'done');
+    assert.equal(getterCalls, 0);
+    assertCoverageFailure(
+      repository,
+      hostilePageCase.market,
+      'SOURCE_RESPONSE_INVALID'
+    );
+    assert.equal(repository.coverageCommits.length, 0);
+    assert.equal(target.listHistory(hostilePageCase.market).length, 0);
+  });
+}
+
+test('a sparse records array is rejected before any coverage commit', async (t) => {
+  const { repository: target } = setupRepository(t, [BITGET_MARKET]);
+  const repository = new ObservedFundingRateRepository(target);
+  const lease = startCoverage(repository, BITGET_MARKET, 'INITIAL', 100);
+  const sparseRecords = new Array<SettledFundingRate>(1);
+  const source = new FakeFundingRateSource('bitget', [{
+    marketId: BITGET_MARKET.exchangeMarketId,
+    cursor: { exchangeId: 'bitget', pageNo: 1 },
+    page: {
+      ...fakeBitgetPage(1, []),
+      records: sparseRecords,
+      nextCursor: { exchangeId: 'bitget', pageNo: 2 }
+    }
+  }]);
+  const task = coverageTask(
+    source,
+    repository,
+    new FakeFundingRequestExecutor(),
+    lease
+  );
+
+  assert.equal(await task.runNextPage(), 'done');
+  assertCoverageFailure(repository, BITGET_MARKET, 'SOURCE_RESPONSE_INVALID');
+  assert.equal(repository.coverageCommits.length, 0);
+  assert.equal(target.listHistory(BITGET_MARKET).length, 0);
+});
+
+interface RequestConstructionFailureCase {
+  readonly market: FundingMarketIdentity;
+  readonly expectedRequest: FundingRequestMetadata;
+}
+
+const requestConstructionFailureCases: readonly RequestConstructionFailureCase[] = [
+  {
+    market: BITGET_MARKET,
+    expectedRequest: {
+      method: 'GET',
+      path: '/api/v2/mix/market/history-fund-rate',
+      query: {
+        symbol: BITGET_MARKET.exchangeMarketId,
+        productType: 'USDT-FUTURES',
+        pageNo: 1,
+        pageSize: 100
+      },
+      body: null
+    }
+  },
+  {
+    market: OKX_MARKET,
+    expectedRequest: {
+      method: 'GET',
+      path: '/api/v5/public/funding-rate-history',
+      query: {
+        instId: OKX_MARKET.exchangeMarketId,
+        limit: 400
+      },
+      body: null
+    }
+  }
+];
+
+for (const failureCase of requestConstructionFailureCases) {
+  test(`${failureCase.market.exchangeId} request construction failure emits a static safe incomplete event`, async (t) => {
+    const { repository } = setupRepository(t, [failureCase.market]);
+    const lease = startCoverage(repository, failureCase.market, 'INITIAL', 100);
+    const rawErrorText = `synthetic ${failureCase.market.exchangeId} request construction detail`;
+    const cursor: FundingPageCursor = failureCase.market.exchangeId === 'bitget'
+      ? { exchangeId: 'bitget', pageNo: 1 }
+      : { exchangeId: 'okx', afterMs: null };
+    const source = new FakeFundingRateSource(failureCase.market.exchangeId, [{
+      marketId: failureCase.market.exchangeMarketId,
+      cursor,
+      pageRequestError: new Error(rawErrorText)
+    }]);
+    const executor = new FakeFundingRequestExecutor();
+    const events = new RecordingEventSink();
+    const task = coverageTask(source, repository, executor, lease, events);
+
+    assert.equal(await task.runNextPage(), 'done');
+    assertCoverageFailure(
+      repository,
+      failureCase.market,
+      'SOURCE_RESPONSE_INVALID'
+    );
+    assert.equal(source.pageRequestCalls.length, 1);
+    assert.equal(executor.calls.length, 0);
+    assert.equal(source.fetchCalls.length, 0);
+    const state = stateFor(repository, failureCase.market);
+    assert.equal(state.coverageErrorSummary?.includes(rawErrorText), false);
+    const incomplete = events.events.find(
+      ({ event }) => event === 'funding_task_incomplete'
+    );
+    assert.ok(incomplete?.event === 'funding_task_incomplete');
+    assert.deepEqual({
+      exchangeId: incomplete.exchangeId,
+      exchangeMarketId: incomplete.exchangeMarketId,
+      symbol: incomplete.symbol,
+      cursor: incomplete.cursor,
+      request: incomplete.request
+    }, {
+      exchangeId: failureCase.market.exchangeId,
+      exchangeMarketId: failureCase.market.exchangeMarketId,
+      symbol: failureCase.market.symbol,
+      cursor,
+      request: failureCase.expectedRequest
+    });
+    assert.equal(incomplete.error.message.includes(rawErrorText), true);
+  });
+}
+
+test('OKX request construction failure after a committed page reports the string after cursor', async (t) => {
+  const { repository } = setupRepository(t, [OKX_MARKET]);
+  const lease = startCoverage(repository, OKX_MARKET, 'INITIAL', 100);
+  const rawErrorText = 'synthetic OKX after request construction detail';
+  const source = new FakeFundingRateSource('okx', [
+    okxStep(OKX_MARKET, null, [fundingRecord(OKX_MARKET, 79)]),
+    {
+      marketId: OKX_MARKET.exchangeMarketId,
+      cursor: { exchangeId: 'okx', afterMs: 79 },
+      pageRequestError: new Error(rawErrorText)
+    }
+  ]);
+  const executor = new FakeFundingRequestExecutor();
+  const events = new RecordingEventSink();
+  const task = coverageTask(source, repository, executor, lease, events);
+
+  assert.equal(await task.runNextPage(), 'requeue');
+  assert.equal(repository.listHistory(OKX_MARKET).length, 1);
+  assert.equal(await task.runNextPage(), 'done');
+
+  assertCoverageFailure(repository, OKX_MARKET, 'SOURCE_RESPONSE_INVALID');
+  assert.equal(source.pageRequestCalls.length, 2);
+  assert.equal(executor.calls.length, 1);
+  assert.equal(source.fetchCalls.length, 1);
+  const state = stateFor(repository, OKX_MARKET);
+  assert.equal(state.coverageErrorSummary?.includes(rawErrorText), false);
+  const incomplete = events.events.find(
+    ({ event }) => event === 'funding_task_incomplete'
+  );
+  assert.ok(incomplete?.event === 'funding_task_incomplete');
+  assert.deepEqual({
+    exchangeId: incomplete.exchangeId,
+    exchangeMarketId: incomplete.exchangeMarketId,
+    symbol: incomplete.symbol,
+    cursor: incomplete.cursor,
+    request: incomplete.request
+  }, {
+    exchangeId: OKX_MARKET.exchangeId,
+    exchangeMarketId: OKX_MARKET.exchangeMarketId,
+    symbol: OKX_MARKET.symbol,
+    cursor: { exchangeId: 'okx', afterMs: 79 },
+    request: {
+      method: 'GET',
+      path: '/api/v5/public/funding-rate-history',
+      query: {
+        instId: OKX_MARKET.exchangeMarketId,
+        after: '79',
+        limit: 400
+      },
+      body: null
+    }
+  });
+  assert.equal(incomplete.error.message.includes(rawErrorText), true);
 });
 
 test('the approved failure set remains finite and summaries never contain source errors', async (t) => {
