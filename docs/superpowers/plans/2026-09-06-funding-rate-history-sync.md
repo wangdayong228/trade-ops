@@ -899,7 +899,7 @@ Expected: exit 0。
 - Modify: `tests/support/fake-funding-rate-source.ts`
 - Create: `tests/funding-rates/funding-rate-sync-service.test.ts`
 
-- [ ] **Step 1: 写确定性并发/调度/关闭红测试**
+- [x] **Step 1: 写确定性并发/调度/关闭红测试**
 
 使用虚拟 `nowMs`、可取消 sleeper 和手动 promise gates，证明：
 
@@ -919,7 +919,7 @@ Expected: exit 0。
 - discovery queued/running 时的重复 timer tick 只合并到现有 key 且不形成补偿 backlog；两个 worker 同时内部 fatal 时完整 join 后按 `bitget -> okx` 固定顺序上报；
 - stop 先取消 timer/sleeper、停止派发，再等待两个完整 root promise；返回后 repository 调用数固定不变。
 
-- [ ] **Step 2: 确认 RED**
+- [x] **Step 2: 确认 RED**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-sync-service.test.js
@@ -927,7 +927,7 @@ npm run build && node --test dist/tests/funding-rates/funding-rate-sync-service.
 
 Expected: exit 非 0，新 worker/service 不存在。
 
-- [ ] **Step 3: 实现公平队列和 service**
+- [x] **Step 3: 实现公平队列和 service**
 
 先把 `package.json` 与 `package-lock.json` 的直接依赖声明从 caret 改为精确 `4.5.68`，不执行联网安装；当前 lock 中 resolved tarball 与 integrity 保持不变。worker 为四个 FIFO queue 维护 `Set<taskKey>` 和上次成功取出的 category index。每轮从 index 后最多检查四类，只执行一个 discovery 或一个历史页面；返回 `requeue` 时排到本类尾部，`done` 才删除 key。discovery 的重复 timer tick 由同一 key 丢弃，不累计 missed-tick backlog。单一 async loop 是该 exchange 所有 CCXT 调用的唯一入口。
 
@@ -935,7 +935,7 @@ Expected: exit 非 0，新 worker/service 不存在。
 
 `FundingRateSyncService.start()` 同步建立 timer/root loop 后立即调度恢复与 discovery，不返回网络 promise；已经 stopped 时永久 no-op。`stop()` 幂等共享 Promise，按设计先取消、再 join；内部错误只能在 quiescence 后报告。两个 worker 都失败时按构造顺序 `bitget`、`okx` 选择首个 rejection。远端单市场失败不得 reject 整个服务 root 或触碰交易组件。
 
-- [ ] **Step 4: GREEN 并提交**
+- [x] **Step 4: GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-sync-service.test.js
