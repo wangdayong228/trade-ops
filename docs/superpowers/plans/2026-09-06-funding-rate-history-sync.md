@@ -1012,7 +1012,7 @@ git commit -m "feat: start funding sync after listen"
 - Modify: `README.md`
 - Modify only if a verified omission is found: files already owned by Tasks 1-9
 
-- [ ] **Step 1: 更新运维合同**
+- [x] **Step 1: 更新运维合同**
 
 README 明确：
 
@@ -1029,11 +1029,11 @@ README 明确：
 
 首期无页面/操作入口，不修改 `docs/usage/operator-guide.md`。
 
-- [ ] **Step 2: 由 risk_reviewer 做 defect-first review**
+- [x] **Step 2: 由 risk_reviewer 做 defect-first review**
 
 review 范围为本计划全部新增/修改代码及不变量 1-21，重点检查：raw 字段、rate 精度、generation/transaction、OKX overlap、Bitget 双扫描、reactivation、队列公平、stop/join、凭证隔离和缺失测试。P0/P1/P2 必须先以源码和可复现 fake 测试解决；不得按票数忽略。
 
-- [ ] **Step 3: 执行 pre-verification 与完整验证**
+- [x] **Step 3: 执行 pre-verification 与完整验证**
 
 先由 `pre-verification-check` 确认 Node/npm/native module/显式测试 glob 可用，且命令不会读取 `.env`、`data/**` 或访问网络。然后运行：
 
@@ -1051,11 +1051,11 @@ Expected:
 - `git diff --check` exit 0；
 - `git status --short` 只显示明确属于用户或当前任务、已逐项解释的文件，不出现 `dist/`、`data/`、`.env` 或临时 DB。
 
-- [ ] **Step 4: 执行 completion consistency gates**
+- [x] **Step 4: 执行 completion consistency gates**
 
 按顺序运行 `verification-before-completion`、`consistency-check`、`post-verification-check`。逐条回读批准 spec 的完成标准、正确性不变量 1-21、本计划 checkbox、README 与实际接口；任何未证明项保持未完成，不得用“测试大致覆盖”替代证据。
 
-- [ ] **Step 5: 提交 README 或必要的已验证修正**
+- [x] **Step 5: 提交 README 或必要的已验证修正**
 
 ```bash
 git add .env.example README.md
