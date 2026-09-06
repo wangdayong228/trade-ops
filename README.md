@@ -50,6 +50,7 @@ npm start
 | 变量 | 默认值 | 规则 |
 | --- | --- | --- |
 | `TRADING_EXCHANGES` | 无 | 必填；本期集合必须恰好是 `bitget,okx`。逗号两侧空白会被去除；空项、重复项、未知交易所或只配置一家都会拒绝启动。 |
+| `FUNDING_RATE_SYNC_INTERVAL_MS` | `3600000` | 资金费率市场发现、增量和失败重试的调度周期，单位为毫秒。只接受规范十进制整数 `60000` 到 `86400000`；不接受空白、符号、前导零、小数或指数。 |
 | `TRADING_DATABASE_PATH` | `./data/trade-ops.sqlite` | 本地 SQLite 文件路径。拒绝 `:memory:` 和 `file:` URI；相对路径以启动进程的当前工作目录为基准，父目录会自动创建。 |
 | `HOST` | `127.0.0.1` | 只接受数字形式 `127.0.0.1` 或 `::1`。不接受 `localhost`、主机名、空白、`0.0.0.0`、`::` 或任何外部地址。 |
 | `PORT` | `3000` | 只接受规范十进制整数 `1` 到 `65535`；不接受空白、前导零、小数、指数或符号。 |
@@ -67,6 +68,22 @@ npm start
 生产环境应使用专用系统用户和进程管理器注入凭证，不要把凭证写进仓库、SQLite 或普通日志。建议数据库使用绝对路径，例如 `/var/lib/trade-ops/trade-ops.sqlite`；目录仅允许服务用户访问（建议 `0700`），数据库及备份仅允许服务用户读写（建议 `0600`）。备份前停止服务并等待正常关闭，随后把主 SQLite 文件作为一个一致的离线文件备份；不要在仍有 `-wal`/`-shm` 活动写入时只复制主文件。恢复备份前先保留当前数据库的只读副本。
 
 数据库必须位于正确支持 SQLite/VFS 文件锁的本地文件系统，不支持 NFS、SMB 或其他网络挂载。同一个数据库文件同一时刻只能由一个 trade-ops 进程持有；服务运行时，其他 SQLite 工具也不能并行读取。检查、迁移和备份前必须先停止服务并等待数据库关闭。进程崩溃后，新实例通过 SQLite 原生锁接管并执行恢复；应用不创建或清理 PID 文件或独立 lock 文件。
+
+## 资金费率历史同步
+
+服务在 HTTP 监听成功后启动一条只读、与订单执行隔离的资金费率链路。交易所固定为 Bitget 和 OKX；新市场只有同时满足 `active=true`、`swap=true`、`future=false`、`contract=true`、`linear=true`、`inverse=false`、`quote=USDT`、`settle=USDT` 才进入同步。Bitget 还要求 raw 产品为 `symbolType=perpetual` 且 `symbolStatus=normal`；OKX 要求 `instType=SWAP`、`ctType=linear`、`state=live`，且 quote 与 settle 的 raw 币种一致。状态缺失、未知或身份冲突时，本轮发现按不完整处理：不新增或停用市场，不猜测为 active，并保留已知市场供后续安全重试。
+
+系统只保存公共历史接口返回的已结算费率：Bitget 读取 raw `fundingRate`，OKX 只读取 raw `realizedRate`。当前预计费率、下一期预测费率和实时未结算快照均不保存；OKX 同一响应中的预测 `fundingRate` 也不会写库。费率以严格验证后的原始十进制字符串保存，不经过 JavaScript `number`。
+
+每个新发现的目标 market 独立回填接口当前可见历史，完成后立即执行增量，不等待其他 market；后续按 `FUNDING_RATE_SYNC_INTERVAL_MS` 调度，默认每小时一次。active market 每 24 小时从头执行一次全可见范围复核，以发现迟到记录和修订。market 明确变为 inactive 后停止普通增量，但必须先完成最后一次全范围复核；以后再次明确 active 时，必须先成功完成专用 reactivation 全范围任务，才能恢复普通增量。
+
+这里的“完整”只表示已经按该交易所的终止规则遍历本次接口可见范围，并且只验证到持久化的 `last_caught_up_cutoff_ms`。OKX 必须继续翻页直到成功取得显式空页；Bitget 必须在固定 cutoff 下取得连续两轮完整扫描集合一致和相同空终点。Bitget 没有公布历史保留期；OKX 公开说明最多约三个月，但没有给出可据此推导精确起点的日历边界。服务不宣称覆盖合约上市以来、cutoff 之后或交易所未返回的记录。
+
+资金费率使用独立、无 API key、secret 或 password 的 CCXT 公共客户端；它不会获得交易 gateway、账户设置、持仓或订单能力。远端请求失败只更新资金费率同步状态，不推进或重试订单，也不改变对冲状态。临时网络类失败最多额外重试三次，间隔为 1、2、4 秒；响应结构、身份、分页或数据完整性错误不会用盲目立即重试掩盖。
+
+数据与现有业务表共用 `TRADING_DATABASE_PATH` 指向的 SQLite 文件，但只写入三张独立持久表：`funding_rate_history` 保存当前版本，`funding_rate_revisions` 永久保存应用观察到的旧版本，`funding_rate_sync_state` 分别保存全范围 `coverage` 与增量 `incremental` 状态。首期不自动删除这些记录，也不提供页面、HTTP 查询或导出入口，因此数据库文件会持续增长，备份和容量规划必须包含这些表。
+
+诊断时应分别查看 `coverage_status` 的 `PENDING`/`BACKFILLING`/`CAUGHT_UP`/`INCOMPLETE` 与 `incremental_status` 的 `IDLE`/`RUNNING`/`INCOMPLETE`，不能用增量成功覆盖一次全范围失败。关键 stdout 结构化事件包括 `funding_market_discovery_completed`/`funding_market_discovery_incomplete`、`funding_coverage_started`/`funding_coverage_completed`、`funding_page_committed`、`funding_incremental_completed`/`funding_incremental_blocked`、`funding_request_retry`、`funding_task_incomplete`、`funding_rate_revised` 和 `funding_sync_fatal`。事件只记录 allowlist 内的 exchange、market、generation、cutoff、游标、计数和脱敏错误上下文，不记录凭证、headers 或完整原始错误对象。
 
 ## stdout JSON 日志
 
