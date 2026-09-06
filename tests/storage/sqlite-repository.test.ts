@@ -2315,6 +2315,62 @@ test('uses exact snapshot arithmetic independently of global Decimal precision',
   }
 });
 
+test('accepts an extreme supported quantity when either sum operand is zero', async (t) => {
+  const quantity = '2e-9000000000000000';
+  for (const testCase of [
+    {
+      name: 'zero remaining after a full fill',
+      filledBaseQuantity: quantity,
+      remainingBaseQuantity: '0',
+      averagePrice: '60000',
+      status: 'closed'
+    },
+    {
+      name: 'zero fill with the full quantity remaining',
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: quantity,
+      averagePrice: null,
+      status: 'open'
+    }
+  ] as const) {
+    await t.test(testCase.name, (child) => {
+      const { repository } = setup(child);
+      const strategyId = repository.createPending(preflight({
+        requestedBaseQuantity: quantity,
+        effectiveBaseQuantity: quantity
+      })).id;
+      const request = requestFor(strategyId, 'SPOT_MARKET', {
+        baseQuantity: quantity
+      });
+      const row = repository.planOrder(
+        strategyId,
+        'SPOT_MARKET',
+        request
+      );
+
+      assert.equal(repository.attachOrderSnapshot(
+        row.id,
+        snapshotFor(request, 'bitget', {
+          filledBaseQuantity: testCase.filledBaseQuantity,
+          remainingBaseQuantity: testCase.remainingBaseQuantity,
+          averagePrice: testCase.averagePrice,
+          status: testCase.status
+        })
+      ), 'attached');
+      assert.deepEqual(
+        repository.listOrders(strategyId)[0]?.snapshot,
+        snapshotFor(request, 'bitget', {
+          filledBaseQuantity: testCase.filledBaseQuantity,
+          remainingBaseQuantity: testCase.remainingBaseQuantity,
+          averagePrice: testCase.averagePrice,
+          status: testCase.status
+        })
+      );
+      assert.equal(repository.listOrderEvents(row.id).length, 1);
+    });
+  }
+});
+
 test('does not let ambient Decimal exponent settings underflow snapshot quantities', (t) => {
   const originalMinE = Decimal.minE;
   t.after(() => Decimal.set({ minE: originalMinE }));

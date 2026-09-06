@@ -466,7 +466,7 @@ function exactSumEquals(
     new StorageDecimal(requestedValue),
     new StorageDecimal(filledValue),
     new StorageDecimal(remainingValue)
-  ];
+  ].filter((value) => !value.isZero());
   const highestExponent = Math.max(...operands.map((value) => value.e));
   const lowestSignificantExponent = Math.min(...operands.map(
     (value) => value.e - value.sd() + 1
