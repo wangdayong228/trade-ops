@@ -35,6 +35,11 @@ interface FundingMarketDiscoveryCompletedEvent {
   readonly event: 'funding_market_discovery_completed';
   readonly exchangeId: FundingExchangeId;
   readonly phase: string;
+  readonly observedActiveCount: number;
+  readonly observedInactiveCount: number;
+  readonly createdActiveCount: number;
+  readonly becameInactiveCount: number;
+  readonly reactivatedCount: number;
 }
 
 interface FundingMarketDiscoveryIncompleteEvent {
@@ -651,7 +656,27 @@ function allowlistedFundingRateEvent(
       return {
         event,
         exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
-        phase: requiredString(ownValue(record, 'phase'), 'phase')
+        phase: requiredString(ownValue(record, 'phase'), 'phase'),
+        observedActiveCount: nonNegativeSafeInteger(
+          ownValue(record, 'observedActiveCount'),
+          'observedActiveCount'
+        ),
+        observedInactiveCount: nonNegativeSafeInteger(
+          ownValue(record, 'observedInactiveCount'),
+          'observedInactiveCount'
+        ),
+        createdActiveCount: nonNegativeSafeInteger(
+          ownValue(record, 'createdActiveCount'),
+          'createdActiveCount'
+        ),
+        becameInactiveCount: nonNegativeSafeInteger(
+          ownValue(record, 'becameInactiveCount'),
+          'becameInactiveCount'
+        ),
+        reactivatedCount: nonNegativeSafeInteger(
+          ownValue(record, 'reactivatedCount'),
+          'reactivatedCount'
+        )
       };
     case 'funding_market_discovery_incomplete':
       return {

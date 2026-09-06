@@ -191,8 +191,17 @@ export class StaleFundingTaskError extends Error {
 export class IncompleteFundingDiscoveryError extends Error {
   readonly name = 'IncompleteFundingDiscoveryError';
 
-  constructor() {
-    super('incomplete funding discovery: known market is missing');
+  constructor(context?: Readonly<{
+    exchangeId: FundingExchangeId;
+    exchangeMarketId: string;
+    expectedSymbol: string;
+    actualSymbol: string;
+  }>) {
+    super(context === undefined
+      ? 'incomplete funding discovery: known market is missing'
+      : 'incomplete funding discovery: known market symbol mismatch for '
+        + `${context.exchangeId}/${context.exchangeMarketId}; `
+        + `expected ${context.expectedSymbol}; actual ${context.actualSymbol}`);
   }
 }
 

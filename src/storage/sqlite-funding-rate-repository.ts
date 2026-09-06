@@ -2414,7 +2414,12 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         throw new IncompleteFundingDiscoveryError();
       }
       if (state.symbol !== observation.symbol) {
-        throw new Error('invalid funding discovery: known market symbol changed');
+        throw new IncompleteFundingDiscoveryError({
+          exchangeId: state.exchangeId,
+          exchangeMarketId: state.exchangeMarketId,
+          expectedSymbol: state.symbol,
+          actualSymbol: observation.symbol
+        });
       }
       if (state.active !== observation.active) {
         if (state.coverageGeneration === MAX_SAFE_INTEGER) {

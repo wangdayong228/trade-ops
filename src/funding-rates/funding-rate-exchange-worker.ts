@@ -23,6 +23,7 @@ import {
 import {
   IncompleteFundingDiscoveryError,
   type FundingCoverageKind,
+  type FundingDiscoveryResult,
   type FundingMarketState,
   type FundingRateRepository
 } from '../storage/funding-rate-repository.js';
@@ -185,6 +186,7 @@ export class FundingRateExchangeWorker {
     reconcile: []
   };
   private readonly taskKeys = new Set<string>();
+  private readonly reportedReactivationBlocks = new Set<string>();
   private lifecycle: 'new' | 'running' | 'stopping' | 'stopped' = 'new';
   private lastCategoryIndex = QUEUE_CATEGORIES.length - 1;
   private wake: (() => void) | null = null;
@@ -323,6 +325,8 @@ export class FundingRateExchangeWorker {
     );
     for (const state of states) {
       if (this.lifecycle !== 'running') return;
+      this.recordReactivationBlock(state);
+      if (this.lifecycle !== 'running') return;
       if (state.coverageStatus !== 'BACKFILLING') {
         const coverageKind = this.coverageKindDue(state, nowMs);
         if (coverageKind !== null) {
@@ -343,6 +347,22 @@ export class FundingRateExchangeWorker {
         this.enqueue(this.marketSync.createIncrementalTask(lease));
       }
     }
+  }
+
+  private recordReactivationBlock(state: FundingMarketState): void {
+    const key = state.exchangeMarketId;
+    if (!state.active || !state.reactivationRequired) {
+      this.reportedReactivationBlocks.delete(key);
+      return;
+    }
+    if (this.reportedReactivationBlocks.has(key)) return;
+    this.reportedReactivationBlocks.add(key);
+    this.recordEvent({
+      event: 'funding_incremental_blocked',
+      ...marketIdentity(state),
+      phase: 'incremental-blocked-by-reactivation',
+      generation: state.incrementalGeneration
+    });
   }
 
   private coverageKindDue(
@@ -454,8 +474,9 @@ export class FundingRateExchangeWorker {
       return 'done';
     }
 
+    let discoveryResult: FundingDiscoveryResult;
     try {
-      this.options.repository.applyCompleteDiscovery(
+      discoveryResult = this.options.repository.applyCompleteDiscovery(
         this.options.source.exchangeId,
         observations,
         this.now()
@@ -468,7 +489,12 @@ export class FundingRateExchangeWorker {
     this.recordEvent({
       event: 'funding_market_discovery_completed',
       exchangeId: this.options.source.exchangeId,
-      phase: 'market-discovery-complete'
+      phase: 'market-discovery-complete',
+      observedActiveCount: discoveryResult.observedActiveCount,
+      observedInactiveCount: discoveryResult.observedInactiveCount,
+      createdActiveCount: discoveryResult.createdActiveMarketIds.length,
+      becameInactiveCount: discoveryResult.becameInactiveMarketIds.length,
+      reactivatedCount: discoveryResult.reactivatedMarketIds.length
     });
     return 'done';
   }

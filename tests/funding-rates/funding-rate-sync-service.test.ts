@@ -157,6 +157,11 @@ const OKX_SOL = {
   exchangeMarketId: 'SOL-USDT-SWAP',
   symbol: 'SOL/USDT:USDT'
 } as const satisfies FundingMarketIdentity;
+const OKX_XRP = {
+  exchangeId: 'okx',
+  exchangeMarketId: 'XRP-USDT-SWAP',
+  symbol: 'XRP/USDT:USDT'
+} as const satisfies FundingMarketIdentity;
 
 class ManualClock {
   constructor(private value: number = START_MS) {}
@@ -1016,6 +1021,189 @@ task8Test('rejects a missing known market atomically but continues known work an
   await stopping;
 });
 
+task8Test('contains a known symbol conflict to one discovery while both workers continue', async (t) => {
+  const intervals = installManualIntervals(t);
+  const { target } = memoryRepository(t);
+  discover(target, [OKX_BTC], START_MS - 10);
+  target.startCoverage(
+    OKX_BTC,
+    'INITIAL',
+    START_MS - 1,
+    new Date(START_MS - 1)
+  );
+  const probe = observeRepository(target);
+  const clock = new ManualClock(START_MS);
+  const sleeper = new AutoAdvancingSleeper(clock);
+  const events = new RecordingEventSink();
+  const bitget = new FakeFundingRateSource(
+    'bitget',
+    [],
+    [],
+    [{ observations: [] }, { observations: [] }],
+    clock.nowMs
+  );
+  const changedSymbol = 'XBT/USDT:USDT';
+  const okx = new FakeFundingRateSource(
+    'okx',
+    [
+      {
+        marketId: OKX_BTC.exchangeMarketId,
+        cursor: { exchangeId: 'okx', afterMs: null },
+        page: fakeOkxPage(null, [])
+      },
+      {
+        marketId: OKX_BTC.exchangeMarketId,
+        cursor: { exchangeId: 'okx', afterMs: null },
+        page: fakeOkxPage(null, [])
+      }
+    ],
+    [],
+    [
+      { observations: [observation({ ...OKX_BTC, symbol: changedSymbol })] },
+      { observations: [observation(OKX_BTC)] }
+    ],
+    clock.nowMs
+  );
+  const { FundingRateSyncService } = task8Modules();
+  const service = new FundingRateSyncService({
+    bitgetSource: bitget,
+    okxSource: okx,
+    repository: probe.repository,
+    events,
+    intervalMs: INTERVAL_MS,
+    nowMs: clock.nowMs,
+    sleep: sleeper.sleep
+  });
+  t.after(async () => service.stop().catch(() => undefined));
+
+  service.start();
+  await waitFor(
+    () => events.events.some(({ event }) => (
+      event === 'funding_market_discovery_incomplete'
+      || event === 'funding_sync_fatal'
+    )),
+    'known symbol conflict produced no terminal discovery event'
+  );
+  assert.equal(
+    events.events.some(({ event }) => event === 'funding_sync_fatal'),
+    false
+  );
+  await waitFor(
+    () => okx.fetchCalls.length === 2,
+    'known persisted coverage and incremental work did not continue'
+  );
+
+  intervals.tick();
+  await waitFor(
+    () => bitget.discoveryCalls.length === 2
+      && okx.discoveryCalls.length === 2,
+    'both workers did not execute the next discovery round'
+  );
+  await service.stop();
+
+  const incomplete = events.events.find(({ event }) => (
+    event === 'funding_market_discovery_incomplete'
+  ));
+  assert.equal(incomplete?.event, 'funding_market_discovery_incomplete');
+  if (incomplete?.event !== 'funding_market_discovery_incomplete') {
+    assert.fail('expected a discovery-incomplete event');
+  }
+  assert.match(incomplete.error.message, /okx/);
+  assert.match(incomplete.error.message, new RegExp(OKX_BTC.exchangeMarketId));
+  assert.match(incomplete.error.message, /expected/i);
+  assert.match(incomplete.error.message, /BTC\/USDT:USDT/);
+  assert.match(incomplete.error.message, /actual/i);
+  assert.match(incomplete.error.message, /XBT\/USDT:USDT/);
+  assert.equal(callsNamed(probe.calls, 'resumeInterruptedCoverage').length, 1);
+  assert.equal(callsNamed(probe.calls, 'startIncremental').length, 1);
+});
+
+task8Test('reports the committed discovery result instead of guessing observation counts', async (t) => {
+  const { target } = memoryRepository(t);
+  discover(target, [OKX_BTC, OKX_ETH, OKX_XRP], START_MS - 20);
+  target.applyCompleteDiscovery('okx', [
+    observation(OKX_BTC),
+    observation(OKX_ETH),
+    observation(OKX_XRP, false)
+  ], new Date(START_MS - 10));
+  const originalApplyCompleteDiscovery = target.applyCompleteDiscovery
+    .bind(target);
+  let committedResult: FundingDiscoveryResult | undefined;
+  target.applyCompleteDiscovery = (exchangeId, observations, observedAt) => {
+    const result = originalApplyCompleteDiscovery(
+      exchangeId,
+      observations,
+      observedAt
+    );
+    committedResult = result;
+    return result;
+  };
+  const clock = new ManualClock();
+  const sleeper = new AutoAdvancingSleeper(clock);
+  const source = new FakeFundingRateSource(
+    'okx',
+    [],
+    [],
+    [{ observations: [
+      observation(OKX_BTC),
+      observation(OKX_ETH, false),
+      observation(OKX_SOL),
+      observation(OKX_XRP)
+    ] }],
+    clock.nowMs
+  );
+  const events = new RecordingEventSink();
+  let worker: Task8Worker | undefined;
+  const stopAfterCompletion: FundingRateEventSink = {
+    record(event): void {
+      events.record(event);
+      if (event.event === 'funding_market_discovery_completed') {
+        void worker?.stop().catch(() => undefined);
+      }
+    }
+  };
+  const { FundingRateExchangeWorker } = task8Modules();
+  worker = new FundingRateExchangeWorker(workerOptions(
+    source,
+    target,
+    clock,
+    sleeper.sleep,
+    stopAfterCompletion
+  ));
+  t.after(async () => worker?.stop().catch(() => undefined));
+
+  worker.start();
+  await waitFor(
+    () => events.events.some(({ event }) => (
+      event === 'funding_market_discovery_completed'
+    )),
+    'completed discovery event was not emitted'
+  );
+  await worker.stop();
+
+  assert.deepEqual(committedResult, {
+    createdActiveMarketIds: [OKX_SOL.exchangeMarketId],
+    becameInactiveMarketIds: [OKX_ETH.exchangeMarketId],
+    reactivatedMarketIds: [OKX_XRP.exchangeMarketId],
+    observedActiveCount: 3,
+    observedInactiveCount: 1
+  });
+  const completed = events.events.find(({ event }) => (
+    event === 'funding_market_discovery_completed'
+  ));
+  assert.deepEqual(completed, {
+    event: 'funding_market_discovery_completed',
+    exchangeId: 'okx',
+    phase: 'market-discovery-complete',
+    observedActiveCount: 3,
+    observedInactiveCount: 1,
+    createdActiveCount: 1,
+    becameInactiveCount: 1,
+    reactivatedCount: 1
+  });
+  assert.deepEqual(source.fetchCalls, []);
+});
+
 task8Test('uses attempt-end and 24-hour due boundaries without hot-loop duplicates', async (t) => {
   interface DueCase {
     readonly name: string;
@@ -1363,6 +1551,198 @@ task8Test('schedules new active, inactive-final, and reactivation coverage kinds
   const stopping = worker.stop();
   gate.release();
   await stopping;
+});
+
+task8Test('reports each persisted reactivation block once per worker epoch without incremental requests', async (t) => {
+  const { target } = memoryRepository(t);
+  discover(target, [OKX_BTC, OKX_ETH], START_MS - 50_000);
+  const oldGeneration = completeOkxCoverage(
+    target,
+    OKX_BTC,
+    START_MS - 40_000
+  );
+  completeOkxCoverage(target, OKX_ETH, START_MS - 40_000);
+  const recentIncremental = target.startIncremental(
+    OKX_ETH,
+    new Date(START_MS - 30_001)
+  );
+  target.completeIncremental(
+    recentIncremental,
+    new Date(START_MS - 30_000)
+  );
+  target.applyCompleteDiscovery('okx', [
+    observation(OKX_BTC, false),
+    observation(OKX_ETH)
+  ], new Date(START_MS - 20_000));
+  const inactiveFinal = target.startCoverage(
+    OKX_BTC,
+    'INACTIVE_FINAL',
+    START_MS - 10_001,
+    new Date(START_MS - 10_001)
+  );
+  target.completeCoverage(
+    inactiveFinal,
+    {
+      exchangeId: 'okx',
+      generation: inactiveFinal.generation,
+      cutoffMs: inactiveFinal.cutoffMs,
+      explicitEmpty: true,
+      finalRequestAfterMs: null
+    },
+    new Date(START_MS - 10_000)
+  );
+
+  const clock = new ManualClock();
+  const sleeper = new AutoAdvancingSleeper(clock);
+  const discoveryGate = new FakeAsyncGate();
+  const reactivationFailure = new Error('synthetic reactivation failure');
+  const observations = [observation(OKX_BTC), observation(OKX_ETH)];
+  const source = new FakeFundingRateSource(
+    'okx',
+    [{
+      marketId: OKX_BTC.exchangeMarketId,
+      cursor: { exchangeId: 'okx', afterMs: null },
+      responseError: reactivationFailure
+    }],
+    [],
+    [
+      { observations, gate: discoveryGate },
+      { observations },
+      { observations }
+    ],
+    clock.nowMs
+  );
+  const firstEvents = new RecordingEventSink();
+  const firstProbe = observeRepository(target);
+  const firstWorker = startWorker(
+    t,
+    workerOptions(
+      source,
+      firstProbe.repository,
+      clock,
+      sleeper.sleep,
+      firstEvents
+    )
+  );
+
+  await discoveryGate.entered;
+  assert.equal(firstEvents.events.some(({ event }) => (
+    event === 'funding_incremental_blocked'
+  )), false);
+  assert.equal(callsNamed(firstProbe.calls, 'startIncremental').length, 0);
+  assert.deepEqual(source.fetchCalls, []);
+
+  discoveryGate.release();
+  await waitFor(
+    () => firstEvents.events.some(({ event }) => (
+      event === 'funding_incremental_blocked'
+    )),
+    'false-to-true reactivation did not report its incremental gate'
+  );
+  await waitFor(
+    () => firstEvents.events.some(({ event }) => (
+      event === 'funding_task_incomplete'
+    )),
+    'reactivation failure was not persisted'
+  );
+  const blocked = firstEvents.events.find(({ event }) => (
+    event === 'funding_incremental_blocked'
+  ));
+  assert.equal(blocked?.event, 'funding_incremental_blocked');
+  if (blocked?.event !== 'funding_incremental_blocked') {
+    assert.fail('expected a reactivation blocked event');
+  }
+  const failedState = target.listMarketStates('okx').find((state) => (
+    state.exchangeMarketId === OKX_BTC.exchangeMarketId
+  ));
+  assert.ok(failedState);
+  assert.equal(failedState.active, true);
+  assert.equal(failedState.reactivationRequired, true);
+  assert.equal(blocked.exchangeId, failedState.exchangeId);
+  assert.equal(blocked.exchangeMarketId, failedState.exchangeMarketId);
+  assert.equal(blocked.symbol, failedState.symbol);
+  assert.equal(blocked.generation, failedState.incrementalGeneration);
+  assert.match(blocked.phase, /reactivation/i);
+
+  for (const expectedDiscoveryCalls of [2, 3]) {
+    firstWorker.scheduleDiscovery();
+    await waitFor(
+      () => source.discoveryCalls.length === expectedDiscoveryCalls,
+      `discovery round ${expectedDiscoveryCalls} was not retried`
+    );
+    await waitFor(
+      () => firstEvents.events.filter(({ event }) => (
+        event === 'funding_market_discovery_completed'
+      )).length === expectedDiscoveryCalls,
+      `discovery round ${expectedDiscoveryCalls} did not commit`
+    );
+  }
+  assert.equal(firstEvents.events.filter(({ event }) => (
+    event === 'funding_incremental_blocked'
+  )).length, 1);
+  assert.equal(callsNamed(firstProbe.calls, 'startIncremental').length, 0);
+  assert.equal(source.fetchCalls.length, 1);
+
+  assert.throws(
+    () => target.completeCoverage(
+      oldGeneration,
+      {
+        exchangeId: 'okx',
+        generation: oldGeneration.generation,
+        cutoffMs: oldGeneration.cutoffMs,
+        explicitEmpty: true,
+        finalRequestAfterMs: null
+      },
+      new Date(clock.nowMs())
+    ),
+    /stale funding task/i
+  );
+  assert.equal(target.listMarketStates('okx').find((state) => (
+    state.exchangeMarketId === OKX_BTC.exchangeMarketId
+  ))?.reactivationRequired, true);
+  await firstWorker.stop();
+
+  const restartEvents = new RecordingEventSink();
+  const restartProbe = observeRepository(target);
+  const restartSource = new FakeFundingRateSource(
+    'okx',
+    [],
+    [],
+    [{ observations }],
+    clock.nowMs
+  );
+  const restartedWorker = startWorker(
+    t,
+    workerOptions(
+      restartSource,
+      restartProbe.repository,
+      clock,
+      sleeper.sleep,
+      restartEvents
+    )
+  );
+  await waitFor(
+    () => restartEvents.events.some(({ event }) => (
+      event === 'funding_incremental_blocked'
+    )),
+    'restart did not report the persisted reactivation gate'
+  );
+  await waitFor(
+    () => restartEvents.events.some(({ event }) => (
+      event === 'funding_market_discovery_completed'
+    )),
+    'restart discovery did not complete'
+  );
+  await restartedWorker.stop();
+
+  assert.equal(restartEvents.events.filter(({ event }) => (
+    event === 'funding_incremental_blocked'
+  )).length, 1);
+  assert.equal(callsNamed(restartProbe.calls, 'startIncremental').length, 0);
+  assert.deepEqual(restartSource.fetchCalls, []);
+  assert.equal(target.listMarketStates('okx').find((state) => (
+    state.exchangeMarketId === OKX_BTC.exchangeMarketId
+  ))?.reactivationRequired, true);
 });
 
 task8Test('cancels backoff without marking the task incomplete', async (t) => {

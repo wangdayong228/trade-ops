@@ -203,6 +203,17 @@ const OKX_DISCOVERY_REQUEST = {
   body: null
 } as const;
 
+const DISCOVERY_COMPLETED_INPUT = {
+  event: 'funding_market_discovery_completed',
+  exchangeId: 'bitget',
+  phase: 'market-discovery-complete',
+  observedActiveCount: 3,
+  observedInactiveCount: 2,
+  createdActiveCount: 1,
+  becameInactiveCount: 1,
+  reactivatedCount: 1
+} as const;
+
 function captureDestination(output: string[]): Writable {
   return new Writable({
     write(chunk, _encoding, callback) {
@@ -225,11 +236,7 @@ test('builds the closed discriminated union of thirteen production events', () =
   const inputs: readonly FundingRateEventInput[] = [
     { event: 'funding_sync_started', phase: 'startup' },
     { event: 'funding_sync_stopped', phase: 'shutdown' },
-    {
-      event: 'funding_market_discovery_completed',
-      exchangeId: 'bitget',
-      phase: 'discovery'
-    },
+    DISCOVERY_COMPLETED_INPUT,
     {
       event: 'funding_market_discovery_incomplete',
       exchangeId: 'okx',
@@ -375,6 +382,92 @@ test('builds the closed discriminated union of thirteen production events', () =
       phase: 'test'
     }]),
     /event|approved|unsupported/i
+  );
+});
+
+test('discovery completion builder keeps only the committed count summary', () => {
+  const input = {
+    ...DISCOVERY_COMPLETED_INPUT,
+    createdActiveMarketIds: ['BTCUSDT'],
+    becameInactiveMarketIds: ['ETHUSDT'],
+    reactivatedMarketIds: ['SOLUSDT'],
+    credentials: 'MUST-NOT-BE-LOGGED'
+  };
+
+  assert.deepEqual(fundingRateEvent(input), DISCOVERY_COMPLETED_INPUT);
+});
+
+test('discovery completion counts are required non-negative safe integers', () => {
+  const countFields = [
+    'observedActiveCount',
+    'observedInactiveCount',
+    'createdActiveCount',
+    'becameInactiveCount',
+    'reactivatedCount'
+  ] as const;
+  const invalidValues = [
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    '1',
+    Number.NaN
+  ] as const;
+
+  for (const field of countFields) {
+    const missing = { ...DISCOVERY_COMPLETED_INPUT };
+    Reflect.deleteProperty(missing, field);
+    assert.throws(
+      () => Reflect.apply(fundingRateEvent, undefined, [missing]),
+      new RegExp(field)
+    );
+    for (const invalidValue of invalidValues) {
+      assert.throws(
+        () => Reflect.apply(fundingRateEvent, undefined, [{
+          ...DISCOVERY_COMPLETED_INPUT,
+          [field]: invalidValue
+        }]),
+        new RegExp(field)
+      );
+    }
+    for (const boundary of [0, Number.MAX_SAFE_INTEGER]) {
+      const event = Reflect.apply(fundingRateEvent, undefined, [{
+        ...DISCOVERY_COMPLETED_INPUT,
+        [field]: boundary
+      }]);
+      assert.equal(Reflect.get(event, field), boundary);
+    }
+  }
+});
+
+test('Pino sink preserves discovery counts without logging transition IDs', () => {
+  const output: string[] = [];
+  const sink = new PinoFundingRateEventSink(
+    createAppLogger(captureDestination(output))
+  );
+  const event = {
+    ...DISCOVERY_COMPLETED_INPUT,
+    createdActiveMarketIds: ['BTCUSDT'],
+    becameInactiveMarketIds: ['ETHUSDT'],
+    reactivatedMarketIds: ['SOLUSDT']
+  };
+
+  sink.record(event);
+
+  assert.equal(output.length, 1);
+  const logged = JSON.parse(output[0] ?? '') as Record<string, unknown>;
+  assert.deepEqual({
+    event: logged.event,
+    exchangeId: logged.exchangeId,
+    phase: logged.phase,
+    observedActiveCount: logged.observedActiveCount,
+    observedInactiveCount: logged.observedInactiveCount,
+    createdActiveCount: logged.createdActiveCount,
+    becameInactiveCount: logged.becameInactiveCount,
+    reactivatedCount: logged.reactivatedCount
+  }, DISCOVERY_COMPLETED_INPUT);
+  assert.doesNotMatch(
+    JSON.stringify(logged),
+    /createdActiveMarketIds|becameInactiveMarketIds|reactivatedMarketIds|BTCUSDT|ETHUSDT|SOLUSDT/
   );
 });
 

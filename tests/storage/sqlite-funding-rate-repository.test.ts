@@ -13,6 +13,7 @@ import { SQLITE_FUNDING_RATE_SCHEMA } from '../../src/storage/funding-rate-schem
 import * as fundingRateRepositoryModule from '../../src/storage/funding-rate-repository.js';
 import {
   fundingTaskFailure,
+  IncompleteFundingDiscoveryError,
   MAX_FUNDING_TASK_FAILURE_SUMMARY_BYTES,
   type CoverageLease,
   type FundingCoverageKind,
@@ -1798,6 +1799,37 @@ for (const invalidDiscovery of invalidDiscoveryCases) {
     assert.equal(fundingPersistenceSnapshot(database), before);
   });
 }
+
+test('known market symbol conflict is an incomplete discovery with precise safe context', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  const actualSymbol = 'XBT/USDT:USDT';
+  repository.applyCompleteDiscovery(
+    'okx',
+    [observation(OKX_MARKET)],
+    DISCOVERED_AT
+  );
+  const before = fundingPersistenceSnapshot(database);
+
+  let caught: unknown;
+  try {
+    repository.applyCompleteDiscovery(
+      'okx',
+      [observation({ ...OKX_MARKET, symbol: actualSymbol })],
+      FIRST_OBSERVED_AT
+    );
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.ok(caught instanceof IncompleteFundingDiscoveryError);
+  assert.match(caught.message, /okx/);
+  assert.match(caught.message, new RegExp(OKX_MARKET.exchangeMarketId));
+  assert.match(caught.message, /expected/i);
+  assert.match(caught.message, new RegExp(OKX_MARKET.symbol.replaceAll('/', '\\/')));
+  assert.match(caught.message, /actual/i);
+  assert.match(caught.message, new RegExp(actualSymbol.replaceAll('/', '\\/')));
+  assert.equal(fundingPersistenceSnapshot(database), before);
+});
 
 test('fences fresh PENDING coverage across inactive and reactivation transitions', (t) => {
   const { repository } = setupFundingRepository(t);
