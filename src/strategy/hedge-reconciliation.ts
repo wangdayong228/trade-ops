@@ -540,7 +540,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
     const entered = this.repository.getStrategy(strategyId);
     if (terminalStrategyState(entered.state)) {
       const observed = { kind: 'observed_state', state: entered.state } as const;
-      this.logConclusion(entered, observed);
+      this.logConclusion(entered, observed, undefined, entered);
       return observed;
     }
     activeState(entered);
@@ -573,7 +573,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
     if (current.state !== entered.state) {
       const observed = { kind: 'observed_state', state: current.state } as const;
       if (terminalStrategyState(current.state)) {
-        this.logConclusion(current, observed);
+        this.logConclusion(entered, observed, undefined, current);
       }
       return observed;
     }
@@ -610,11 +610,22 @@ export class HedgeReconciliation implements ReconciliationRunner {
       });
     }
 
+    const gtc = orders.find(isGtcOrder);
     let amounts: ReconciledAmounts;
     try {
       amounts = this.reconciledAmounts(orders);
     } catch (error) {
       if (!(error instanceof ExactArithmeticUnavailable)) throw error;
+      if (gtc?.snapshot?.status === 'unknown') {
+        return this.pending(entered, orders, {
+          kind: 'pending',
+          reason: 'GTC_STATUS_UNKNOWN',
+          exposureKnown: hasPositiveFill(orders),
+          strategyOrderId: gtc.id,
+          clientOrderId: gtc.clientOrderId,
+          exchangeId: gtc.exchangeId
+        });
+      }
       return this.pending(
         entered,
         orders,
@@ -622,7 +633,6 @@ export class HedgeReconciliation implements ReconciliationRunner {
       );
     }
 
-    const gtc = orders.find(isGtcOrder);
     if (gtc?.snapshot?.status === 'unknown') {
       return this.decideExistingGtc(entered, orders, gtc, amounts);
     }
@@ -1167,7 +1177,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       && current.failureCode === expectedFailureCode
     ) {
       const observed = { kind: 'observed_state', state: current.state } as const;
-      this.logConclusion(current, observed, amounts);
+      this.logConclusion(entered, observed, amounts, current);
       return observed;
     }
     return this.pending(entered, this.repository.listOrders(entered.id), {
@@ -1231,20 +1241,22 @@ export class HedgeReconciliation implements ReconciliationRunner {
   private logConclusion(
     entered: Readonly<StrategyRecord>,
     result: Readonly<ReconciliationResult>,
-    amounts?: Readonly<AmountFields>
+    amounts?: Readonly<AmountFields>,
+    observedStrategy?: Readonly<StrategyRecord>
   ): void {
-    const strategyState = result.kind === 'written'
-      || result.kind === 'observed_state'
-      ? result.state
-      : entered.state;
+    const observedFailureCode = observedStrategy?.failureCode;
     const fields: OperationalFields = {
       strategyId: entered.id,
-      strategyState,
-      conclusion: result.kind === 'written' ? result.state : result.kind,
+      strategyState: entered.state,
+      conclusion: result.kind === 'written' || result.kind === 'observed_state'
+        ? result.state
+        : result.kind,
       ...(result.kind === 'written' && 'failureCode' in result
         ? { failureCode: result.failureCode }
-        : result.kind === 'observed_state' && entered.failureCode !== null
-          ? { failureCode: entered.failureCode }
+        : result.kind === 'observed_state'
+          && observedFailureCode !== undefined
+          && observedFailureCode !== null
+          ? { failureCode: observedFailureCode }
         : {}),
       ...(result.kind === 'need_gtc' ? { role: result.role } : {}),
       ...(amounts === undefined ? {} : amounts)

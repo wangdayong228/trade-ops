@@ -2439,12 +2439,20 @@ test('logs written, observed terminal, and need_gtc conclusions', async (t) => {
     kind: 'observed_state',
     state: 'HEDGED'
   });
-  assert.equal(
-    terminalEntries.filter(
-      ({ event }) => event === 'hedge_reconciliation_conclusion'
-    ).length,
-    2
+  const terminalConclusions = terminalEntries.filter(
+    ({ event }) => event === 'hedge_reconciliation_conclusion'
   );
+  assert.equal(terminalConclusions.length, 2);
+  assert.deepEqual(terminalConclusions.map((entry) => {
+    assert.ok(entry.fields);
+    return {
+      strategyState: entry.fields.strategyState,
+      conclusion: entry.fields.conclusion
+    };
+  }), [
+    { strategyState: 'EXECUTING', conclusion: 'HEDGED' },
+    { strategyState: 'HEDGED', conclusion: 'HEDGED' }
+  ]);
 
   const gtcEntries: CapturedReconciliationOperation[] = [];
   const gtc = decisionFixture(
@@ -2808,6 +2816,48 @@ for (const marketFailure of ['rejected', 'definite-null'] as const) {
   });
 }
 
+test(
+  'GTC status priority: unknown precedes exact arithmetic resource limit',
+  { timeout: 1_000 },
+  async (t) => {
+    const requested = '2e-9000000000000000';
+    const residual = '1e-9000000000000000';
+    const f = decisionFixture(t, 'CONCURRENT', undefined, requested);
+    seedClosedConcurrentMarkets(f, {
+      requested,
+      spotFill: requested,
+      spotRemaining: '0',
+      spotAverage: '60000',
+      contractFill: residual,
+      contractRemaining: residual,
+      contractAverage: '60010'
+    });
+    const gtc = planOrder(f, 'CONTRACT_HEDGE_GTC', residual);
+    scriptFind(f, gtc, snapshotForOrder(gtc, {
+      status: 'unknown',
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: residual,
+      averagePrice: null
+    }));
+    const originalTransition = f.repository.transition.bind(f.repository);
+    let transitions = 0;
+    Reflect.set(f.repository, 'transition', (...args: Parameters<
+      StrategyRepository['transition']
+    >): boolean => {
+      transitions += 1;
+      return originalTransition(...args);
+    });
+
+    const result = await f.reconciliation.run(f.strategyId);
+
+    assert.equal(result.kind, 'pending');
+    assert.equal(result.reason, 'GTC_STATUS_UNKNOWN');
+    assert.equal(transitions, 0);
+    assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+    assertNoTradingSideEffects(f);
+  }
+);
+
 test('failure conclusion logs include actual state and code on first observation', async (t) => {
   const entries: CapturedReconciliationOperation[] = [];
   const f = decisionFixture(
@@ -2832,6 +2882,7 @@ test('failure conclusion logs include actual state and code on first observation
     'hedge_reconciliation_conclusion'
   );
   assert.equal(fields.strategyState, 'FAILED');
+  assert.equal(fields.conclusion, 'FAILED');
   assert.equal(fields.failureCode, 'ORDER_SUBMISSION_FAILED');
   assertNoGatewayCalls(f);
 });
@@ -2867,7 +2918,8 @@ test('failure conclusion logs include actual state and code after CAS observatio
     'info',
     'hedge_reconciliation_conclusion'
   );
-  assert.equal(fields.strategyState, 'FAILED');
+  assert.equal(fields.strategyState, 'EXECUTING');
+  assert.equal(fields.conclusion, 'FAILED');
   assert.equal(fields.failureCode, 'NO_FILL');
   assertNoTradingSideEffects(f);
 });
