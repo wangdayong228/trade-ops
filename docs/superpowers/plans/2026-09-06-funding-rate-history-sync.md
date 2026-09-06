@@ -769,7 +769,7 @@ Expected: exit 0，所有历史写入测试始终经带 fencing 的生产路径�
 - Create: `tests/support/fake-funding-rate-source.ts`
 - Create: `tests/funding-rates/funding-rate-market-sync.test.ts`
 
-- [ ] **Step 1: 写覆盖算法红测试**
+- [x] **Step 1: 写覆盖算法红测试**
 
 fake source 以每次调用的 cursor 返回脚本页面，并可在任意 request/parse/commit gate 暂停。覆盖矩阵：
 
@@ -786,7 +786,7 @@ fake source 以每次调用的 cursor 返回脚本页面，并可在任意 reque
 - `resumeInterruptedCoverage(market, resumedAt)` 使用注入时间原子验证旧 generation/锚点、递增 generation、保留 cutoff/任务类型、更新 `updated_at` 并重新固定 task 启动恢复字段；第二次 resume 会 fence 第一次返回的 lease，Bitget 旧 TEMP 轮次不能进入新 generation；
 - 任一失败只影响该 market，传出的 failure code/summary 有限、定位精确。
 
-- [ ] **Step 2: 确认 RED**
+- [x] **Step 2: 确认 RED**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js
@@ -794,7 +794,7 @@ npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.t
 
 Expected: exit 非 0，新逐页状态机缺失。
 
-- [ ] **Step 3: 实现一次只推进一页的 coverage task**
+- [x] **Step 3: 实现一次只推进一页的 coverage task**
 
 `FundingRateMarketSync` 不拥有 timer 或并发循环。它创建可重排的 page task：
 
@@ -814,7 +814,7 @@ Bitget task 在内存保存 round/pageNo/前一轮 empty pageNo；每个空页�
 
 OKX task 从 fresh null 或合法 resume anchor 开始。带 `after=A` 的响应每条时间和 next 都必须 `< A`；恢复页允许没有数据库新记录。只有 source 明确返回空页才完成。
 
-- [ ] **Step 4: GREEN 并提交**
+- [x] **Step 4: GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js

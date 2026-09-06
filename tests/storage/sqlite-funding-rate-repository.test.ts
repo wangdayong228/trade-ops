@@ -2102,6 +2102,70 @@ test('Bitget resume creates a new fenced generation and discards old TEMP rounds
   `).pluck().get(resumed.generation), 0);
 });
 
+test('rolls back Bitget TEMP cleanup when the coverage resume update aborts', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  const lifecycle = task5Repository(repository);
+  const lease = startCoverage(repository, BITGET_MARKET);
+  repository.commitCoveragePage(
+    lease,
+    [
+      rateRecord(BITGET_MARKET, '0.0001', FUNDING_TIMESTAMP_MS),
+      rateRecord(BITGET_MARKET, '-0.0002', FUNDING_TIMESTAMP_MS - 1)
+    ],
+    { exchangeId: 'bitget', round: 1 },
+    FIRST_OBSERVED_AT
+  );
+  database.exec(`
+    CREATE TEMP TRIGGER test_abort_coverage_resume
+    BEFORE UPDATE OF coverage_generation ON funding_rate_sync_state
+    WHEN OLD.exchange_market_id = '${BITGET_MARKET.exchangeMarketId}'
+      AND NEW.coverage_generation = OLD.coverage_generation + 1
+    BEGIN
+      SELECT RAISE(ABORT, 'test coverage resume failed');
+    END;
+  `);
+  const before = fundingPersistenceSnapshot(database);
+  const tempRowsBefore = database.prepare(`
+    SELECT COUNT(*) FROM temp.funding_rate_bitget_scan
+    WHERE exchange_id = ? AND exchange_market_id = ?
+      AND coverage_generation = ?
+  `).pluck().get(
+    BITGET_MARKET.exchangeId,
+    BITGET_MARKET.exchangeMarketId,
+    lease.generation
+  );
+
+  const error = invocationError(() => resumeCoverage(
+    repository,
+    BITGET_MARKET,
+    RESTARTED_AT
+  ));
+
+  assert.deepEqual({
+    abortedAtStateUpdate:
+      error instanceof Error
+      && /test coverage resume failed/i.test(error.message),
+    persistenceUnchanged: fundingPersistenceSnapshot(database) === before,
+    tempRowsBefore,
+    tempRowsAfter: database.prepare(`
+      SELECT COUNT(*) FROM temp.funding_rate_bitget_scan
+      WHERE exchange_id = ? AND exchange_market_id = ?
+        AND coverage_generation = ?
+    `).pluck().get(
+      BITGET_MARKET.exchangeId,
+      BITGET_MARKET.exchangeMarketId,
+      lease.generation
+    ),
+    oldLeaseCurrent: lifecycle.isCoverageLeaseCurrent(lease)
+  }, {
+    abortedAtStateUpdate: true,
+    persistenceUnchanged: true,
+    tempRowsBefore: 2,
+    tempRowsAfter: 2,
+    oldLeaseCurrent: true
+  });
+});
+
 test('Bitget page advancement preserves the persisted task-start boundary', (t) => {
   const { repository, lifecycle, actual } = setupForgedCoverageLease(t, 'bitget');
   repository.commitCoveragePage(
@@ -2208,6 +2272,118 @@ test('fails closed when interrupted coverage recovery fields are inconsistent', 
     }
   }
 });
+
+const corruptCoverageProvenanceCases = [
+  {
+    name: 'OKX state carrying a Bitget task-start boundary',
+    assignment:
+      `coverage_required_bitget_boundary_ms = ${FUNDING_TIMESTAMP_MS}`,
+    setup(repository: FundingRateRepository): CoverageLease {
+      return startCoverage(repository, OKX_MARKET);
+    }
+  },
+  {
+    name: 'OKX initial after older than its mutable recovery anchor',
+    assignment:
+      `coverage_initial_okx_after_ms = ${FUNDING_TIMESTAMP_MS - 1}`,
+    setup(repository: FundingRateRepository): CoverageLease {
+      const interrupted = startCoverage(repository, OKX_MARKET);
+      commitOkxPage(
+        repository,
+        interrupted,
+        [rateRecord(OKX_MARKET, '0.0001', FUNDING_TIMESTAMP_MS)],
+        FIRST_OBSERVED_AT,
+        FUNDING_TIMESTAMP_MS
+      );
+      return resumeCoverage(repository, OKX_MARKET, RESTARTED_AT);
+    }
+  }
+] as const;
+
+const corruptCoverageProvenanceOperations = [
+  'read',
+  'resume',
+  'currency',
+  'page',
+  'complete',
+  'fail'
+] as const;
+
+for (const corruptCase of corruptCoverageProvenanceCases) {
+  test(`fails closed across coverage entries on corrupt provenance: ${corruptCase.name}`, () => {
+    const results: Array<{
+      readonly operation: typeof corruptCoverageProvenanceOperations[number];
+      readonly rejectedForCorruptProvenance: boolean;
+      readonly persistenceUnchanged: boolean;
+    }> = [];
+    for (const operation of corruptCoverageProvenanceOperations) {
+      const database = new Database(':memory:');
+      try {
+        const repository: FundingRateRepository =
+          new SqliteFundingRateRepository(database);
+        const lifecycle = task5Repository(repository);
+        const lease = corruptCase.setup(repository);
+        setStateIgnoringChecks(
+          database,
+          OKX_MARKET,
+          corruptCase.assignment
+        );
+        const before = fundingPersistenceSnapshot(database);
+        const error = invocationError(() => {
+          if (operation === 'read') {
+            repository.listMarketStates('okx');
+          } else if (operation === 'resume') {
+            resumeCoverage(repository, OKX_MARKET, LATER_AT);
+          } else if (operation === 'currency') {
+            lifecycle.isCoverageLeaseCurrent(lease);
+          } else if (operation === 'page') {
+            commitOkxPage(
+              repository,
+              lease,
+              [rateRecord(
+                OKX_MARKET,
+                '-0.0002',
+                FUNDING_TIMESTAMP_MS - 1
+              )],
+              LATER_AT,
+              FUNDING_TIMESTAMP_MS - 1
+            );
+          } else if (operation === 'complete') {
+            lifecycle.completeCoverage(
+              lease,
+              okxEvidence(lease),
+              LATER_AT
+            );
+          } else {
+            lifecycle.failCoverage(
+              lease,
+              fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'),
+              LATER_AT
+            );
+          }
+        });
+        results.push({
+          operation,
+          rejectedForCorruptProvenance: errorContains(error, [
+            'invalid funding state',
+            'coverage task-start provenance'
+          ]),
+          persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+        });
+      } finally {
+        database.close();
+      }
+    }
+
+    assert.deepEqual(results, corruptCoverageProvenanceOperations.map(
+      (operation) => ({
+        operation,
+        rejectedForCorruptProvenance: true,
+        persistenceUnchanged: true
+      })
+    ));
+  });
+}
 
 test('rejects an interrupted resume at the maximum coverage generation atomically', (t) => {
   const { database, repository } = setupFundingRepository(t);
