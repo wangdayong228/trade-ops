@@ -600,7 +600,7 @@ class SignalTarget extends EventEmitter {
 }
 
 interface CapturedOperation {
-  readonly level: 'info' | 'error' | 'fatal';
+  readonly level: 'info' | 'warn' | 'error' | 'fatal';
   readonly event: string;
   readonly error?: unknown;
   readonly fields: Readonly<OperationalFields> | undefined;
@@ -610,6 +610,9 @@ function captureOperationalLog(entries: CapturedOperation[]): OperationalLog {
   return {
     info(event, fields): void {
       entries.push({ level: 'info', event, fields });
+    },
+    warn(event, fields): void {
+      entries.push({ level: 'warn', event, fields });
     },
     error(event, error, fields): void {
       entries.push({ level: 'error', event, error, fields });
@@ -919,6 +922,9 @@ test('a throwing operational log cannot interrupt startup or cleanup', async () 
   const fixture = runnableFixture(events);
   const throwingLog: OperationalLog = {
     info(): never {
+      throw new Error('logging unavailable');
+    },
+    warn(): never {
       throw new Error('logging unavailable');
     },
     error(): never {

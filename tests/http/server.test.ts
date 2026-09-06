@@ -54,6 +54,7 @@ function captureOperationalErrors(
 ): OperationalLog {
   return {
     info(): void {},
+    warn(): void {},
     error(event, error, fields): void {
       entries.push({ event, error, fields });
     },
@@ -1991,6 +1992,7 @@ test('a throwing operational log cannot replace an HTTP 500 response', async (t)
     repository: tamperedRepository,
     operationalLog: {
       info(): void {},
+      warn(): void {},
       error(): never {
         throw new Error('logging unavailable');
       },

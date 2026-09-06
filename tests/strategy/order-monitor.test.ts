@@ -343,6 +343,7 @@ function captureOperationalErrors(
 ): OperationalLog {
   return {
     info(): void {},
+    warn(): void {},
     error(event, error, fields): void {
       errors.push({ event, error, fields });
     },
@@ -1863,6 +1864,7 @@ test('isolates recovery failures between strategies', async (t) => {
   const operationalErrors: CapturedOperationalError[] = [];
   const throwingOperationalLog: OperationalLog = {
     info(): void {},
+    warn(): void {},
     error(event, error, fields): never {
       operationalErrors.push({ event, error, fields });
       throw new Error('logging unavailable');
