@@ -390,6 +390,19 @@ function isNoOrderSubmitted(error: unknown): boolean {
   return true;
 }
 
+function isNoOrderSubmittedWithReason(
+  expectedReason: 'UNCLASSIFIED' | 'UNTRADABLE_REQUEST'
+): (error: unknown) => boolean {
+  return (error: unknown): boolean => {
+    assert(error instanceof NoOrderSubmittedError);
+    assert.equal(error.code, 'NO_ORDER_SUBMITTED');
+    assert.equal(error.reason, expectedReason);
+    assert.equal(error.message, 'order was not submitted');
+    assert.equal('cause' in error, false);
+    return true;
+  };
+}
+
 function swapRequest(
   overrides: Partial<OrderRequest> = {}
 ): OrderRequest {
@@ -1102,6 +1115,86 @@ test('spot orders reject a contract margin mode instead of forwarding it', async
   await assert.rejects(
     gateway.createOrder(request),
     isNoOrderSubmitted
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('classifies a base minimum rejection as untradable before create', async () => {
+  const constrained = okxSpotMarket({
+    precision: { amount: 0.001, price: 0.1 },
+    limits: {
+      amount: { min: 0.01, max: undefined },
+      price: { min: undefined, max: undefined },
+      cost: { min: undefined, max: undefined }
+    }
+  });
+  const { gateway, ccxt } = makeGateway('okx', [constrained]);
+
+  await assert.rejects(
+    gateway.createOrder(spotRequest({ baseQuantity: '0.005' })),
+    isNoOrderSubmittedWithReason('UNTRADABLE_REQUEST')
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('classifies changed whole-contract precision as untradable before create', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  ccxt.amountPrecisionResult = '9';
+
+  await assert.rejects(
+    gateway.createOrder(swapRequest()),
+    isNoOrderSubmittedWithReason('UNTRADABLE_REQUEST')
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('classifies quote-notional rejection as untradable before create', async () => {
+  const constrained = okxSpotMarket({
+    limits: {
+      amount: { min: 0.000001, max: undefined },
+      price: { min: undefined, max: undefined },
+      cost: { min: 650, max: undefined }
+    }
+  });
+  const { gateway, ccxt } = makeGateway('okx', [constrained]);
+  ccxt.pricePrecisionResult = '60000';
+
+  await assert.rejects(
+    gateway.createOrder(spotRequest({ price: '65000' })),
+    isNoOrderSubmittedWithReason('UNTRADABLE_REQUEST')
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('keeps market resolution failure unclassified before create', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+
+  await assert.rejects(
+    gateway.createOrder(spotRequest({ symbol: 'ETH/USDT' })),
+    isNoOrderSubmittedWithReason('UNCLASSIFIED')
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('keeps missing account parameters unclassified before create', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  const request = swapRequest();
+  delete request.marginMode;
+
+  await assert.rejects(
+    gateway.createOrder(request),
+    isNoOrderSubmittedWithReason('UNCLASSIFIED')
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('keeps price preparation failure unclassified before create', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.ticker = {};
+
+  await assert.rejects(
+    gateway.createOrder(spotMarketRequest()),
+    isNoOrderSubmittedWithReason('UNCLASSIFIED')
   );
   assert.equal(ccxt.createCalls.length, 0);
 });

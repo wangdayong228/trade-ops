@@ -28,10 +28,14 @@ export interface ExchangeGateway {
   ): Promise<OrderSnapshot | null>;
 }
 
+export type NoOrderSubmittedReason =
+  | 'UNCLASSIFIED'
+  | 'UNTRADABLE_REQUEST';
+
 export class NoOrderSubmittedError extends Error {
   readonly code = 'NO_ORDER_SUBMITTED';
 
-  constructor() {
+  constructor(readonly reason: NoOrderSubmittedReason = 'UNCLASSIFIED') {
     super('order was not submitted');
     this.name = 'NoOrderSubmittedError';
   }

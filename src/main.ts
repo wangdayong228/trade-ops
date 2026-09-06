@@ -32,6 +32,7 @@ import {
 import { claimSqliteProcessOwnership } from './storage/sqlite-process-owner.js';
 import { SqliteStrategyRepository } from './storage/sqlite-strategy-repository.js';
 import { HedgeCoordinator } from './strategy/hedge-coordinator.js';
+import { HedgeReconciliation } from './strategy/hedge-reconciliation.js';
 import { OrderMonitor } from './strategy/order-monitor.js';
 import { PreflightService } from './strategy/preflight-service.js';
 
@@ -306,10 +307,18 @@ export function composeService(
             options.loggerInstance.child({ component: 'trade' }),
             () => configuredSecretValues(env)
           ));
+    const reconciliation = new HedgeReconciliation(
+      registry,
+      repository,
+      tradeEvents,
+      operationalLog
+    );
     const coordinator = new HedgeCoordinator(
       registry,
       repository,
-      tradeEvents
+      reconciliation,
+      tradeEvents,
+      operationalLog
     );
     const monitor = new OrderMonitor(
       registry,

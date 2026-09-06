@@ -33,6 +33,7 @@ import type {
   StrategyRepository
 } from '../../src/storage/strategy-repository.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
+import { HedgeReconciliation } from '../../src/strategy/hedge-reconciliation.js';
 import { OrderMonitor } from '../../src/strategy/order-monitor.js';
 import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
@@ -270,11 +271,10 @@ function fixture(t: TestContext): Fixture {
   const repository = new SqliteStrategyRepository(database);
   const spot = new MonitorGateway('bitget');
   const contract = new MonitorGateway('okx');
-  contract.accountSettings = {
-    marginMode: 'cross',
-    positionMode: 'hedged',
-    leverage: '2'
-  };
+  const preview = preflight('CONCURRENT');
+  spot.markets.set(`spot:${preview.symbol}`, preview.spotMarket);
+  contract.markets.set(`swap:${preview.symbol}`, preview.contractMarket);
+  contract.accountSettings = { ...preview.accountSettings };
   const registry = new ExchangeRegistry(new Map([
     ['bitget', spot],
     ['okx', contract]
@@ -780,20 +780,38 @@ test('marks unequal terminal exposure incomplete without replaying event history
 test('does not race an active coordinator planning a concurrent difference GTC', async (t) => {
   const f = fixture(t);
   const strategy = createStrategy(f.repository, 'CONCURRENT');
+  const spotSnapshot = snapshotFor(
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    '1',
+    '0',
+    'closed'
+  );
   planOrder(
     f.repository,
     strategy.id,
     'SPOT_MARKET',
     '1',
-    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+    spotSnapshot
+  );
+  f.spot.seedObservedOrder(spotSnapshot);
+  const contractSnapshot = snapshotFor(
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    '0.9',
+    '0.1',
+    'closed'
   );
   planOrder(
     f.repository,
     strategy.id,
     'CONTRACT_MARKET',
     '1',
-    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0.9', '0.1', 'closed')
+    contractSnapshot
   );
+  f.contract.seedObservedOrder(contractSnapshot);
   let releaseQuantize: (() => void) | undefined;
   let markQuantizeStarted: (() => void) | undefined;
   const quantizeStarted = new Promise<void>((resolve) => {
@@ -822,9 +840,11 @@ test('does not race an active coordinator planning a concurrent difference GTC',
       'open'
     )
   );
+  const reconciliation = new HedgeReconciliation(f.registry, f.repository);
   const execution = new HedgeCoordinator(
     f.registry,
-    f.repository
+    f.repository,
+    reconciliation
   ).confirmAndExecute(strategy.id);
   void execution.catch(() => {
     // The awaited assertion below reports coordinator failure without an
@@ -848,20 +868,38 @@ test('does not race an active coordinator planning a concurrent difference GTC',
 test('restart monitor preserves an executable concurrent difference topology for coordinator recovery', async (t) => {
   const f = fixture(t);
   const strategy = createStrategy(f.repository, 'CONCURRENT');
+  const spotSnapshot = snapshotFor(
+    strategy.id,
+    'SPOT_MARKET',
+    '1',
+    '1',
+    '0',
+    'closed'
+  );
   const spot = planOrder(
     f.repository,
     strategy.id,
     'SPOT_MARKET',
     '1',
-    snapshotFor(strategy.id, 'SPOT_MARKET', '1', '1', '0', 'closed')
+    spotSnapshot
+  );
+  f.spot.seedObservedOrder(spotSnapshot);
+  const contractSnapshot = snapshotFor(
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    '0.9',
+    '0.1',
+    'closed'
   );
   const contract = planOrder(
     f.repository,
     strategy.id,
     'CONTRACT_MARKET',
     '1',
-    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0.9', '0.1', 'closed')
+    contractSnapshot
   );
+  f.contract.seedObservedOrder(contractSnapshot);
   const restartedMonitorRepository = new SqliteStrategyRepository(f.database);
 
   await new OrderMonitor(
@@ -892,9 +930,14 @@ test('restart monitor preserves an executable concurrent difference topology for
   );
   const restartedCoordinatorRepository =
     new SqliteStrategyRepository(f.database);
-  await new HedgeCoordinator(
+  const restartedReconciliation = new HedgeReconciliation(
     f.registry,
     restartedCoordinatorRepository
+  );
+  await new HedgeCoordinator(
+    f.registry,
+    restartedCoordinatorRepository,
+    restartedReconciliation
   ).confirmAndExecute(strategy.id);
 
   assert.equal(
@@ -920,9 +963,15 @@ test('restart monitor preserves an executable concurrent difference topology for
       timeInForce: 'GTC'
     }
   );
+  const finalRepository = new SqliteStrategyRepository(f.database);
+  const finalReconciliation = new HedgeReconciliation(
+    f.registry,
+    finalRepository
+  );
   await new HedgeCoordinator(
     f.registry,
-    new SqliteStrategyRepository(f.database)
+    finalRepository,
+    finalReconciliation
   ).confirmAndExecute(strategy.id);
   assert.equal(f.contract.createdRequests.length, 1);
   assert.equal(f.spot.createdRequests.length, 0);
@@ -933,36 +982,40 @@ test('restart monitor continues a reliable concurrent positive-zero topology exa
     await t.test(positiveStatus, async (t) => {
       const f = fixture(t);
       const strategy = createStrategy(f.repository, 'CONCURRENT');
+      const spotSnapshot = snapshotFor(
+        strategy.id,
+        'SPOT_MARKET',
+        '1',
+        '0.7',
+        '0.3',
+        positiveStatus,
+        { averagePrice: '61111' }
+      );
       planOrder(
         f.repository,
         strategy.id,
         'SPOT_MARKET',
         '1',
-        snapshotFor(
-          strategy.id,
-          'SPOT_MARKET',
-          '1',
-          '0.7',
-          '0.3',
-          positiveStatus,
-          { averagePrice: '61111' }
-        )
+        spotSnapshot
+      );
+      f.spot.seedObservedOrder(spotSnapshot);
+      const contractSnapshot = snapshotFor(
+        strategy.id,
+        'CONTRACT_MARKET',
+        '1',
+        '0',
+        '1',
+        'canceled',
+        { averagePrice: null }
       );
       planOrder(
         f.repository,
         strategy.id,
         'CONTRACT_MARKET',
         '1',
-        snapshotFor(
-          strategy.id,
-          'CONTRACT_MARKET',
-          '1',
-          '0',
-          '1',
-          'canceled',
-          { averagePrice: null }
-        )
+        contractSnapshot
       );
+      f.contract.seedObservedOrder(contractSnapshot);
       f.contract.createResults.push(snapshotFor(
         strategy.id,
         'CONTRACT_HEDGE_GTC',
@@ -972,7 +1025,15 @@ test('restart monitor continues a reliable concurrent positive-zero topology exa
         'open',
         { averagePrice: null }
       ));
-      const coordinator = new HedgeCoordinator(f.registry, f.repository);
+      const reconciliation = new HedgeReconciliation(
+        f.registry,
+        f.repository
+      );
+      const coordinator = new HedgeCoordinator(
+        f.registry,
+        f.repository,
+        reconciliation
+      );
       const monitor = new OrderMonitor(
         f.registry,
         f.repository,
@@ -1027,36 +1088,40 @@ test('restart reconciliation uses topology-dependent concurrent averages', async
   await t.test('unequal terminals need only the larger average', async (t) => {
     const f = fixture(t);
     const strategy = createStrategy(f.repository, 'CONCURRENT');
+    const spotSnapshot = snapshotFor(
+      strategy.id,
+      'SPOT_MARKET',
+      '1',
+      '0.8',
+      '0.2',
+      'canceled',
+      { averagePrice: '61234' }
+    );
     planOrder(
       f.repository,
       strategy.id,
       'SPOT_MARKET',
       '1',
-      snapshotFor(
-        strategy.id,
-        'SPOT_MARKET',
-        '1',
-        '0.8',
-        '0.2',
-        'canceled',
-        { averagePrice: '61234' }
-      )
+      spotSnapshot
+    );
+    f.spot.seedObservedOrder(spotSnapshot);
+    const contractSnapshot = snapshotFor(
+      strategy.id,
+      'CONTRACT_MARKET',
+      '1',
+      '0.5',
+      '0.5',
+      'closed',
+      { averagePrice: null }
     );
     planOrder(
       f.repository,
       strategy.id,
       'CONTRACT_MARKET',
       '1',
-      snapshotFor(
-        strategy.id,
-        'CONTRACT_MARKET',
-        '1',
-        '0.5',
-        '0.5',
-        'closed',
-        { averagePrice: null }
-      )
+      contractSnapshot
     );
+    f.contract.seedObservedOrder(contractSnapshot);
     f.contract.createResults.push(snapshotFor(
       strategy.id,
       'CONTRACT_HEDGE_GTC',
@@ -1066,7 +1131,12 @@ test('restart reconciliation uses topology-dependent concurrent averages', async
       'open',
       { averagePrice: null }
     ));
-    const coordinator = new HedgeCoordinator(f.registry, f.repository);
+    const reconciliation = new HedgeReconciliation(f.registry, f.repository);
+    const coordinator = new HedgeCoordinator(
+      f.registry,
+      f.repository,
+      reconciliation
+    );
 
     await new OrderMonitor(
       f.registry,
@@ -1091,11 +1161,19 @@ test('start automatically continues a terminal sequential market exactly once', 
     '1',
     snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '0', '1', 'open')
   );
+  const terminalMarketSnapshot = snapshotFor(
+    strategy.id,
+    'CONTRACT_MARKET',
+    '1',
+    '1',
+    '0',
+    'closed',
+    { updatedAt: SECOND_UPDATE }
+  );
   f.contract.scriptedFetches.set(market.exchangeOrderId as string, [
-    snapshotFor(strategy.id, 'CONTRACT_MARKET', '1', '1', '0', 'closed', {
-      updatedAt: SECOND_UPDATE
-    })
+    terminalMarketSnapshot
   ]);
+  f.contract.seedObservedOrder(terminalMarketSnapshot);
   const hedge = snapshotFor(
     strategy.id,
     'SPOT_HEDGE_GTC',
@@ -1108,7 +1186,12 @@ test('start automatically continues a terminal sequential market exactly once', 
   f.spot.createResults.push(hedge);
   f.spot.scriptedFetches.set(hedge.exchangeOrderId, [hedge, hedge]);
   installManualIntervals(t);
-  const coordinator = new HedgeCoordinator(f.registry, f.repository);
+  const reconciliation = new HedgeReconciliation(f.registry, f.repository);
+  const coordinator = new HedgeCoordinator(
+    f.registry,
+    f.repository,
+    reconciliation
+  );
   const monitor = new OrderMonitor(
     f.registry,
     f.repository,
@@ -1204,7 +1287,12 @@ test('concurrent asynchronous market terminals create one difference GTC after b
     return difference;
   };
   f.contract.createResults.push(difference);
-  const coordinator = new HedgeCoordinator(f.registry, f.repository);
+  const reconciliation = new HedgeReconciliation(f.registry, f.repository);
+  const coordinator = new HedgeCoordinator(
+    f.registry,
+    f.repository,
+    reconciliation
+  );
   const monitor = new OrderMonitor(
     f.registry,
     f.repository,

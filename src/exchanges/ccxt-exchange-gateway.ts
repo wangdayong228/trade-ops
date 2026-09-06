@@ -147,6 +147,14 @@ interface PreparedCcxtOrder {
   readonly params: Record<string, unknown>;
 }
 
+class UntradableOrderRequestError extends Error {
+  readonly name = 'UntradableOrderRequestError';
+
+  constructor() {
+    super('order request is definitely untradable');
+  }
+}
+
 function supportedExchangeId(exchangeId: string): SupportedExchangeId {
   if (exchangeId === 'bitget' || exchangeId === 'okx') {
     return exchangeId;
@@ -553,17 +561,13 @@ function validateBaseAmount(
 ): void {
   const base = decimal(baseQuantity);
   if (base.lt(rules.minBaseAmount)) {
-    throw new Error(
-      `order is below minimum base amount ${rules.minBaseAmount}`
-    );
+    throw new UntradableOrderRequestError();
   }
   if (
     rules.maxBaseAmount !== undefined
     && base.gt(rules.maxBaseAmount)
   ) {
-    throw new Error(
-      `order exceeds maximum base amount ${rules.maxBaseAmount}`
-    );
+    throw new UntradableOrderRequestError();
   }
 }
 
@@ -581,17 +585,13 @@ function validateQuoteNotional(
     rules.minQuoteNotional !== undefined
     && decimal(quoteNotional).lt(rules.minQuoteNotional)
   ) {
-    throw new Error(
-      `order is below minimum quote notional ${rules.minQuoteNotional}`
-    );
+    throw new UntradableOrderRequestError();
   }
   if (
     rules.maxQuoteNotional !== undefined
     && decimal(quoteNotional).gt(rules.maxQuoteNotional)
   ) {
-    throw new Error(
-      `order exceeds maximum quote notional ${rules.maxQuoteNotional}`
-    );
+    throw new UntradableOrderRequestError();
   }
 }
 
@@ -630,9 +630,7 @@ function baseToCcxtAmount(
   });
   const exchangeAmount = new ExactDecimal(base).div(size).toFixed();
   if (!decimal(exchangeAmountToBase(exchangeAmount, size)).eq(base)) {
-    throw new Error(
-      'base quantity cannot be represented exactly in exchange amount units'
-    );
+    throw new UntradableOrderRequestError();
   }
   return exchangeAmount;
 }
@@ -858,8 +856,12 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     let prepared: PreparedCcxtOrder;
     try {
       prepared = await this.prepareCreateOrder(request);
-    } catch {
-      throw new NoOrderSubmittedError();
+    } catch (error) {
+      throw new NoOrderSubmittedError(
+        error instanceof UntradableOrderRequestError
+          ? 'UNTRADABLE_REQUEST'
+          : 'UNCLASSIFIED'
+      );
     }
     const order = await this.exchange.createOrder(
       prepared.market.symbol,
@@ -913,9 +915,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       'formatted amount'
     );
     if (!decimal(validFormattedAmount).eq(exchangeAmount)) {
-      throw new Error(
-        'amount precision changed the pre-normalized base quantity'
-      );
+      throw new UntradableOrderRequestError();
     }
 
     let formattedPrice: string | undefined;
