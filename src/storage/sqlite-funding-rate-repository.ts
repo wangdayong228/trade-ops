@@ -12,6 +12,8 @@ import {
   type SqliteFundingRateSchemaScope
 } from './funding-rate-schema.js';
 import {
+  IncompleteFundingDiscoveryError,
+  MAX_FUNDING_TASK_FAILURE_SUMMARY_BYTES,
   StaleFundingTaskError,
   fundingTaskFailure,
   type CoverageLease,
@@ -19,11 +21,14 @@ import {
   type FundingCoverageKind,
   type FundingCoverageStatus,
   type FundingDiscoveryResult,
+  type FundingExhaustionEvidence,
   type FundingIncrementalStatus,
   type FundingMarketState,
   type FundingPageWriteResult,
   type FundingRateRepository,
-  type FundingTaskFailureCode
+  type FundingTaskFailure,
+  type FundingTaskFailureCode,
+  type IncrementalLease
 } from './funding-rate-repository.js';
 
 const FUNDING_SCHEMA_ERROR = 'SQLite funding rate schema initialization failed';
@@ -700,6 +705,123 @@ function nullableFailure(
   return { code, summary: summaryValue };
 }
 
+function normalizedFailure(untrusted: FundingTaskFailure): FundingTaskFailure {
+  if (typeof untrusted !== 'object' || untrusted === null) {
+    throw new Error('invalid funding task failure: expected normalized failure');
+  }
+  const record = untrusted as unknown as Record<string, unknown>;
+  const code = enumValue(
+    record.code,
+    FAILURE_CODES,
+    'funding task failure code'
+  );
+  const expected = fundingTaskFailure(code);
+  if (
+    typeof record.summary !== 'string'
+    || record.summary !== expected.summary
+    || Buffer.byteLength(record.summary, 'utf8') < 1
+    || Buffer.byteLength(record.summary, 'utf8')
+      > MAX_FUNDING_TASK_FAILURE_SUMMARY_BYTES
+    || !/^[\x20-\x7e]+$/.test(record.summary)
+  ) {
+    throw new Error('invalid funding task failure: failure summary is not normalized');
+  }
+  return expected;
+}
+
+function hasExactKeys(
+  record: Readonly<Record<string, unknown>>,
+  expected: readonly string[]
+): boolean {
+  const actual = Object.keys(record).sort();
+  const sortedExpected = expected.slice().sort();
+  return actual.length === sortedExpected.length
+    && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function normalizedExhaustionEvidence(
+  untrusted: unknown,
+  context: string
+): FundingExhaustionEvidence {
+  if (typeof untrusted !== 'object' || untrusted === null || Array.isArray(untrusted)) {
+    throw new Error(`invalid ${context}: expected an exhaustion evidence object`);
+  }
+  const record = untrusted as Readonly<Record<string, unknown>>;
+  if (record.exchangeId === 'bitget') {
+    if (!hasExactKeys(record, [
+      'exchangeId',
+      'generation',
+      'cutoffMs',
+      'matchingRounds',
+      'emptyPageNo'
+    ])) {
+      throw new Error(`invalid ${context}: unexpected Bitget evidence fields`);
+    }
+    const matchingRounds = record.matchingRounds;
+    if (
+      !Array.isArray(matchingRounds)
+      || matchingRounds.length !== 2
+      || !(
+        (matchingRounds[0] === 1 && matchingRounds[1] === 2)
+        || (matchingRounds[0] === 2 && matchingRounds[1] === 3)
+      )
+    ) {
+      throw new Error(`invalid ${context}: invalid Bitget matching rounds`);
+    }
+    return {
+      exchangeId: 'bitget',
+      generation: sqliteInteger(
+        record.generation,
+        0,
+        MAX_SAFE_INTEGER,
+        `${context} generation`
+      ),
+      cutoffMs: timestampMs(record.cutoffMs, `${context} cutoff_ms`),
+      matchingRounds: matchingRounds[0] === 1 ? [1, 2] : [2, 3],
+      emptyPageNo: sqliteInteger(
+        record.emptyPageNo,
+        1,
+        MAX_SAFE_INTEGER,
+        `${context} empty page number`
+      )
+    };
+  }
+  if (record.exchangeId === 'okx') {
+    if (!hasExactKeys(record, [
+      'exchangeId',
+      'generation',
+      'cutoffMs',
+      'explicitEmpty',
+      'finalRequestAfterMs'
+    ])) {
+      throw new Error(`invalid ${context}: unexpected OKX evidence fields`);
+    }
+    if (record.explicitEmpty !== true) {
+      throw new Error(`invalid ${context}: OKX explicit-empty proof is required`);
+    }
+    return {
+      exchangeId: 'okx',
+      generation: sqliteInteger(
+        record.generation,
+        0,
+        MAX_SAFE_INTEGER,
+        `${context} generation`
+      ),
+      cutoffMs: timestampMs(record.cutoffMs, `${context} cutoff_ms`),
+      explicitEmpty: true,
+      finalRequestAfterMs: nullableTimestampMs(
+        record.finalRequestAfterMs,
+        `${context} final request after_ms`
+      )
+    };
+  }
+  throw new Error(`invalid ${context}: unsupported evidence exchange`);
+}
+
+function corruptState(context: string, field: string): never {
+  throw new Error(`invalid funding state ${context}: ${field}`);
+}
+
 function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   const stateExchangeId = exchangeId(row.exchange_id, 'funding state exchange_id');
   const stateMarketId = nonEmptyString(
@@ -707,6 +829,80 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     'funding state exchange_market_id'
   );
   const stateContext = `${stateExchangeId}/${stateMarketId}`;
+  const symbol = nonEmptyString(row.symbol, `${stateContext} symbol`);
+  const active = sqliteBoolean(row.active, `${stateContext} active`);
+  const activeObservedAt = isoTimestamp(
+    row.active_observed_at,
+    `${stateContext} active_observed_at`
+  );
+  const activeChangedAt = isoTimestamp(
+    row.active_changed_at,
+    `${stateContext} active_changed_at`
+  );
+  const reactivationRequired = sqliteBoolean(
+    row.reactivation_required,
+    `${stateContext} reactivation_required`
+  );
+  const reactivationAfterGeneration = nullableSqliteInteger(
+    row.reactivation_after_generation,
+    0,
+    MAX_SAFE_INTEGER,
+    `${stateContext} reactivation_after_generation`
+  );
+  const inactiveFinalCaughtUpAt = nullableIsoTimestamp(
+    row.inactive_final_caught_up_at,
+    `${stateContext} inactive_final_caught_up_at`
+  );
+  const coverageStatus = enumValue(
+    row.coverage_status,
+    COVERAGE_STATUSES,
+    `${stateContext} coverage_status`
+  );
+  const coverageGeneration = sqliteInteger(
+    row.coverage_generation,
+    0,
+    MAX_SAFE_INTEGER,
+    `${stateContext} coverage_generation`
+  );
+  const coverageTaskKind = nullableEnumValue(
+    row.coverage_task_kind,
+    COVERAGE_KINDS,
+    `${stateContext} coverage_task_kind`
+  );
+  const coverageCutoffMs = nullableTimestampMs(
+    row.coverage_cutoff_ms,
+    `${stateContext} coverage_cutoff_ms`
+  );
+  const lastCaughtUpGeneration = nullableSqliteInteger(
+    row.last_caught_up_generation,
+    0,
+    MAX_SAFE_INTEGER,
+    `${stateContext} last_caught_up_generation`
+  );
+  const lastCaughtUpCutoffMs = nullableTimestampMs(
+    row.last_caught_up_cutoff_ms,
+    `${stateContext} last_caught_up_cutoff_ms`
+  );
+  const lastExhaustedAt = nullableIsoTimestamp(
+    row.last_exhausted_at,
+    `${stateContext} last_exhausted_at`
+  );
+  const lastExhaustionEvidenceJson = row.last_exhaustion_evidence_json === null
+    ? null
+    : nonEmptyString(
+        row.last_exhaustion_evidence_json,
+        `${stateContext} last_exhaustion_evidence_json`
+      );
+  const okxResumeAfterMs = nullableTimestampMs(
+    row.okx_resume_after_ms,
+    `${stateContext} okx_resume_after_ms`
+  );
+  const okxResumeGeneration = nullableSqliteInteger(
+    row.okx_resume_generation,
+    0,
+    MAX_SAFE_INTEGER,
+    `${stateContext} okx_resume_generation`
+  );
   const oldest = nullableTimestampMs(
     row.oldest_funding_timestamp_ms,
     `${stateContext} oldest_funding_timestamp_ms`
@@ -718,8 +914,20 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   if ((oldest === null) !== (latest === null) || (
     oldest !== null && latest !== null && oldest > latest
   )) {
-    throw new Error(`invalid funding state ${stateContext}: funding bounds`);
+    return corruptState(stateContext, 'funding bounds');
   }
+  const coverageStartedAt = nullableIsoTimestamp(
+    row.coverage_started_at,
+    `${stateContext} coverage_started_at`
+  );
+  const coverageEndedAt = nullableIsoTimestamp(
+    row.coverage_ended_at,
+    `${stateContext} coverage_ended_at`
+  );
+  const coverageLastSuccessAt = nullableIsoTimestamp(
+    row.coverage_last_success_at,
+    `${stateContext} coverage_last_success_at`
+  );
   const coverageFailure = nullableFailure(
     row.coverage_error_code,
     row.coverage_error_summary,
@@ -730,14 +938,194 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     row.incremental_error_summary,
     `${stateContext} incremental failure`
   );
-  const evidence = row.last_exhaustion_evidence_json === null
-    ? null
-    : nonEmptyString(
-        row.last_exhaustion_evidence_json,
-        `${stateContext} last_exhaustion_evidence_json`
+  const incrementalStatus = enumValue(
+    row.incremental_status,
+    INCREMENTAL_STATUSES,
+    `${stateContext} incremental_status`
+  );
+  const incrementalGeneration = sqliteInteger(
+    row.incremental_generation,
+    0,
+    MAX_SAFE_INTEGER,
+    `${stateContext} incremental_generation`
+  );
+  const incrementalStartedAt = nullableIsoTimestamp(
+    row.incremental_started_at,
+    `${stateContext} incremental_started_at`
+  );
+  const incrementalEndedAt = nullableIsoTimestamp(
+    row.incremental_ended_at,
+    `${stateContext} incremental_ended_at`
+  );
+  const incrementalLastSuccessAt = nullableIsoTimestamp(
+    row.incremental_last_success_at,
+    `${stateContext} incremental_last_success_at`
+  );
+
+  const proofValues = [
+    lastCaughtUpGeneration,
+    lastCaughtUpCutoffMs,
+    lastExhaustedAt,
+    lastExhaustionEvidenceJson,
+    coverageLastSuccessAt
+  ];
+  const presentProofValues = proofValues.filter((value) => value !== null).length;
+  if (presentProofValues !== 0 && presentProofValues !== proofValues.length) {
+    return corruptState(stateContext, 'coverage evidence fields');
+  }
+  if (
+    lastExhaustionEvidenceJson !== null
+    && lastCaughtUpGeneration !== null
+    && lastCaughtUpCutoffMs !== null
+  ) {
+    let evidence: FundingExhaustionEvidence;
+    try {
+      evidence = normalizedExhaustionEvidence(
+        parsedObjectJson(
+          lastExhaustionEvidenceJson,
+          `${stateContext} last_exhaustion_evidence_json`
+        ),
+        `${stateContext} exhaustion evidence`
       );
-  if (evidence !== null) {
-    parsedObjectJson(evidence, `${stateContext} last_exhaustion_evidence_json`);
+    } catch {
+      return corruptState(stateContext, 'exhaustion evidence');
+    }
+    if (
+      evidence.exchangeId !== stateExchangeId
+      || evidence.generation !== lastCaughtUpGeneration
+      || evidence.cutoffMs !== lastCaughtUpCutoffMs
+      || JSON.stringify(evidence) !== lastExhaustionEvidenceJson
+    ) {
+      return corruptState(stateContext, 'exhaustion evidence');
+    }
+  }
+
+  if ((okxResumeAfterMs === null) !== (okxResumeGeneration === null)) {
+    return corruptState(stateContext, 'OKX anchor fields');
+  }
+  if (
+    okxResumeAfterMs !== null
+    && (
+      stateExchangeId !== 'okx'
+      || coverageStatus !== 'BACKFILLING'
+      || okxResumeGeneration !== coverageGeneration
+    )
+  ) {
+    return corruptState(stateContext, 'OKX anchor generation');
+  }
+
+  if (reactivationRequired !== (reactivationAfterGeneration !== null)) {
+    return corruptState(stateContext, 'reactivation fields');
+  }
+  if (
+    reactivationRequired
+    && (
+      !active
+      || inactiveFinalCaughtUpAt !== null
+      || reactivationAfterGeneration === null
+      || reactivationAfterGeneration > coverageGeneration
+    )
+  ) {
+    return corruptState(stateContext, 'reactivation fields');
+  }
+  if (
+    inactiveFinalCaughtUpAt !== null
+    && (
+      active
+      || coverageStatus !== 'CAUGHT_UP'
+      || coverageTaskKind !== 'INACTIVE_FINAL'
+      || inactiveFinalCaughtUpAt !== coverageLastSuccessAt
+    )
+  ) {
+    return corruptState(stateContext, 'inactive final proof');
+  }
+
+  if (coverageStatus === 'PENDING') {
+    if (
+      coverageTaskKind !== null
+      || coverageCutoffMs !== null
+      || coverageStartedAt !== null
+      || coverageEndedAt !== null
+      || coverageFailure.code !== null
+      || presentProofValues !== 0
+    ) {
+      return corruptState(stateContext, 'PENDING coverage evidence');
+    }
+  } else if (coverageStatus === 'BACKFILLING') {
+    if (
+      coverageTaskKind === null
+      || coverageCutoffMs === null
+      || coverageStartedAt === null
+      || coverageEndedAt !== null
+      || coverageFailure.code !== null
+    ) {
+      return corruptState(stateContext, 'coverage BACKFILLING fields');
+    }
+  } else if (coverageStatus === 'INCOMPLETE') {
+    if (
+      coverageTaskKind === null
+      || coverageCutoffMs === null
+      || coverageStartedAt === null
+      || coverageEndedAt === null
+      || coverageFailure.code === null
+    ) {
+      return corruptState(stateContext, 'coverage INCOMPLETE fields');
+    }
+  } else if (
+    coverageTaskKind === null
+    || coverageCutoffMs === null
+    || coverageStartedAt === null
+    || coverageEndedAt === null
+    || coverageLastSuccessAt === null
+    || coverageFailure.code !== null
+    || lastCaughtUpGeneration !== coverageGeneration
+    || lastCaughtUpCutoffMs !== coverageCutoffMs
+    || presentProofValues !== proofValues.length
+  ) {
+    return corruptState(stateContext, 'coverage CAUGHT_UP cutoff evidence');
+  }
+  if (
+    reactivationRequired
+    && coverageStatus === 'CAUGHT_UP'
+  ) {
+    return corruptState(stateContext, 'reactivation coverage status');
+  }
+  if (
+    coverageStatus === 'CAUGHT_UP'
+    && !active
+    && (
+      coverageTaskKind !== 'INACTIVE_FINAL'
+      || inactiveFinalCaughtUpAt === null
+    )
+  ) {
+    return corruptState(stateContext, 'inactive final coverage proof');
+  }
+  if (
+    coverageStatus === 'CAUGHT_UP'
+    && active
+    && coverageTaskKind === 'INACTIVE_FINAL'
+  ) {
+    return corruptState(stateContext, 'inactive final coverage state');
+  }
+
+  if (incrementalStatus === 'IDLE') {
+    if (incrementalFailure.code !== null) {
+      return corruptState(stateContext, 'incremental IDLE fields');
+    }
+  } else if (incrementalStatus === 'RUNNING') {
+    if (
+      incrementalStartedAt === null
+      || incrementalEndedAt !== null
+      || incrementalFailure.code !== null
+    ) {
+      return corruptState(stateContext, 'incremental RUNNING fields');
+    }
+  } else if (
+    incrementalStartedAt === null
+    || incrementalEndedAt === null
+    || incrementalFailure.code === null
+  ) {
+    return corruptState(stateContext, 'incremental INCOMPLETE fields');
   }
   isoTimestamp(row.created_at, `${stateContext} created_at`);
   isoTimestamp(row.updated_at, `${stateContext} updated_at`);
@@ -745,114 +1133,35 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   return {
     exchangeId: stateExchangeId,
     exchangeMarketId: stateMarketId,
-    symbol: nonEmptyString(row.symbol, `${stateContext} symbol`),
-    active: sqliteBoolean(row.active, `${stateContext} active`),
-    activeObservedAt: isoTimestamp(
-      row.active_observed_at,
-      `${stateContext} active_observed_at`
-    ),
-    activeChangedAt: isoTimestamp(
-      row.active_changed_at,
-      `${stateContext} active_changed_at`
-    ),
-    reactivationRequired: sqliteBoolean(
-      row.reactivation_required,
-      `${stateContext} reactivation_required`
-    ),
-    reactivationAfterGeneration: nullableSqliteInteger(
-      row.reactivation_after_generation,
-      0,
-      MAX_SAFE_INTEGER,
-      `${stateContext} reactivation_after_generation`
-    ),
-    inactiveFinalCaughtUpAt: nullableIsoTimestamp(
-      row.inactive_final_caught_up_at,
-      `${stateContext} inactive_final_caught_up_at`
-    ),
-    coverageStatus: enumValue(
-      row.coverage_status,
-      COVERAGE_STATUSES,
-      `${stateContext} coverage_status`
-    ),
-    coverageGeneration: sqliteInteger(
-      row.coverage_generation,
-      0,
-      MAX_SAFE_INTEGER,
-      `${stateContext} coverage_generation`
-    ),
-    coverageTaskKind: nullableEnumValue(
-      row.coverage_task_kind,
-      COVERAGE_KINDS,
-      `${stateContext} coverage_task_kind`
-    ),
-    coverageCutoffMs: nullableTimestampMs(
-      row.coverage_cutoff_ms,
-      `${stateContext} coverage_cutoff_ms`
-    ),
-    lastCaughtUpGeneration: nullableSqliteInteger(
-      row.last_caught_up_generation,
-      0,
-      MAX_SAFE_INTEGER,
-      `${stateContext} last_caught_up_generation`
-    ),
-    lastCaughtUpCutoffMs: nullableTimestampMs(
-      row.last_caught_up_cutoff_ms,
-      `${stateContext} last_caught_up_cutoff_ms`
-    ),
-    lastExhaustedAt: nullableIsoTimestamp(
-      row.last_exhausted_at,
-      `${stateContext} last_exhausted_at`
-    ),
-    lastExhaustionEvidenceJson: evidence,
-    okxResumeAfterMs: nullableTimestampMs(
-      row.okx_resume_after_ms,
-      `${stateContext} okx_resume_after_ms`
-    ),
-    okxResumeGeneration: nullableSqliteInteger(
-      row.okx_resume_generation,
-      0,
-      MAX_SAFE_INTEGER,
-      `${stateContext} okx_resume_generation`
-    ),
+    symbol,
+    active,
+    activeObservedAt,
+    activeChangedAt,
+    reactivationRequired,
+    reactivationAfterGeneration,
+    inactiveFinalCaughtUpAt,
+    coverageStatus,
+    coverageGeneration,
+    coverageTaskKind,
+    coverageCutoffMs,
+    lastCaughtUpGeneration,
+    lastCaughtUpCutoffMs,
+    lastExhaustedAt,
+    lastExhaustionEvidenceJson,
+    okxResumeAfterMs,
+    okxResumeGeneration,
     oldestFundingTimestampMs: oldest,
     latestFundingTimestampMs: latest,
-    coverageStartedAt: nullableIsoTimestamp(
-      row.coverage_started_at,
-      `${stateContext} coverage_started_at`
-    ),
-    coverageEndedAt: nullableIsoTimestamp(
-      row.coverage_ended_at,
-      `${stateContext} coverage_ended_at`
-    ),
-    coverageLastSuccessAt: nullableIsoTimestamp(
-      row.coverage_last_success_at,
-      `${stateContext} coverage_last_success_at`
-    ),
+    coverageStartedAt,
+    coverageEndedAt,
+    coverageLastSuccessAt,
     coverageErrorCode: coverageFailure.code,
     coverageErrorSummary: coverageFailure.summary,
-    incrementalStatus: enumValue(
-      row.incremental_status,
-      INCREMENTAL_STATUSES,
-      `${stateContext} incremental_status`
-    ),
-    incrementalGeneration: sqliteInteger(
-      row.incremental_generation,
-      0,
-      MAX_SAFE_INTEGER,
-      `${stateContext} incremental_generation`
-    ),
-    incrementalStartedAt: nullableIsoTimestamp(
-      row.incremental_started_at,
-      `${stateContext} incremental_started_at`
-    ),
-    incrementalEndedAt: nullableIsoTimestamp(
-      row.incremental_ended_at,
-      `${stateContext} incremental_ended_at`
-    ),
-    incrementalLastSuccessAt: nullableIsoTimestamp(
-      row.incremental_last_success_at,
-      `${stateContext} incremental_last_success_at`
-    ),
+    incrementalStatus,
+    incrementalGeneration,
+    incrementalStartedAt,
+    incrementalEndedAt,
+    incrementalLastSuccessAt,
     incrementalErrorCode: incrementalFailure.code,
     incrementalErrorSummary: incrementalFailure.summary
   };
@@ -911,11 +1220,78 @@ function coverageLease(lease: CoverageLease): CoverageLease {
   };
 }
 
+function incrementalLease(lease: IncrementalLease): IncrementalLease {
+  const market = marketIdentity(lease);
+  return {
+    ...market,
+    generation: sqliteInteger(
+      lease.generation,
+      0,
+      MAX_SAFE_INTEGER,
+      'incremental lease generation'
+    ),
+    frozenBoundaryMs: nullableTimestampMs(
+      lease.frozenBoundaryMs,
+      'incremental lease frozen boundary'
+    )
+  };
+}
+
+function coverageStateMatchesLease(
+  state: FundingMarketState,
+  lease: CoverageLease
+): boolean {
+  return state.exchangeId === lease.exchangeId
+    && state.exchangeMarketId === lease.exchangeMarketId
+    && state.symbol === lease.symbol
+    && state.coverageStatus === 'BACKFILLING'
+    && state.coverageGeneration === lease.generation
+    && state.coverageTaskKind === lease.kind
+    && state.coverageCutoffMs === lease.cutoffMs;
+}
+
+function coverageStateAllowsLease(
+  state: FundingMarketState,
+  lease: CoverageLease
+): boolean {
+  if (lease.kind === 'INACTIVE_FINAL') return !state.active;
+  if (lease.kind === 'REACTIVATION') {
+    return state.active
+      && state.reactivationRequired
+      && state.reactivationAfterGeneration !== null
+      && lease.generation > state.reactivationAfterGeneration;
+  }
+  return state.active && !state.reactivationRequired;
+}
+
+function stateAllowsIncremental(state: FundingMarketState): boolean {
+  return state.active
+    && !state.reactivationRequired
+    && state.lastCaughtUpGeneration !== null
+    && state.lastCaughtUpCutoffMs !== null
+    && state.lastExhaustedAt !== null
+    && state.lastExhaustionEvidenceJson !== null
+    && state.coverageLastSuccessAt !== null;
+}
+
+function incrementalStateMatchesLease(
+  state: FundingMarketState,
+  lease: IncrementalLease
+): boolean {
+  return state.exchangeId === lease.exchangeId
+    && state.exchangeMarketId === lease.exchangeMarketId
+    && state.symbol === lease.symbol
+    && state.incrementalStatus === 'RUNNING'
+    && state.incrementalGeneration === lease.generation
+    && stateAllowsIncremental(state);
+}
+
 export class SqliteFundingRateRepository implements FundingRateRepository {
   private readonly selectState;
   private readonly selectStates;
   private readonly insertState;
   private readonly updateObservedActiveState;
+  private readonly updateDiscoveryTransition;
   private readonly updateCoverageStart;
   private readonly selectHistoryRecord;
   private readonly selectHistory;
@@ -925,6 +1301,14 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
   private readonly updateRevisedHistory;
   private readonly updateCoverageCheckpoint;
   private readonly upsertBitgetScanRecord;
+  private readonly deleteBitgetScansForMarket;
+  private readonly deleteBitgetScansForLease;
+  private readonly selectBitgetRoundDifference;
+  private readonly updateCoverageComplete;
+  private readonly updateCoverageFailure;
+  private readonly updateIncrementalStart;
+  private readonly updateIncrementalCheckpoint;
+  private readonly updateIncrementalTerminal;
   private readonly applyDiscoveryTransaction;
   private readonly startCoverageTransaction;
   private readonly commitCoveragePageTransaction;
@@ -982,7 +1366,38 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       WHERE exchange_id = @exchangeId
         AND exchange_market_id = @exchangeMarketId
         AND symbol = @symbol
-        AND active = 1
+        AND active = @active
+    `);
+    this.updateDiscoveryTransition = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET active = @active,
+          active_observed_at = @observedAt,
+          active_changed_at = @observedAt,
+          reactivation_required = @reactivationRequired,
+          reactivation_after_generation = @reactivationAfterGeneration,
+          inactive_final_caught_up_at = NULL,
+          coverage_status = @coverageStatus,
+          coverage_generation = @coverageGeneration,
+          coverage_task_kind = @coverageTaskKind,
+          coverage_cutoff_ms = @coverageCutoffMs,
+          okx_resume_after_ms = NULL,
+          okx_resume_generation = NULL,
+          coverage_started_at = @coverageStartedAt,
+          coverage_ended_at = @coverageEndedAt,
+          coverage_error_code = @coverageErrorCode,
+          coverage_error_summary = @coverageErrorSummary,
+          incremental_status = @incrementalStatus,
+          incremental_generation = @incrementalGeneration,
+          incremental_ended_at = @incrementalEndedAt,
+          incremental_error_code = @incrementalErrorCode,
+          incremental_error_summary = @incrementalErrorSummary,
+          updated_at = @observedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND active = @previousActive
+        AND coverage_generation = @previousCoverageGeneration
+        AND incremental_generation = @previousIncrementalGeneration
     `);
     this.updateCoverageStart = this.database.prepare(`
       UPDATE funding_rate_sync_state
@@ -1000,7 +1415,6 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       WHERE exchange_id = @exchangeId
         AND exchange_market_id = @exchangeMarketId
         AND symbol = @symbol
-        AND active = 1
         AND coverage_generation = @previousGeneration
     `);
     this.selectHistoryRecord = this.database.prepare(`
@@ -1075,7 +1489,6 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       WHERE exchange_id = @exchangeId
         AND exchange_market_id = @exchangeMarketId
         AND symbol = @symbol
-        AND active = 1
         AND coverage_status = 'BACKFILLING'
         AND coverage_generation = @generation
         AND coverage_task_kind = @kind
@@ -1099,6 +1512,144 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         funding_rate = excluded.funding_rate,
         raw_json = excluded.raw_json,
         content_hash = excluded.content_hash
+    `);
+    this.deleteBitgetScansForMarket = this.database.prepare(`
+      DELETE FROM funding_rate_bitget_scan
+      WHERE exchange_id = ? AND exchange_market_id = ?
+    `);
+    this.deleteBitgetScansForLease = this.database.prepare(`
+      DELETE FROM funding_rate_bitget_scan
+      WHERE exchange_id = ?
+        AND exchange_market_id = ?
+        AND coverage_generation = ?
+    `);
+    this.selectBitgetRoundDifference = this.database.prepare(`
+      SELECT (
+        EXISTS (
+          SELECT funding_timestamp_ms, symbol, funding_rate, raw_json, content_hash
+          FROM funding_rate_bitget_scan
+          WHERE exchange_id = @exchangeId
+            AND exchange_market_id = @exchangeMarketId
+            AND coverage_generation = @generation
+            AND scan_round = @leftRound
+          EXCEPT
+          SELECT funding_timestamp_ms, symbol, funding_rate, raw_json, content_hash
+          FROM funding_rate_bitget_scan
+          WHERE exchange_id = @exchangeId
+            AND exchange_market_id = @exchangeMarketId
+            AND coverage_generation = @generation
+            AND scan_round = @rightRound
+        )
+        OR EXISTS (
+          SELECT funding_timestamp_ms, symbol, funding_rate, raw_json, content_hash
+          FROM funding_rate_bitget_scan
+          WHERE exchange_id = @exchangeId
+            AND exchange_market_id = @exchangeMarketId
+            AND coverage_generation = @generation
+            AND scan_round = @rightRound
+          EXCEPT
+          SELECT funding_timestamp_ms, symbol, funding_rate, raw_json, content_hash
+          FROM funding_rate_bitget_scan
+          WHERE exchange_id = @exchangeId
+            AND exchange_market_id = @exchangeMarketId
+            AND coverage_generation = @generation
+            AND scan_round = @leftRound
+        )
+      ) AS different
+    `);
+    this.updateCoverageComplete = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET coverage_status = 'CAUGHT_UP',
+          last_caught_up_generation = @generation,
+          last_caught_up_cutoff_ms = @cutoffMs,
+          last_exhausted_at = @completedAt,
+          last_exhaustion_evidence_json = @evidenceJson,
+          okx_resume_after_ms = NULL,
+          okx_resume_generation = NULL,
+          coverage_ended_at = @completedAt,
+          coverage_last_success_at = @completedAt,
+          coverage_error_code = NULL,
+          coverage_error_summary = NULL,
+          inactive_final_caught_up_at = @inactiveFinalCaughtUpAt,
+          reactivation_required = @reactivationRequired,
+          reactivation_after_generation = @reactivationAfterGeneration,
+          updated_at = @completedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND coverage_status = 'BACKFILLING'
+        AND coverage_generation = @generation
+        AND coverage_task_kind = @kind
+        AND coverage_cutoff_ms = @cutoffMs
+    `);
+    this.updateCoverageFailure = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET coverage_status = 'INCOMPLETE',
+          okx_resume_after_ms = NULL,
+          okx_resume_generation = NULL,
+          coverage_ended_at = @failedAt,
+          coverage_error_code = @failureCode,
+          coverage_error_summary = @failureSummary,
+          updated_at = @failedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND coverage_status = 'BACKFILLING'
+        AND coverage_generation = @generation
+        AND coverage_task_kind = @kind
+        AND coverage_cutoff_ms = @cutoffMs
+    `);
+    this.updateIncrementalStart = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET incremental_status = 'RUNNING',
+          incremental_generation = @generation,
+          incremental_started_at = @startedAt,
+          incremental_ended_at = NULL,
+          incremental_error_code = NULL,
+          incremental_error_summary = NULL,
+          updated_at = @startedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND incremental_status = @previousStatus
+        AND incremental_generation = @previousGeneration
+    `);
+    this.updateIncrementalCheckpoint = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET oldest_funding_timestamp_ms = CASE
+            WHEN oldest_funding_timestamp_ms IS NULL
+              OR @pageOldestMs < oldest_funding_timestamp_ms
+            THEN @pageOldestMs
+            ELSE oldest_funding_timestamp_ms
+          END,
+          latest_funding_timestamp_ms = CASE
+            WHEN latest_funding_timestamp_ms IS NULL
+              OR @pageLatestMs > latest_funding_timestamp_ms
+            THEN @pageLatestMs
+            ELSE latest_funding_timestamp_ms
+          END,
+          updated_at = @observedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND active = 1
+        AND reactivation_required = 0
+        AND incremental_status = 'RUNNING'
+        AND incremental_generation = @generation
+    `);
+    this.updateIncrementalTerminal = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET incremental_status = @status,
+          incremental_ended_at = @endedAt,
+          incremental_last_success_at = @lastSuccessAt,
+          incremental_error_code = @failureCode,
+          incremental_error_summary = @failureSummary,
+          updated_at = @endedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND incremental_status = 'RUNNING'
+        AND incremental_generation = @generation
     `);
 
     this.applyDiscoveryTransaction = this.database.transaction((
@@ -1229,6 +1780,57 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     );
   }
 
+  resumeInterruptedCoverage(
+    untrustedMarket: FundingMarketIdentity
+  ): CoverageLease {
+    const market = marketIdentity(untrustedMarket);
+    return this.database.transaction((): CoverageLease => {
+      const state = this.stateForMarket(market);
+      if (
+        state === null
+        || state.symbol !== market.symbol
+        || state.coverageStatus !== 'BACKFILLING'
+        || state.coverageTaskKind === null
+        || state.coverageCutoffMs === null
+      ) {
+        throw new Error('funding market has no interrupted coverage task');
+      }
+      const common = {
+        exchangeMarketId: state.exchangeMarketId,
+        symbol: state.symbol,
+        generation: state.coverageGeneration,
+        kind: state.coverageTaskKind,
+        cutoffMs: state.coverageCutoffMs,
+        recovered: true
+      } as const;
+      const lease: CoverageLease = state.exchangeId === 'bitget'
+        ? {
+            ...common,
+            exchangeId: 'bitget',
+            okxResumeAfterMs: null,
+            requiredBitgetBoundaryMs: state.oldestFundingTimestampMs
+          }
+        : {
+            ...common,
+            exchangeId: 'okx',
+            okxResumeAfterMs: state.okxResumeAfterMs,
+            requiredBitgetBoundaryMs: null
+          };
+      if (!coverageStateAllowsLease(state, lease)) {
+        throw new Error('interrupted coverage task is no longer eligible');
+      }
+      return lease;
+    })();
+  }
+
+  isCoverageLeaseCurrent(untrustedLease: CoverageLease): boolean {
+    const lease = coverageLease(untrustedLease);
+    const state = this.stateForMarket(lease);
+    return state !== null
+      && coverageStateMatchesLease(state, lease)
+      && coverageStateAllowsLease(state, lease);
+  }
+
   commitCoveragePage(
     untrustedLease: CoverageLease,
     untrustedRecords: readonly SettledFundingRate[],
@@ -1247,46 +1849,477 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     );
   }
 
+  bitgetRoundsEqual(
+    untrustedLease: CoverageLease,
+    left: 1 | 2,
+    right: 2 | 3
+  ): boolean {
+    const lease = coverageLease(untrustedLease);
+    if (
+      lease.exchangeId !== 'bitget'
+      || (left !== 1 && left !== 2)
+      || (right !== 2 && right !== 3)
+      || right !== left + 1
+    ) {
+      throw new Error('invalid Bitget funding scan round comparison');
+    }
+    return this.database.transaction((): boolean => {
+      this.requireCurrentCoverageState(lease);
+      return this.bitgetRoundsEqualInsideCurrentTransaction(lease, left, right);
+    })();
+  }
+
+  completeCoverage(
+    untrustedLease: CoverageLease,
+    untrustedEvidence: FundingExhaustionEvidence,
+    completedAt: Date
+  ): void {
+    const lease = coverageLease(untrustedLease);
+    const evidence = normalizedExhaustionEvidence(
+      untrustedEvidence,
+      'funding exhaustion evidence'
+    );
+    if (
+      evidence.exchangeId !== lease.exchangeId
+      || evidence.generation !== lease.generation
+      || evidence.cutoffMs !== lease.cutoffMs
+    ) {
+      throw new Error('invalid funding exhaustion evidence: lease mismatch');
+    }
+    const completedAtText = dateTimestamp(
+      completedAt,
+      'funding coverage completion time'
+    );
+    this.database.transaction(() => {
+      const state = this.requireCurrentCoverageState(lease);
+      if (evidence.exchangeId === 'bitget') {
+        if (lease.exchangeId !== 'bitget') {
+          throw new Error('invalid funding exhaustion evidence: lease mismatch');
+        }
+        const [left, right] = evidence.matchingRounds;
+        if (!this.bitgetRoundsEqualInsideCurrentTransaction(
+          lease,
+          left,
+          right
+        )) {
+          throw new Error('invalid funding exhaustion evidence: Bitget rounds are not equal');
+        }
+      }
+      this.deleteBitgetScansForLease.run(
+        lease.exchangeId,
+        lease.exchangeMarketId,
+        lease.generation
+      );
+      const clearsReactivation = lease.kind === 'REACTIVATION';
+      const update = this.updateCoverageComplete.run({
+        ...lease,
+        completedAt: completedAtText,
+        evidenceJson: JSON.stringify(evidence),
+        inactiveFinalCaughtUpAt: lease.kind === 'INACTIVE_FINAL'
+          ? completedAtText
+          : state.inactiveFinalCaughtUpAt,
+        reactivationRequired: clearsReactivation
+          ? 0
+          : state.reactivationRequired ? 1 : 0,
+        reactivationAfterGeneration: clearsReactivation
+          ? null
+          : state.reactivationAfterGeneration
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
+      }
+    })();
+  }
+
+  failCoverage(
+    untrustedLease: CoverageLease,
+    untrustedFailure: FundingTaskFailure,
+    failedAt: Date
+  ): void {
+    const lease = coverageLease(untrustedLease);
+    const failure = normalizedFailure(untrustedFailure);
+    const failedAtText = dateTimestamp(failedAt, 'funding coverage failure time');
+    this.database.transaction(() => {
+      this.requireCurrentCoverageState(lease);
+      this.deleteBitgetScansForLease.run(
+        lease.exchangeId,
+        lease.exchangeMarketId,
+        lease.generation
+      );
+      const update = this.updateCoverageFailure.run({
+        ...lease,
+        failedAt: failedAtText,
+        failureCode: failure.code,
+        failureSummary: failure.summary
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
+      }
+    })();
+  }
+
+  startIncremental(
+    untrustedMarket: FundingMarketIdentity,
+    startedAt: Date
+  ): IncrementalLease {
+    const market = marketIdentity(untrustedMarket);
+    const startedAtText = dateTimestamp(startedAt, 'funding incremental start time');
+    return this.database.transaction((): IncrementalLease => {
+      const state = this.stateForMarket(market);
+      if (
+        state === null
+        || state.symbol !== market.symbol
+        || !stateAllowsIncremental(state)
+      ) {
+        throw new Error('funding market is not eligible for incremental sync');
+      }
+      if (state.incrementalStatus === 'RUNNING') {
+        throw new Error('funding incremental task is already RUNNING');
+      }
+      if (state.incrementalGeneration === MAX_SAFE_INTEGER) {
+        throw new Error('funding incremental generation exhausted');
+      }
+      const generation = state.incrementalGeneration + 1;
+      const update = this.updateIncrementalStart.run({
+        ...market,
+        generation,
+        previousGeneration: state.incrementalGeneration,
+        previousStatus: state.incrementalStatus,
+        startedAt: startedAtText
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
+      }
+      return {
+        ...market,
+        generation,
+        frozenBoundaryMs: state.latestFundingTimestampMs
+      };
+    })();
+  }
+
+  restartInterruptedIncremental(
+    untrustedMarket: FundingMarketIdentity,
+    restartedAt: Date
+  ): IncrementalLease {
+    const market = marketIdentity(untrustedMarket);
+    const restartedAtText = dateTimestamp(
+      restartedAt,
+      'funding incremental restart time'
+    );
+    return this.database.transaction((): IncrementalLease => {
+      const state = this.stateForMarket(market);
+      if (
+        state === null
+        || state.symbol !== market.symbol
+        || state.incrementalStatus !== 'RUNNING'
+      ) {
+        throw new Error('funding market has no interrupted RUNNING incremental task');
+      }
+      if (!stateAllowsIncremental(state)) {
+        throw new Error('interrupted incremental task is no longer eligible');
+      }
+      if (state.incrementalGeneration === MAX_SAFE_INTEGER) {
+        throw new Error('funding incremental generation exhausted');
+      }
+      const generation = state.incrementalGeneration + 1;
+      const update = this.updateIncrementalStart.run({
+        ...market,
+        generation,
+        previousGeneration: state.incrementalGeneration,
+        previousStatus: 'RUNNING',
+        startedAt: restartedAtText
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
+      }
+      return {
+        ...market,
+        generation,
+        frozenBoundaryMs: state.latestFundingTimestampMs
+      };
+    })();
+  }
+
+  isIncrementalLeaseEligible(untrustedLease: IncrementalLease): boolean {
+    const lease = incrementalLease(untrustedLease);
+    const state = this.stateForMarket(lease);
+    return state !== null && incrementalStateMatchesLease(state, lease);
+  }
+
+  commitIncrementalPage(
+    untrustedLease: IncrementalLease,
+    untrustedRecords: readonly SettledFundingRate[],
+    observedAt: Date
+  ): FundingPageWriteResult {
+    const lease = incrementalLease(untrustedLease);
+    const records = deduplicatePageRecords(untrustedRecords, lease);
+    const observedAtText = dateTimestamp(
+      observedAt,
+      'funding incremental page observation time'
+    );
+    return this.database.transaction((): FundingPageWriteResult => {
+      this.requireCurrentIncrementalState(lease);
+      const result = this.writeRecordsInCurrentTransaction(
+        lease,
+        records,
+        observedAtText
+      );
+      const pageOldestMs = Math.min(...records.map(
+        ({ fundingTimestampMs }) => fundingTimestampMs
+      ));
+      const pageLatestMs = Math.max(...records.map(
+        ({ fundingTimestampMs }) => fundingTimestampMs
+      ));
+      const update = this.updateIncrementalCheckpoint.run({
+        ...lease,
+        pageOldestMs,
+        pageLatestMs,
+        observedAt: observedAtText
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
+      }
+      return result;
+    })();
+  }
+
+  completeIncremental(
+    untrustedLease: IncrementalLease,
+    completedAt: Date
+  ): void {
+    const lease = incrementalLease(untrustedLease);
+    const completedAtText = dateTimestamp(
+      completedAt,
+      'funding incremental completion time'
+    );
+    this.finishIncremental(
+      lease,
+      'IDLE',
+      completedAtText,
+      null,
+      true
+    );
+  }
+
+  failIncremental(
+    untrustedLease: IncrementalLease,
+    untrustedFailure: FundingTaskFailure,
+    failedAt: Date
+  ): void {
+    const lease = incrementalLease(untrustedLease);
+    const failure = normalizedFailure(untrustedFailure);
+    const failedAtText = dateTimestamp(failedAt, 'funding incremental failure time');
+    this.finishIncremental(
+      lease,
+      'INCOMPLETE',
+      failedAtText,
+      failure,
+      false
+    );
+  }
+
+  cancelIncremental(
+    untrustedLease: IncrementalLease,
+    canceledAt: Date
+  ): void {
+    const lease = incrementalLease(untrustedLease);
+    const canceledAtText = dateTimestamp(
+      canceledAt,
+      'funding incremental cancellation time'
+    );
+    this.finishIncremental(lease, 'IDLE', canceledAtText, null, false);
+  }
+
+  private stateForMarket(
+    market: FundingMarketIdentity
+  ): FundingMarketState | null {
+    const row = this.selectState.get(
+      market.exchangeId,
+      market.exchangeMarketId
+    ) as FundingStateDbRow | undefined;
+    return row === undefined ? null : validateStateRow(row);
+  }
+
+  private requireCurrentCoverageState(
+    lease: CoverageLease
+  ): FundingMarketState {
+    const state = this.stateForMarket(lease);
+    if (
+      state === null
+      || !coverageStateMatchesLease(state, lease)
+      || !coverageStateAllowsLease(state, lease)
+    ) {
+      throw new StaleFundingTaskError();
+    }
+    return state;
+  }
+
+  private requireCurrentIncrementalState(
+    lease: IncrementalLease
+  ): FundingMarketState {
+    const state = this.stateForMarket(lease);
+    if (state === null || !incrementalStateMatchesLease(state, lease)) {
+      throw new StaleFundingTaskError();
+    }
+    return state;
+  }
+
+  private bitgetRoundsEqualInsideCurrentTransaction(
+    lease: Extract<CoverageLease, { readonly exchangeId: 'bitget' }>,
+    left: 1 | 2,
+    right: 2 | 3
+  ): boolean {
+    const row = this.selectBitgetRoundDifference.get({
+      ...lease,
+      leftRound: left,
+      rightRound: right
+    }) as { readonly different: unknown };
+    return !sqliteBoolean(row.different, 'Bitget scan round difference');
+  }
+
+  private finishIncremental(
+    lease: IncrementalLease,
+    status: 'IDLE' | 'INCOMPLETE',
+    endedAt: string,
+    failure: FundingTaskFailure | null,
+    successful: boolean
+  ): void {
+    this.database.transaction(() => {
+      const state = this.requireCurrentIncrementalState(lease);
+      const update = this.updateIncrementalTerminal.run({
+        ...lease,
+        status,
+        endedAt,
+        lastSuccessAt: successful ? endedAt : state.incrementalLastSuccessAt,
+        failureCode: failure?.code ?? null,
+        failureSummary: failure?.summary ?? null
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
+      }
+    })();
+  }
+
   private applyDiscoveryInsideTransaction(
     discoveryExchangeId: FundingExchangeId,
     observations: readonly FundingMarketObservation[],
     observedAt: string
   ): FundingDiscoveryResult {
+    const existingRows = this.selectStates.all(
+      discoveryExchangeId
+    ) as FundingStateDbRow[];
+    const existingByMarketId = new Map<string, FundingMarketState>();
+    for (const row of existingRows) {
+      const state = validateStateRow(row);
+      existingByMarketId.set(state.exchangeMarketId, state);
+    }
+    const observationByMarketId = new Map(observations.map((observation) => (
+      [observation.exchangeMarketId, observation] as const
+    )));
+    for (const state of existingByMarketId.values()) {
+      const observation = observationByMarketId.get(state.exchangeMarketId);
+      if (observation === undefined) {
+        throw new IncompleteFundingDiscoveryError();
+      }
+      if (state.symbol !== observation.symbol) {
+        throw new Error('invalid funding discovery: known market symbol changed');
+      }
+      if (state.active !== observation.active) {
+        if (state.coverageGeneration === MAX_SAFE_INTEGER) {
+          throw new Error('funding coverage generation exhausted');
+        }
+        if (
+          state.incrementalStatus === 'RUNNING'
+          && state.incrementalGeneration === MAX_SAFE_INTEGER
+        ) {
+          throw new Error('funding incremental generation exhausted');
+        }
+      }
+    }
+
     const createdActiveMarketIds: string[] = [];
+    const becameInactiveMarketIds: string[] = [];
+    const reactivatedMarketIds: string[] = [];
     for (const observation of observations) {
-      const existingRow = this.selectState.get(
-        discoveryExchangeId,
-        observation.exchangeMarketId
-      ) as FundingStateDbRow | undefined;
-      if (existingRow === undefined) {
+      const existing = existingByMarketId.get(observation.exchangeMarketId);
+      if (existing === undefined) {
         if (!observation.active) continue;
         this.insertState.run({ ...observation, observedAt });
         createdActiveMarketIds.push(observation.exchangeMarketId);
         continue;
       }
-      const existing = validateStateRow(existingRow);
-      if (
-        existing.symbol !== observation.symbol
-        || existing.active !== observation.active
-      ) {
-        throw new Error(
-          'funding discovery state transitions require the lifecycle repository'
-        );
-      }
-      if (observation.active) {
+      if (existing.active === observation.active) {
         const update = this.updateObservedActiveState.run({
           ...observation,
+          active: observation.active ? 1 : 0,
           observedAt
         });
         if (!sqliteIntegerEquals(update.changes, 1)) {
           throw new Error('funding discovery state changed during update');
         }
+        continue;
+      }
+
+      const coverageGeneration = existing.coverageGeneration + 1;
+      const remainsPending = existing.coverageStatus === 'PENDING'
+        && existing.lastCaughtUpGeneration === null;
+      const coverageFailure = remainsPending
+        ? null
+        : fundingTaskFailure('COVERAGE_CANCELED_BY_MARKET_STATE');
+      const cancelIncremental = existing.incrementalStatus === 'RUNNING';
+      const incrementalGeneration = cancelIncremental
+        ? existing.incrementalGeneration + 1
+        : existing.incrementalGeneration;
+      const reactivated = observation.active;
+      this.deleteBitgetScansForMarket.run(
+        observation.exchangeId,
+        observation.exchangeMarketId
+      );
+      const update = this.updateDiscoveryTransition.run({
+        ...observation,
+        active: observation.active ? 1 : 0,
+        observedAt,
+        previousActive: existing.active ? 1 : 0,
+        previousCoverageGeneration: existing.coverageGeneration,
+        previousIncrementalGeneration: existing.incrementalGeneration,
+        reactivationRequired: reactivated ? 1 : 0,
+        reactivationAfterGeneration: reactivated ? coverageGeneration : null,
+        coverageStatus: remainsPending ? 'PENDING' : 'INCOMPLETE',
+        coverageGeneration,
+        coverageTaskKind: remainsPending ? null : existing.coverageTaskKind,
+        coverageCutoffMs: remainsPending ? null : existing.coverageCutoffMs,
+        coverageStartedAt: remainsPending ? null : existing.coverageStartedAt,
+        coverageEndedAt: remainsPending ? null : observedAt,
+        coverageErrorCode: coverageFailure?.code ?? null,
+        coverageErrorSummary: coverageFailure?.summary ?? null,
+        incrementalStatus: cancelIncremental
+          ? 'IDLE'
+          : existing.incrementalStatus,
+        incrementalGeneration,
+        incrementalEndedAt: cancelIncremental
+          ? observedAt
+          : existing.incrementalEndedAt,
+        incrementalErrorCode: cancelIncremental
+          ? null
+          : existing.incrementalErrorCode,
+        incrementalErrorSummary: cancelIncremental
+          ? null
+          : existing.incrementalErrorSummary
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new Error('funding discovery state changed during transition');
+      }
+      if (reactivated) {
+        reactivatedMarketIds.push(observation.exchangeMarketId);
+      } else {
+        becameInactiveMarketIds.push(observation.exchangeMarketId);
       }
     }
     return {
       createdActiveMarketIds,
-      becameInactiveMarketIds: [],
-      reactivatedMarketIds: [],
+      becameInactiveMarketIds,
+      reactivatedMarketIds,
       observedActiveCount: observations.filter(({ active }) => active).length,
       observedInactiveCount: observations.filter(({ active }) => !active).length
     };
@@ -1306,13 +2339,42 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       throw new Error('unknown funding market');
     }
     const state = validateStateRow(row);
-    if (state.symbol !== market.symbol || !state.active) {
+    if (state.symbol !== market.symbol) {
       throw new Error('funding market is not eligible for coverage');
+    }
+    if (kind === 'INACTIVE_FINAL') {
+      if (state.active) {
+        throw new Error('active funding market is not eligible for inactive final coverage');
+      }
+      if (state.inactiveFinalCaughtUpAt !== null) {
+        throw new Error('inactive funding market already completed final coverage');
+      }
+    } else if (kind === 'REACTIVATION') {
+      if (!state.active || !state.reactivationRequired) {
+        throw new Error('funding market is not eligible for reactivation coverage');
+      }
+    } else if (!state.active) {
+      throw new Error('inactive funding market is not eligible for coverage');
+    } else if (state.reactivationRequired) {
+      throw new Error('funding market requires reactivation coverage');
     }
     if (state.coverageGeneration === MAX_SAFE_INTEGER) {
       throw new Error('funding coverage generation exhausted');
     }
     const generation = state.coverageGeneration + 1;
+    if (
+      kind === 'REACTIVATION'
+      && (
+        state.reactivationAfterGeneration === null
+        || generation <= state.reactivationAfterGeneration
+      )
+    ) {
+      throw new Error('funding reactivation coverage generation is not newer');
+    }
+    this.deleteBitgetScansForMarket.run(
+      market.exchangeId,
+      market.exchangeMarketId
+    );
     const update = this.updateCoverageStart.run({
       ...market,
       kind,
@@ -1383,21 +2445,18 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     checkpoint: CoveragePageCheckpoint,
     observedAt: string
   ): FundingPageWriteResult {
-    const row = this.selectState.get(
-      lease.exchangeId,
-      lease.exchangeMarketId
-    ) as FundingStateDbRow | undefined;
-    if (row === undefined) throw new StaleFundingTaskError();
-    const state = validateStateRow(row);
+    this.requireCurrentCoverageState(lease);
+    const pageLatestMs = Math.max(...records.map(
+      ({ fundingTimestampMs }) => fundingTimestampMs
+    ));
     if (
-      state.symbol !== lease.symbol
-      || !state.active
-      || state.coverageStatus !== 'BACKFILLING'
-      || state.coverageGeneration !== lease.generation
-      || state.coverageTaskKind !== lease.kind
-      || state.coverageCutoffMs !== lease.cutoffMs
+      checkpoint.exchangeId === 'okx'
+      && checkpoint.recoveryAnchorMs !== pageLatestMs
     ) {
-      throw new StaleFundingTaskError();
+      throw new Error(
+        'funding page transaction failed validation: '
+        + 'invalid OKX funding checkpoint; anchor must equal page maximum'
+      );
     }
 
     const result = this.writeRecordsInCurrentTransaction(
@@ -1418,9 +2477,6 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     }
 
     const pageOldestMs = Math.min(...records.map(
-      ({ fundingTimestampMs }) => fundingTimestampMs
-    ));
-    const pageLatestMs = Math.max(...records.map(
       ({ fundingTimestampMs }) => fundingTimestampMs
     ));
     const update = this.updateCoverageCheckpoint.run({

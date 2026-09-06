@@ -186,6 +186,14 @@ export class StaleFundingTaskError extends Error {
   }
 }
 
+export class IncompleteFundingDiscoveryError extends Error {
+  readonly name = 'IncompleteFundingDiscoveryError';
+
+  constructor() {
+    super('incomplete funding discovery: known market is missing');
+  }
+}
+
 export interface FundingRateRepository {
   applyCompleteDiscovery(
     exchangeId: FundingExchangeId,
@@ -200,10 +208,48 @@ export interface FundingRateRepository {
     cutoffMs: number,
     startedAt: Date
   ): CoverageLease;
+  resumeInterruptedCoverage(market: FundingMarketIdentity): CoverageLease;
+  isCoverageLeaseCurrent(lease: CoverageLease): boolean;
   commitCoveragePage(
     lease: CoverageLease,
     records: readonly SettledFundingRate[],
     checkpoint: CoveragePageCheckpoint,
     observedAt: Date
   ): FundingPageWriteResult;
+  bitgetRoundsEqual(
+    lease: CoverageLease,
+    left: 1 | 2,
+    right: 2 | 3
+  ): boolean;
+  completeCoverage(
+    lease: CoverageLease,
+    evidence: FundingExhaustionEvidence,
+    completedAt: Date
+  ): void;
+  failCoverage(
+    lease: CoverageLease,
+    failure: FundingTaskFailure,
+    failedAt: Date
+  ): void;
+  startIncremental(
+    market: FundingMarketIdentity,
+    startedAt: Date
+  ): IncrementalLease;
+  restartInterruptedIncremental(
+    market: FundingMarketIdentity,
+    restartedAt: Date
+  ): IncrementalLease;
+  isIncrementalLeaseEligible(lease: IncrementalLease): boolean;
+  commitIncrementalPage(
+    lease: IncrementalLease,
+    records: readonly SettledFundingRate[],
+    observedAt: Date
+  ): FundingPageWriteResult;
+  completeIncremental(lease: IncrementalLease, completedAt: Date): void;
+  failIncremental(
+    lease: IncrementalLease,
+    failure: FundingTaskFailure,
+    failedAt: Date
+  ): void;
+  cancelIncremental(lease: IncrementalLease, canceledAt: Date): void;
 }
