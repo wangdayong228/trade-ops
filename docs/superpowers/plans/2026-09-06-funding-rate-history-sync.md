@@ -451,13 +451,13 @@ created_at, updated_at
 - Create: `tests/config/funding-rate-config.test.ts`
 - Create: `tests/funding-rates/funding-rate-record.test.ts`
 
-- [ ] **Step 1: 写配置和精确记录红测试**
+- [x] **Step 1: 写配置和精确记录红测试**
 
 配置测试覆盖：缺失默认 `3600000`；接受 `60000`、`3600000`、`86400000`；拒绝空白、首尾空白、`+1`、`-1`、`060000`、`1.0`、`1e6`、非数字、低于/高于边界和非 safe integer。
 
 记录测试覆盖：正/零/负、40+ 位小数、科学计数原样保留；timestamp 的 string/安全 number；确定性 key 排序和稳定 SHA-256；同语义不同 key 顺序同 hash；所有非法 rate、时间、raw value/prototype/getter/cycle 精确拒绝。
 
-- [ ] **Step 2: 运行红测试并确认失败边界**
+- [x] **Step 2: 运行红测试并确认失败边界**
 
 Run:
 
@@ -467,11 +467,11 @@ npm run build && node --test dist/tests/config/funding-rate-config.test.js dist/
 
 Expected: exit 非 0，且只因新模块/行为尚不存在；若出现既有测试、环境或 native module 失败，先按 systematic-debugging 排除，不得把它当作 RED。
 
-- [ ] **Step 3: 实现最小纯函数**
+- [x] **Step 3: 实现最小纯函数**
 
 `fundingRateSyncIntervalMs(raw)` 使用规范十进制正则、`Number.isSafeInteger` 和闭区间；`settledFundingRate` 按“锁定的领域合同”逐项先检查再计算。规范 JSON 不调用对象自定义 `toJSON`，读取前检查 property descriptor，hash 不含观察时间。
 
-- [ ] **Step 4: 运行聚焦测试并重构**
+- [x] **Step 4: 运行聚焦测试并重构**
 
 Run 同 Step 2。Expected: exit 0，所有 case pass。随后运行：
 
@@ -481,7 +481,7 @@ npm run build
 
 Expected: exit 0，无宽化到 `any`、无非空断言绕过。
 
-- [ ] **Step 5: 提交本任务文件**
+- [x] **Step 5: 提交本任务文件**
 
 ```bash
 git add src/config/funding-rate-config.ts src/funding-rates/funding-rate-record.ts src/funding-rates/funding-rate-source.ts tests/config/funding-rate-config.test.ts tests/funding-rates/funding-rate-record.test.ts
