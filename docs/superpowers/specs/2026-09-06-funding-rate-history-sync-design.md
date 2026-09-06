@@ -12,6 +12,10 @@
 
 2026-09-06 Task 7 风险审查复现：只比较 `incremental_generation` 而不持久化任务启动时的冻结边界，会接受复制后伪造 `frozenBoundaryMs` 的 data-only lease，并可能在真实边界出现前静默结束增量任务。依据同一正确性授权，本设计将 `incremental_frozen_boundary_ms` 纳入 generation-scoped 持久 task provenance；所有资格、页面和终态入口必须比较完整 provenance。
 
+2026-09-06 Task 8 外部源码核对证明：重试边界依赖 CCXT `4.5.68` 的 ESM `NetworkError` 原型身份和该版本的继承树，而运行时导出的版本字符串存在上游不一致，不能作为绑定证据。依据同一正确性授权，`package.json` 与 `package-lock.json` 的直接依赖声明都必须精确固定为 `4.5.68`；生产和测试必须从同一 ESM 入口导入错误类型，不得接受 caret 漂移、CommonJS 交叉实例或仅同名的伪造错误。
+
+同次 Task 8 仓库调查还固定三个生命周期边界：`stop()` 一旦被调用，后续 `start()` 永久 no-op 且不得访问 repository；discovery 已排队或运行时到来的周期 tick 只由同一去重 key 合并，不累计补偿任务，完成后由下一正常 tick 再调度；两个 worker 都报告内部 fatal 时，服务在双 root 完全 quiescent 后按固定 `bitget`、`okx` 顺序选择首个错误上报。
+
 ## 2. 目标
 
 在现有单进程 trade-ops 服务中新增一条与交易执行隔离的只读资金费率同步链路：
@@ -63,7 +67,7 @@
 
 ## 4. 外部语义证据与限制
 
-仓库锁定并安装 CCXT `4.5.68`。两家交易所均有公共历史资金费率接口，但分页规则不同，且当前 CCXT 自动分页不能证明满足本设计的完整性要求。
+仓库通过 `package.json` 和 `package-lock.json` 的精确直接依赖共同锁定并安装 CCXT `4.5.68`。两家交易所均有公共历史资金费率接口，但分页规则不同，且当前 CCXT 自动分页不能证明满足本设计的完整性要求。错误分类以该版本 ESM 源码和类原型为准，不使用 CCXT 运行时导出的版本字符串。
 
 ### 4.1 Bitget Classic V2
 
@@ -312,6 +316,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 单个市场先回填、后增量；同一市场不并行执行两类任务。
 - worker 在页面边界调度。市场发现、到期增量、首次/恢复回填和周期复核使用持久轮转游标：每个非空类别都取得一次执行机会后，任何类别才能取得下一轮机会；历史任务的一次机会为一页，发现任务的一次机会为一次目标 raw 产品配置请求及完整响应校验。同一历史类别内的 market 使用 FIFO，一页完成后续页排到队尾。由此任何持续任务都不能饿死发现、增量、回填或复核，单个长市场也不能饿死同类其他市场。
 - 历史任务队列按 exchange、market ID 和任务类型去重，发现任务按 exchange 和发现类型去重。同一调度周期尚未完成时不再添加相同任务。
+- discovery 已排队或运行时到来的 timer tick 由上述 key 去重并直接合并，不记录补偿 backlog；该任务完成后只由下一次正常 timer tick 再次入队。
 - 普通增量入队资格必须同时检查：当前明确 active、至少一次成功覆盖、无 reactivation 待完成标记且无 inactive 最后复核待完成条件。该持久化谓词在启动恢复和每轮调度都使用，不能仅依赖内存队列；周期复核失败后的重试任务已排队时，普通增量仍可按页面边界与其串行交错执行。
 - 已排队增量在每次公共请求前必须重新读取并检查同一资格谓词；资格失效时不发请求，丢弃该任务并按第 7.4 节完成生命周期状态转换。覆盖任务在每次请求前也检查其 fencing generation，失配时不发请求并丢弃旧任务。
 - 已完成市场的下一次增量时间按最后一次尝试结束时间加 interval 计算；三次临时重试耗尽后也等待一个完整 interval，避免因 `last_success` 仍然过旧而形成热循环。服务重启后，已到期任务立即进入队列。
@@ -333,6 +338,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 配置、schema、repository 或同步器构造失败时拒绝启动，并按现有构造失败路径关闭已经打开的 SQLite。
 - 远端公共接口运行失败不得推进对冲状态，也不关闭现有交易 HTTP 服务；只影响对应资金费率市场的同步状态。
 - SQLite 页面事务失败时整页回滚且不推进断点。同步器停止信任本次操作结果，记录错误并等待安全重试。
+- worker 未被任务边界吸收的内部 fatal 必须触发另一 worker 停止，但服务仍等待两个完整 root quiescent。若两个 root 都报告内部 fatal，最终按固定 `bitget`、`okx` 顺序选择首个错误，不按竞态完成顺序决定。
 
 ### 8.4 关闭
 
@@ -346,6 +352,8 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 6. 移除 signal listener。
 
 多次 `shutdown()` 继续共享同一个 Promise。监听失败或启动期间收到 signal 时也必须经过同一幂等关闭路径。同步器停止后不得再访问 SQLite。`stop()` 即使需要报告内部错误，也必须先完成所有 root Promise 的 quiescence；只有已经证明同步器不会再访问仓储，关闭流程才可继续关闭 SQLite。
+
+`stop()` 在 `start()` 前调用也会把同步器永久置为 stopped；其后任何 `start()` 都是同步 no-op，不建立 timer/root、不请求 source，也不访问 repository。重复 `start()` 与重复 `stop()` 同样不得创建额外生命周期。
 
 `FundingRateSyncService.start()` 只能在 `await listen(...)` 成功返回且同一同步控制分支确认 `shutdownPromise === null` 后同步调用。如果 signal 在 listen 未完成时已经启动 shutdown，则 listen 后不得启动同步器，也不得访问已经关闭的 SQLite。该检查与 `start()` 调用之间不得出现可让 signal handler 插入的 `await`。
 

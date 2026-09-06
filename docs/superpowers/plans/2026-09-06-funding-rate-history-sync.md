@@ -892,6 +892,8 @@ Expected: exit 0。
 ### Task 8: 实现单所公平 worker、重试、周期计划和完整停止
 
 **Files:**
+- Modify: `package.json`
+- Modify: `package-lock.json`
 - Create: `src/funding-rates/funding-rate-exchange-worker.ts`
 - Create: `src/funding-rates/funding-rate-sync-service.ts`
 - Modify: `tests/support/fake-funding-rate-source.ts`
@@ -910,9 +912,11 @@ Expected: exit 0。
 - 已知 market 从 discovery 消失时整轮不应用，但已知任务继续；发现下周期重试；
 - incremental 下次时间按最近 attempt ended + interval；periodic 成功按 last coverage success + 24h，失败按 attempt ended + interval；积压不重复；
 - 只有 CCXT `NetworkError` 子类执行初次请求 + 3 次重试，虚拟等待精确为 1000/2000/4000ms；解析/身份/游标/DB 错误零立即重试；
+- `package.json` 与 root lock dependency 都精确等于 `4.5.68`；生产和 fake 从相同 ESM 入口导入类型，直接 `NetworkError` 及其全部 v4.5.68 子类重试，ExchangeError/OperationFailed 非网络分支/CommonJS 交叉实例/同名伪造对象不重试；不得用上游不一致的运行时 version 字符串做 gate；
 - 每次请求额外满足 source 的 100/250ms spacing；spacing 与 backoff 均不并发发请求；
 - retry/incomplete 日志携带精确 request metadata 和 coverage/incremental 分类；
-- stop-before-start、重复 start、重复 stop、stop-during-discovery/backoff/request/transaction/timer-race；正常取消不写 INCOMPLETE；
+- stop-before-start、stop 后 start 永久 no-op、重复 start、重复 stop、stop-during-discovery/backoff/request/transaction/timer-race；正常取消不写 INCOMPLETE；
+- discovery queued/running 时的重复 timer tick 只合并到现有 key 且不形成补偿 backlog；两个 worker 同时内部 fatal 时完整 join 后按 `bitget -> okx` 固定顺序上报；
 - stop 先取消 timer/sleeper、停止派发，再等待两个完整 root promise；返回后 repository 调用数固定不变。
 
 - [ ] **Step 2: 确认 RED**
@@ -925,17 +929,17 @@ Expected: exit 非 0，新 worker/service 不存在。
 
 - [ ] **Step 3: 实现公平队列和 service**
 
-worker 为四个 FIFO queue 维护 `Set<taskKey>` 和上次成功取出的 category index。每轮从 index 后最多检查四类，只执行一个 discovery 或一个历史页面；返回 `requeue` 时排到本类尾部，`done` 才删除 key。单一 async loop 是该 exchange 所有 CCXT 调用的唯一入口。
+先把 `package.json` 与 `package-lock.json` 的直接依赖声明从 caret 改为精确 `4.5.68`，不执行联网安装；当前 lock 中 resolved tarball 与 integrity 保持不变。worker 为四个 FIFO queue 维护 `Set<taskKey>` 和上次成功取出的 category index。每轮从 index 后最多检查四类，只执行一个 discovery 或一个历史页面；返回 `requeue` 时排到本类尾部，`done` 才删除 key。discovery 的重复 timer tick 由同一 key 丢弃，不累计 missed-tick backlog。单一 async loop 是该 exchange 所有 CCXT 调用的唯一入口。
 
 每个 worker 自己实现并独占一个 `FundingRequestExecutor`。discovery task 和由 `FundingRateMarketSync` 创建的所有 page task 必须注入同一个实例；测试用 source 方法调用计数证明无旁路。请求 policy 在每次 attempt 前同时满足 spacing 和取消状态；只捕获 `error instanceof NetworkError` 重试。停止前尚未发出的 attempt 或正在 backoff 的等待抛从 `funding-rate-source.ts` 导入的 `FundingRequestCanceledError`，market task 必须原样传播，worker 不写 INCOMPLETE。第四次临时网络 attempt 失败后抛同文件导出的 `FundingRequestRetryExhaustedError`，由 market task 写对应任务类型的固定 `REQUEST_RETRY_EXHAUSTED`。每次实际重试调用必填 observer，由调用 task 补齐上下文并经安全事件 sink 记录。已经进入不可取消底层请求时，root promise 等待其结束：成功响应仍允许完成该一页验证与原子提交，失败响应在 stop 已请求时改抛取消错误且不改写任务状态；两种情况都不再 requeue。由此持久状态保持可恢复，而 shutdown 本身不伪装成远端数据失败。
 
-`FundingRateSyncService.start()` 同步建立 timer/root loop 后立即调度恢复与 discovery，不返回网络 promise。`stop()` 幂等共享 Promise，按设计先取消、再 join；内部错误只能在 quiescence 后报告。远端单市场失败不得 reject 整个服务 root 或触碰交易组件。
+`FundingRateSyncService.start()` 同步建立 timer/root loop 后立即调度恢复与 discovery，不返回网络 promise；已经 stopped 时永久 no-op。`stop()` 幂等共享 Promise，按设计先取消、再 join；内部错误只能在 quiescence 后报告。两个 worker 都失败时按构造顺序 `bitget`、`okx` 选择首个 rejection。远端单市场失败不得 reject 整个服务 root 或触碰交易组件。
 
 - [ ] **Step 4: GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-sync-service.test.js
-git add src/funding-rates/funding-rate-exchange-worker.ts src/funding-rates/funding-rate-sync-service.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-sync-service.test.ts
+git add package.json package-lock.json src/funding-rates/funding-rate-exchange-worker.ts src/funding-rates/funding-rate-sync-service.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-sync-service.test.ts
 git diff --cached --check
 git commit -m "feat: schedule funding rate synchronization"
 ```
