@@ -645,7 +645,7 @@ Expected: tests/build exit 0；提交只含列出的四个文件。
 - Create: `src/storage/sqlite-funding-rate-repository.ts`
 - Create: `tests/storage/sqlite-funding-rate-repository.test.ts`
 
-- [ ] **Step 1: 写 schema、幂等、修订和回滚红测试**
+- [x] **Step 1: 写 schema、幂等、修订和回滚红测试**
 
 使用 `new Database(':memory:')`，验证：
 
@@ -660,7 +660,7 @@ Expected: tests/build exit 0；提交只含列出的四个文件。
 - 自由文本、凭证片段、NUL/control、超过 512 UTF-8 bytes 的多字节 summary 均不能写入；固定 normalizer 的 summary 可以写入且不含原始异常内容。
 - `fundingTaskFailure` 对每个批准 code 只产生锁定的静态 summary；其函数签名不接受原始错误、response、headers、cause、env 或任意自由文本。
 
-- [ ] **Step 2: 确认 RED**
+- [x] **Step 2: 确认 RED**
 
 ```bash
 npm run build && node --test dist/tests/storage/sqlite-funding-rate-repository.test.js
@@ -668,7 +668,7 @@ npm run build && node --test dist/tests/storage/sqlite-funding-rate-repository.t
 
 Expected: exit 非 0，只因 funding repository 尚不存在。
 
-- [ ] **Step 3: 实现 schema 和历史事务内核**
+- [x] **Step 3: 实现 schema 和历史事务内核**
 
 构造器顺序固定为：检查不在外部 transaction -> `foreign_keys=ON` 并验证 -> 执行幂等 funding schema -> 创建 TEMP scan table -> prepare statements。不得切换现有连接 journal mode。
 
@@ -676,7 +676,7 @@ Expected: exit 非 0，只因 funding repository 尚不存在。
 
 本 Task 同时实现驱动历史写入所需的最小生产路径 `applyCompleteDiscovery -> startCoverage -> commitCoveragePage`；测试只能经这条带 generation fencing 的路径写记录。`writeRecordsInCurrentTransaction` 保持 private，任何阶段都不得暴露无状态、无 fencing 的测试专用写入口。Task 5 再补齐完整状态转换矩阵。
 
-- [ ] **Step 4: GREEN、检查 schema 并提交**
+- [x] **Step 4: GREEN、检查 schema 并提交**
 
 ```bash
 npm run build && node --test dist/tests/storage/sqlite-funding-rate-repository.test.js
