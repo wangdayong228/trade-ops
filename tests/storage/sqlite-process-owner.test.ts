@@ -229,6 +229,35 @@ for (const sqliteCode of [
   });
 }
 
+for (const sqliteCode of [
+  'SQLITE_BUSYISH',
+  'SQLITE_LOCKEDISH'
+] as const) {
+  test(`classifies lookalike ${sqliteCode} as unavailable without retaining details`, () => {
+    const unavailableDatabase = {
+      pragma: () => 'exclusive',
+      exec: () => {
+        throw Object.assign(new Error('secret sqlite detail', {
+          cause: new Error('secret nested cause')
+        }), { code: sqliteCode });
+      }
+    } as unknown as Database.Database;
+    assert.throws(
+      () => claimSqliteProcessOwnership(
+        unavailableDatabase,
+        '/safe/service.sqlite'
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof SqliteOwnershipError);
+        assert.equal(error.code, 'DATABASE_OWNERSHIP_UNAVAILABLE');
+        assert.doesNotMatch(error.message, /secret sqlite detail/);
+        assert.equal(Object.hasOwn(error, 'cause'), false);
+        return true;
+      }
+    );
+  });
+}
+
 test('classifies non-contention ownership failures as unavailable', () => {
   const unsupported = {
     pragma: () => 'normal',
