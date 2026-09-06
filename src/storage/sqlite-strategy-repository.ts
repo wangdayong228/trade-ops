@@ -1270,14 +1270,72 @@ function canonicalSql(value: unknown): string {
   if (typeof value !== 'string') {
     throw schemaError();
   }
-  return value
-    .toLowerCase()
-    .replace(/["`\[\]]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(/\s*([(),;])\s*/g, '$1')
-    .replace(/\s*(<>|=)\s*/g, '$1')
-    .replace(/;+$/g, '')
-    .trim();
+  let result = '';
+  let pendingSpace = false;
+  let previousWasCompact = false;
+  let quotedTerminator: "'" | '"' | '`' | ']' | null = null;
+
+  const appendText = (text: string): void => {
+    if (pendingSpace && result.length !== 0 && !previousWasCompact) {
+      result += ' ';
+    }
+    result += text;
+    pendingSpace = false;
+    previousWasCompact = false;
+  };
+  const appendCompact = (text: string): void => {
+    result = result.trimEnd();
+    result += text;
+    pendingSpace = false;
+    previousWasCompact = true;
+  };
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index] as string;
+    if (quotedTerminator !== null) {
+      result += character;
+      if (character === quotedTerminator) {
+        if (
+          quotedTerminator !== ']'
+          && value[index + 1] === quotedTerminator
+        ) {
+          result += quotedTerminator;
+          index += 1;
+        } else {
+          quotedTerminator = null;
+        }
+      }
+      continue;
+    }
+    if (/\s/.test(character)) {
+      pendingSpace = true;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === '`') {
+      appendText(character);
+      quotedTerminator = character;
+      continue;
+    }
+    if (character === '[') {
+      appendText(character);
+      quotedTerminator = ']';
+      continue;
+    }
+    if (character === '<' && value[index + 1] === '>') {
+      appendCompact('<>');
+      index += 1;
+      continue;
+    }
+    if (character === '=' || /[(),;]/.test(character)) {
+      appendCompact(character);
+      continue;
+    }
+    appendText(character.toLowerCase());
+  }
+  if (quotedTerminator !== null) {
+    throw schemaError();
+  }
+  return result.replace(/;+$/g, '');
 }
 
 function assertColumns(
@@ -1412,7 +1470,7 @@ function assertV2BusinessSchema(database: Database.Database): void {
   );
 
   if (
-    !strategiesSql.includes("'hedge_residual_not_tradable'")
+    !strategiesSql.includes("'HEDGE_RESIDUAL_NOT_TRADABLE'")
     || !strategiesSql.includes(canonicalSql(`
       CHECK (
         (state IN ('HEDGE_INCOMPLETE', 'FAILED')
@@ -1422,11 +1480,11 @@ function assertV2BusinessSchema(database: Database.Database): void {
           AND failure_code IS NULL)
       )
     `))
-    || !ordersSql.includes("'submission_uncertain'")
-    || !ordersSql.includes("'definitely_not_submitted'")
-    || !ordersSql.includes("'remote_observed'")
-    || !ordersSql.includes("'order_submission_failed'")
-    || !ordersSql.includes("'hedge_residual_not_tradable'")
+    || !ordersSql.includes("'SUBMISSION_UNCERTAIN'")
+    || !ordersSql.includes("'DEFINITELY_NOT_SUBMITTED'")
+    || !ordersSql.includes("'REMOTE_OBSERVED'")
+    || !ordersSql.includes("'ORDER_SUBMISSION_FAILED'")
+    || !ordersSql.includes("'HEDGE_RESIDUAL_NOT_TRADABLE'")
     || recoverableIndexSql !== canonicalSql(`
       CREATE INDEX strategies_recoverable_idx
       ON strategies(state, created_at)

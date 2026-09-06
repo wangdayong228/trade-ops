@@ -356,27 +356,29 @@ function legacyFingerprint(database: Database.Database): string {
   });
 }
 
-function tableDefinition(
+function schemaObjectDefinition(
   database: Database.Database,
-  table: string
+  type: 'table' | 'trigger',
+  name: string
 ): string {
   const sql = database.prepare(`
     SELECT sql
     FROM sqlite_master
-    WHERE type = 'table' AND name = ?
-  `).pluck().get(table);
+    WHERE type = ? AND name = ?
+  `).pluck().get(type, name);
   if (typeof sql !== 'string') {
-    assert.fail(`missing SQLite table definition: ${table}`);
+    assert.fail(`missing SQLite ${type} definition: ${name}`);
   }
   return sql;
 }
 
-function rewriteTableDefinition(
+function rewriteSchemaObjectDefinition(
   database: Database.Database,
-  table: string,
+  type: 'table' | 'trigger',
+  name: string,
   rewrite: (sql: string) => string
 ): void {
-  const original = tableDefinition(database, table);
+  const original = schemaObjectDefinition(database, type, name);
   const rewritten = rewrite(original);
   assert.notEqual(rewritten, original);
   database.unsafeMode(true);
@@ -385,8 +387,8 @@ function rewriteTableDefinition(
     const result = database.prepare(`
       UPDATE sqlite_master
       SET sql = ?
-      WHERE type = 'table' AND name = ?
-    `).run(rewritten, table);
+      WHERE type = ? AND name = ?
+    `).run(rewritten, type, name);
     assert.equal(result.changes, 1);
   } finally {
     try {
@@ -395,6 +397,21 @@ function rewriteTableDefinition(
       database.unsafeMode(false);
     }
   }
+}
+
+function tableDefinition(
+  database: Database.Database,
+  table: string
+): string {
+  return schemaObjectDefinition(database, 'table', table);
+}
+
+function rewriteTableDefinition(
+  database: Database.Database,
+  table: string,
+  rewrite: (sql: string) => string
+): void {
+  rewriteSchemaObjectDefinition(database, 'table', table, rewrite);
 }
 
 function makeMalformedLegacyStrategies(database: Database.Database): void {
@@ -515,6 +532,68 @@ test('rejects v2 submission evidence checks with the wrong inequality operator',
   assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
 });
 
+test('rejects v2 evidence CHECK with a case-changed quoted literal', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-check-case-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const repository = new SqliteStrategyRepository(database);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const order = repository.planOrder(
+    strategyId,
+    'CONTRACT_MARKET',
+    requestFor(strategyId, 'CONTRACT_MARKET')
+  );
+  const correctLiteral =
+    "submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+  const caseChangedLiteral =
+    "submission_disposition <> 'definitely_not_submitted'";
+
+  rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+    assert.equal(sql.split(correctLiteral).length - 1, 1);
+    return sql.replace(correctLiteral, caseChangedLiteral);
+  });
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = tableDefinition(database, 'strategy_orders');
+  assert.equal(reloadedSql.includes(correctLiteral), false);
+  assert.equal(reloadedSql.includes(caseChangedLiteral), true);
+  database.exec('SAVEPOINT invalid_literal_case_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+      WHERE id = ?
+    `).run(order.id).changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO invalid_literal_case_probe');
+    database.exec('RELEASE invalid_literal_case_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = ?
+  `).get(order.id), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+});
+
 test('migrates v1 failure constraints and order submission evidence atomically', (t) => {
   const database = legacyDatabase(t);
   seedLegacyExecutingStrategy(database, 'legacy-strategy');
@@ -538,6 +617,82 @@ test('migrates v1 failure constraints and order submission evidence atomically',
     ),
     true
   );
+});
+
+test('rejects migrated v1 evidence trigger with a case-changed quoted literal', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-trigger-case-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  database.exec(LEGACY_SCHEMA);
+  seedLegacyExecutingStrategy(database, 'legacy-case-strategy');
+  seedLegacyPlannedOrder(
+    database,
+    'legacy-case-strategy',
+    'legacy-case-order'
+  );
+  new SqliteStrategyRepository(database);
+  const triggerName = 'strategy_orders_submission_evidence_update';
+  const correctLiteral =
+    "NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+  const caseChangedLiteral =
+    "NEW.submission_disposition <> 'definitely_not_submitted'";
+
+  rewriteSchemaObjectDefinition(
+    database,
+    'trigger',
+    triggerName,
+    (sql) => {
+      assert.equal(sql.split(correctLiteral).length - 1, 1);
+      return sql.replace(correctLiteral, caseChangedLiteral);
+    }
+  );
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = schemaObjectDefinition(
+    database,
+    'trigger',
+    triggerName
+  );
+  assert.equal(reloadedSql.includes(correctLiteral), false);
+  assert.equal(reloadedSql.includes(caseChangedLiteral), true);
+  database.exec('SAVEPOINT invalid_trigger_literal_case_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+      WHERE id = 'legacy-case-order'
+    `).run().changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO invalid_trigger_literal_case_probe');
+    database.exec('RELEASE invalid_trigger_literal_case_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT singleton, version FROM strategy_schema_metadata
+  `).all(), [{ singleton: 1, version: 2 }]);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = 'legacy-case-order'
+  `).get(), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
 for (const missingForeignKey of [
