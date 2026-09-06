@@ -267,6 +267,17 @@ interface TableInfoRow {
   name: unknown;
 }
 
+interface ForeignKeyRow {
+  id: unknown;
+  seq: unknown;
+  table: unknown;
+  from: unknown;
+  to: unknown;
+  on_update: unknown;
+  on_delete: unknown;
+  match: unknown;
+}
+
 interface OrderEventDbRow {
   id: unknown;
   snapshot_json: unknown;
@@ -1054,6 +1065,64 @@ function safely<T>(context: string, operation: () => T): T {
   }
 }
 
+const SUBMISSION_EVIDENCE_CONDITION = `
+  (
+    (
+      (
+        NEW.submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+        AND NEW.submission_failure_code IS NOT NULL
+      )
+      OR
+      (
+        NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
+        AND NEW.submission_failure_code IS NULL
+      )
+    )
+    AND
+    (
+      (
+        NEW.status = 'planned'
+        AND NEW.snapshot_json IS NULL
+        AND NEW.exchange_order_id IS NULL
+        AND NEW.submission_disposition IN (
+          'SUBMISSION_UNCERTAIN', 'DEFINITELY_NOT_SUBMITTED'
+        )
+      )
+      OR
+      (
+        NEW.status <> 'planned'
+        AND NEW.snapshot_json IS NOT NULL
+        AND NEW.exchange_order_id IS NOT NULL
+        AND NEW.submission_disposition = 'REMOTE_OBSERVED'
+      )
+    )
+  )
+`;
+
+const SUBMISSION_EVIDENCE_INSERT_TRIGGER = `
+  CREATE TRIGGER strategy_orders_submission_evidence_insert
+  BEFORE INSERT ON strategy_orders
+  WHEN NOT ${SUBMISSION_EVIDENCE_CONDITION}
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid submission evidence');
+  END;
+`;
+
+const SUBMISSION_EVIDENCE_UPDATE_TRIGGER = `
+  CREATE TRIGGER strategy_orders_submission_evidence_update
+  BEFORE UPDATE OF
+    status,
+    snapshot_json,
+    exchange_order_id,
+    submission_disposition,
+    submission_failure_code
+  ON strategy_orders
+  WHEN NOT ${SUBMISSION_EVIDENCE_CONDITION}
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid submission evidence');
+  END;
+`;
+
 const SQLITE_V1_MIGRATION = `
   CREATE TABLE strategies_v2 (
     id TEXT PRIMARY KEY,
@@ -1127,85 +1196,8 @@ const SQLITE_V1_MIGRATION = `
     END,
     submission_failure_code = NULL;
 
-  CREATE TRIGGER strategy_orders_submission_evidence_insert
-  BEFORE INSERT ON strategy_orders
-  WHEN NOT (
-    (
-      (
-        NEW.submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
-        AND NEW.submission_failure_code IS NOT NULL
-      )
-      OR
-      (
-        NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
-        AND NEW.submission_failure_code IS NULL
-      )
-    )
-    AND
-    (
-      (
-        NEW.status = 'planned'
-        AND NEW.snapshot_json IS NULL
-        AND NEW.exchange_order_id IS NULL
-        AND NEW.submission_disposition IN (
-          'SUBMISSION_UNCERTAIN', 'DEFINITELY_NOT_SUBMITTED'
-        )
-      )
-      OR
-      (
-        NEW.status <> 'planned'
-        AND NEW.snapshot_json IS NOT NULL
-        AND NEW.exchange_order_id IS NOT NULL
-        AND NEW.submission_disposition = 'REMOTE_OBSERVED'
-      )
-    )
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'invalid submission evidence');
-  END;
-
-  CREATE TRIGGER strategy_orders_submission_evidence_update
-  BEFORE UPDATE OF
-    status,
-    snapshot_json,
-    exchange_order_id,
-    submission_disposition,
-    submission_failure_code
-  ON strategy_orders
-  WHEN NOT (
-    (
-      (
-        NEW.submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
-        AND NEW.submission_failure_code IS NOT NULL
-      )
-      OR
-      (
-        NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
-        AND NEW.submission_failure_code IS NULL
-      )
-    )
-    AND
-    (
-      (
-        NEW.status = 'planned'
-        AND NEW.snapshot_json IS NULL
-        AND NEW.exchange_order_id IS NULL
-        AND NEW.submission_disposition IN (
-          'SUBMISSION_UNCERTAIN', 'DEFINITELY_NOT_SUBMITTED'
-        )
-      )
-      OR
-      (
-        NEW.status <> 'planned'
-        AND NEW.snapshot_json IS NOT NULL
-        AND NEW.exchange_order_id IS NOT NULL
-        AND NEW.submission_disposition = 'REMOTE_OBSERVED'
-      )
-    )
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'invalid submission evidence');
-  END;
+  ${SUBMISSION_EVIDENCE_INSERT_TRIGGER}
+  ${SUBMISSION_EVIDENCE_UPDATE_TRIGGER}
 
   CREATE INDEX strategies_recoverable_idx
     ON strategies(state, created_at);
@@ -1281,7 +1273,10 @@ function canonicalSql(value: unknown): string {
   return value
     .toLowerCase()
     .replace(/["`\[\]]/g, '')
-    .replace(/[^a-z0-9_']+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([(),;])\s*/g, '$1')
+    .replace(/\s*(<>|=)\s*/g, '$1')
+    .replace(/;+$/g, '')
     .trim();
 }
 
@@ -1299,6 +1294,33 @@ function assertColumns(
     actual.some((name) => typeof name !== 'string')
     || actual.length !== expected.length
     || expected.some((name) => !actualNames.has(name))
+  ) {
+    throw schemaError();
+  }
+}
+
+function assertParentForeignKey(
+  database: Database.Database,
+  childTable: string,
+  childColumn: string,
+  parentTable: string,
+  parentColumn: string
+): void {
+  const rows = database.prepare(
+    `PRAGMA foreign_key_list(${childTable})`
+  ).all() as ForeignKeyRow[];
+  const row = rows[0];
+  if (
+    rows.length !== 1
+    || row === undefined
+    || !sqliteIntegerEquals(row.id, 0)
+    || !sqliteIntegerEquals(row.seq, 0)
+    || row.table !== parentTable
+    || row.from !== childColumn
+    || row.to !== parentColumn
+    || row.on_update !== 'NO ACTION'
+    || row.on_delete !== 'NO ACTION'
+    || row.match !== 'NONE'
   ) {
     throw schemaError();
   }
@@ -1374,59 +1396,110 @@ function assertV2BusinessSchema(database: Database.Database): void {
   assertColumns(database, 'order_events', [
     'id', 'strategy_order_id', 'snapshot_json', 'recorded_at'
   ]);
+  assertParentForeignKey(
+    database,
+    'strategy_orders',
+    'strategy_id',
+    'strategies',
+    'id'
+  );
+  assertParentForeignKey(
+    database,
+    'order_events',
+    'strategy_order_id',
+    'strategy_orders',
+    'id'
+  );
 
   if (
     !strategiesSql.includes("'hedge_residual_not_tradable'")
-    || !strategiesSql.includes(
-      "state in 'hedge_incomplete' 'failed' and failure_code is not null"
-    )
-    || !strategiesSql.includes(
-      "state not in 'hedge_incomplete' 'failed' and failure_code is null"
-    )
+    || !strategiesSql.includes(canonicalSql(`
+      CHECK (
+        (state IN ('HEDGE_INCOMPLETE', 'FAILED')
+          AND failure_code IS NOT NULL)
+        OR
+        (state NOT IN ('HEDGE_INCOMPLETE', 'FAILED')
+          AND failure_code IS NULL)
+      )
+    `))
     || !ordersSql.includes("'submission_uncertain'")
     || !ordersSql.includes("'definitely_not_submitted'")
     || !ordersSql.includes("'remote_observed'")
     || !ordersSql.includes("'order_submission_failed'")
     || !ordersSql.includes("'hedge_residual_not_tradable'")
-    || recoverableIndexSql !== (
-      'create index strategies_recoverable_idx on strategies state created_at'
-    )
-    || strategyOrdersIndexSql !== (
-      'create index strategy_orders_strategy_idx '
-      + 'on strategy_orders strategy_id created_at'
-    )
-    || orderEventsIndexSql !== (
-      'create index order_events_order_idx on order_events strategy_order_id id'
-    )
-    || !noUpdateSql.includes(
-      "before update on order_events begin select raise abort 'order events are immutable'"
-    )
-    || !noDeleteSql.includes(
-      "before delete on order_events begin select raise abort 'order events are immutable'"
-    )
+    || recoverableIndexSql !== canonicalSql(`
+      CREATE INDEX strategies_recoverable_idx
+      ON strategies(state, created_at)
+    `)
+    || strategyOrdersIndexSql !== canonicalSql(`
+      CREATE INDEX strategy_orders_strategy_idx
+      ON strategy_orders(strategy_id, created_at)
+    `)
+    || orderEventsIndexSql !== canonicalSql(`
+      CREATE INDEX order_events_order_idx
+      ON order_events(strategy_order_id, id)
+    `)
+    || noUpdateSql !== canonicalSql(`
+      CREATE TRIGGER order_events_no_update
+      BEFORE UPDATE ON order_events
+      BEGIN
+        SELECT RAISE(ABORT, 'order events are immutable');
+      END
+    `)
+    || noDeleteSql !== canonicalSql(`
+      CREATE TRIGGER order_events_no_delete
+      BEFORE DELETE ON order_events
+      BEGIN
+        SELECT RAISE(ABORT, 'order events are immutable');
+      END
+    `)
   ) {
     throw schemaError();
   }
 
-  const hasSnapshotPairing = ordersSql.includes(
-    "status 'planned' and snapshot_json is null "
-    + 'and exchange_order_id is null'
-  ) && ordersSql.includes(
-    "status 'planned' and snapshot_json is not null "
-    + 'and exchange_order_id is not null'
-  );
-  const hasTableEvidenceChecks = ordersSql.includes(
-    "submission_disposition 'definitely_not_submitted' "
-    + 'and submission_failure_code is not null'
-  ) && ordersSql.includes(
-    "submission_disposition 'definitely_not_submitted' "
-    + 'and submission_failure_code is null'
-  ) && ordersSql.includes(
-    "status 'planned' and submission_disposition in "
-    + "'submission_uncertain' 'definitely_not_submitted'"
-  ) && ordersSql.includes(
-    "status 'planned' and submission_disposition 'remote_observed'"
-  );
+  const hasSnapshotPairing = ordersSql.includes(canonicalSql(`
+    CHECK (
+      (
+        status = 'planned'
+        AND snapshot_json IS NULL
+        AND exchange_order_id IS NULL
+      )
+      OR
+      (
+        status <> 'planned'
+        AND snapshot_json IS NOT NULL
+        AND exchange_order_id IS NOT NULL
+      )
+    )
+  `));
+  const hasTableEvidenceChecks = ordersSql.includes(canonicalSql(`
+    CHECK (
+      (
+        submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+        AND submission_failure_code IS NOT NULL
+      )
+      OR
+      (
+        submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
+        AND submission_failure_code IS NULL
+      )
+    )
+  `)) && ordersSql.includes(canonicalSql(`
+    CHECK (
+      (
+        status = 'planned'
+        AND submission_disposition IN (
+          'SUBMISSION_UNCERTAIN',
+          'DEFINITELY_NOT_SUBMITTED'
+        )
+      )
+      OR
+      (
+        status <> 'planned'
+        AND submission_disposition = 'REMOTE_OBSERVED'
+      )
+    )
+  `));
   const evidenceInsert = rows.find(({ type, name, tbl_name: table }) => (
     type === 'trigger'
     && name === 'strategy_orders_submission_evidence_insert'
@@ -1437,35 +1510,12 @@ function assertV2BusinessSchema(database: Database.Database): void {
     && name === 'strategy_orders_submission_evidence_update'
     && table === 'strategy_orders'
   ));
-  const hasEvidenceTriggerBody = (value: unknown): boolean => {
-    const sql = canonicalSql(value);
-    return sql.includes(
-      "new submission_disposition 'definitely_not_submitted' "
-      + 'and new submission_failure_code is not null'
-    ) && sql.includes(
-      "new submission_disposition 'definitely_not_submitted' "
-      + 'and new submission_failure_code is null'
-    ) && sql.includes(
-      "new status 'planned' and new snapshot_json is null "
-      + 'and new exchange_order_id is null and new submission_disposition in '
-      + "'submission_uncertain' 'definitely_not_submitted'"
-    ) && sql.includes(
-      "new status 'planned' and new snapshot_json is not null "
-      + 'and new exchange_order_id is not null '
-      + "and new submission_disposition 'remote_observed'"
-    ) && sql.includes("select raise abort 'invalid submission evidence'");
-  };
   const hasMigrationEvidenceTriggers = evidenceInsert !== undefined
     && evidenceUpdate !== undefined
-    && canonicalSql(evidenceInsert.sql).includes(
-      "before insert on strategy_orders when not"
-    )
-    && hasEvidenceTriggerBody(evidenceInsert.sql)
-    && canonicalSql(evidenceUpdate.sql).includes(
-      'before update of status snapshot_json exchange_order_id '
-      + 'submission_disposition submission_failure_code on strategy_orders'
-    )
-    && hasEvidenceTriggerBody(evidenceUpdate.sql);
+    && canonicalSql(evidenceInsert.sql)
+      === canonicalSql(SUBMISSION_EVIDENCE_INSERT_TRIGGER)
+    && canonicalSql(evidenceUpdate.sql)
+      === canonicalSql(SUBMISSION_EVIDENCE_UPDATE_TRIGGER);
   if (
     !hasSnapshotPairing
     || (!hasTableEvidenceChecks && !hasMigrationEvidenceTriggers)
@@ -1491,8 +1541,12 @@ function assertCompleteV2Schema(database: Database.Database): void {
     'version'
   ]);
   if (
-    !metadataSql.includes('singleton integer primary key check singleton 1')
-    || !metadataSql.includes('version integer not null check version 2')
+    !metadataSql.includes(
+      'singleton integer primary key check(singleton=1)'
+    )
+    || !metadataSql.includes(
+      'version integer not null check(version=2)'
+    )
     || !validV2Metadata(schemaMetadata(database))
   ) {
     throw schemaError();
