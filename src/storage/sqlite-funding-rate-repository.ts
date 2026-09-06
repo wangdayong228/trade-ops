@@ -9,7 +9,7 @@ import {
 import {
   SQLITE_FUNDING_RATE_SCHEMA,
   SQLITE_FUNDING_RATE_SCHEMA_OBJECTS,
-  type SqliteFundingRateSchemaObject
+  type SqliteFundingRateSchemaScope
 } from './funding-rate-schema.js';
 import {
   StaleFundingTaskError,
@@ -511,26 +511,52 @@ function assertTableContract(
   }
 }
 
-function assertSchemaObject(
+function assertFundingSchemaCatalog(
   database: Database.Database,
-  object: SqliteFundingRateSchemaObject
+  scope: SqliteFundingRateSchemaScope
 ): void {
-  const catalog = object.scope === 'main'
+  const catalog = scope === 'main'
     ? 'sqlite_master'
     : 'sqlite_temp_master';
-  const row = database.prepare(`
+  const expected = SQLITE_FUNDING_RATE_SCHEMA_OBJECTS
+    .filter((object) => object.scope === scope)
+    .slice()
+    .sort((left, right) => (
+      left.type === right.type
+        ? left.name.localeCompare(right.name)
+        : left.type.localeCompare(right.type)
+    ));
+  const expectedNames = expected.map(({ name }) => name);
+  const managedTableNames = SQLITE_FUNDING_RATE_SCHEMA_OBJECTS
+    .filter(({ type }) => type === 'table')
+    .map(({ name }) => name);
+  const placeholders = (values: readonly string[]): string => (
+    values.map(() => '?').join(', ')
+  );
+  const rows = database.prepare(`
     SELECT type, name, tbl_name, sql
     FROM ${catalog}
-    WHERE name = ?
-  `).get(object.name) as SqliteMasterDbRow | undefined;
-  if (
-    row === undefined
-    || row.type !== object.type
-    || row.name !== object.name
-    || row.tbl_name !== object.tableName
-    || row.sql !== object.storedSql
-  ) {
-    throw schemaError();
+    WHERE sql IS NOT NULL
+      AND (
+        name IN (${placeholders(expectedNames)})
+        OR tbl_name IN (${placeholders(managedTableNames)})
+      )
+    ORDER BY type, name
+  `).all(...expectedNames, ...managedTableNames) as unknown as SqliteMasterDbRow[];
+  if (rows.length !== expected.length) throw schemaError();
+  for (let index = 0; index < expected.length; index += 1) {
+    const row = rows[index];
+    const object = expected[index];
+    if (
+      row === undefined
+      || object === undefined
+      || row.type !== object.type
+      || row.name !== object.name
+      || row.tbl_name !== object.tableName
+      || row.sql !== object.storedSql
+    ) {
+      throw schemaError();
+    }
   }
 }
 
@@ -596,9 +622,7 @@ function assertFundingSchema(database: Database.Database): void {
     ['created_at', 'TEXT', 0],
     ['updated_at', 'TEXT', 0]
   ]);
-  for (const object of SQLITE_FUNDING_RATE_SCHEMA_OBJECTS) {
-    if (object.scope === 'main') assertSchemaObject(database, object);
-  }
+  assertFundingSchemaCatalog(database, 'main');
 }
 
 function prepareFundingSchema(database: Database.Database): void {
@@ -635,19 +659,21 @@ function createBitgetScanTable(database: Database.Database): void {
       && object.name === 'funding_rate_bitget_scan'
     ));
     if (scanSchema === undefined) throw schemaError();
-    database.exec(scanSchema.installSql);
-    assertSchemaObject(database, scanSchema);
-    assertTableContract(database, 'temp.funding_rate_bitget_scan', [
-      ['exchange_id', 'TEXT', 1],
-      ['exchange_market_id', 'TEXT', 2],
-      ['coverage_generation', 'INTEGER', 3],
-      ['scan_round', 'INTEGER', 4],
-      ['funding_timestamp_ms', 'INTEGER', 5],
-      ['symbol', 'TEXT', 0],
-      ['funding_rate', 'TEXT', 0],
-      ['raw_json', 'TEXT', 0],
-      ['content_hash', 'TEXT', 0]
-    ]);
+    database.transaction(() => {
+      database.exec(scanSchema.installSql);
+      assertFundingSchemaCatalog(database, 'temp');
+      assertTableContract(database, 'temp.funding_rate_bitget_scan', [
+        ['exchange_id', 'TEXT', 1],
+        ['exchange_market_id', 'TEXT', 2],
+        ['coverage_generation', 'INTEGER', 3],
+        ['scan_round', 'INTEGER', 4],
+        ['funding_timestamp_ms', 'INTEGER', 5],
+        ['symbol', 'TEXT', 0],
+        ['funding_rate', 'TEXT', 0],
+        ['raw_json', 'TEXT', 0],
+        ['content_hash', 'TEXT', 0]
+      ]);
+    })();
   } catch {
     throw schemaError();
   }

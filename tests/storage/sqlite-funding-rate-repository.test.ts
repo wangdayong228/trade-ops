@@ -176,6 +176,19 @@ function fundingSchemaObjects(database: Database.Database): unknown[] {
   `).all();
 }
 
+function schemaCatalog(
+  database: Database.Database,
+  scope: 'main' | 'temp'
+): unknown[] {
+  const catalog = scope === 'main' ? 'sqlite_master' : 'sqlite_temp_master';
+  return database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM ${catalog}
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name
+  `).all();
+}
+
 function strategyFingerprint(database: Database.Database): string {
   return JSON.stringify({
     schema: database.prepare(`
@@ -456,6 +469,88 @@ test('rejects immutable trigger names whose bodies do not abort mutations', (t) 
     WHERE name LIKE 'funding_rate_%'
     ORDER BY type, name
   `).all(), []);
+});
+
+test('rejects an unexpected destructive trigger on a main funding table', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec(SQLITE_FUNDING_RATE_SCHEMA);
+  database.exec(`
+    CREATE TRIGGER purge_inserted_history
+    AFTER INSERT ON funding_rate_history
+    BEGIN
+      DELETE FROM funding_rate_history
+      WHERE exchange_id = NEW.exchange_id
+        AND exchange_market_id = NEW.exchange_market_id
+        AND funding_timestamp_ms = NEW.funding_timestamp_ms;
+    END;
+  `);
+  const unexpectedTrigger = database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    WHERE name = 'purge_inserted_history'
+  `).get() as {
+    readonly type: unknown;
+    readonly name: unknown;
+    readonly tbl_name: unknown;
+    readonly sql: unknown;
+  } | undefined;
+  assert.notEqual(unexpectedTrigger, undefined);
+  assert.equal(unexpectedTrigger?.type, 'trigger');
+  assert.equal(unexpectedTrigger?.name, 'purge_inserted_history');
+  assert.equal(unexpectedTrigger?.tbl_name, 'funding_rate_history');
+  assert.match(String(unexpectedTrigger?.sql), /DELETE FROM funding_rate_history/i);
+  const mainBefore = schemaCatalog(database, 'main');
+  const tempBefore = schemaCatalog(database, 'temp');
+
+  assert.throws(
+    () => new SqliteFundingRateRepository(database),
+    /SQLite funding rate schema initialization failed/
+  );
+
+  assert.deepEqual(schemaCatalog(database, 'main'), mainBefore);
+  assert.deepEqual(schemaCatalog(database, 'temp'), tempBefore);
+});
+
+test('rejects an unexpected destructive TEMP trigger without leaving scan schema', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec(SQLITE_FUNDING_RATE_SCHEMA);
+  database.exec(`
+    CREATE TEMP TRIGGER purge_inserted_history_temp
+    AFTER INSERT ON main.funding_rate_history
+    BEGIN
+      DELETE FROM funding_rate_history
+      WHERE exchange_id = NEW.exchange_id
+        AND exchange_market_id = NEW.exchange_market_id
+        AND funding_timestamp_ms = NEW.funding_timestamp_ms;
+    END;
+  `);
+  const unexpectedTrigger = database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_temp_master
+    WHERE name = 'purge_inserted_history_temp'
+  `).get() as {
+    readonly type: unknown;
+    readonly name: unknown;
+    readonly tbl_name: unknown;
+    readonly sql: unknown;
+  } | undefined;
+  assert.notEqual(unexpectedTrigger, undefined);
+  assert.equal(unexpectedTrigger?.type, 'trigger');
+  assert.equal(unexpectedTrigger?.name, 'purge_inserted_history_temp');
+  assert.equal(unexpectedTrigger?.tbl_name, 'funding_rate_history');
+  assert.match(String(unexpectedTrigger?.sql), /DELETE FROM funding_rate_history/i);
+  const mainBefore = schemaCatalog(database, 'main');
+  const tempBefore = schemaCatalog(database, 'temp');
+
+  assert.throws(
+    () => new SqliteFundingRateRepository(database),
+    /SQLite funding rate schema initialization failed/
+  );
+
+  assert.deepEqual(schemaCatalog(database, 'main'), mainBefore);
+  assert.deepEqual(schemaCatalog(database, 'temp'), tempBefore);
 });
 
 test('installs the locked columns, keys, immutable triggers, and basic constraints', (t) => {
