@@ -29,6 +29,7 @@ import {
   PinoTradeEventSink,
   type TradeEventSink
 } from './logging/trade-events.js';
+import { claimSqliteProcessOwnership } from './storage/sqlite-process-owner.js';
 import { SqliteStrategyRepository } from './storage/sqlite-strategy-repository.js';
 import { HedgeCoordinator } from './strategy/hedge-coordinator.js';
 import { OrderMonitor } from './strategy/order-monitor.js';
@@ -174,10 +175,14 @@ function exchangeIds(
 }
 
 function databasePath(raw: string | undefined): string {
-  if (raw === undefined) {
-    return DEFAULT_DATABASE_PATH;
-  }
-  if (raw.trim() === '' || raw.includes('\0')) {
+  if (raw === undefined) return DEFAULT_DATABASE_PATH;
+  const trimmed = raw.trim();
+  if (
+    trimmed === ''
+    || raw.includes('\0')
+    || trimmed === ':memory:'
+    || /^file:/i.test(trimmed)
+  ) {
     return invalidConfiguration('TRADING_DATABASE_PATH');
   }
   return raw;
@@ -238,7 +243,7 @@ function defaultGatewayFactory(
 }
 
 function defaultDatabaseFactory(path: string): Database.Database {
-  return new Database(path);
+  return new Database(path, { timeout: 0 });
 }
 
 function closeDatabaseAfterConstructionFailure(
@@ -258,22 +263,6 @@ export function composeService(
 ): ServiceComposition {
   const env = options.env ?? process.env;
   const config = loadRuntimeConfig(env);
-  const gatewayFactory = options.gatewayFactory ?? defaultGatewayFactory;
-  const gateways = new Map<string, ExchangeGateway>();
-  for (const exchangeId of config.exchangeIds) {
-    const credentials = config.credentials.get(exchangeId);
-    if (credentials === undefined) {
-      throw new Error(
-        `missing credentials for configured exchange ${exchangeId}`
-      );
-    }
-    gateways.set(
-      exchangeId,
-      gatewayFactory(exchangeId, credentials, env)
-    );
-  }
-  const registry = new ExchangeRegistry(gateways);
-
   mkdirSync(dirname(resolve(config.databasePath)), {
     recursive: true,
     mode: 0o700
@@ -281,8 +270,25 @@ export function composeService(
   const databaseFactory = options.databaseFactory ?? defaultDatabaseFactory;
   const database = databaseFactory(config.databasePath);
   try {
+    claimSqliteProcessOwnership(database, config.databasePath);
     const clock = options.clock ?? (() => new Date());
     const repository = new SqliteStrategyRepository(database, clock);
+
+    const gatewayFactory = options.gatewayFactory ?? defaultGatewayFactory;
+    const gateways = new Map<string, ExchangeGateway>();
+    for (const exchangeId of config.exchangeIds) {
+      const credentials = config.credentials.get(exchangeId);
+      if (credentials === undefined) {
+        throw new Error(
+          `missing credentials for configured exchange ${exchangeId}`
+        );
+      }
+      gateways.set(
+        exchangeId,
+        gatewayFactory(exchangeId, credentials, env)
+      );
+    }
+    const registry = new ExchangeRegistry(gateways);
     const preflightService = new PreflightService(registry, clock);
     const operationalLog = nonThrowingOperationalLog(
       options.operationalLog

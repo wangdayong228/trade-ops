@@ -18,6 +18,10 @@ import type {
   OperationalFields,
   OperationalLog
 } from '../src/logging/logger.js';
+import {
+  claimSqliteProcessOwnership,
+  SqliteOwnershipError
+} from '../src/storage/sqlite-process-owner.js';
 import { FakeExchangeGateway } from './support/fake-exchange-gateway.js';
 
 const VALID_ENV = {
@@ -182,47 +186,196 @@ test('configuration failure happens before gateway or database construction', ()
   assert.equal(databaseConstructions, 0);
 });
 
-test('gateway construction failure happens before opening SQLite', () => {
+for (const databasePath of [
+  ':memory:',
+  ' :memory: ',
+  'file:trade-ops.sqlite',
+  'FILE:trade-ops.sqlite?mode=memory&cache=shared'
+] as const) {
+  test(`rejects non-file production database path ${databasePath}`, () => {
+    let gatewayConstructions = 0;
+    let databaseConstructions = 0;
+    assert.throws(
+      () => composeService({
+        env: { ...VALID_ENV, TRADING_DATABASE_PATH: databasePath },
+        gatewayFactory: (exchangeId) => {
+          gatewayConstructions += 1;
+          return new FakeExchangeGateway(exchangeId);
+        },
+        databaseFactory: () => {
+          databaseConstructions += 1;
+          throw new Error('database factory must not be called');
+        },
+        logger: false
+      }),
+      /^Error: invalid TRADING_DATABASE_PATH configuration$/
+    );
+    assert.equal(databaseConstructions, 0);
+    assert.equal(gatewayConstructions, 0);
+  });
+}
+
+test('opens and claims SQLite before gateway construction', () => {
   let databaseConstructions = 0;
+  let database: Database.Database | undefined;
 
   assert.throws(
     () => composeService({
       env: VALID_ENV,
-      gatewayFactory: () => {
-        throw new Error('gateway construction failed');
-      },
       databaseFactory: () => {
         databaseConstructions += 1;
-        return new Database(':memory:');
+        database = new Database(':memory:', { timeout: 0 });
+        return database;
+      },
+      gatewayFactory: () => {
+        throw new Error('gateway construction failed');
       },
       logger: false
     }),
     /^Error: gateway construction failed$/
   );
-  assert.equal(databaseConstructions, 0);
+  assert.equal(databaseConstructions, 1);
+  assert.equal(database?.open, false);
 });
 
-test('schema construction failure closes an opened database', () => {
-  let closed = 0;
+test('closes SQLite once when exclusive ownership is busy', () => {
+  let closes = 0;
+  let gatewayConstructions = 0;
   const database = {
+    pragma(): string { return 'exclusive'; },
     exec(): never {
-      throw new Error('schema unavailable');
+      throw Object.assign(new Error('raw busy detail'), {
+        code: 'SQLITE_BUSY'
+      });
     },
     close(): void {
-      closed += 1;
+      closes += 1;
     }
   } as unknown as Database.Database;
 
   assert.throws(
     () => composeService({
       env: VALID_ENV,
-      gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
       databaseFactory: () => database,
+      gatewayFactory: (exchangeId) => {
+        gatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
+      logger: false
+    }),
+    (error: unknown) => error instanceof SqliteOwnershipError
+      && (error as { readonly code: string }).code
+        === 'DATABASE_OWNERSHIP_BUSY'
+      && !(error as { readonly message: string }).message
+        .includes('raw busy detail')
+  );
+  assert.equal(gatewayConstructions, 0);
+  assert.equal(closes, 1);
+});
+
+test('closes an owned database once when schema construction fails', () => {
+  let closes = 0;
+  let gatewayConstructions = 0;
+  const statements: string[] = [];
+  const database = {
+    pragma(): string { return 'exclusive'; },
+    exec(statement: string) {
+      statements.push(statement);
+      if (statements.length === 2) {
+        throw new Error('schema unavailable');
+      }
+      return this;
+    },
+    close() {
+      closes += 1;
+      return this;
+    }
+  } as unknown as Database.Database;
+
+  assert.throws(
+    () => composeService({
+      env: VALID_ENV,
+      databaseFactory: () => database,
+      gatewayFactory: (exchangeId) => {
+        gatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
       logger: false
     }),
     /^Error: schema unavailable$/
   );
-  assert.equal(closed, 1);
+  assert.equal(statements[0], 'BEGIN EXCLUSIVE; COMMIT');
+  assert.equal(gatewayConstructions, 0);
+  assert.equal(closes, 1);
+});
+
+test('claims SQLite before gateway construction and releases after close', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-main-owner-'));
+  const databasePath = join(directory, 'trade-ops.sqlite');
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const env = { ...VALID_ENV, TRADING_DATABASE_PATH: databasePath };
+  const owner = composeService({
+    env,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    logger: false
+  });
+  let ownerClosed = false;
+  t.after(async () => {
+    if (!ownerClosed) {
+      await owner.server.close();
+      if (owner.database.open) owner.database.close();
+    }
+  });
+
+  let blockedGatewayConstructions = 0;
+  assert.throws(
+    () => composeService({
+      env,
+      gatewayFactory: (exchangeId) => {
+        blockedGatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
+      logger: false
+    }),
+    (error: unknown) => error instanceof SqliteOwnershipError
+      && (error as { readonly code: string }).code
+        === 'DATABASE_OWNERSHIP_BUSY'
+  );
+  assert.equal(blockedGatewayConstructions, 0);
+
+  await owner.server.close();
+  owner.database.close();
+  ownerClosed = true;
+  const successor = composeService({
+    env,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    logger: false
+  });
+  await successor.server.close();
+  successor.database.close();
+});
+
+test('releases claimed ownership when gateway construction fails', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-main-owner-'));
+  const databasePath = join(directory, 'trade-ops.sqlite');
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const env = { ...VALID_ENV, TRADING_DATABASE_PATH: databasePath };
+
+  assert.throws(
+    () => composeService({
+      env,
+      gatewayFactory: () => { throw new Error('gateway construction failed'); },
+      logger: false
+    }),
+    /^Error: gateway construction failed$/
+  );
+  const successor = composeService({
+    env,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    logger: false
+  });
+  await successor.server.close();
+  successor.database.close();
 });
 
 test('database open failure is propagated before a server can listen', () => {
@@ -833,4 +986,39 @@ test('shutdown still closes SQLite when Fastify close fails', async () => {
     (operations[3]?.error as Error | undefined)?.message,
     'server close failed'
   );
+});
+
+test('releases SQLite ownership when server close fails', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-stop-owner-'));
+  const databasePath = join(directory, 'trade-ops.sqlite');
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const database = new Database(databasePath, { timeout: 0 });
+  claimSqliteProcessOwnership(database, databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+  });
+
+  const started = await startService({
+    config: { host: '127.0.0.1', port: 3000 },
+    monitor: {
+      start: () => () => {},
+      stop: async () => {}
+    },
+    server: {
+      listen: async () => 'unused',
+      close: async () => { throw new Error('server close failed'); }
+    },
+    database
+  }, {
+    signalTarget: new SignalTarget(),
+    listen: async () => {}
+  });
+  await assert.rejects(started.shutdown(), /^Error: server close failed$/);
+  assert.equal(database.open, false);
+
+  const successor = new Database(databasePath, { timeout: 0 });
+  assert.doesNotThrow(() => {
+    claimSqliteProcessOwnership(successor, databasePath);
+  });
+  successor.close();
 });
