@@ -30,6 +30,13 @@ function sqliteErrorCode(error: unknown): string | undefined {
   }
 }
 
+function isSqliteContentionCode(code: string | undefined): boolean {
+  return code === 'SQLITE_BUSY'
+    || code?.startsWith('SQLITE_BUSY_') === true
+    || code === 'SQLITE_LOCKED'
+    || code?.startsWith('SQLITE_LOCKED_') === true;
+}
+
 export function claimSqliteProcessOwnership(
   database: Database.Database,
   databasePath: string
@@ -50,7 +57,7 @@ export function claimSqliteProcessOwnership(
     if (error instanceof SqliteOwnershipError) throw error;
     const code = sqliteErrorCode(error);
     throw new SqliteOwnershipError(
-      code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED'
+      isSqliteContentionCode(code)
         ? 'DATABASE_OWNERSHIP_BUSY'
         : 'DATABASE_OWNERSHIP_UNAVAILABLE',
       databasePath

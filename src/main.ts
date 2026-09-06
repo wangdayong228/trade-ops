@@ -185,7 +185,7 @@ function databasePath(raw: string | undefined): string {
   ) {
     return invalidConfiguration('TRADING_DATABASE_PATH');
   }
-  return raw;
+  return trimmed;
 }
 
 function loopbackHost(

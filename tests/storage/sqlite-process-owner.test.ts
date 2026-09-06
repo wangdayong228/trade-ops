@@ -91,33 +91,65 @@ async function waitForClose(child: ChildProcess): Promise<void> {
   await once(child, 'close');
 }
 
-async function temporaryDatabase(t: TestContext): Promise<string> {
+interface TemporaryDatabase {
+  readonly databasePath: string;
+  trackChild(child: ChildProcess): ChildProcess;
+  trackDatabase(database: Database.Database): Database.Database;
+}
+
+async function temporaryDatabase(t: TestContext): Promise<TemporaryDatabase> {
   const directory = await mkdtemp(join(tmpdir(), 'trade-ops-owner-'));
-  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const children: ChildProcess[] = [];
+  const databases: Database.Database[] = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+    await Promise.allSettled(children.map(waitForClose));
+    for (const database of databases) {
+      try {
+        if (database.open) database.close();
+      } catch {
+        // Best-effort cleanup must not replace the test's primary failure.
+      }
+    }
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup must not replace the test's primary failure.
+    }
+  });
   const databasePath = join(directory, 'trade-ops.sqlite');
   const seed = new Database(databasePath, { timeout: 0 });
   seed.exec('CREATE TABLE ownership_probe (id INTEGER PRIMARY KEY)');
   seed.close();
-  return databasePath;
+  return {
+    databasePath,
+    trackChild(child): ChildProcess {
+      children.push(child);
+      return child;
+    },
+    trackDatabase(database): Database.Database {
+      databases.push(database);
+      return database;
+    }
+  };
 }
 
 test('does not treat the exclusive pragma as acquired ownership', {
   timeout: 10_000
 }, async (t) => {
-  const databasePath = await temporaryDatabase(t);
-  const owner = new Database(databasePath, { timeout: 0 });
-  t.after(() => {
-    if (owner.open) owner.close();
-  });
+  const fixture = await temporaryDatabase(t);
+  const { databasePath } = fixture;
+  const owner = fixture.trackDatabase(
+    new Database(databasePath, { timeout: 0 })
+  );
 
   assert.equal(
     owner.pragma('main.locking_mode = EXCLUSIVE', { simple: true }),
     'exclusive'
   );
-  const reader = startChild(databasePath, 'read');
-  t.after(() => {
-    if (reader.exitCode === null && reader.signalCode === null) reader.kill();
-  });
+  const reader = fixture.trackChild(startChild(databasePath, 'read'));
 
   assert.deepEqual(await nextResult(reader), { kind: 'read' });
   await waitForClose(reader);
@@ -126,19 +158,12 @@ test('does not treat the exclusive pragma as acquired ownership', {
 test('allows exactly one process to own a SQLite file', {
   timeout: 10_000
 }, async (t) => {
-  const databasePath = await temporaryDatabase(t);
-  const owner = startChild(databasePath, 'hold');
-  t.after(() => {
-    if (owner.exitCode === null && owner.signalCode === null) owner.kill();
-  });
+  const fixture = await temporaryDatabase(t);
+  const { databasePath } = fixture;
+  const owner = fixture.trackChild(startChild(databasePath, 'hold'));
   assert.deepEqual(await nextResult(owner), { kind: 'owned' });
 
-  const contender = startChild(databasePath, 'claim');
-  t.after(() => {
-    if (contender.exitCode === null && contender.signalCode === null) {
-      contender.kill();
-    }
-  });
+  const contender = fixture.trackChild(startChild(databasePath, 'claim'));
   assert.deepEqual(await nextResult(contender), {
     kind: 'rejected',
     code: 'DATABASE_OWNERSHIP_BUSY'
@@ -147,12 +172,7 @@ test('allows exactly one process to own a SQLite file', {
 
   owner.send('release');
   await waitForClose(owner);
-  const successor = startChild(databasePath, 'claim');
-  t.after(() => {
-    if (successor.exitCode === null && successor.signalCode === null) {
-      successor.kill();
-    }
-  });
+  const successor = fixture.trackChild(startChild(databasePath, 'claim'));
   assert.deepEqual(await nextResult(successor), { kind: 'owned' });
   await waitForClose(successor);
 });
@@ -160,28 +180,26 @@ test('allows exactly one process to own a SQLite file', {
 test('releases SQLite ownership after an owner process is killed', {
   timeout: 10_000
 }, async (t) => {
-  const databasePath = await temporaryDatabase(t);
-  const owner = startChild(databasePath, 'hold');
+  const fixture = await temporaryDatabase(t);
+  const { databasePath } = fixture;
+  const owner = fixture.trackChild(startChild(databasePath, 'hold'));
   const ownerClosed = once(owner, 'close');
-  t.after(() => {
-    if (owner.exitCode === null && owner.signalCode === null) owner.kill();
-  });
   assert.deepEqual(await nextResult(owner), { kind: 'owned' });
   assert.equal(owner.kill('SIGKILL'), true);
   await ownerClosed;
 
-  const successor = startChild(databasePath, 'claim');
-  t.after(() => {
-    if (successor.exitCode === null && successor.signalCode === null) {
-      successor.kill();
-    }
-  });
+  const successor = fixture.trackChild(startChild(databasePath, 'claim'));
   assert.deepEqual(await nextResult(successor), { kind: 'owned' });
   await waitForClose(successor);
 });
 
-test('classifies ownership failures without retaining SQLite messages', () => {
-  for (const sqliteCode of ['SQLITE_BUSY', 'SQLITE_LOCKED'] as const) {
+for (const sqliteCode of [
+  'SQLITE_BUSY',
+  'SQLITE_BUSY_RECOVERY',
+  'SQLITE_LOCKED',
+  'SQLITE_LOCKED_SHAREDCACHE'
+] as const) {
+  test(`classifies ${sqliteCode} as busy without retaining SQLite messages`, () => {
     const lockedDatabase = {
       pragma: () => 'exclusive',
       exec: () => {
@@ -208,8 +226,10 @@ test('classifies ownership failures without retaining SQLite messages', () => {
         return true;
       }
     );
-  }
+  });
+}
 
+test('classifies non-contention ownership failures as unavailable', () => {
   const unsupported = {
     pragma: () => 'normal',
     exec: () => { throw new Error('must not execute'); }
@@ -241,19 +261,12 @@ test('classifies ownership failures without retaining SQLite messages', () => {
 test('rejects a competing service before gateway or recovery startup', {
   timeout: 10_000
 }, async (t) => {
-  const databasePath = await temporaryDatabase(t);
-  const owner = startChild(databasePath, 'hold');
-  t.after(() => {
-    if (owner.exitCode === null && owner.signalCode === null) owner.kill();
-  });
+  const fixture = await temporaryDatabase(t);
+  const { databasePath } = fixture;
+  const owner = fixture.trackChild(startChild(databasePath, 'hold'));
   assert.deepEqual(await nextResult(owner), { kind: 'owned' });
 
-  const contender = startServiceContender(databasePath);
-  t.after(() => {
-    if (contender.exitCode === null && contender.signalCode === null) {
-      contender.kill();
-    }
-  });
+  const contender = fixture.trackChild(startServiceContender(databasePath));
   assert.deepEqual(await nextServiceResult(contender), {
     kind: 'startup_rejected',
     code: 'DATABASE_OWNERSHIP_BUSY',
