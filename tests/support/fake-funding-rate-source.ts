@@ -59,8 +59,22 @@ export interface FakeFundingPageStep {
   readonly page?: FundingRatePage;
   readonly pageRequestError?: unknown;
   readonly responseError?: unknown;
+  readonly responseGate?: FakeAsyncGate;
   readonly parseError?: unknown;
   readonly parseGate?: FakeAsyncGate;
+}
+
+export interface FakeFundingDiscoveryStep {
+  readonly observations?: readonly FundingMarketObservation[];
+  readonly requestError?: unknown;
+  readonly responseError?: unknown;
+  readonly gate?: FakeAsyncGate;
+}
+
+export interface FakeFundingOperationCall {
+  readonly kind: 'discovery' | 'page';
+  readonly marketId: string | null;
+  readonly startedAtMs: number | null;
 }
 
 export interface FakeFundingFetchCall {
@@ -119,27 +133,92 @@ export class FakeFundingRateSource implements FundingRateSource {
   readonly minimumRequestSpacingMs: 100 | 250;
   readonly pageRequestCalls: FakeFundingFetchCall[] = [];
   readonly fetchCalls: FakeFundingFetchCall[] = [];
+  readonly discoveryRequestCalls: FundingRequestMetadata[] = [];
+  readonly discoveryCalls: FakeFundingOperationCall[] = [];
+  readonly operationCalls: FakeFundingOperationCall[] = [];
+  maximumConcurrentOperations = 0;
   readonly #steps: readonly FakeFundingPageStep[];
+  readonly #discoverySteps: readonly FakeFundingDiscoveryStep[];
   readonly #trace: string[];
+  readonly #nowMs: (() => number) | undefined;
   #nextStep = 0;
+  #nextDiscoveryStep = 0;
+  #activeOperations = 0;
 
   constructor(
     readonly exchangeId: FundingExchangeId,
     steps: readonly FakeFundingPageStep[],
-    trace: string[] = []
+    trace: string[] = [],
+    discoverySteps: readonly FakeFundingDiscoveryStep[] = [],
+    nowMs?: () => number
   ) {
     this.pageSize = exchangeId === 'bitget' ? 100 : 400;
     this.minimumRequestSpacingMs = exchangeId === 'bitget' ? 100 : 250;
     this.#steps = steps;
+    this.#discoverySteps = discoverySteps;
     this.#trace = trace;
+    this.#nowMs = nowMs;
   }
 
   discoveryRequest(): FundingRequestMetadata {
-    throw new Error('unexpected discovery request in market sync test');
+    const step = this.#discoverySteps[this.#nextDiscoveryStep];
+    if (step === undefined) {
+      throw new Error('unexpected discovery request in market sync test');
+    }
+    if (step.requestError !== undefined) {
+      throw step.requestError;
+    }
+    const request: FundingRequestMetadata = this.exchangeId === 'bitget'
+      ? {
+          method: 'GET',
+          path: '/api/v2/mix/market/contracts',
+          query: { productType: 'USDT-FUTURES' },
+          body: null
+        }
+      : {
+          method: 'GET',
+          path: '/api/v5/public/instruments',
+          query: { instType: 'SWAP' },
+          body: null
+        };
+    this.discoveryRequestCalls.push(request);
+    this.#trace.push(`discoveryRequest:${this.exchangeId}`);
+    return request;
   }
 
   async discoverMarkets(): Promise<readonly FundingMarketObservation[]> {
-    throw new Error('unexpected discovery fetch in market sync test');
+    const step = this.#discoverySteps[this.#nextDiscoveryStep];
+    if (step === undefined) {
+      throw new Error('unexpected discovery fetch in market sync test');
+    }
+    this.#nextDiscoveryStep += 1;
+    const call: FakeFundingOperationCall = {
+      kind: 'discovery',
+      marketId: null,
+      startedAtMs: this.#nowMs?.() ?? null
+    };
+    this.discoveryCalls.push(call);
+    this.operationCalls.push(call);
+    this.#trace.push(`discover:${this.exchangeId}`);
+    this.#activeOperations += 1;
+    this.maximumConcurrentOperations = Math.max(
+      this.maximumConcurrentOperations,
+      this.#activeOperations
+    );
+    try {
+      if (step.gate !== undefined) {
+        await step.gate.wait();
+      }
+      if (step.responseError !== undefined) {
+        throw step.responseError;
+      }
+      if (step.observations === undefined) {
+        throw new Error('fake funding discovery step has no observations or error');
+      }
+      return step.observations;
+    } finally {
+      this.#activeOperations -= 1;
+    }
   }
 
   pageRequest(
@@ -171,26 +250,44 @@ export class FakeFundingRateSource implements FundingRateSource {
     this.#nextStep += 1;
     const call = { market: { ...market }, cursor: { ...cursor } };
     this.fetchCalls.push(call);
+    const operationCall: FakeFundingOperationCall = {
+      kind: 'page',
+      marketId: market.exchangeMarketId,
+      startedAtMs: this.#nowMs?.() ?? null
+    };
+    this.operationCalls.push(operationCall);
     this.#trace.push(`fetch:${market.exchangeMarketId}:${cursorText(cursor)}`);
     if (step.marketId !== market.exchangeMarketId || !sameCursor(step.cursor, cursor)) {
       throw new Error(
         `unexpected fake funding cursor for ${market.exchangeMarketId}: ${cursorText(cursor)}`
       );
     }
-    if (step.responseError !== undefined) {
-      throw step.responseError;
+    this.#activeOperations += 1;
+    this.maximumConcurrentOperations = Math.max(
+      this.maximumConcurrentOperations,
+      this.#activeOperations
+    );
+    try {
+      if (step.responseGate !== undefined) {
+        await step.responseGate.wait();
+      }
+      if (step.responseError !== undefined) {
+        throw step.responseError;
+      }
+      this.#trace.push(`parse:${market.exchangeMarketId}:${cursorText(cursor)}`);
+      if (step.parseGate !== undefined) {
+        await step.parseGate.wait();
+      }
+      if (step.parseError !== undefined) {
+        throw step.parseError;
+      }
+      if (step.page === undefined) {
+        throw new Error('fake funding page step has no page or error');
+      }
+      return step.page;
+    } finally {
+      this.#activeOperations -= 1;
     }
-    this.#trace.push(`parse:${market.exchangeMarketId}:${cursorText(cursor)}`);
-    if (step.parseGate !== undefined) {
-      await step.parseGate.wait();
-    }
-    if (step.parseError !== undefined) {
-      throw step.parseError;
-    }
-    if (step.page === undefined) {
-      throw new Error('fake funding page step has no page or error');
-    }
-    return step.page;
   }
 }
 
