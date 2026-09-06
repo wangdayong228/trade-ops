@@ -9,12 +9,15 @@ import {
   type FundingMarketIdentity,
   type SettledFundingRate
 } from './funding-rate-record.js';
-import type {
-  FundingPageCursor,
-  FundingRatePage,
-  FundingRateSource,
-  FundingRequestExecutor,
-  FundingRequestMetadata
+import {
+  FundingRequestCanceledError,
+  FundingRequestRetryExhaustedError,
+  type FundingPageCursor,
+  type FundingRatePage,
+  type FundingRateSource,
+  type FundingRequestExecutor,
+  type FundingRequestMetadata,
+  type FundingRequestRetryNotice,
 } from './funding-rate-source.js';
 import {
   StaleFundingTaskError,
@@ -23,7 +26,8 @@ import {
   type CoveragePageCheckpoint,
   type FundingPageWriteResult,
   type FundingRateRepository,
-  type FundingTaskFailureCode
+  type FundingTaskFailureCode,
+  type IncrementalLease
 } from '../storage/funding-rate-repository.js';
 
 export interface FundingPageTask {
@@ -66,6 +70,15 @@ type ValidatedOkxPage =
       readonly recoveryAnchorMs: number;
     };
 
+type ValidatedIncrementalPage =
+  | { readonly empty: true }
+  | {
+      readonly empty: false;
+      readonly records: readonly SettledFundingRate[];
+      readonly nextCursor: FundingPageCursor;
+      readonly boundaryObserved: boolean;
+    };
+
 class PageValidationFailure extends Error {
   constructor(
     readonly code: PageValidationFailureCode,
@@ -76,18 +89,24 @@ class PageValidationFailure extends Error {
   }
 }
 
-function pageContext(lease: CoverageLease): string {
+function pageContext(lease: FundingMarketIdentity): string {
   return `${lease.exchangeId}/${lease.exchangeMarketId}/${lease.symbol}`;
 }
 
-function sourceResponseInvalid(lease: CoverageLease, detail: string): never {
+function sourceResponseInvalid(
+  lease: FundingMarketIdentity,
+  detail: string
+): never {
   throw new PageValidationFailure(
     'SOURCE_RESPONSE_INVALID',
     `invalid funding page for ${pageContext(lease)}: ${detail}`
   );
 }
 
-function cursorNotAdvancing(lease: CoverageLease, detail: string): never {
+function cursorNotAdvancing(
+  lease: FundingMarketIdentity,
+  detail: string
+): never {
   throw new PageValidationFailure(
     'CURSOR_NOT_ADVANCING',
     `funding cursor did not advance for ${pageContext(lease)}: ${detail}`
@@ -310,6 +329,79 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
   });
 }
 
+function invalidIncrementalLease(detail: string): never {
+  throw new Error(`invalid incremental lease: ${detail}`);
+}
+
+function incrementalLeaseSnapshot(value: unknown): IncrementalLease {
+  const subject = 'incremental lease';
+  const descriptors = ownDataDescriptors(
+    value,
+    'object',
+    subject,
+    invalidIncrementalLease
+  );
+  const exchangeId = requiredOwnDataValue(
+    descriptors,
+    'exchangeId',
+    subject,
+    invalidIncrementalLease
+  );
+  const exchangeMarketId = requiredOwnDataValue(
+    descriptors,
+    'exchangeMarketId',
+    subject,
+    invalidIncrementalLease
+  );
+  const symbol = requiredOwnDataValue(
+    descriptors,
+    'symbol',
+    subject,
+    invalidIncrementalLease
+  );
+  const generation = requiredOwnDataValue(
+    descriptors,
+    'generation',
+    subject,
+    invalidIncrementalLease
+  );
+  const frozenBoundaryMs = requiredOwnDataValue(
+    descriptors,
+    'frozenBoundaryMs',
+    subject,
+    invalidIncrementalLease
+  );
+
+  if (exchangeId !== 'bitget' && exchangeId !== 'okx') {
+    return invalidIncrementalLease('exchangeId must be bitget or okx');
+  }
+  if (!identityString(exchangeMarketId)) {
+    return invalidIncrementalLease(
+      'exchangeMarketId must be a non-empty identity string'
+    );
+  }
+  if (!identityString(symbol)) {
+    return invalidIncrementalLease('symbol must be a non-empty identity string');
+  }
+  if (!nonNegativeSafeInteger(generation)) {
+    return invalidIncrementalLease(
+      'generation must be a non-negative safe integer'
+    );
+  }
+  if (frozenBoundaryMs !== null && !nonNegativeSafeInteger(frozenBoundaryMs)) {
+    return invalidIncrementalLease(
+      'frozenBoundaryMs must be null or a non-negative safe integer'
+    );
+  }
+  return Object.freeze({
+    exchangeId,
+    exchangeMarketId,
+    symbol,
+    generation,
+    frozenBoundaryMs
+  });
+}
+
 type CursorSnapshot =
   | { readonly exchangeId: 'bitget'; readonly pageNo: unknown }
   | { readonly exchangeId: 'okx'; readonly afterMs: unknown }
@@ -322,13 +414,13 @@ interface FundingPageSnapshot {
   readonly recoveryAnchorMs: unknown;
 }
 
-function pageInvalid(lease: CoverageLease): InvalidData {
+function pageInvalid(lease: FundingMarketIdentity): InvalidData {
   return (detail) => sourceResponseInvalid(lease, detail);
 }
 
 function cursorSnapshot(
   value: unknown,
-  lease: CoverageLease,
+  lease: FundingMarketIdentity,
   subject: string
 ): CursorSnapshot {
   const invalid = pageInvalid(lease);
@@ -376,7 +468,7 @@ function sameRecord(
 
 function normalizedPageRecords(
   value: unknown,
-  lease: CoverageLease,
+  lease: FundingMarketIdentity,
   maximumRecords: number
 ): readonly SettledFundingRate[] {
   const invalid = pageInvalid(lease);
@@ -504,7 +596,7 @@ function normalizedPageRecords(
 
 function fundingPage(
   value: unknown,
-  lease: CoverageLease,
+  lease: FundingMarketIdentity,
   pageSize: number
 ): FundingPageSnapshot {
   const invalid = pageInvalid(lease);
@@ -546,9 +638,10 @@ function fundingPage(
 
 function validateBitgetPage(
   value: unknown,
-  lease: BitgetLease,
+  lease: FundingMarketIdentity,
   requestedPageNo: number,
-  pageSize: number
+  pageSize: number,
+  boundaryMs: number | null
 ): ValidatedBitgetPage {
   const page = fundingPage(value, lease, pageSize);
   const requestedCursor = {
@@ -592,16 +685,16 @@ function validateBitgetPage(
     empty: false,
     records,
     nextPageNo: page.nextCursor.pageNo,
-    boundaryObserved: lease.requiredBitgetBoundaryMs !== null
+    boundaryObserved: boundaryMs !== null
       && records.some(({ fundingTimestampMs }) => (
-        fundingTimestampMs === lease.requiredBitgetBoundaryMs
+        fundingTimestampMs === boundaryMs
       ))
   };
 }
 
 function validateOkxPage(
   value: unknown,
-  lease: OkxLease,
+  lease: FundingMarketIdentity,
   requestedAfterMs: number | null,
   pageSize: number
 ): ValidatedOkxPage {
@@ -679,7 +772,7 @@ function validateOkxPage(
 }
 
 function diagnosticPageRequest(
-  lease: CoverageLease,
+  lease: FundingMarketIdentity,
   cursor: FundingPageCursor
 ): FundingRequestMetadata {
   if (cursor.exchangeId === 'bitget') {
@@ -785,11 +878,15 @@ class CoveragePageTask implements FundingPageTask {
       try {
         page = await this.requestExecutor.execute(
           request,
-          () => this.source.fetchPage(this.lease, cursor)
+          () => this.source.fetchPage(this.lease, cursor),
+          (notice) => this.recordRetry(notice, cursor, request)
         );
       } catch (error) {
+        if (error instanceof FundingRequestCanceledError) throw error;
         return this.finishWithFailure(
-          'SOURCE_RESPONSE_INVALID',
+          error instanceof FundingRequestRetryExhaustedError
+            ? 'REQUEST_RETRY_EXHAUSTED'
+            : 'SOURCE_RESPONSE_INVALID',
           cursor,
           request,
           error
@@ -822,7 +919,8 @@ class CoveragePageTask implements FundingPageTask {
         page,
         lease,
         this.bitgetPageNo,
-        this.pageSize
+        this.pageSize,
+        lease.requiredBitgetBoundaryMs
       );
     } catch (error) {
       return this.finishValidationFailure(error, cursor, request);
@@ -1130,6 +1228,366 @@ class CoveragePageTask implements FundingPageTask {
       : Object.freeze({ exchangeId: 'okx', afterMs: this.okxAfterMs });
   }
 
+  private recordRetry(
+    notice: FundingRequestRetryNotice,
+    cursor: FundingPageCursor,
+    request: FundingRequestMetadata
+  ): void {
+    this.recordEvent({
+      event: 'funding_request_retry',
+      taskCategory: 'coverage',
+      exchangeId: this.lease.exchangeId,
+      exchangeMarketId: this.lease.exchangeMarketId,
+      symbol: this.lease.symbol,
+      phase: 'coverage-request-retry',
+      taskKind: this.lease.kind,
+      generation: this.lease.generation,
+      coverageCutoffMs: this.lease.cutoffMs,
+      cursor,
+      retryAttempt: notice.retryAttempt,
+      retryDelayMs: notice.retryDelayMs,
+      request,
+      error: notice.error
+    });
+  }
+
+  private recordEvent(input: FundingRateEventInput): void {
+    try {
+      this.events.record(fundingRateEvent(input));
+    } catch {
+      // Event reporting cannot change funding synchronization state.
+    }
+  }
+}
+
+class IncrementalPageTask implements FundingPageTask {
+  readonly key: string;
+  readonly category = 'incremental' as const;
+  private finished = false;
+  private running = false;
+  private cursor: FundingPageCursor;
+  private readonly frozenBoundaryMs: number | null;
+  private boundarySeen = false;
+  private postBoundaryRequestCompleted = false;
+  private inserted = 0;
+  private unchanged = 0;
+  private revised = 0;
+
+  constructor(
+    private readonly source: FundingRateSource,
+    private readonly pageSize: number,
+    private readonly repository: FundingRateRepository,
+    private readonly requestExecutor: FundingRequestExecutor,
+    private readonly events: FundingRateEventSink,
+    private readonly now: () => Date,
+    private readonly lease: IncrementalLease
+  ) {
+    this.key = [
+      'incremental',
+      lease.exchangeId,
+      lease.exchangeMarketId,
+      lease.generation
+    ].join(':');
+    this.cursor = lease.exchangeId === 'bitget'
+      ? Object.freeze({ exchangeId: 'bitget', pageNo: 1 })
+      : Object.freeze({ exchangeId: 'okx', afterMs: null });
+    this.frozenBoundaryMs = lease.frozenBoundaryMs;
+  }
+
+  async runNextPage(): Promise<PageTaskResult> {
+    if (this.running) {
+      throw new Error(`funding page task ${this.key} is already running`);
+    }
+    this.running = true;
+    try {
+      if (this.finished) return 'done';
+      if (!this.repository.isIncrementalLeaseEligible(this.lease)) {
+        return this.cancelIneligibleTask();
+      }
+
+      const cursor = this.cursor;
+      let request: FundingRequestMetadata;
+      try {
+        request = this.source.pageRequest(this.lease, cursor);
+      } catch (error) {
+        return this.finishWithFailure(
+          'SOURCE_RESPONSE_INVALID',
+          cursor,
+          diagnosticPageRequest(this.lease, cursor),
+          error
+        );
+      }
+
+      let page: FundingRatePage;
+      try {
+        page = await this.requestExecutor.execute(
+          request,
+          () => this.source.fetchPage(this.lease, cursor),
+          (notice) => this.recordRetry(notice, cursor, request)
+        );
+      } catch (error) {
+        if (error instanceof FundingRequestCanceledError) throw error;
+        return this.finishWithFailure(
+          error instanceof FundingRequestRetryExhaustedError
+            ? 'REQUEST_RETRY_EXHAUSTED'
+            : 'SOURCE_RESPONSE_INVALID',
+          cursor,
+          request,
+          error
+        );
+      }
+
+      let validated: ValidatedIncrementalPage;
+      try {
+        validated = this.validatePage(page, cursor);
+      } catch (error) {
+        return this.finishValidationFailure(error, cursor, request);
+      }
+      if (validated.empty) {
+        return this.completeIncremental(cursor, request);
+      }
+
+      const boundarySeenBeforePage = this.boundarySeen;
+      const result = this.commitPage(
+        validated.records,
+        cursor,
+        request
+      );
+      if (result === null) return 'done';
+
+      this.inserted += result.inserted;
+      this.unchanged += result.unchanged;
+      this.revised += result.revised;
+      this.cursor = validated.nextCursor;
+      if (boundarySeenBeforePage) {
+        this.postBoundaryRequestCompleted = true;
+      }
+      if (validated.boundaryObserved) {
+        this.boundarySeen = true;
+      }
+      this.recordRevisions(result);
+
+      return this.postBoundaryRequestCompleted
+        ? this.completeIncremental(cursor, request)
+        : 'requeue';
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private validatePage(
+    page: FundingRatePage,
+    cursor: FundingPageCursor
+  ): ValidatedIncrementalPage {
+    if (this.lease.exchangeId === 'bitget') {
+      if (cursor.exchangeId !== 'bitget') {
+        return sourceResponseInvalid(this.lease, 'incremental cursor identity mismatch');
+      }
+      const validated = validateBitgetPage(
+        page,
+        this.lease,
+        cursor.pageNo,
+        this.pageSize,
+        this.frozenBoundaryMs
+      );
+      return validated.empty
+        ? validated
+        : {
+            empty: false,
+            records: validated.records,
+            nextCursor: Object.freeze({
+              exchangeId: 'bitget',
+              pageNo: validated.nextPageNo
+            }),
+            boundaryObserved: validated.boundaryObserved
+          };
+    }
+    if (cursor.exchangeId !== 'okx') {
+      return sourceResponseInvalid(this.lease, 'incremental cursor identity mismatch');
+    }
+    const validated = validateOkxPage(
+      page,
+      this.lease,
+      cursor.afterMs,
+      this.pageSize
+    );
+    return validated.empty
+      ? validated
+      : {
+          empty: false,
+          records: validated.records,
+          nextCursor: Object.freeze({
+            exchangeId: 'okx',
+            afterMs: validated.nextAfterMs
+          }),
+          boundaryObserved: this.frozenBoundaryMs !== null
+            && validated.records.some(({ fundingTimestampMs }) => (
+              fundingTimestampMs === this.frozenBoundaryMs
+            ))
+        };
+  }
+
+  private commitPage(
+    records: readonly SettledFundingRate[],
+    cursor: FundingPageCursor,
+    request: FundingRequestMetadata
+  ): FundingPageWriteResult | null {
+    try {
+      return this.repository.commitIncrementalPage(
+        this.lease,
+        records,
+        this.now()
+      );
+    } catch (error) {
+      if (error instanceof StaleFundingTaskError) {
+        this.finished = true;
+        return null;
+      }
+      this.finishWithFailure(
+        'DATABASE_WRITE_FAILED',
+        cursor,
+        request,
+        error
+      );
+      return null;
+    }
+  }
+
+  private completeIncremental(
+    cursor: FundingPageCursor,
+    request: FundingRequestMetadata
+  ): PageTaskResult {
+    try {
+      this.repository.completeIncremental(this.lease, this.now());
+    } catch (error) {
+      if (error instanceof StaleFundingTaskError) {
+        this.finished = true;
+        return 'done';
+      }
+      return this.finishWithFailure(
+        'DATABASE_WRITE_FAILED',
+        cursor,
+        request,
+        error
+      );
+    }
+    this.finished = true;
+    this.recordEvent({
+      event: 'funding_incremental_completed',
+      exchangeId: this.lease.exchangeId,
+      exchangeMarketId: this.lease.exchangeMarketId,
+      symbol: this.lease.symbol,
+      phase: 'incremental-complete',
+      generation: this.lease.generation,
+      inserted: this.inserted,
+      unchanged: this.unchanged,
+      revised: this.revised
+    });
+    return 'done';
+  }
+
+  private cancelIneligibleTask(): PageTaskResult {
+    try {
+      this.repository.cancelIncremental(this.lease, this.now());
+    } catch (error) {
+      if (!(error instanceof StaleFundingTaskError)) throw error;
+    }
+    this.finished = true;
+    return 'done';
+  }
+
+  private finishValidationFailure(
+    error: unknown,
+    cursor: FundingPageCursor,
+    request: FundingRequestMetadata
+  ): PageTaskResult {
+    const failure = error instanceof PageValidationFailure
+      ? error
+      : new PageValidationFailure(
+          'SOURCE_RESPONSE_INVALID',
+          `invalid funding page for ${pageContext(this.lease)}`
+        );
+    return this.finishWithFailure(
+      failure.code,
+      cursor,
+      request,
+      failure
+    );
+  }
+
+  private finishWithFailure(
+    code: FundingTaskFailureCode,
+    cursor: FundingPageCursor,
+    request: FundingRequestMetadata,
+    error: unknown
+  ): PageTaskResult {
+    try {
+      this.repository.failIncremental(
+        this.lease,
+        fundingTaskFailure(code),
+        this.now()
+      );
+    } catch (failureError) {
+      if (!(failureError instanceof StaleFundingTaskError)) {
+        throw failureError;
+      }
+      this.finished = true;
+      return 'done';
+    }
+    this.finished = true;
+    this.recordEvent({
+      event: 'funding_task_incomplete',
+      taskCategory: 'incremental',
+      exchangeId: this.lease.exchangeId,
+      exchangeMarketId: this.lease.exchangeMarketId,
+      symbol: this.lease.symbol,
+      phase: 'incremental-incomplete',
+      generation: this.lease.generation,
+      frozenBoundaryMs: this.frozenBoundaryMs,
+      cursor,
+      request,
+      error
+    });
+    return 'done';
+  }
+
+  private recordRevisions(result: FundingPageWriteResult): void {
+    for (const revision of result.revisedKeys) {
+      this.recordEvent({
+        event: 'funding_rate_revised',
+        exchangeId: this.lease.exchangeId,
+        exchangeMarketId: this.lease.exchangeMarketId,
+        symbol: this.lease.symbol,
+        phase: 'incremental-page',
+        fundingTimestampMs: revision.fundingTimestampMs,
+        previousContentHash: revision.previousContentHash,
+        currentContentHash: revision.currentContentHash
+      });
+    }
+  }
+
+  private recordRetry(
+    notice: FundingRequestRetryNotice,
+    cursor: FundingPageCursor,
+    request: FundingRequestMetadata
+  ): void {
+    this.recordEvent({
+      event: 'funding_request_retry',
+      taskCategory: 'incremental',
+      exchangeId: this.lease.exchangeId,
+      exchangeMarketId: this.lease.exchangeMarketId,
+      symbol: this.lease.symbol,
+      phase: 'incremental-request-retry',
+      generation: this.lease.generation,
+      frozenBoundaryMs: this.frozenBoundaryMs,
+      cursor,
+      retryAttempt: notice.retryAttempt,
+      retryDelayMs: notice.retryDelayMs,
+      request,
+      error: notice.error
+    });
+  }
+
   private recordEvent(input: FundingRateEventInput): void {
     try {
       this.events.record(fundingRateEvent(input));
@@ -1173,6 +1631,28 @@ export class FundingRateMarketSync {
       throw new StaleFundingTaskError();
     }
     return new CoveragePageTask(
+      this.options.source,
+      this.pageSize,
+      this.options.repository,
+      this.options.requestExecutor,
+      this.events,
+      this.options.now,
+      snapshot
+    );
+  }
+
+  createIncrementalTask(lease: IncrementalLease): FundingPageTask {
+    const snapshot = incrementalLeaseSnapshot(lease);
+    if (snapshot.exchangeId !== this.sourceExchangeId) {
+      throw new Error(
+        `funding source and incremental lease exchange identity mismatch: `
+        + `expected ${this.sourceExchangeId}, actual ${snapshot.exchangeId}`
+      );
+    }
+    if (!this.options.repository.isIncrementalLeaseEligible(snapshot)) {
+      throw new StaleFundingTaskError();
+    }
+    return new IncrementalPageTask(
       this.options.source,
       this.pageSize,
       this.options.repository,

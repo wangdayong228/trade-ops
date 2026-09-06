@@ -328,6 +328,13 @@ const FUNDING_RATE_SYNC_STATE_BODY = ` (
       typeof(incremental_generation) = 'integer'
       AND incremental_generation BETWEEN 0 AND 9007199254740991
     ),
+    incremental_frozen_boundary_ms INTEGER CHECK (
+      incremental_frozen_boundary_ms IS NULL
+      OR (
+        typeof(incremental_frozen_boundary_ms) = 'integer'
+        AND incremental_frozen_boundary_ms BETWEEN 0 AND 8640000000000000
+      )
+    ),
     incremental_started_at TEXT CHECK (
       incremental_started_at IS NULL
       OR (
@@ -516,6 +523,16 @@ const FUNDING_RATE_SYNC_STATE_BODY = ` (
         AND incremental_started_at IS NOT NULL
         AND incremental_ended_at IS NOT NULL
         AND incremental_error_code IS NOT NULL)
+    ),
+    CHECK (
+      (incremental_status = 'RUNNING'
+        AND (
+          incremental_frozen_boundary_ms IS NULL
+          OR (latest_funding_timestamp_ms IS NOT NULL
+            AND incremental_frozen_boundary_ms <= latest_funding_timestamp_ms)
+        ))
+      OR (incremental_status <> 'RUNNING'
+        AND incremental_frozen_boundary_ms IS NULL)
     )
   )`;
 

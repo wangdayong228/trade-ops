@@ -164,6 +164,7 @@ export interface FundingMarketState extends FundingMarketIdentity {
   readonly coverageErrorSummary: string | null;
   readonly incrementalStatus: FundingIncrementalStatus;
   readonly incrementalGeneration: number;
+  readonly incrementalFrozenBoundaryMs: number | null;
   readonly incrementalStartedAt: string | null;
   readonly incrementalEndedAt: string | null;
   readonly incrementalLastSuccessAt: string | null;

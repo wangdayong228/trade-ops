@@ -838,7 +838,7 @@ Expected: exit 0。
 - Modify: `tests/funding-rates/funding-rate-record.test.ts`
 - Modify: `tests/funding-rates/funding-rate-market-sync.test.ts`
 
-- [ ] **Step 1: 写增量红测试**
+- [x] **Step 1: 写增量红测试**
 
 覆盖：
 
@@ -857,7 +857,7 @@ Expected: exit 0。
 - retry observer 在 coverage/incremental task 中补齐各自 generation、cutoff/boundary、cursor 和安全 request metadata，交给 non-throwing allowlist event sink；raw error 不进入 repository；
 - 增量完成事件的 inserted/unchanged/revised 是本 generation 所有已提交非空页的累计值；失败页、空终止页和 stale 页不累计。
 
-- [ ] **Step 2: 确认 RED**
+- [x] **Step 2: 确认 RED**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js
@@ -865,7 +865,7 @@ npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.t
 
 Expected: exit 非 0，仅新增量 case 失败。
 
-- [ ] **Step 3: 实现增量 task**
+- [x] **Step 3: 实现增量 task**
 
 repository 在 start/restart 事务中将当时 `latest_funding_timestamp_ms` 原样写入 generation-scoped `incremental_frozen_boundary_ms`。`FundingMarketState` 暴露该字段；schema 允许 `RUNNING` 的空历史边界为 `NULL`，但非 `RUNNING` 必须为 `NULL`，非空边界不得大于当前 latest。资格、页面、complete/fail/cancel 的 currentness 与 SQL CAS 都用 SQLite `IS` 比较 generation 和冻结边界；页面推进不改变它，终态和市场转换在成功 CAS 中清空。由此 data-only lease 的伪造边界不能到达请求或写入。
 
@@ -878,7 +878,7 @@ task 内存字段固定为 `cursor`、`frozenBoundaryMs`、`boundarySeen`、`pos
 
 同时扩展请求合同与 coverage 共用错误边界：固定名义取消必须原样抛出，固定名义重试耗尽映射 `REQUEST_RETRY_EXHAUSTED`，其他 executor/source rejection 映射 `SOURCE_RESPONSE_INVALID`。所有 `execute` 调用显式传入 retry observer；observer 只经安全事件 sink 发出上下文完整的 `funding_request_retry`，自身失败不影响任务。fake executor 只实现确定性 notice 驱动，不包含真实计时或 CCXT 判断。
 
-- [ ] **Step 4: GREEN 并提交**
+- [x] **Step 4: GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js

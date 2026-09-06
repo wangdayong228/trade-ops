@@ -118,6 +118,7 @@ interface FundingStateDbRow {
   readonly coverage_error_summary: unknown;
   readonly incremental_status: unknown;
   readonly incremental_generation: unknown;
+  readonly incremental_frozen_boundary_ms: unknown;
   readonly incremental_started_at: unknown;
   readonly incremental_ended_at: unknown;
   readonly incremental_last_success_at: unknown;
@@ -629,6 +630,7 @@ function assertFundingSchema(database: Database.Database): void {
     ['coverage_error_summary', 'TEXT', 0],
     ['incremental_status', 'TEXT', 0],
     ['incremental_generation', 'INTEGER', 0],
+    ['incremental_frozen_boundary_ms', 'INTEGER', 0],
     ['incremental_started_at', 'TEXT', 0],
     ['incremental_ended_at', 'TEXT', 0],
     ['incremental_last_success_at', 'TEXT', 0],
@@ -967,6 +969,10 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     MAX_SAFE_INTEGER,
     `${stateContext} incremental_generation`
   );
+  const incrementalFrozenBoundaryMs = nullableTimestampMs(
+    row.incremental_frozen_boundary_ms,
+    `${stateContext} incremental_frozen_boundary_ms`
+  );
   const incrementalStartedAt = nullableIsoTimestamp(
     row.incremental_started_at,
     `${stateContext} incremental_started_at`
@@ -1154,6 +1160,20 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     return corruptState(stateContext, 'inactive final coverage state');
   }
 
+  if (
+    (incrementalStatus !== 'RUNNING'
+      && incrementalFrozenBoundaryMs !== null)
+    || (
+      incrementalStatus === 'RUNNING'
+      && incrementalFrozenBoundaryMs !== null
+      && (
+        latest === null
+        || incrementalFrozenBoundaryMs > latest
+      )
+    )
+  ) {
+    return corruptState(stateContext, 'incremental frozen boundary provenance');
+  }
   if (incrementalStatus === 'IDLE') {
     if (incrementalFailure.code !== null) {
       return corruptState(stateContext, 'incremental IDLE fields');
@@ -1207,6 +1227,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     coverageErrorSummary: coverageFailure.summary,
     incrementalStatus,
     incrementalGeneration,
+    incrementalFrozenBoundaryMs,
     incrementalStartedAt,
     incrementalEndedAt,
     incrementalLastSuccessAt,
@@ -1329,6 +1350,7 @@ function incrementalStateMatchesLease(
     && state.symbol === lease.symbol
     && state.incrementalStatus === 'RUNNING'
     && state.incrementalGeneration === lease.generation
+    && state.incrementalFrozenBoundaryMs === lease.frozenBoundaryMs
     && stateAllowsIncremental(state);
 }
 
@@ -1389,6 +1411,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         coverage_started_at, coverage_ended_at, coverage_last_success_at,
         coverage_error_code, coverage_error_summary,
         incremental_status, incremental_generation,
+        incremental_frozen_boundary_ms,
         incremental_started_at, incremental_ended_at,
         incremental_last_success_at,
         incremental_error_code, incremental_error_summary,
@@ -1402,7 +1425,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         NULL, NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL,
-        'IDLE', 0,
+        'IDLE', 0, NULL,
         NULL, NULL, NULL,
         NULL, NULL,
         @observedAt, @observedAt
@@ -1438,6 +1461,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           coverage_error_summary = @coverageErrorSummary,
           incremental_status = @incrementalStatus,
           incremental_generation = @incrementalGeneration,
+          incremental_frozen_boundary_ms = NULL,
           incremental_ended_at = @incrementalEndedAt,
           incremental_error_code = @incrementalErrorCode,
           incremental_error_summary = @incrementalErrorSummary,
@@ -1447,7 +1471,10 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND symbol = @symbol
         AND active = @previousActive
         AND coverage_generation = @previousCoverageGeneration
+        AND incremental_status = @previousIncrementalStatus
         AND incremental_generation = @previousIncrementalGeneration
+        AND incremental_frozen_boundary_ms
+          IS @previousIncrementalFrozenBoundaryMs
     `);
     this.updateCoverageStart = this.database.prepare(`
       UPDATE funding_rate_sync_state
@@ -1692,6 +1719,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       UPDATE funding_rate_sync_state
       SET incremental_status = 'RUNNING',
           incremental_generation = @generation,
+          incremental_frozen_boundary_ms = @frozenBoundaryMs,
           incremental_started_at = @startedAt,
           incremental_ended_at = NULL,
           incremental_error_code = NULL,
@@ -1702,6 +1730,9 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND symbol = @symbol
         AND incremental_status = @previousStatus
         AND incremental_generation = @previousGeneration
+        AND incremental_frozen_boundary_ms IS @previousFrozenBoundaryMs
+        AND incremental_started_at IS @previousStartedAt
+        AND latest_funding_timestamp_ms IS @frozenBoundaryMs
     `);
     this.updateIncrementalCheckpoint = this.database.prepare(`
       UPDATE funding_rate_sync_state
@@ -1725,10 +1756,12 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND reactivation_required = 0
         AND incremental_status = 'RUNNING'
         AND incremental_generation = @generation
+        AND incremental_frozen_boundary_ms IS @frozenBoundaryMs
     `);
     this.updateIncrementalTerminal = this.database.prepare(`
       UPDATE funding_rate_sync_state
       SET incremental_status = @status,
+          incremental_frozen_boundary_ms = NULL,
           incremental_ended_at = @endedAt,
           incremental_last_success_at = @lastSuccessAt,
           incremental_error_code = @failureCode,
@@ -1739,6 +1772,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND symbol = @symbol
         AND incremental_status = 'RUNNING'
         AND incremental_generation = @generation
+        AND incremental_frozen_boundary_ms IS @frozenBoundaryMs
     `);
 
     this.applyDiscoveryTransaction = this.database.transaction((
@@ -2129,11 +2163,15 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         throw new Error('funding incremental generation exhausted');
       }
       const generation = state.incrementalGeneration + 1;
+      const frozenBoundaryMs = state.latestFundingTimestampMs;
       const update = this.updateIncrementalStart.run({
         ...market,
         generation,
+        frozenBoundaryMs,
         previousGeneration: state.incrementalGeneration,
         previousStatus: state.incrementalStatus,
+        previousFrozenBoundaryMs: state.incrementalFrozenBoundaryMs,
+        previousStartedAt: state.incrementalStartedAt,
         startedAt: startedAtText
       });
       if (!sqliteIntegerEquals(update.changes, 1)) {
@@ -2142,7 +2180,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       return {
         ...market,
         generation,
-        frozenBoundaryMs: state.latestFundingTimestampMs
+        frozenBoundaryMs
       };
     })();
   }
@@ -2172,11 +2210,15 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         throw new Error('funding incremental generation exhausted');
       }
       const generation = state.incrementalGeneration + 1;
+      const frozenBoundaryMs = state.latestFundingTimestampMs;
       const update = this.updateIncrementalStart.run({
         ...market,
         generation,
+        frozenBoundaryMs,
         previousGeneration: state.incrementalGeneration,
         previousStatus: 'RUNNING',
+        previousFrozenBoundaryMs: state.incrementalFrozenBoundaryMs,
+        previousStartedAt: state.incrementalStartedAt,
         startedAt: restartedAtText
       });
       if (!sqliteIntegerEquals(update.changes, 1)) {
@@ -2185,7 +2227,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       return {
         ...market,
         generation,
-        frozenBoundaryMs: state.latestFundingTimestampMs
+        frozenBoundaryMs
       };
     })();
   }
@@ -2431,7 +2473,10 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         observedAt,
         previousActive: existing.active ? 1 : 0,
         previousCoverageGeneration: existing.coverageGeneration,
+        previousIncrementalStatus: existing.incrementalStatus,
         previousIncrementalGeneration: existing.incrementalGeneration,
+        previousIncrementalFrozenBoundaryMs:
+          existing.incrementalFrozenBoundaryMs,
         reactivationRequired: reactivated ? 1 : 0,
         reactivationAfterGeneration: reactivated ? coverageGeneration : null,
         coverageStatus: remainsPending ? 'PENDING' : 'INCOMPLETE',

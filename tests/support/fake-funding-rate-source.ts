@@ -198,10 +198,24 @@ export interface FakeExecutorStep {
   readonly gate?: FakeAsyncGate;
   readonly error?: unknown;
   readonly onExecute?: () => void;
+  readonly retryNotices?: readonly FakeFundingRequestRetryNotice[];
 }
+
+export interface FakeFundingRequestRetryNotice {
+  readonly retryAttempt: number;
+  readonly retryDelayMs: number;
+  readonly error: unknown;
+}
+
+export type FakeFundingRequestRetryObserver = (
+  notice: FakeFundingRequestRetryNotice
+) => void;
 
 export class FakeFundingRequestExecutor implements FundingRequestExecutor {
   readonly calls: FundingRequestMetadata[] = [];
+  readonly retryObserverCalls: Array<
+    FakeFundingRequestRetryObserver | undefined
+  > = [];
   readonly #steps: readonly FakeExecutorStep[];
   readonly #trace: string[];
 
@@ -215,13 +229,24 @@ export class FakeFundingRequestExecutor implements FundingRequestExecutor {
 
   async execute<Value>(
     request: FundingRequestMetadata,
-    operation: () => Promise<Value>
+    operation: () => Promise<Value>,
+    onRetry?: FakeFundingRequestRetryObserver
   ): Promise<Value> {
     const index = this.calls.length;
     this.calls.push(request);
+    this.retryObserverCalls.push(onRetry);
     this.#trace.push(`execute:${request.path}`);
     const step = this.#steps[index];
     step?.onExecute?.();
+    for (const notice of step?.retryNotices ?? []) {
+      if (onRetry === undefined) {
+        throw new Error('funding request retry observer is required');
+      }
+      this.#trace.push(
+        `retry:${request.path}:${notice.retryAttempt}:${notice.retryDelayMs}`
+      );
+      onRetry(notice);
+    }
     if (step?.gate !== undefined) {
       await step.gate.wait();
     }

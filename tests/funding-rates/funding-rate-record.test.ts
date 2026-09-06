@@ -7,12 +7,15 @@ import {
   type FundingMarketIdentity,
   type SettledFundingRate
 } from '../../src/funding-rates/funding-rate-record.js';
+import * as fundingRequestContracts from '../../src/funding-rates/funding-rate-source.js';
 import type {
   FundingPageCursor,
   FundingRatePage,
   FundingRateSource,
   FundingRequestExecutor,
-  FundingRequestMetadata
+  FundingRequestMetadata,
+  FundingRequestRetryNotice,
+  FundingRequestRetryObserver
 } from '../../src/funding-rates/funding-rate-source.js';
 
 type Equal<Left, Right> =
@@ -80,23 +83,36 @@ interface ExpectedFundingRateSource {
 interface ExpectedFundingRequestExecutor {
   execute<Value>(
     request: ExpectedFundingRequestMetadata,
-    operation: () => Promise<Value>
+    operation: () => Promise<Value>,
+    onRetry: ExpectedFundingRequestRetryObserver
   ): Promise<Value>;
 }
+interface ExpectedFundingRequestRetryNotice {
+  readonly retryAttempt: number;
+  readonly retryDelayMs: number;
+  readonly error: unknown;
+}
+type ExpectedFundingRequestRetryObserver = (
+  notice: ExpectedFundingRequestRetryNotice
+) => void;
 
 type ActualSourceContracts = readonly [
   FundingPageCursor,
   FundingRequestMetadata,
   FundingRatePage,
   FundingRateSource,
-  FundingRequestExecutor
+  FundingRequestExecutor,
+  FundingRequestRetryNotice,
+  FundingRequestRetryObserver
 ];
 type ExpectedSourceContracts = readonly [
   ExpectedFundingPageCursor,
   ExpectedFundingRequestMetadata,
   ExpectedFundingRatePage,
   ExpectedFundingRateSource,
-  ExpectedFundingRequestExecutor
+  ExpectedFundingRequestExecutor,
+  ExpectedFundingRequestRetryNotice,
+  ExpectedFundingRequestRetryObserver
 ];
 type SourceContracts = Expect<
   NoneAreAny<ActualSourceContracts> extends true
@@ -105,6 +121,50 @@ type SourceContracts = Expect<
 >;
 const sourceContractsCompile: SourceContracts = true;
 void sourceContractsCompile;
+
+interface TaskSevenRequestContracts {
+  readonly FundingRequestCanceledError: new () => Error;
+  readonly FundingRequestRetryExhaustedError: new () => Error;
+}
+
+test('exports fixed no-argument nominal request errors without payload fields', () => {
+  const contracts = fundingRequestContracts as unknown as Partial<
+    TaskSevenRequestContracts
+  >;
+
+  for (const exportName of [
+    'FundingRequestCanceledError',
+    'FundingRequestRetryExhaustedError'
+  ] as const) {
+    const ErrorType = contracts[exportName];
+    if (typeof ErrorType !== 'function') {
+      assert.fail(`${exportName} must be exported as a runtime constructor`);
+    }
+    assert.equal(ErrorType.length, 0, `${exportName} must take no arguments`);
+
+    const first = new ErrorType();
+    const second = new ErrorType();
+    const secret = 'synthetic-credential-must-not-be-retained';
+    const withIgnoredPayload = new (ErrorType as unknown as new (
+      value: unknown
+    ) => Error)(secret);
+
+    assert.equal(first.name, exportName);
+    assert.notEqual(first.message, '');
+    assert.equal(second.name, first.name);
+    assert.equal(second.message, first.message);
+    assert.equal(withIgnoredPayload.message, first.message);
+    assert.equal('cause' in first, false);
+    assert.equal('cause' in withIgnoredPayload, false);
+    assert.deepEqual(
+      Reflect.ownKeys(first).filter(
+        (key) => key !== 'name' && key !== 'message' && key !== 'stack'
+      ),
+      []
+    );
+    assert.equal(JSON.stringify(withIgnoredPayload).includes(secret), false);
+  }
+});
 
 const identity: FundingMarketIdentity = {
   exchangeId: 'okx',

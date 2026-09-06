@@ -12,6 +12,7 @@ import {
   FundingRateMarketSync,
   type FundingPageTask
 } from '../../src/funding-rates/funding-rate-market-sync.js';
+import * as fundingRequestContracts from '../../src/funding-rates/funding-rate-source.js';
 import {
   settledFundingRate,
   type FundingMarketIdentity,
@@ -25,6 +26,7 @@ import type {
   FundingRequestMetadata
 } from '../../src/funding-rates/funding-rate-source.js';
 import {
+  StaleFundingTaskError,
   fundingTaskFailure,
   type CoverageLease,
   type CoveragePageCheckpoint,
@@ -76,6 +78,11 @@ interface RepositoryHooks {
     checkpoint: CoveragePageCheckpoint
   ) => void;
   readonly commitError?: unknown;
+  readonly beforeIncrementalCommit?: (
+    lease: IncrementalLease,
+    records: readonly SettledFundingRate[]
+  ) => void;
+  readonly incrementalCommitError?: unknown;
 }
 
 class ObservedFundingRateRepository implements FundingRateRepository {
@@ -85,6 +92,16 @@ class ObservedFundingRateRepository implements FundingRateRepository {
     readonly checkpoint: CoveragePageCheckpoint;
   }> = [];
   readonly roundComparisons: Array<readonly [1 | 2, 2 | 3]> = [];
+  readonly incrementalCommits: Array<{
+    readonly lease: IncrementalLease;
+    readonly records: readonly SettledFundingRate[];
+  }> = [];
+  readonly incrementalCompletions: IncrementalLease[] = [];
+  readonly incrementalFailures: Array<{
+    readonly lease: IncrementalLease;
+    readonly failure: FundingTaskFailure;
+  }> = [];
+  readonly incrementalCancellations: IncrementalLease[] = [];
 
   constructor(
     private readonly target: FundingRateRepository,
@@ -191,10 +208,16 @@ class ObservedFundingRateRepository implements FundingRateRepository {
     records: readonly SettledFundingRate[],
     observedAt: Date
   ): FundingPageWriteResult {
+    this.incrementalCommits.push({ lease, records });
+    this.hooks.beforeIncrementalCommit?.(lease, records);
+    if (this.hooks.incrementalCommitError !== undefined) {
+      throw this.hooks.incrementalCommitError;
+    }
     return this.target.commitIncrementalPage(lease, records, observedAt);
   }
 
   completeIncremental(lease: IncrementalLease, completedAt: Date): void {
+    this.incrementalCompletions.push(lease);
     this.target.completeIncremental(lease, completedAt);
   }
 
@@ -203,10 +226,12 @@ class ObservedFundingRateRepository implements FundingRateRepository {
     failure: FundingTaskFailure,
     failedAt: Date
   ): void {
+    this.incrementalFailures.push({ lease, failure });
     this.target.failIncremental(lease, failure, failedAt);
   }
 
   cancelIncremental(lease: IncrementalLease, canceledAt: Date): void {
+    this.incrementalCancellations.push(lease);
     this.target.cancelIncremental(lease, canceledAt);
   }
 }
@@ -303,6 +328,52 @@ function coverageTask(
     now: () => new Date(NOW.getTime())
   });
   return sync.createCoverageTask(lease);
+}
+
+interface TaskSevenFundingRateMarketSync {
+  createIncrementalTask(lease: IncrementalLease): FundingPageTask;
+}
+
+interface TaskSevenRequestContracts {
+  readonly FundingRequestCanceledError: new () => Error;
+  readonly FundingRequestRetryExhaustedError: new () => Error;
+}
+
+function incrementalTask(
+  source: FundingRateSource,
+  repository: FundingRateRepository,
+  requestExecutor: FundingRequestExecutor,
+  lease: IncrementalLease,
+  events: FundingRateEventSink = NOOP_FUNDING_RATE_EVENT_SINK
+): FundingPageTask {
+  const sync = new FundingRateMarketSync({
+    source,
+    repository,
+    requestExecutor,
+    events,
+    now: () => new Date(NOW.getTime())
+  });
+  const createIncrementalTask = (
+    sync as unknown as Partial<TaskSevenFundingRateMarketSync>
+  ).createIncrementalTask;
+  if (typeof createIncrementalTask !== 'function') {
+    assert.fail('FundingRateMarketSync.createIncrementalTask must be implemented');
+  }
+  return createIncrementalTask.call(sync, lease);
+}
+
+function nominalRequestError(
+  exportName:
+    | 'FundingRequestCanceledError'
+    | 'FundingRequestRetryExhaustedError'
+): Error {
+  const ErrorType = (
+    fundingRequestContracts as unknown as Partial<TaskSevenRequestContracts>
+  )[exportName];
+  if (typeof ErrorType !== 'function') {
+    assert.fail(`${exportName} must be exported as a runtime constructor`);
+  }
+  return new ErrorType();
 }
 
 async function drainTask(
@@ -438,6 +509,72 @@ function seedCaughtUpBitget(
     matchingRounds: [1, 2],
     emptyPageNo: 2
   }, NOW);
+}
+
+function seedCaughtUpHistory(
+  repository: FundingRateRepository,
+  market: FundingMarketIdentity,
+  records: readonly SettledFundingRate[]
+): void {
+  const lease = startCoverage(repository, market, 'INITIAL', 100);
+  if (market.exchangeId === 'bitget') {
+    if (records.length > 0) {
+      repository.commitCoveragePage(
+        lease,
+        records,
+        { exchangeId: 'bitget', round: 1 },
+        NOW
+      );
+      repository.commitCoveragePage(
+        lease,
+        records,
+        { exchangeId: 'bitget', round: 2 },
+        NOW
+      );
+    }
+    repository.completeCoverage(lease, {
+      exchangeId: 'bitget',
+      generation: lease.generation,
+      cutoffMs: lease.cutoffMs,
+      matchingRounds: [1, 2],
+      emptyPageNo: 2
+    }, NOW);
+    return;
+  }
+
+  if (records.length > 0) {
+    const recoveryAnchorMs = Math.max(
+      ...records.map(({ fundingTimestampMs }) => fundingTimestampMs)
+    );
+    repository.commitCoveragePage(
+      lease,
+      records,
+      { exchangeId: 'okx', recoveryAnchorMs },
+      NOW
+    );
+  }
+  repository.completeCoverage(lease, {
+    exchangeId: 'okx',
+    generation: lease.generation,
+    cutoffMs: lease.cutoffMs,
+    explicitEmpty: true,
+    finalRequestAfterMs: records.length === 0
+      ? null
+      : Math.min(...records.map(({ fundingTimestampMs }) => fundingTimestampMs))
+  }, NOW);
+}
+
+function coverageProof(state: FundingMarketState): unknown {
+  return {
+    coverageStatus: state.coverageStatus,
+    coverageErrorCode: state.coverageErrorCode,
+    coverageErrorSummary: state.coverageErrorSummary,
+    coverageCutoffMs: state.coverageCutoffMs,
+    lastCaughtUpCutoffMs: state.lastCaughtUpCutoffMs,
+    lastCaughtUpGeneration: state.lastCaughtUpGeneration,
+    lastExhaustedAt: state.lastExhaustedAt,
+    lastExhaustionEvidenceJson: state.lastExhaustionEvidenceJson
+  };
 }
 
 function forgedTaskStartLease(
@@ -1871,5 +2008,825 @@ test('the approved failure set remains finite and summaries never contain source
     symbol: BITGET_MARKET.symbol,
     taskCategory: 'coverage',
     cursor: { exchangeId: 'bitget', pageNo: 1 }
+  });
+});
+
+for (const market of [BITGET_MARKET, OKX_MARKET] as const) {
+  test(`${market.exchangeId} incremental freezes the boundary and commits the overlap page before completion`, async (t) => {
+    const { repository: target } = setupRepository(t, [market]);
+    const boundary = fundingRecord(market, 70);
+    seedCaughtUpHistory(target, market, [boundary]);
+    const repository = new ObservedFundingRateRepository(target);
+    const coverageBefore = coverageProof(stateFor(repository, market));
+    const lease = repository.startIncremental(market, STARTED_AT);
+    const newer = fundingRecord(market, 90);
+    const olderUnknown = fundingRecord(
+      market,
+      69,
+      '-0.0000000000000001234500'
+    );
+    const steps = market.exchangeId === 'bitget'
+      ? [
+          bitgetStep(market, 1, [newer, boundary]),
+          bitgetStep(market, 2, [olderUnknown])
+        ]
+      : [
+          okxStep(market, null, [newer, boundary]),
+          okxStep(market, 70, [olderUnknown])
+        ];
+    const source = new FakeFundingRateSource(market.exchangeId, steps);
+    const events = new RecordingEventSink();
+    const task = incrementalTask(
+      source,
+      repository,
+      new FakeFundingRequestExecutor(),
+      lease,
+      events
+    );
+
+    assert.equal(task.category, 'incremental');
+    assert.equal(lease.frozenBoundaryMs, 70);
+    assert.equal(await task.runNextPage(), 'requeue');
+    assert.equal(stateFor(repository, market).latestFundingTimestampMs, 90);
+    assert.equal(lease.frozenBoundaryMs, 70);
+    assert.equal(await task.runNextPage(), 'done');
+
+    assert.deepEqual(pageCursors(source), market.exchangeId === 'bitget'
+      ? [
+          { exchangeId: 'bitget', pageNo: 1 },
+          { exchangeId: 'bitget', pageNo: 2 }
+        ]
+      : [
+          { exchangeId: 'okx', afterMs: null },
+          { exchangeId: 'okx', afterMs: 70 }
+        ]);
+    assert.deepEqual(
+      repository.listHistory(market)
+        .map(({ fundingTimestampMs }) => fundingTimestampMs)
+        .sort((left, right) => right - left),
+      [90, 70, 69]
+    );
+    assert.equal(
+      repository.listHistory(market).find(
+        ({ fundingTimestampMs }) => fundingTimestampMs === 69
+      )?.fundingRate,
+      '-0.0000000000000001234500'
+    );
+    assert.equal(repository.incrementalCommits.length, 2);
+    assert.equal(stateFor(repository, market).incrementalStatus, 'IDLE');
+    assert.deepEqual(coverageProof(stateFor(repository, market)), coverageBefore);
+    const completed = events.events.find(
+      ({ event }) => event === 'funding_incremental_completed'
+    );
+    assert.ok(completed?.event === 'funding_incremental_completed');
+    assert.deepEqual({
+      exchangeId: completed.exchangeId,
+      generation: completed.generation,
+      inserted: completed.inserted,
+      unchanged: completed.unchanged,
+      revised: completed.revised
+    }, {
+      exchangeId: market.exchangeId,
+      generation: lease.generation,
+      inserted: 2,
+      unchanged: 1,
+      revised: 0
+    });
+  });
+}
+
+for (const scenario of [
+  {
+    name: 'empty local history',
+    market: BITGET_MARKET,
+    seed: [] as readonly SettledFundingRate[],
+    records: [fundingRecord(BITGET_MARKET, 50)],
+    steps: (records: readonly SettledFundingRate[]) => [
+      bitgetStep(BITGET_MARKET, 1, records),
+      bitgetStep(BITGET_MARKET, 2, [])
+    ]
+  },
+  {
+    name: 'frozen boundary absent from the response',
+    market: OKX_MARKET,
+    seed: [fundingRecord(OKX_MARKET, 70)],
+    records: [fundingRecord(OKX_MARKET, 90), fundingRecord(OKX_MARKET, 80)],
+    steps: (records: readonly SettledFundingRate[]) => [
+      okxStep(OKX_MARKET, null, records),
+      okxStep(OKX_MARKET, 80, [])
+    ]
+  }
+] as const) {
+  test(`incremental ${scenario.name} scans through an explicit empty page`, async (t) => {
+    const { repository: target } = setupRepository(t, [scenario.market]);
+    seedCaughtUpHistory(target, scenario.market, scenario.seed);
+    const coverageBefore = coverageProof(stateFor(target, scenario.market));
+    const lease = target.startIncremental(scenario.market, STARTED_AT);
+    const source = new FakeFundingRateSource(
+      scenario.market.exchangeId,
+      scenario.steps(scenario.records)
+    );
+    const events = new RecordingEventSink();
+    const task = incrementalTask(
+      source,
+      target,
+      new FakeFundingRequestExecutor(),
+      lease,
+      events
+    );
+
+    assert.equal(await task.runNextPage(), 'requeue');
+    assert.equal(await task.runNextPage(), 'done');
+
+    assert.equal(source.fetchCalls.length, 2);
+    assert.equal(stateFor(target, scenario.market).incrementalStatus, 'IDLE');
+    assert.deepEqual(coverageProof(stateFor(target, scenario.market)), coverageBefore);
+    const completed = events.events.find(
+      ({ event }) => event === 'funding_incremental_completed'
+    );
+    assert.ok(completed?.event === 'funding_incremental_completed');
+    assert.deepEqual({
+      inserted: completed.inserted,
+      unchanged: completed.unchanged,
+      revised: completed.revised
+    }, {
+      inserted: scenario.records.length,
+      unchanged: 0,
+      revised: 0
+    });
+  });
+}
+
+test('incremental commits an older revision in full and reports cumulative page results', async (t) => {
+  const { database, repository: target } = setupRepository(t, [OKX_MARKET]);
+  const boundary = fundingRecord(OKX_MARKET, 70);
+  const previous = fundingRecord(OKX_MARKET, 60, '0.0001', 'A');
+  seedCaughtUpHistory(target, OKX_MARKET, [boundary, previous]);
+  const lease = target.startIncremental(OKX_MARKET, STARTED_AT);
+  const revised = fundingRecord(OKX_MARKET, 60, '0.0002', 'B');
+  const source = new FakeFundingRateSource('okx', [
+    okxStep(OKX_MARKET, null, [boundary]),
+    okxStep(OKX_MARKET, 70, [revised])
+  ]);
+  const events = new RecordingEventSink();
+  const task = incrementalTask(
+    source,
+    target,
+    new FakeFundingRequestExecutor(),
+    lease,
+    events
+  );
+
+  assert.deepEqual(await drainTask(task), ['requeue', 'done']);
+
+  assert.equal(
+    target.listHistory(OKX_MARKET).find(
+      ({ fundingTimestampMs }) => fundingTimestampMs === 60
+    )?.fundingRate,
+    '0.0002'
+  );
+  const revisionCount = database.prepare(`
+    SELECT COUNT(*) AS count FROM funding_rate_revisions
+  `).get() as { readonly count: number };
+  assert.equal(revisionCount.count, 1);
+  const completed = events.events.find(
+    ({ event }) => event === 'funding_incremental_completed'
+  );
+  assert.ok(completed?.event === 'funding_incremental_completed');
+  assert.deepEqual({
+    inserted: completed.inserted,
+    unchanged: completed.unchanged,
+    revised: completed.revised
+  }, {
+    inserted: 0,
+    unchanged: 1,
+    revised: 1
+  });
+});
+
+for (const failureCase of [
+  {
+    name: 'request construction',
+    code: 'SOURCE_RESPONSE_INVALID' as const,
+    step: {
+      marketId: BITGET_MARKET.exchangeMarketId,
+      cursor: { exchangeId: 'bitget', pageNo: 1 } as const,
+      pageRequestError: new Error('synthetic incremental request failure')
+    },
+    databaseError: undefined
+  },
+  {
+    name: 'response parsing',
+    code: 'SOURCE_RESPONSE_INVALID' as const,
+    step: {
+      marketId: BITGET_MARKET.exchangeMarketId,
+      cursor: { exchangeId: 'bitget', pageNo: 1 } as const,
+      parseError: new Error('synthetic incremental parse failure')
+    },
+    databaseError: undefined
+  },
+  {
+    name: 'non-advancing cursor',
+    code: 'CURSOR_NOT_ADVANCING' as const,
+    step: {
+      marketId: BITGET_MARKET.exchangeMarketId,
+      cursor: { exchangeId: 'bitget', pageNo: 1 } as const,
+      page: {
+        ...fakeBitgetPage(1, [fundingRecord(BITGET_MARKET, 90)]),
+        nextCursor: { exchangeId: 'bitget', pageNo: 1 } as const
+      }
+    },
+    databaseError: undefined
+  },
+  {
+    name: 'database commit',
+    code: 'DATABASE_WRITE_FAILED' as const,
+    step: bitgetStep(
+      BITGET_MARKET,
+      1,
+      [fundingRecord(BITGET_MARKET, 90)]
+    ),
+    databaseError: new Error('synthetic incremental sqlite failure')
+  }
+] as const) {
+  test(`incremental ${failureCase.name} failure marks only incremental incomplete`, async (t) => {
+    const { database, repository: target } = setupRepository(t, [BITGET_MARKET]);
+    seedCaughtUpHistory(target, BITGET_MARKET, [fundingRecord(BITGET_MARKET, 70)]);
+    const coverageBefore = coverageProof(stateFor(target, BITGET_MARKET));
+    const repository = new ObservedFundingRateRepository(target, {
+      incrementalCommitError: failureCase.databaseError
+    });
+    const lease = repository.startIncremental(BITGET_MARKET, STARTED_AT);
+    const beforeRun = persistenceSnapshot(database);
+    const source = new FakeFundingRateSource('bitget', [failureCase.step]);
+    const events = new RecordingEventSink();
+    const task = incrementalTask(
+      source,
+      repository,
+      new FakeFundingRequestExecutor(),
+      lease,
+      events
+    );
+
+    assert.equal(await task.runNextPage(), 'done');
+
+    const state = stateFor(repository, BITGET_MARKET);
+    const expectedFailure = fundingTaskFailure(failureCase.code);
+    assert.deepEqual({
+      status: state.incrementalStatus,
+      errorCode: state.incrementalErrorCode,
+      errorSummary: state.incrementalErrorSummary
+    }, {
+      status: 'INCOMPLETE',
+      errorCode: expectedFailure.code,
+      errorSummary: expectedFailure.summary
+    });
+    assert.deepEqual(coverageProof(state), coverageBefore);
+    assert.deepEqual(
+      repository.listHistory(BITGET_MARKET).map(
+        ({ fundingTimestampMs }) => fundingTimestampMs
+      ),
+      [70]
+    );
+    assert.notEqual(persistenceSnapshot(database), beforeRun);
+    const incomplete = events.events.find(
+      ({ event }) => event === 'funding_task_incomplete'
+    );
+    assert.ok(incomplete?.event === 'funding_task_incomplete');
+    assert.equal(incomplete.taskCategory, 'incremental');
+    assert.equal(incomplete.generation, lease.generation);
+    assert.equal(incomplete.frozenBoundaryMs, 70);
+  });
+}
+
+test('incremental success preserves an existing incomplete coverage state and proof', async (t) => {
+  const { repository } = setupRepository(t, [OKX_MARKET]);
+  seedCaughtUpHistory(repository, OKX_MARKET, [fundingRecord(OKX_MARKET, 70)]);
+  const periodic = startCoverage(repository, OKX_MARKET, 'PERIODIC', 110);
+  repository.failCoverage(
+    periodic,
+    fundingTaskFailure('SOURCE_RESPONSE_INVALID'),
+    LATER_AT
+  );
+  const coverageBefore = coverageProof(stateFor(repository, OKX_MARKET));
+  const lease = repository.startIncremental(OKX_MARKET, STARTED_AT);
+  const source = new FakeFundingRateSource('okx', [
+    okxStep(OKX_MARKET, null, [])
+  ]);
+  const events = new RecordingEventSink();
+  const task = incrementalTask(
+    source,
+    repository,
+    new FakeFundingRequestExecutor(),
+    lease,
+    events
+  );
+
+  assert.equal(await task.runNextPage(), 'done');
+
+  const state = stateFor(repository, OKX_MARKET);
+  assert.deepEqual(coverageProof(state), coverageBefore);
+  assert.equal(state.coverageStatus, 'INCOMPLETE');
+  assert.equal(state.incrementalStatus, 'IDLE');
+  assert.ok(events.events.some(
+    ({ event }) => event === 'funding_incremental_completed'
+  ));
+});
+
+for (const transition of ['inactive', 'reactivation', 'generation'] as const) {
+  test(`incremental ${transition} fencing cancels before the next request`, async (t) => {
+    const { database, repository: target } = setupRepository(t, [BITGET_MARKET]);
+    seedCaughtUpHistory(target, BITGET_MARKET, [fundingRecord(BITGET_MARKET, 70)]);
+    const repository = new ObservedFundingRateRepository(target);
+    const lease = repository.startIncremental(BITGET_MARKET, STARTED_AT);
+    const source = new FakeFundingRateSource('bitget', [
+      bitgetStep(BITGET_MARKET, 1, [fundingRecord(BITGET_MARKET, 90)])
+    ]);
+    const executor = new FakeFundingRequestExecutor();
+    const task = incrementalTask(source, repository, executor, lease);
+    assert.equal(await task.runNextPage(), 'requeue');
+
+    if (transition === 'generation') {
+      repository.restartInterruptedIncremental(BITGET_MARKET, LATER_AT);
+    } else {
+      repository.applyCompleteDiscovery(
+        'bitget',
+        [{ ...BITGET_MARKET, active: false }],
+        LATER_AT
+      );
+      if (transition === 'reactivation') {
+        repository.applyCompleteDiscovery(
+          'bitget',
+          [{ ...BITGET_MARKET, active: true }],
+          new Date(LATER_AT.getTime() + 1_000)
+        );
+      }
+    }
+    const beforeOldRun = persistenceSnapshot(database);
+
+    assert.equal(await task.runNextPage(), 'done');
+
+    assert.equal(source.pageRequestCalls.length, 1);
+    assert.equal(source.fetchCalls.length, 1);
+    assert.equal(executor.calls.length, 1);
+    assert.equal(repository.incrementalCancellations.length, 1);
+    assert.equal(persistenceSnapshot(database), beforeOldRun);
+    const state = stateFor(repository, BITGET_MARKET);
+    assert.equal(
+      state.incrementalStatus,
+      transition === 'generation' ? 'RUNNING' : 'IDLE'
+    );
+  });
+}
+
+test('a returned-stale incremental commit performs zero writes and preserves the replacement generation', async (t) => {
+  const { database, repository: target } = setupRepository(t, [OKX_MARKET]);
+  seedCaughtUpHistory(target, OKX_MARKET, [fundingRecord(OKX_MARKET, 70)]);
+  let replacement: IncrementalLease | undefined;
+  let snapshotAfterReplacement = '';
+  const repository = new ObservedFundingRateRepository(target, {
+    beforeIncrementalCommit: () => {
+      replacement = target.restartInterruptedIncremental(OKX_MARKET, LATER_AT);
+      snapshotAfterReplacement = persistenceSnapshot(database);
+    }
+  });
+  const lease = repository.startIncremental(OKX_MARKET, STARTED_AT);
+  const source = new FakeFundingRateSource('okx', [
+    okxStep(OKX_MARKET, null, [fundingRecord(OKX_MARKET, 90)])
+  ]);
+  const events = new RecordingEventSink();
+  const task = incrementalTask(
+    source,
+    repository,
+    new FakeFundingRequestExecutor(),
+    lease,
+    events
+  );
+
+  assert.equal(await task.runNextPage(), 'done');
+
+  assert.ok(replacement !== undefined);
+  assert.equal(persistenceSnapshot(database), snapshotAfterReplacement);
+  assert.deepEqual(
+    repository.listHistory(OKX_MARKET).map(
+      ({ fundingTimestampMs }) => fundingTimestampMs
+    ),
+    [70]
+  );
+  const state = stateFor(repository, OKX_MARKET);
+  assert.equal(state.incrementalGeneration, replacement.generation);
+  assert.equal(state.incrementalStatus, 'RUNNING');
+  assert.equal(events.events.some(
+    ({ event }) => event === 'funding_task_incomplete'
+      || event === 'funding_incremental_completed'
+  ), false);
+});
+
+test('incremental restart resets its cursor and counters and refreezes persisted latest', async (t) => {
+  const { repository } = setupRepository(t, [BITGET_MARKET]);
+  seedCaughtUpHistory(repository, BITGET_MARKET, [fundingRecord(BITGET_MARKET, 70)]);
+  const firstLease = repository.startIncremental(BITGET_MARKET, STARTED_AT);
+  const firstSource = new FakeFundingRateSource('bitget', [
+    bitgetStep(BITGET_MARKET, 1, [fundingRecord(BITGET_MARKET, 90)])
+  ]);
+  const firstTask = incrementalTask(
+    firstSource,
+    repository,
+    new FakeFundingRequestExecutor(),
+    firstLease
+  );
+  assert.equal(await firstTask.runNextPage(), 'requeue');
+
+  const restarted = repository.restartInterruptedIncremental(
+    BITGET_MARKET,
+    LATER_AT
+  );
+  assert.equal(restarted.frozenBoundaryMs, 90);
+  const source = new FakeFundingRateSource('bitget', [
+    bitgetStep(BITGET_MARKET, 1, [fundingRecord(BITGET_MARKET, 90)]),
+    bitgetStep(BITGET_MARKET, 2, [fundingRecord(BITGET_MARKET, 89)])
+  ]);
+  const events = new RecordingEventSink();
+  const task = incrementalTask(
+    source,
+    repository,
+    new FakeFundingRequestExecutor(),
+    restarted,
+    events
+  );
+
+  assert.deepEqual(await drainTask(task), ['requeue', 'done']);
+
+  assert.deepEqual(pageCursors(source), [
+    { exchangeId: 'bitget', pageNo: 1 },
+    { exchangeId: 'bitget', pageNo: 2 }
+  ]);
+  const completed = events.events.find(
+    ({ event }) => event === 'funding_incremental_completed'
+  );
+  assert.ok(completed?.event === 'funding_incremental_completed');
+  assert.deepEqual({
+    inserted: completed.inserted,
+    unchanged: completed.unchanged,
+    revised: completed.revised
+  }, {
+    inserted: 1,
+    unchanged: 1,
+    revised: 0
+  });
+});
+
+for (const taskCategory of ['coverage', 'incremental'] as const) {
+  for (const outcome of ['canceled', 'retry exhausted'] as const) {
+    test(`${taskCategory} handles nominal request ${outcome} without guessing`, async (t) => {
+      const { database, repository } = setupRepository(t, [OKX_MARKET]);
+      if (taskCategory === 'incremental') {
+        seedCaughtUpHistory(repository, OKX_MARKET, []);
+      }
+      const events = new RecordingEventSink();
+      const error = nominalRequestError(
+        outcome === 'canceled'
+          ? 'FundingRequestCanceledError'
+          : 'FundingRequestRetryExhaustedError'
+      );
+      const executor = new FakeFundingRequestExecutor([{ error }]);
+      const source = new FakeFundingRateSource('okx', [
+        okxStep(OKX_MARKET, null, [])
+      ]);
+      const task = taskCategory === 'coverage'
+        ? coverageTask(
+            source,
+            repository,
+            executor,
+            startCoverage(repository, OKX_MARKET),
+            events
+          )
+        : incrementalTask(
+            source,
+            repository,
+            executor,
+            repository.startIncremental(OKX_MARKET, STARTED_AT),
+            events
+          );
+      const beforeRun = persistenceSnapshot(database);
+
+      if (outcome === 'canceled') {
+        assert.equal(await promiseError(task.runNextPage()), error);
+        assert.equal(persistenceSnapshot(database), beforeRun);
+        const state = stateFor(repository, OKX_MARKET);
+        assert.equal(
+          taskCategory === 'coverage'
+            ? state.coverageStatus
+            : state.incrementalStatus,
+          taskCategory === 'coverage' ? 'BACKFILLING' : 'RUNNING'
+        );
+        assert.equal(events.events.some(
+          ({ event }) => event === 'funding_task_incomplete'
+            || event === 'funding_coverage_completed'
+            || event === 'funding_incremental_completed'
+        ), false);
+        return;
+      }
+
+      assert.equal(await task.runNextPage(), 'done');
+      const state = stateFor(repository, OKX_MARKET);
+      assert.deepEqual({
+        status: taskCategory === 'coverage'
+          ? state.coverageStatus
+          : state.incrementalStatus,
+        code: taskCategory === 'coverage'
+          ? state.coverageErrorCode
+          : state.incrementalErrorCode,
+        summary: taskCategory === 'coverage'
+          ? state.coverageErrorSummary
+          : state.incrementalErrorSummary
+      }, {
+        status: 'INCOMPLETE',
+        ...fundingTaskFailure('REQUEST_RETRY_EXHAUSTED')
+      });
+      const incomplete = events.events.find(
+        ({ event }) => event === 'funding_task_incomplete'
+      );
+      assert.ok(incomplete?.event === 'funding_task_incomplete');
+      assert.equal(incomplete.taskCategory, taskCategory);
+    });
+  }
+}
+
+for (const taskCategory of ['coverage', 'incremental'] as const) {
+  test(`${taskCategory} maps an ordinary executor rejection to source invalid`, async (t) => {
+    const { repository } = setupRepository(t, [OKX_MARKET]);
+    if (taskCategory === 'incremental') {
+      seedCaughtUpHistory(repository, OKX_MARKET, []);
+    }
+    const source = new FakeFundingRateSource('okx', [
+      okxStep(OKX_MARKET, null, [])
+    ]);
+    const executor = new FakeFundingRequestExecutor([{
+      error: new Error('synthetic ordinary executor rejection')
+    }]);
+    const task = taskCategory === 'coverage'
+      ? coverageTask(
+          source,
+          repository,
+          executor,
+          startCoverage(repository, OKX_MARKET)
+        )
+      : incrementalTask(
+          source,
+          repository,
+          executor,
+          repository.startIncremental(OKX_MARKET, STARTED_AT)
+        );
+
+    assert.equal(await task.runNextPage(), 'done');
+
+    const state = stateFor(repository, OKX_MARKET);
+    assert.deepEqual({
+      code: taskCategory === 'coverage'
+        ? state.coverageErrorCode
+        : state.incrementalErrorCode,
+      summary: taskCategory === 'coverage'
+        ? state.coverageErrorSummary
+        : state.incrementalErrorSummary
+    }, fundingTaskFailure('SOURCE_RESPONSE_INVALID'));
+  });
+}
+
+test('an error with cancel name and message is still an ordinary rejection', async (t) => {
+  const { repository } = setupRepository(t, [BITGET_MARKET]);
+  const nominal = nominalRequestError('FundingRequestCanceledError');
+  const lookalike = new Error(nominal.message);
+  lookalike.name = nominal.name;
+  const lease = startCoverage(repository, BITGET_MARKET);
+  const task = coverageTask(
+    new FakeFundingRateSource('bitget', [
+      bitgetStep(BITGET_MARKET, 1, [])
+    ]),
+    repository,
+    new FakeFundingRequestExecutor([{ error: lookalike }]),
+    lease
+  );
+
+  assert.equal(await task.runNextPage(), 'done');
+  assertCoverageFailure(repository, BITGET_MARKET, 'SOURCE_RESPONSE_INVALID');
+});
+
+for (const taskCategory of ['coverage', 'incremental'] as const) {
+  test(`${taskCategory} emits one safe event for each real request retry`, async (t) => {
+    const { database, repository } = setupRepository(t, [OKX_MARKET]);
+    if (taskCategory === 'incremental') {
+      seedCaughtUpHistory(repository, OKX_MARKET, []);
+    }
+    const rawErrors = [
+      new Error('synthetic retry-one credential=alpha'),
+      new Error('synthetic retry-two credential=beta'),
+      new Error('synthetic retry-three credential=gamma')
+    ];
+    const executor = new FakeFundingRequestExecutor([{
+      retryNotices: [
+        { retryAttempt: 1, retryDelayMs: 1_000, error: rawErrors[0] },
+        { retryAttempt: 2, retryDelayMs: 2_000, error: rawErrors[1] },
+        { retryAttempt: 3, retryDelayMs: 4_000, error: rawErrors[2] }
+      ]
+    }]);
+    const source = new FakeFundingRateSource('okx', [
+      okxStep(OKX_MARKET, null, [])
+    ]);
+    const events = new RecordingEventSink();
+    const lease = taskCategory === 'coverage'
+      ? startCoverage(repository, OKX_MARKET)
+      : repository.startIncremental(OKX_MARKET, STARTED_AT);
+    const task = taskCategory === 'coverage'
+      ? coverageTask(source, repository, executor, lease as CoverageLease, events)
+      : incrementalTask(
+          source,
+          repository,
+          executor,
+          lease as IncrementalLease,
+          events
+        );
+
+    assert.equal(await task.runNextPage(), 'done');
+
+    assert.notEqual(executor.retryObserverCalls[0], undefined);
+    const retries = events.events.filter(
+      ({ event }) => event === 'funding_request_retry'
+    );
+    assert.equal(retries.length, 3);
+    for (const [index, retry] of retries.entries()) {
+      assert.ok(retry.event === 'funding_request_retry');
+      if (retry.taskCategory === 'discovery') {
+        assert.fail('market page retries must not be discovery retries');
+      }
+      assert.equal(retry.taskCategory, taskCategory);
+      assert.equal(retry.exchangeId, OKX_MARKET.exchangeId);
+      assert.equal(retry.exchangeMarketId, OKX_MARKET.exchangeMarketId);
+      assert.equal(retry.generation, lease.generation);
+      assert.equal(retry.retryAttempt, index + 1);
+      assert.equal(retry.retryDelayMs, (2 ** index) * 1_000);
+      assert.deepEqual(retry.cursor, { exchangeId: 'okx', afterMs: null });
+      assert.deepEqual(retry.request, {
+        method: 'GET',
+        path: '/api/v5/public/funding-rate-history',
+        query: { instId: OKX_MARKET.exchangeMarketId, limit: 400 },
+        body: null
+      });
+      assert.equal(retry.error.type, 'Error');
+      assert.equal(retry.error.message, rawErrors[index]?.message);
+      if (retry.taskCategory === 'coverage') {
+        assert.equal(retry.coverageCutoffMs, CUTOFF_MS);
+        assert.equal(retry.taskKind, 'INITIAL');
+      } else if (retry.taskCategory === 'incremental') {
+        assert.equal(retry.frozenBoundaryMs, null);
+      }
+    }
+    const databaseState = persistenceSnapshot(database);
+    assert.equal(databaseState.includes('credential=alpha'), false);
+    assert.equal(databaseState.includes('credential=beta'), false);
+    assert.equal(databaseState.includes('credential=gamma'), false);
+  });
+}
+
+test('a retry observer uses the nonthrowing event sink', async (t) => {
+  const { repository } = setupRepository(t, [OKX_MARKET]);
+  seedCaughtUpHistory(repository, OKX_MARKET, []);
+  const lease = repository.startIncremental(OKX_MARKET, STARTED_AT);
+  const executor = new FakeFundingRequestExecutor([{
+    retryNotices: [{
+      retryAttempt: 1,
+      retryDelayMs: 1_000,
+      error: new Error('synthetic retry before success')
+    }]
+  }]);
+  const task = incrementalTask(
+    new FakeFundingRateSource('okx', [okxStep(OKX_MARKET, null, [])]),
+    repository,
+    executor,
+    lease,
+    {
+      record(): void {
+        throw new Error('synthetic retry event sink failure');
+      }
+    }
+  );
+
+  assert.equal(await task.runNextPage(), 'done');
+  assert.equal(stateFor(repository, OKX_MARKET).incrementalStatus, 'IDLE');
+  assert.notEqual(executor.retryObserverCalls[0], undefined);
+});
+
+test('Bitget forged incremental boundary is rejected before it can skip the true overlap page', async (t) => {
+  const { database, repository } = setupRepository(t, [BITGET_MARKET]);
+  seedCaughtUpHistory(
+    repository,
+    BITGET_MARKET,
+    [fundingRecord(BITGET_MARKET, 70)]
+  );
+  const actual = repository.startIncremental(BITGET_MARKET, STARTED_AT);
+  const forged = { ...actual, frozenBoundaryMs: 100 };
+  const source = new FakeFundingRateSource('bitget', [
+    bitgetStep(BITGET_MARKET, 1, [
+      fundingRecord(BITGET_MARKET, 110),
+      fundingRecord(BITGET_MARKET, 100)
+    ]),
+    bitgetStep(BITGET_MARKET, 2, [
+      fundingRecord(BITGET_MARKET, 90),
+      fundingRecord(BITGET_MARKET, 80)
+    ]),
+    bitgetStep(BITGET_MARKET, 3, [
+      fundingRecord(BITGET_MARKET, 70),
+      fundingRecord(BITGET_MARKET, 60)
+    ])
+  ]);
+  const executor = new FakeFundingRequestExecutor();
+  const events = new RecordingEventSink();
+  const before = persistenceSnapshot(database);
+  let task: FundingPageTask | undefined;
+  let creationError: unknown = null;
+  try {
+    task = incrementalTask(
+      source,
+      repository,
+      executor,
+      forged,
+      events
+    );
+  } catch (error) {
+    creationError = error;
+  }
+
+  if (creationError !== null) {
+    assert.equal(creationError instanceof StaleFundingTaskError, true);
+    assert.equal(source.pageRequestCalls.length, 0);
+    assert.equal(source.fetchCalls.length, 0);
+    assert.equal(executor.calls.length, 0);
+    assert.equal(events.events.length, 0);
+    assert.equal(persistenceSnapshot(database), before);
+    return;
+  }
+  if (task === undefined) assert.fail('expected the unsafely accepted forged task');
+
+  assert.deepEqual(await drainTask(task), ['requeue', 'done']);
+  const persistedTimestamps = repository.listHistory(BITGET_MARKET).map(
+    ({ fundingTimestampMs }) => fundingTimestampMs
+  );
+  assert.deepEqual({
+    requestedPages: pageCursors(source),
+    trueBoundaryStillPresent: persistedTimestamps.includes(70),
+    skippedOlderUnknown: !persistedTimestamps.includes(60),
+    incrementalStatus: stateFor(repository, BITGET_MARKET).incrementalStatus
+  }, {
+    requestedPages: [
+      { exchangeId: 'bitget', pageNo: 1 },
+      { exchangeId: 'bitget', pageNo: 2 }
+    ],
+    trueBoundaryStillPresent: true,
+    skippedOlderUnknown: true,
+    incrementalStatus: 'IDLE'
+  });
+  assert.fail(
+    'forged boundary was accepted and completed before the true boundary page'
+  );
+});
+
+test('OKX createIncrementalTask rejects forged boundary with zero side effects', (t) => {
+  const { database, repository } = setupRepository(t, [OKX_MARKET]);
+  seedCaughtUpHistory(
+    repository,
+    OKX_MARKET,
+    [fundingRecord(OKX_MARKET, 70)]
+  );
+  const actual = repository.startIncremental(OKX_MARKET, STARTED_AT);
+  const forged = { ...actual, frozenBoundaryMs: 0 };
+  const source = new FakeFundingRateSource('okx', [
+    okxStep(OKX_MARKET, null, [])
+  ]);
+  const executor = new FakeFundingRequestExecutor();
+  const events = new RecordingEventSink();
+  const before = persistenceSnapshot(database);
+
+  const error = invocationError(() => incrementalTask(
+    source,
+    repository,
+    executor,
+    forged,
+    events
+  ));
+
+  assert.deepEqual({
+    staleError: error instanceof StaleFundingTaskError,
+    pageRequests: source.pageRequestCalls.length,
+    fetches: source.fetchCalls.length,
+    executions: executor.calls.length,
+    events: events.events.length,
+    persistenceUnchanged: persistenceSnapshot(database) === before
+  }, {
+    staleError: true,
+    pageRequests: 0,
+    fetches: 0,
+    executions: 0,
+    events: 0,
+    persistenceUnchanged: true
   });
 });

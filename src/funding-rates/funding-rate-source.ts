@@ -23,6 +23,32 @@ export interface FundingRatePage {
   readonly recoveryAnchorMs: number | null;
 }
 
+export interface FundingRequestRetryNotice {
+  readonly retryAttempt: number;
+  readonly retryDelayMs: number;
+  readonly error: unknown;
+}
+
+export type FundingRequestRetryObserver = (
+  notice: FundingRequestRetryNotice
+) => void;
+
+export class FundingRequestCanceledError extends Error {
+  readonly name = 'FundingRequestCanceledError';
+
+  constructor() {
+    super('funding request canceled');
+  }
+}
+
+export class FundingRequestRetryExhaustedError extends Error {
+  readonly name = 'FundingRequestRetryExhaustedError';
+
+  constructor() {
+    super('funding request retries exhausted');
+  }
+}
+
 export interface FundingRateSource {
   readonly exchangeId: FundingExchangeId;
   readonly pageSize: 100 | 400;
@@ -42,6 +68,7 @@ export interface FundingRateSource {
 export interface FundingRequestExecutor {
   execute<Value>(
     request: FundingRequestMetadata,
-    operation: () => Promise<Value>
+    operation: () => Promise<Value>,
+    onRetry: FundingRequestRetryObserver
   ): Promise<Value>;
 }

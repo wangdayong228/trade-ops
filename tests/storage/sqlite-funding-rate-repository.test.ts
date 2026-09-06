@@ -120,6 +120,10 @@ interface CoverageProvenanceState extends FundingMarketState {
   readonly coverageInitialOkxAfterMs: number | null;
 }
 
+interface IncrementalProvenanceState extends FundingMarketState {
+  readonly incrementalFrozenBoundaryMs: number | null;
+}
+
 interface HistoryDbRow {
   readonly exchange_id: unknown;
   readonly exchange_market_id: unknown;
@@ -196,6 +200,13 @@ function provenanceState(
   return onlyMarketState(repository, market) as CoverageProvenanceState;
 }
 
+function incrementalProvenanceState(
+  repository: FundingRateRepository,
+  market: FundingMarketIdentity
+): IncrementalProvenanceState {
+  return onlyMarketState(repository, market) as IncrementalProvenanceState;
+}
+
 function resumeCoverage(
   repository: FundingRateRepository,
   market: FundingMarketIdentity,
@@ -251,6 +262,60 @@ function completeEmptyOkxCoverage(
   const lease = repository.startCoverage(market, kind, cutoffMs, STARTED_AT);
   repository.completeCoverage(lease, okxEvidence(lease), completedAt);
   return lease;
+}
+
+function setupIncrementalProvenance(
+  t: TestContext,
+  boundaryMs: number | null = 70
+): FundingTestContext & {
+  readonly lifecycle: Task5FundingRateRepository;
+  readonly lease: IncrementalLease;
+} {
+  const context = setupFundingRepository(t);
+  const lifecycle = task5Repository(context.repository);
+  if (boundaryMs === null) {
+    completeEmptyOkxCoverage(lifecycle);
+  } else {
+    context.repository.applyCompleteDiscovery(
+      'okx',
+      [observation(OKX_MARKET)],
+      DISCOVERED_AT
+    );
+    const coverage = context.repository.startCoverage(
+      OKX_MARKET,
+      'INITIAL',
+      COVERAGE_CUTOFF_MS,
+      STARTED_AT
+    );
+    commitOkxPage(
+      context.repository,
+      coverage,
+      [rateRecord(OKX_MARKET, '0.0001', boundaryMs)],
+      FIRST_OBSERVED_AT,
+      boundaryMs
+    );
+    lifecycle.completeCoverage(
+      coverage,
+      okxEvidence(coverage, boundaryMs),
+      COMPLETED_AT
+    );
+  }
+  return {
+    ...context,
+    lifecycle,
+    lease: lifecycle.startIncremental(OKX_MARKET, RESTARTED_AT)
+  };
+}
+
+function persistedIncrementalBoundary(
+  database: Database.Database,
+  market: FundingMarketIdentity
+): unknown {
+  return database.prepare(`
+    SELECT incremental_frozen_boundary_ms
+    FROM funding_rate_sync_state
+    WHERE exchange_id = ? AND exchange_market_id = ?
+  `).pluck().get(market.exchangeId, market.exchangeMarketId);
 }
 
 function fundingPersistenceSnapshot(database: Database.Database): string {
@@ -920,6 +985,7 @@ test('installs the locked columns, keys, immutable triggers, and basic constrain
     ['coverage_error_summary', 'TEXT', 0],
     ['incremental_status', 'TEXT', 0],
     ['incremental_generation', 'INTEGER', 0],
+    ['incremental_frozen_boundary_ms', 'INTEGER', 0],
     ['incremental_started_at', 'TEXT', 0],
     ['incremental_ended_at', 'TEXT', 0],
     ['incremental_last_success_at', 'TEXT', 0],
@@ -950,6 +1016,12 @@ test('installs the locked columns, keys, immutable triggers, and basic constrain
   assert.equal(initialState?.lastExhaustionEvidenceJson, null);
   assert.equal(initialState?.oldestFundingTimestampMs, null);
   assert.equal(initialState?.latestFundingTimestampMs, null);
+  assert.equal(
+    (initialState as IncrementalProvenanceState | undefined)
+      ?.incrementalFrozenBoundaryMs,
+    null
+  );
+  assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), null);
   assert.throws(() => database.prepare(`
     UPDATE funding_rate_sync_state SET active = 2
   `).run(), /constraint/i);
@@ -963,6 +1035,20 @@ test('installs the locked columns, keys, immutable triggers, and basic constrain
   assert.throws(() => database.prepare(`
     UPDATE funding_rate_sync_state
     SET coverage_generation = ${MAX_SQLITE_SAFE_INTEGER + 1}
+  `).run(), /constraint/i);
+  for (const invalidBoundary of [
+    "'70'",
+    '-1',
+    String(MAX_UNIX_TIMESTAMP_MS + 1)
+  ]) {
+    assert.throws(() => database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET incremental_frozen_boundary_ms = ${invalidBoundary}
+    `).run(), /constraint/i);
+  }
+  assert.throws(() => database.prepare(`
+    UPDATE funding_rate_sync_state
+    SET incremental_frozen_boundary_ms = 0
   `).run(), /constraint/i);
 
   const lease = repository.startCoverage(
@@ -3320,6 +3406,301 @@ test('rejects exhausted incremental generations without changing eligible state'
   );
   assert.equal(fundingPersistenceSnapshot(database), before);
 });
+
+for (const boundaryCase of [
+  { name: 'non-empty history', boundaryMs: 70 },
+  { name: 'empty history', boundaryMs: null },
+  { name: 'timestamp zero', boundaryMs: 0 }
+] as const) {
+  test(`incremental start persists the exact frozen boundary for ${boundaryCase.name}`, (t) => {
+    const { database, repository, lifecycle, lease } = setupIncrementalProvenance(
+      t,
+      boundaryCase.boundaryMs
+    );
+    const state = incrementalProvenanceState(repository, OKX_MARKET);
+
+    assert.equal(lease.frozenBoundaryMs, boundaryCase.boundaryMs);
+    assert.equal(
+      state.incrementalFrozenBoundaryMs,
+      boundaryCase.boundaryMs
+    );
+    assert.equal(
+      persistedIncrementalBoundary(database, OKX_MARKET),
+      boundaryCase.boundaryMs
+    );
+    assert.equal(lifecycle.isIncrementalLeaseEligible(lease), true);
+  });
+}
+
+test('incremental page advancement never moves persisted frozen provenance', (t) => {
+  const { database, repository, lifecycle, lease } = setupIncrementalProvenance(t);
+  lifecycle.commitIncrementalPage(
+    lease,
+    [rateRecord(OKX_MARKET, '0.0002', 90)],
+    FINALIZED_AT
+  );
+  const state = incrementalProvenanceState(repository, OKX_MARKET);
+
+  assert.equal(state.latestFundingTimestampMs, 90);
+  assert.equal(lease.frozenBoundaryMs, 70);
+  assert.equal(state.incrementalFrozenBoundaryMs, 70);
+  assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), 70);
+  assert.equal(lifecycle.isIncrementalLeaseEligible(lease), true);
+});
+
+test('incremental restart atomically fences and rebinds provenance to persisted latest', (t) => {
+  const { database, repository, lifecycle, lease } = setupIncrementalProvenance(t);
+  lifecycle.commitIncrementalPage(
+    lease,
+    [rateRecord(OKX_MARKET, '0.0002', 90)],
+    FINALIZED_AT
+  );
+
+  const restarted = lifecycle.restartInterruptedIncremental(
+    OKX_MARKET,
+    LATER_AT
+  );
+
+  const state = incrementalProvenanceState(repository, OKX_MARKET);
+  assert.equal(restarted.generation, lease.generation + 1);
+  assert.equal(restarted.frozenBoundaryMs, 90);
+  assert.equal(state.incrementalGeneration, restarted.generation);
+  assert.equal(state.incrementalFrozenBoundaryMs, 90);
+  assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), 90);
+  assert.equal(lifecycle.isIncrementalLeaseEligible(lease), false);
+  assert.equal(lifecycle.isIncrementalLeaseEligible(restarted), true);
+});
+
+for (const terminal of ['complete', 'fail', 'cancel'] as const) {
+  test(`incremental ${terminal} clears persisted frozen provenance`, (t) => {
+    const { database, repository, lifecycle, lease } = setupIncrementalProvenance(t);
+    if (terminal === 'complete') {
+      lifecycle.completeIncremental(lease, FINALIZED_AT);
+    } else if (terminal === 'fail') {
+      lifecycle.failIncremental(
+        lease,
+        fundingTaskFailure('SOURCE_RESPONSE_INVALID'),
+        FINALIZED_AT
+      );
+    } else {
+      lifecycle.cancelIncremental(lease, FINALIZED_AT);
+    }
+
+    const state = incrementalProvenanceState(repository, OKX_MARKET);
+    assert.equal(
+      state.incrementalStatus,
+      terminal === 'fail' ? 'INCOMPLETE' : 'IDLE'
+    );
+    assert.equal(state.incrementalFrozenBoundaryMs, null);
+    assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), null);
+    assert.equal(lifecycle.isIncrementalLeaseEligible(lease), false);
+  });
+}
+
+for (const transition of ['inactive', 'reactivation'] as const) {
+  test(`${transition} transition clears and fences incremental frozen provenance`, (t) => {
+    const { database, repository, lifecycle, lease } = setupIncrementalProvenance(t);
+    repository.applyCompleteDiscovery(
+      'okx',
+      [observation(OKX_MARKET, false)],
+      TRANSITIONED_AT
+    );
+    if (transition === 'reactivation') {
+      repository.applyCompleteDiscovery(
+        'okx',
+        [observation(OKX_MARKET)],
+        REACTIVATED_AT
+      );
+    }
+
+    const state = incrementalProvenanceState(repository, OKX_MARKET);
+    assert.equal(state.incrementalStatus, 'IDLE');
+    assert.equal(state.incrementalFrozenBoundaryMs, null);
+    assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), null);
+    assert.equal(lifecycle.isIncrementalLeaseEligible(lease), false);
+  });
+}
+
+const forgedIncrementalBoundaryCases = [
+  { name: 'different non-null boundary', frozenBoundaryMs: 100 },
+  { name: 'null instead of non-null', frozenBoundaryMs: null },
+  { name: 'zero instead of non-zero', frozenBoundaryMs: 0 }
+] as const;
+
+const forgedIncrementalOperations = [
+  'currentness',
+  'page',
+  'complete',
+  'fail',
+  'cancel'
+] as const;
+
+for (const boundaryCase of forgedIncrementalBoundaryCases) {
+  for (const operation of forgedIncrementalOperations) {
+    test(`incremental ${operation} rejects ${boundaryCase.name} with zero writes`, (t) => {
+      const { database, lifecycle, lease } = setupIncrementalProvenance(t);
+      const forged = {
+        ...lease,
+        frozenBoundaryMs: boundaryCase.frozenBoundaryMs
+      };
+      const before = fundingPersistenceSnapshot(database);
+
+      if (operation === 'currentness') {
+        assert.deepEqual({
+          eligible: lifecycle.isIncrementalLeaseEligible(forged),
+          persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+        }, {
+          eligible: false,
+          persistenceUnchanged: true
+        });
+      } else {
+        const error = invocationError(() => {
+          if (operation === 'page') {
+            lifecycle.commitIncrementalPage(
+              forged,
+              [rateRecord(OKX_MARKET, '0.0002', 90)],
+              FINALIZED_AT
+            );
+          } else if (operation === 'complete') {
+            lifecycle.completeIncremental(forged, FINALIZED_AT);
+          } else if (operation === 'fail') {
+            lifecycle.failIncremental(
+              forged,
+              fundingTaskFailure('SOURCE_RESPONSE_INVALID'),
+              FINALIZED_AT
+            );
+          } else {
+            lifecycle.cancelIncremental(forged, FINALIZED_AT);
+          }
+        });
+        assert.deepEqual({
+          staleError:
+            error instanceof fundingRateRepositoryModule.StaleFundingTaskError,
+          persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+        }, {
+          staleError: true,
+          persistenceUnchanged: true
+        }, `${operation} must fail specifically as stale provenance`);
+      }
+    });
+  }
+}
+
+test('schema constrains incremental provenance type, range, state, and latest relation', (t) => {
+  const { database } = setupIncrementalProvenance(t);
+  const invalidAssignments = [
+    "incremental_frozen_boundary_ms = 'broken'",
+    'incremental_frozen_boundary_ms = -1',
+    `incremental_frozen_boundary_ms = ${MAX_UNIX_TIMESTAMP_MS + 1}`,
+    'incremental_frozen_boundary_ms = 71',
+    "incremental_status = 'IDLE', incremental_ended_at = '2026-09-06T00:09:00.000Z'"
+  ];
+
+  for (const assignment of invalidAssignments) {
+    const before = fundingPersistenceSnapshot(database);
+    assert.throws(() => database.prepare(`
+      UPDATE funding_rate_sync_state SET ${assignment}
+      WHERE exchange_id = ? AND exchange_market_id = ?
+    `).run(OKX_MARKET.exchangeId, OKX_MARKET.exchangeMarketId), /constraint/i);
+    assert.equal(fundingPersistenceSnapshot(database), before);
+  }
+});
+
+test('an aborted incremental restart preserves generation and frozen provenance atomically', (t) => {
+  const { database, lifecycle, lease } = setupIncrementalProvenance(t);
+  assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), 70);
+  database.exec(`
+    CREATE TRIGGER test_abort_incremental_restart
+    BEFORE UPDATE OF incremental_generation ON funding_rate_sync_state
+    WHEN OLD.exchange_market_id = '${OKX_MARKET.exchangeMarketId}'
+      AND NEW.incremental_generation = OLD.incremental_generation + 1
+    BEGIN
+      SELECT RAISE(ABORT, 'test incremental restart failed');
+    END;
+  `);
+  const before = fundingPersistenceSnapshot(database);
+
+  assert.throws(
+    () => lifecycle.restartInterruptedIncremental(OKX_MARKET, LATER_AT),
+    /test incremental restart failed|funding incremental/i
+  );
+  assert.equal(fundingPersistenceSnapshot(database), before);
+  assert.equal(lifecycle.isIncrementalLeaseEligible(lease), true);
+  assert.equal(persistedIncrementalBoundary(database, OKX_MARKET), 70);
+});
+
+const corruptIncrementalProvenanceCases = [
+  {
+    name: 'terminal state retaining a boundary',
+    prepare: (lifecycle: Task5FundingRateRepository, lease: IncrementalLease) => {
+      lifecycle.cancelIncremental(lease, FINALIZED_AT);
+    },
+    assignment: 'incremental_frozen_boundary_ms = 70'
+  },
+  {
+    name: 'RUNNING boundary beyond persisted latest',
+    prepare: () => {},
+    assignment: 'incremental_frozen_boundary_ms = 71'
+  },
+  {
+    name: 'non-integer boundary',
+    prepare: () => {},
+    assignment: "incremental_frozen_boundary_ms = 'broken'"
+  },
+  {
+    name: 'negative boundary',
+    prepare: () => {},
+    assignment: 'incremental_frozen_boundary_ms = -1'
+  },
+  {
+    name: 'out-of-range boundary',
+    prepare: () => {},
+    assignment: `incremental_frozen_boundary_ms = ${MAX_UNIX_TIMESTAMP_MS + 1}`
+  }
+] as const;
+
+for (const corruptCase of corruptIncrementalProvenanceCases) {
+  test(`fails closed across incremental entries on corrupt provenance: ${corruptCase.name}`, (t) => {
+    const { database, repository, lifecycle, lease } = setupIncrementalProvenance(t);
+    corruptCase.prepare(lifecycle, lease);
+    setStateIgnoringChecks(database, OKX_MARKET, corruptCase.assignment);
+    const before = fundingPersistenceSnapshot(database);
+    const operations: ReadonlyArray<readonly [string, () => unknown]> = [
+      ['read', () => repository.listMarketStates('okx')],
+      ['restart', () => lifecycle.restartInterruptedIncremental(
+        OKX_MARKET,
+        LATER_AT
+      )],
+      ['currentness', () => lifecycle.isIncrementalLeaseEligible(lease)],
+      ['page', () => lifecycle.commitIncrementalPage(
+        lease,
+        [rateRecord(OKX_MARKET, '0.0002', 69)],
+        LATER_AT
+      )],
+      ['complete', () => lifecycle.completeIncremental(lease, LATER_AT)],
+      ['fail', () => lifecycle.failIncremental(
+        lease,
+        fundingTaskFailure('SOURCE_RESPONSE_INVALID'),
+        LATER_AT
+      )],
+      ['cancel', () => lifecycle.cancelIncremental(lease, LATER_AT)]
+    ];
+
+    for (const [operation, invoke] of operations) {
+      const error = invocationError(invoke);
+      assert.equal(error instanceof Error, true, operation);
+      if (!(error instanceof Error)) assert.fail(operation);
+      assert.match(error.message, /okx/i, operation);
+      assert.match(error.message, /BTC-USDT-SWAP/i, operation);
+      assert.match(
+        error.message,
+        /incremental.*(?:frozen.*boundary|provenance)|incremental_frozen_boundary_ms/i,
+        operation
+      );
+      assert.equal(fundingPersistenceSnapshot(database), before, operation);
+    }
+  });
+}
 
 const corruptFundingStateCases = [
   {
