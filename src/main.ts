@@ -321,10 +321,8 @@ export function composeService(
       operationalLog
     );
     const monitor = new OrderMonitor(
-      registry,
       repository,
       coordinator,
-      tradeEvents,
       operationalLog
     );
     const server = buildServer({

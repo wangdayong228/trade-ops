@@ -1917,11 +1917,8 @@ test('sequential open market remains executing until terminal observation then h
     }
   ));
   const monitor = new OrderMonitor(
-    new ExchangeRegistry(new Map([
-      ['bitget', context.spot],
-      ['okx', context.contract]
-    ])),
-    context.repository
+    context.repository,
+    context.coordinator
   );
 
   await context.coordinator.confirmAndExecute(context.strategyId);
@@ -1933,10 +1930,7 @@ test('sequential open market remains executing until terminal observation then h
   assert.equal(context.spot.createdRequests.length, 0);
 
   await monitor.reconcileStrategy(context.strategyId);
-  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
-  assert.equal(context.spot.createdRequests.length, 0);
-
-  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'WAITING_HEDGE');
   assert.equal(context.contract.createdRequests.length, 1);
   assert.equal(context.spot.createdRequests.length, 1);
   assert.equal(context.spot.createdRequests[0]?.baseQuantity, '0.7');
@@ -2005,11 +1999,8 @@ test('concurrent open markets progress asynchronously without an early GTC or te
     }
   ));
   const monitor = new OrderMonitor(
-    new ExchangeRegistry(new Map([
-      ['bitget', context.spot],
-      ['okx', context.contract]
-    ])),
-    context.repository
+    context.repository,
+    context.coordinator
   );
 
   await context.coordinator.confirmAndExecute(context.strategyId);
@@ -2021,10 +2012,7 @@ test('concurrent open markets progress asynchronously without an early GTC or te
   assert.equal(context.repository.listOrders(context.strategyId).length, 2);
 
   await monitor.reconcileStrategy(context.strategyId);
-  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
-  assert.equal(context.repository.listOrders(context.strategyId).length, 2);
-
-  await context.coordinator.confirmAndExecute(context.strategyId);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'WAITING_HEDGE');
   assert.equal(context.spot.createdRequests.length, 1);
   assert.equal(context.contract.createdRequests.length, 2);
   assert.equal(context.contract.createdRequests[1]?.type, 'limit');
@@ -2062,11 +2050,8 @@ test('create side effect plus transient lookup error remains recoverable and nev
     return originalFind(clientOrderId, symbol, kind);
   };
   const monitor = new OrderMonitor(
-    new ExchangeRegistry(new Map([
-      ['bitget', context.spot],
-      ['okx', context.contract]
-    ])),
-    context.repository
+    context.repository,
+    context.coordinator
   );
 
   await context.coordinator.confirmAndExecute(context.strategyId);

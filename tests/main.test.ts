@@ -553,7 +553,7 @@ test('composition redacts all configured credentials from detailed HTTP errors',
   }
 });
 
-test('composition shares one safe injected trade sink with coordinator and monitor', async (t) => {
+test('composition shares one safe trade sink with submission and evidence owners', async (t) => {
   const tradeEvents = { record(): void {} };
   const composition = composeService({
     env: VALID_ENV,
@@ -567,10 +567,21 @@ test('composition shares one safe injected trade sink with coordinator and monit
     composition.database.close();
   });
 
-  const coordinatorSink = Reflect.get(composition.coordinator, 'tradeEvents');
-  const monitorSink = Reflect.get(composition.monitor, 'tradeEvents');
-  assert.equal(coordinatorSink, monitorSink);
+  const coordinatorSink = Reflect.get(
+    composition.coordinator,
+    'tradeEvents'
+  );
+  const reconciliation = Reflect.get(
+    composition.coordinator,
+    'reconciliation'
+  ) as object;
+  const evidence = Reflect.get(reconciliation, 'evidence') as object;
+  const evidenceSink = Reflect.get(evidence, 'tradeEvents');
+
+  assert.equal(coordinatorSink, evidenceSink);
   assert.notEqual(coordinatorSink, tradeEvents);
+  assert.equal(Reflect.has(composition.monitor, 'tradeEvents'), false);
+  assert.equal(Reflect.has(composition.monitor, 'registry'), false);
 });
 
 test('creates the database parent directory during normal composition', async (t) => {
