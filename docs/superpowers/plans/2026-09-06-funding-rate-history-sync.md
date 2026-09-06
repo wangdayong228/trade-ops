@@ -499,7 +499,7 @@ git commit -m "feat: define funding rate data contracts"
 - Create: `tests/funding-rates/bitget-funding-rate-source.test.ts`
 - Create: `tests/funding-rates/okx-funding-rate-source.test.ts`
 
-- [ ] **Step 1: 写 fake client 驱动的红测试**
+- [x] **Step 1: 写 fake client 驱动的红测试**
 
 Bitget 发现精确断言每轮只调用：
 
@@ -546,7 +546,7 @@ publicGetPublicFundingRateHistory({
 
 两所都覆盖非法 envelope、超 page size、错 market ID、同页相同/冲突重复、无 `paginate` 调用。
 
-- [ ] **Step 2: 运行并确认预期 RED**
+- [x] **Step 2: 运行并确认预期 RED**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-market-discovery.test.js dist/tests/funding-rates/bitget-funding-rate-source.test.js dist/tests/funding-rates/okx-funding-rate-source.test.js
@@ -554,7 +554,7 @@ npm run build && node --test dist/tests/funding-rates/funding-market-discovery.t
 
 Expected: exit 非 0，只因三个新实现缺失。
 
-- [ ] **Step 3: 实现窄 CCXT client 接口和适配器**
+- [x] **Step 3: 实现窄 CCXT client 接口和适配器**
 
 只为测试和生产实际调用声明 `safeCurrencyCode` 及各所两个 generated raw public methods；不把现有凭证型 `CcxtExchangeGateway` 注入这里。Bitget discovery method 为 `publicMixGetV2MixMarketContracts`，OKX discovery method 为 `publicGetPublicInstruments`；两者均无分页，每轮恰好调用一次并完整校验 envelope/data。不得调用 `loadMarkets/fetchMarkets/fetchCurrencies` 或访问 market cache。
 
@@ -562,11 +562,11 @@ Expected: exit 非 0，只因三个新实现缺失。
 
 Bitget `minimumRequestSpacingMs=100`，OKX `minimumRequestSpacingMs=250`；两者均保守低于已批准设计绑定的官方限制。
 
-- [ ] **Step 4: 聚焦 GREEN**
+- [x] **Step 4: 聚焦 GREEN**
 
 Run 同 Step 2。Expected: exit 0。再运行 `npm run build`，Expected: exit 0。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/funding-rates/funding-market-discovery.ts src/funding-rates/bitget-funding-rate-source.ts src/funding-rates/okx-funding-rate-source.ts tests/funding-rates/funding-market-discovery.test.ts tests/funding-rates/bitget-funding-rate-source.test.ts tests/funding-rates/okx-funding-rate-source.test.ts
