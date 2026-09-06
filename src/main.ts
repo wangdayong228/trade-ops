@@ -12,9 +12,22 @@ import type { Logger } from 'pino';
 import { loadEnvironmentFile } from './config/environment-loader.js';
 import type { ExchangeCredentials } from './config/exchange-credentials.js';
 import { loadExchangeCredentials } from './config/exchange-credentials.js';
+import { fundingRateSyncIntervalMs } from './config/funding-rate-config.js';
 import { CcxtExchangeGateway } from './exchanges/ccxt-exchange-gateway.js';
 import type { ExchangeGateway } from './exchanges/exchange-gateway.js';
 import { ExchangeRegistry } from './exchanges/exchange-registry.js';
+import { createCcxtFundingRateSources } from './funding-rates/ccxt-funding-rate-source-factory.js';
+import {
+  NOOP_FUNDING_RATE_EVENT_SINK,
+  PinoFundingRateEventSink,
+  type FundingRateEventSink
+} from './funding-rates/funding-rate-events.js';
+import type { FundingSleep } from './funding-rates/funding-rate-exchange-worker.js';
+import type { FundingRateSource } from './funding-rates/funding-rate-source.js';
+import {
+  FundingRateSyncService,
+  type FundingRateSyncServiceOptions
+} from './funding-rates/funding-rate-sync-service.js';
 import { buildServer } from './http/server.js';
 import {
   configuredSecretValues,
@@ -29,6 +42,8 @@ import {
   PinoTradeEventSink,
   type TradeEventSink
 } from './logging/trade-events.js';
+import type { FundingRateRepository } from './storage/funding-rate-repository.js';
+import { SqliteFundingRateRepository } from './storage/sqlite-funding-rate-repository.js';
 import { claimSqliteProcessOwnership } from './storage/sqlite-process-owner.js';
 import { SqliteStrategyRepository } from './storage/sqlite-strategy-repository.js';
 import { HedgeCoordinator } from './strategy/hedge-coordinator.js';
@@ -42,6 +57,7 @@ export type Clock = () => Date;
 export interface RuntimeConfig {
   readonly exchangeIds: readonly ConfiguredExchangeId[];
   readonly credentials: ReadonlyMap<ConfiguredExchangeId, ExchangeCredentials>;
+  readonly fundingRateSyncIntervalMs: number;
   readonly databasePath: string;
   readonly host: '127.0.0.1' | '::1';
   readonly port: number;
@@ -55,10 +71,34 @@ export type GatewayFactory = (
 
 export type DatabaseFactory = (path: string) => Database.Database;
 
+export interface FundingRateSyncLifecycle {
+  start(): void;
+  stop(): Promise<void>;
+}
+
+export type FundingRateSourceFactory = () => readonly [
+  FundingRateSource,
+  FundingRateSource
+];
+
+export type FundingRateRepositoryFactory = (
+  database: Database.Database
+) => FundingRateRepository;
+
+export type FundingRateSyncFactory = (
+  options: FundingRateSyncServiceOptions
+) => FundingRateSyncLifecycle;
+
 export interface ComposeServiceOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly gatewayFactory?: GatewayFactory;
   readonly databaseFactory?: DatabaseFactory;
+  readonly fundingRateSourceFactory?: FundingRateSourceFactory;
+  readonly fundingRateRepositoryFactory?: FundingRateRepositoryFactory;
+  readonly fundingRateSyncFactory?: FundingRateSyncFactory;
+  readonly fundingRateEvents?: FundingRateEventSink;
+  readonly fundingRateNowMs?: () => number;
+  readonly fundingRateSleep?: FundingSleep;
   readonly clock?: Clock;
   readonly logger?: FastifyServerOptions['logger'];
   readonly loggerInstance?: Logger;
@@ -75,6 +115,7 @@ export interface ServiceComposition {
   readonly preflightService: PreflightService;
   readonly coordinator: HedgeCoordinator;
   readonly monitor: OrderMonitor;
+  readonly fundingRateSync: FundingRateSyncLifecycle;
   readonly server: FastifyInstance;
 }
 
@@ -89,6 +130,7 @@ export interface RunnableComposition {
     start(intervalMs: number): () => void;
     stop(): Promise<void>;
   };
+  readonly fundingRateSync: FundingRateSyncLifecycle;
   readonly server: {
     listen(options: FastifyListenOptions): Promise<string>;
     close(): Promise<void>;
@@ -218,6 +260,9 @@ function canonicalPort(raw: string | undefined): number {
 export function loadRuntimeConfig(
   env: NodeJS.ProcessEnv = process.env
 ): RuntimeConfig {
+  const configuredFundingRateSyncIntervalMs = fundingRateSyncIntervalMs(
+    env.FUNDING_RATE_SYNC_INTERVAL_MS
+  );
   const configuredExchangeIds = exchangeIds(env.TRADING_EXCHANGES);
   const credentials = new Map<
     ConfiguredExchangeId,
@@ -229,6 +274,7 @@ export function loadRuntimeConfig(
   return {
     exchangeIds: configuredExchangeIds,
     credentials,
+    fundingRateSyncIntervalMs: configuredFundingRateSyncIntervalMs,
     databasePath: databasePath(env.TRADING_DATABASE_PATH),
     host: loopbackHost(env.HOST),
     port: canonicalPort(env.PORT)
@@ -245,6 +291,40 @@ function defaultGatewayFactory(
 
 function defaultDatabaseFactory(path: string): Database.Database {
   return new Database(path, { timeout: 0 });
+}
+
+function defaultFundingRateRepositoryFactory(
+  database: Database.Database
+): FundingRateRepository {
+  return new SqliteFundingRateRepository(database);
+}
+
+function defaultFundingRateSyncFactory(
+  options: FundingRateSyncServiceOptions
+): FundingRateSyncLifecycle {
+  return new FundingRateSyncService(options);
+}
+
+function defaultFundingRateSleep(
+  delayMs: number,
+  signal: AbortSignal
+): Promise<void> {
+  return new Promise((resolveSleep, rejectSleep) => {
+    if (signal.aborted) {
+      rejectSleep(new Error('funding rate sleep canceled'));
+      return;
+    }
+    const handleAbort = (): void => {
+      clearTimeout(timeout);
+      signal.removeEventListener('abort', handleAbort);
+      rejectSleep(new Error('funding rate sleep canceled'));
+    };
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort);
+      resolveSleep();
+    }, delayMs);
+    signal.addEventListener('abort', handleAbort, { once: true });
+  });
 }
 
 function closeDatabaseAfterConstructionFailure(
@@ -274,6 +354,31 @@ export function composeService(
     claimSqliteProcessOwnership(database, config.databasePath);
     const clock = options.clock ?? (() => new Date());
     const repository = new SqliteStrategyRepository(database, clock);
+
+    const fundingRateSourceFactory = options.fundingRateSourceFactory
+      ?? createCcxtFundingRateSources;
+    const [bitgetSource, okxSource] = fundingRateSourceFactory();
+    const fundingRateRepositoryFactory = options.fundingRateRepositoryFactory
+      ?? defaultFundingRateRepositoryFactory;
+    const fundingRateRepository = fundingRateRepositoryFactory(database);
+    const fundingRateEvents = options.fundingRateEvents
+      ?? (options.loggerInstance === undefined
+        ? NOOP_FUNDING_RATE_EVENT_SINK
+        : new PinoFundingRateEventSink(
+            options.loggerInstance,
+            () => configuredSecretValues(env)
+          ));
+    const fundingRateSyncFactory = options.fundingRateSyncFactory
+      ?? defaultFundingRateSyncFactory;
+    const fundingRateSync = fundingRateSyncFactory({
+      bitgetSource,
+      okxSource,
+      repository: fundingRateRepository,
+      events: fundingRateEvents,
+      intervalMs: config.fundingRateSyncIntervalMs,
+      nowMs: options.fundingRateNowMs ?? Date.now,
+      sleep: options.fundingRateSleep ?? defaultFundingRateSleep
+    });
 
     const gatewayFactory = options.gatewayFactory ?? defaultGatewayFactory;
     const gateways = new Map<string, ExchangeGateway>();
@@ -347,6 +452,7 @@ export function composeService(
       preflightService,
       coordinator,
       monitor,
+      fundingRateSync,
       server
     };
   } catch (error) {
@@ -397,9 +503,14 @@ export async function startService<T extends RunnableComposition>(
   const closeResources = async (): Promise<void> => {
     let firstError: unknown;
     try {
-      await composition.monitor.stop();
+      await composition.fundingRateSync.stop();
     } catch (error) {
       firstError = error;
+    }
+    try {
+      await composition.monitor.stop();
+    } catch (error) {
+      firstError ??= error;
     }
     try {
       await composition.server.close();
@@ -411,7 +522,11 @@ export async function startService<T extends RunnableComposition>(
     } catch (error) {
       firstError ??= error;
     }
-    removeSignalListeners();
+    try {
+      removeSignalListeners();
+    } catch (error) {
+      firstError ??= error;
+    }
     if (firstError !== undefined) {
       operationalLog?.error('service_stop_failed', firstError, runtimeFields);
       throw firstError;
@@ -445,6 +560,7 @@ export async function startService<T extends RunnableComposition>(
       port: composition.config.port
     });
     if (shutdownPromise === null) {
+      composition.fundingRateSync.start();
       operationalLog?.info('service_started', runtimeFields);
     }
     return { composition, shutdown };

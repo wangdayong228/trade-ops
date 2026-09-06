@@ -12,17 +12,24 @@ import {
   composeService,
   loadRuntimeConfig,
   resolveRuntimeEnvironment,
-  startService
+  startService,
+  type FundingRateSyncLifecycle
 } from '../src/main.js';
+import type { FundingRateEventSink } from '../src/funding-rates/funding-rate-events.js';
+import type { FundingSleep } from '../src/funding-rates/funding-rate-exchange-worker.js';
+import type { FundingRateSyncServiceOptions } from '../src/funding-rates/funding-rate-sync-service.js';
 import type {
   OperationalFields,
   OperationalLog
 } from '../src/logging/logger.js';
+import type { FundingRateRepository } from '../src/storage/funding-rate-repository.js';
+import { SqliteFundingRateRepository } from '../src/storage/sqlite-funding-rate-repository.js';
 import {
   claimSqliteProcessOwnership,
   SqliteOwnershipError
 } from '../src/storage/sqlite-process-owner.js';
 import { FakeExchangeGateway } from './support/fake-exchange-gateway.js';
+import { FakeFundingRateSource } from './support/fake-funding-rate-source.js';
 
 const VALID_ENV = {
   TRADING_EXCHANGES: 'bitget,okx',
@@ -90,6 +97,95 @@ test('uses local database, host, and port defaults', () => {
   assert.equal(config.databasePath, './data/trade-ops.sqlite');
   assert.equal(config.host, '127.0.0.1');
   assert.equal(config.port, 3000);
+});
+
+test('loads the funding sync interval default and canonical boundaries', () => {
+  assert.equal(
+    loadRuntimeConfig(VALID_ENV).fundingRateSyncIntervalMs,
+    3_600_000
+  );
+  assert.equal(
+    loadRuntimeConfig({
+      ...VALID_ENV,
+      FUNDING_RATE_SYNC_INTERVAL_MS: '60000'
+    }).fundingRateSyncIntervalMs,
+    60_000
+  );
+  assert.equal(
+    loadRuntimeConfig({
+      ...VALID_ENV,
+      FUNDING_RATE_SYNC_INTERVAL_MS: '86400000'
+    }).fundingRateSyncIntervalMs,
+    86_400_000
+  );
+});
+
+test('rejects non-canonical or out-of-range funding sync intervals', () => {
+  for (const raw of [
+    '',
+    ' 60000',
+    '60000 ',
+    '+60000',
+    '-60000',
+    '060000',
+    '60000.0',
+    '6e4',
+    '59999',
+    '86400001',
+    '9007199254740992'
+  ]) {
+    assert.throws(
+      () => loadRuntimeConfig({
+        ...VALID_ENV,
+        FUNDING_RATE_SYNC_INTERVAL_MS: raw
+      }),
+      /^Error: Invalid FUNDING_RATE_SYNC_INTERVAL_MS:/,
+      raw
+    );
+  }
+});
+
+test('validates the funding sync interval before loading credentials', () => {
+  assert.throws(
+    () => loadRuntimeConfig({
+      TRADING_EXCHANGES: 'bitget,okx',
+      FUNDING_RATE_SYNC_INTERVAL_MS: '59999'
+    }),
+    /^Error: Invalid FUNDING_RATE_SYNC_INTERVAL_MS:/
+  );
+});
+
+test('invalid funding sync interval does not construct gateways or SQLite', () => {
+  let gatewayConstructions = 0;
+  let databaseConstructions = 0;
+  let caught: unknown;
+
+  try {
+    composeService({
+      env: {
+        ...VALID_ENV,
+        FUNDING_RATE_SYNC_INTERVAL_MS: '86400001'
+      },
+      gatewayFactory: (exchangeId) => {
+        gatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
+      databaseFactory: () => {
+        databaseConstructions += 1;
+        throw new Error('database factory must not be called');
+      },
+      logger: false
+    });
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.equal(databaseConstructions, 0);
+  assert.equal(gatewayConstructions, 0);
+  assert.match(
+    (caught as Error | undefined)?.message ?? '',
+    /^Invalid FUNDING_RATE_SYNC_INTERVAL_MS:/
+  );
 });
 
 for (const [name, exchanges] of [
@@ -506,6 +602,102 @@ test('production CCXT gateway construction performs no startup market load', asy
   assert.equal(composition.repository.listRecoverable().length, 0);
 });
 
+test('composes funding sync on the strategy SQLite without construction I/O', async (t) => {
+  const now = new Date('2026-09-06T00:00:00.000Z');
+  const fundingRateNowMs = () => now.getTime();
+  const bitgetSource = new FakeFundingRateSource('bitget', []);
+  const okxSource = new FakeFundingRateSource('okx', []);
+  const fundingEvents: FundingRateEventSink = { record(): void {} };
+  const fundingSleep: FundingSleep = async () => {};
+  const sourceFactoryCalls: unknown[][] = [];
+  const repositoryFactoryCalls: unknown[][] = [];
+  const syncFactoryCalls: FundingRateSyncServiceOptions[] = [];
+  let fundingRateRepository: FundingRateRepository | undefined;
+  let databaseConstructions = 0;
+  const fundingRateSync: FundingRateSyncLifecycle = {
+    start(): void {},
+    async stop(): Promise<void> {}
+  };
+  let composition: ReturnType<typeof composeService> | undefined;
+  t.after(async () => {
+    await closeCompositionForCleanup(composition);
+  });
+
+  composition = composeService({
+    env: {
+      ...VALID_ENV,
+      FUNDING_RATE_SYNC_INTERVAL_MS: '60000'
+    },
+    databaseFactory: () => {
+      databaseConstructions += 1;
+      return new Database(':memory:', { timeout: 0 });
+    },
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    clock: () => now,
+    fundingRateSourceFactory: (...args: unknown[]) => {
+      sourceFactoryCalls.push(args);
+      return [bitgetSource, okxSource];
+    },
+    fundingRateRepositoryFactory: (...args: unknown[]) => {
+      repositoryFactoryCalls.push(args);
+      fundingRateRepository = new SqliteFundingRateRepository(
+        args[0] as Database.Database
+      );
+      return fundingRateRepository;
+    },
+    fundingRateSyncFactory: (options) => {
+      syncFactoryCalls.push(options);
+      return fundingRateSync;
+    },
+    fundingRateEvents: fundingEvents,
+    fundingRateNowMs,
+    fundingRateSleep: fundingSleep,
+    logger: false
+  });
+
+  assert.equal(databaseConstructions, 1);
+  assert.deepEqual(sourceFactoryCalls, [[]]);
+  assert.equal(repositoryFactoryCalls.length, 1);
+  assert.equal(repositoryFactoryCalls[0]?.length, 1);
+  assert.equal(repositoryFactoryCalls[0]?.[0], composition.database);
+  assert.equal(
+    Reflect.get(composition.repository, 'database'),
+    composition.database
+  );
+  assert.equal(
+    Reflect.get(fundingRateRepository as object, 'database'),
+    composition.database
+  );
+  assert.equal(syncFactoryCalls.length, 1);
+  assert.equal(syncFactoryCalls[0]?.bitgetSource, bitgetSource);
+  assert.equal(syncFactoryCalls[0]?.okxSource, okxSource);
+  assert.equal(
+    syncFactoryCalls[0]?.repository,
+    fundingRateRepository
+  );
+  assert.equal(syncFactoryCalls[0]?.events, fundingEvents);
+  assert.equal(syncFactoryCalls[0]?.intervalMs, 60_000);
+  assert.equal(syncFactoryCalls[0]?.nowMs, fundingRateNowMs);
+  assert.equal(syncFactoryCalls[0]?.nowMs(), now.getTime());
+  assert.equal(syncFactoryCalls[0]?.sleep, fundingSleep);
+  assert.equal(Reflect.has(syncFactoryCalls[0] as object, 'credentials'), false);
+  assert.equal(
+    Reflect.has(syncFactoryCalls[0] as object, 'strategyRepository'),
+    false
+  );
+  assert.equal(Reflect.has(syncFactoryCalls[0] as object, 'coordinator'), false);
+  assert.equal(Reflect.has(syncFactoryCalls[0] as object, 'monitor'), false);
+  assert.equal(composition.fundingRateSync, fundingRateSync);
+  assert.deepEqual(bitgetSource.discoveryRequestCalls, []);
+  assert.deepEqual(bitgetSource.discoveryCalls, []);
+  assert.deepEqual(bitgetSource.pageRequestCalls, []);
+  assert.deepEqual(bitgetSource.fetchCalls, []);
+  assert.deepEqual(okxSource.discoveryRequestCalls, []);
+  assert.deepEqual(okxSource.discoveryCalls, []);
+  assert.deepEqual(okxSource.pageRequestCalls, []);
+  assert.deepEqual(okxSource.fetchCalls, []);
+});
+
 test('composition redacts all configured credentials from detailed HTTP errors', async (t) => {
   const composition = composeService({
     env: VALID_ENV,
@@ -647,6 +839,10 @@ function runnableFixture(events: string[]) {
         databasePath: './fixture.sqlite',
         exchangeIds: ['bitget', 'okx']
       },
+      fundingRateSync: {
+        start(): void {},
+        async stop(): Promise<void> {}
+      },
       monitor: {
         start(intervalMs: number): () => void {
           events.push(`monitor.start:${intervalMs}`);
@@ -679,6 +875,82 @@ function runnableFixture(events: string[]) {
       monitorStops,
       serverCloses,
       databaseCloses
+    })
+  };
+}
+
+interface ManualGate<Value> {
+  readonly promise: Promise<Value>;
+  readonly resolve: (value: Value | PromiseLike<Value>) => void;
+}
+
+function manualGate<Value>(): ManualGate<Value> {
+  let resolve!: ManualGate<Value>['resolve'];
+  const promise = new Promise<Value>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+interface FundingRunnableFixtureOptions {
+  readonly stopGate?: Promise<void>;
+  readonly stopError?: unknown;
+}
+
+function fundingRunnableFixture(
+  events: string[],
+  options: FundingRunnableFixtureOptions = {}
+) {
+  const base = runnableFixture(events);
+  let fundingStarts = 0;
+  let fundingStops = 0;
+  let fundingStopError = options.stopError;
+  let strategyTransitions = 0;
+  let coordinatorActions = 0;
+  let monitorTradingActions = 0;
+
+  return {
+    composition: {
+      ...base.composition,
+      fundingRateSync: {
+        start(): void {
+          events.push('funding.start');
+          fundingStarts += 1;
+        },
+        async stop(): Promise<void> {
+          events.push('funding.stop');
+          fundingStops += 1;
+          await options.stopGate;
+          if (fundingStopError !== undefined) throw fundingStopError;
+        }
+      },
+      strategyRepository: {
+        transition(): void {
+          strategyTransitions += 1;
+        }
+      },
+      coordinator: {
+        async confirmAndExecute(): Promise<void> {
+          coordinatorActions += 1;
+        }
+      },
+      monitor: {
+        ...base.composition.monitor,
+        async reconcileStrategy(): Promise<void> {
+          monitorTradingActions += 1;
+        }
+      }
+    },
+    failFunding(error: unknown): void {
+      fundingStopError = error;
+    },
+    counts: () => ({
+      ...base.counts(),
+      fundingStarts,
+      fundingStops,
+      strategyTransitions,
+      coordinatorActions,
+      monitorTradingActions
     })
   };
 }
@@ -1125,6 +1397,10 @@ test('releases SQLite ownership when server close fails', async (t) => {
 
   const started = await startService({
     config: { host: '127.0.0.1', port: 3000 },
+    fundingRateSync: {
+      start: () => {},
+      stop: async () => {}
+    },
     monitor: {
       start: () => () => {},
       stop: async () => {}
@@ -1149,4 +1425,224 @@ test('releases SQLite ownership when server close fails', async (t) => {
   });
   successor.close();
   successorForCleanup = undefined;
+});
+
+test('funding sync stays stopped while listen is pending and starts without an await gap', async () => {
+  const events: string[] = [];
+  const fixture = fundingRunnableFixture(events);
+  const listenGate = manualGate<void>();
+  const starting = startService(fixture.composition, {
+    signalTarget: new SignalTarget(),
+    listen: () => {
+      events.push('listen');
+      return listenGate.promise;
+    }
+  });
+
+  assert.equal(fixture.counts().fundingStarts, 0);
+  assert.deepEqual(events, ['monitor.start:5000', 'listen']);
+
+  listenGate.resolve(undefined);
+  await Promise.resolve();
+  const startsBeforeTheNextAwait = fixture.counts().fundingStarts;
+  const started = await starting;
+  try {
+    assert.equal(startsBeforeTheNextAwait, 1);
+    assert.equal(fixture.counts().fundingStarts, 1);
+    assert.deepEqual(events, [
+      'monitor.start:5000',
+      'listen',
+      'funding.start'
+    ]);
+  } finally {
+    await started.shutdown();
+  }
+});
+
+test('listen rejection never starts funding and preserves the startup error', async () => {
+  const events: string[] = [];
+  const startupError = new Error('listen failed');
+  const cleanupError = new Error('funding cleanup failed');
+  const fixture = fundingRunnableFixture(events, {
+    stopError: cleanupError
+  });
+  const signals = new SignalTarget();
+
+  await assert.rejects(
+    startService(fixture.composition, {
+      signalTarget: signals,
+      listen: async () => {
+        events.push('listen');
+        throw startupError;
+      }
+    }),
+    (error: unknown) => error === startupError
+  );
+
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'funding.stop',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.equal(fixture.counts().fundingStarts, 0);
+  assert.equal(fixture.counts().fundingStops, 1);
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
+});
+
+test('a signal during listen joins funding before cleanup and prevents start', async () => {
+  const events: string[] = [];
+  const fixture = fundingRunnableFixture(events);
+  const signals = new SignalTarget();
+  const listenGate = manualGate<void>();
+  const starting = startService(fixture.composition, {
+    signalTarget: signals,
+    listen: () => {
+      events.push('listen');
+      return listenGate.promise;
+    }
+  });
+
+  signals.emit('SIGTERM');
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+  listenGate.resolve(undefined);
+  const started = await starting;
+  await started.shutdown();
+
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'funding.stop',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.equal(fixture.counts().fundingStarts, 0);
+  assert.equal(fixture.counts().fundingStops, 1);
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
+  assert.equal(signals.exitCode, 0);
+});
+
+test('repeated shutdown waits for funding before closing later resources', async () => {
+  const events: string[] = [];
+  const stopGate = manualGate<void>();
+  const fixture = fundingRunnableFixture(events, {
+    stopGate: stopGate.promise
+  });
+  const signals = new SignalTarget();
+  const started = await startService(fixture.composition, {
+    signalTarget: signals,
+    listen: async () => {
+      events.push('listen');
+    }
+  });
+
+  const firstShutdown = started.shutdown();
+  const secondShutdown = started.shutdown();
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+  const eventsBeforeFundingJoin = [...events];
+  const countsBeforeFundingJoin = fixture.counts();
+  stopGate.resolve(undefined);
+  await firstShutdown;
+  await secondShutdown;
+
+  assert.equal(firstShutdown, secondShutdown);
+  assert.deepEqual(eventsBeforeFundingJoin, [
+    'monitor.start:5000',
+    'listen',
+    'funding.start',
+    'funding.stop'
+  ]);
+  assert.equal(countsBeforeFundingJoin.monitorStops, 0);
+  assert.equal(countsBeforeFundingJoin.serverCloses, 0);
+  assert.equal(countsBeforeFundingJoin.databaseCloses, 0);
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'funding.start',
+    'funding.stop',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.deepEqual(fixture.counts(), {
+    monitorStarts: 1,
+    monitorStops: 1,
+    serverCloses: 1,
+    databaseCloses: 1,
+    fundingStarts: 1,
+    fundingStops: 1,
+    strategyTransitions: 0,
+    coordinatorActions: 0,
+    monitorTradingActions: 0
+  });
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
+});
+
+test('funding worker failure stays trade-isolated and remains the shutdown error', async () => {
+  const events: string[] = [];
+  const fundingError = new Error('funding worker failed');
+  const laterCloseError = new Error('server close failed');
+  const stopGate = manualGate<void>();
+  const fixture = fundingRunnableFixture(events, {
+    stopGate: stopGate.promise
+  });
+  const signals = new SignalTarget();
+  const originalServerClose = fixture.composition.server.close;
+  fixture.composition.server.close = async () => {
+    await originalServerClose();
+    throw laterCloseError;
+  };
+  const started = await startService(fixture.composition, {
+    signalTarget: signals,
+    listen: async () => {
+      events.push('listen');
+    }
+  });
+  fixture.failFunding(fundingError);
+
+  const outcomePromise = started.shutdown().then(
+    () => ({ status: 'fulfilled' as const }),
+    (error: unknown) => ({ status: 'rejected' as const, error })
+  );
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+  const eventsBeforeFundingJoin = [...events];
+  stopGate.resolve(undefined);
+  const outcome = await outcomePromise;
+
+  assert.deepEqual(eventsBeforeFundingJoin, [
+    'monitor.start:5000',
+    'listen',
+    'funding.start',
+    'funding.stop'
+  ]);
+  assert.deepEqual(outcome, {
+    status: 'rejected',
+    error: fundingError
+  });
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'funding.start',
+    'funding.stop',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.equal(fixture.counts().strategyTransitions, 0);
+  assert.equal(fixture.counts().coordinatorActions, 0);
+  assert.equal(fixture.counts().monitorTradingActions, 0);
+  assert.equal(signals.listenerCount('SIGINT'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
 });
