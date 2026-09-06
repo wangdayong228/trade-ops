@@ -20,6 +20,7 @@ import type {
   TradeEventSink
 } from '../../src/logging/trade-events.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
+import type { SnapshotAttachmentResult } from '../../src/storage/strategy-repository.js';
 import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
 import { OrderMonitor } from '../../src/strategy/order-monitor.js';
@@ -1450,7 +1451,7 @@ test('create snapshot attach failure remains executing for monitor recovery by c
       failAttach = false;
       throw new Error('sqlite password=must-never-escape');
     }
-    originalAttach(orderId, snapshot);
+    return originalAttach(orderId, snapshot);
   };
   const monitor = new OrderMonitor(
     new ExchangeRegistry(new Map([
@@ -2286,7 +2287,7 @@ test('attach failure after a persisted positive unknown fill stays recoverable',
     if (attachCalls === 2) {
       throw repositoryFailure;
     }
-    originalAttach(orderId, snapshot);
+    return originalAttach(orderId, snapshot);
   };
 
   await assert.doesNotReject(
@@ -2951,7 +2952,7 @@ test('concurrent attach failure preserves both intents without terminal transiti
     if (snapshot.kind === 'spot') {
       throw repositoryFailure;
     }
-    originalAttach(orderId, snapshot);
+    return originalAttach(orderId, snapshot);
   };
   const originalTransition = context.repository.transition.bind(
     context.repository
@@ -3026,7 +3027,7 @@ test('concurrent attach failure never invokes a terminal transition', async (t) 
     if (snapshot.kind === 'spot') {
       throw new Error('spot attach secret=must-never-escape');
     }
-    originalAttach(orderId, snapshot);
+    return originalAttach(orderId, snapshot);
   };
   const originalTransition = context.repository.transition.bind(
     context.repository
@@ -3077,7 +3078,7 @@ test('repository snapshot failure preserves a recoverable intent without transit
     attachOrderSnapshot(
       strategyOrderId: string,
       snapshot: OrderSnapshot
-    ): void;
+    ): SnapshotAttachmentResult;
   };
   writableRepository.attachOrderSnapshot = () => {
     throw repositoryFailure;

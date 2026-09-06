@@ -24,6 +24,8 @@ import type {
 } from '../../src/logging/trade-events.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
 import type {
+  OrderSubmissionFailureCode,
+  SnapshotAttachmentResult,
   StrategyFailureCode,
   StrategyOrderPlan,
   StrategyOrderRecord,
@@ -434,8 +436,18 @@ class RepositoryProxy implements StrategyRepository {
   attachOrderSnapshot(
     strategyOrderId: string,
     snapshot: OrderSnapshot
-  ): void {
-    this.target.attachOrderSnapshot(strategyOrderId, snapshot);
+  ): SnapshotAttachmentResult {
+    return this.target.attachOrderSnapshot(strategyOrderId, snapshot);
+  }
+
+  markDefinitelyNotSubmitted(
+    strategyOrderId: string,
+    failureCode: OrderSubmissionFailureCode
+  ): boolean {
+    return this.target.markDefinitelyNotSubmitted(
+      strategyOrderId,
+      failureCode
+    );
   }
 
   listOrders(strategyId: string): StrategyOrderRecord[] {
@@ -1966,7 +1978,10 @@ test('preserves the current state when snapshot attachment temporarily fails', a
     })
   ]);
   class FailingAttachRepository extends RepositoryProxy {
-    override attachOrderSnapshot(): void {
+    override attachOrderSnapshot(
+      _strategyOrderId: string,
+      _snapshot: OrderSnapshot
+    ): SnapshotAttachmentResult {
       throw new Error('sqlite password=must-not-escape');
     }
   }
@@ -2059,12 +2074,12 @@ test('keeps the first attachment and stops before the third when the second atta
     override attachOrderSnapshot(
       strategyOrderId: string,
       snapshot: OrderSnapshot
-    ): void {
+    ): SnapshotAttachmentResult {
       this.attachmentAttempts.push(strategyOrderId);
       if (this.attachmentAttempts.length === 2) {
         throw new Error('second attach secret=must-not-escape');
       }
-      super.attachOrderSnapshot(strategyOrderId, snapshot);
+      return super.attachOrderSnapshot(strategyOrderId, snapshot);
     }
 
     override transition(
@@ -2144,8 +2159,8 @@ test('stops persisting when strategy state changes during attachment', async (t)
     override attachOrderSnapshot(
       orderId: string,
       snapshot: OrderSnapshot
-    ): void {
-      super.attachOrderSnapshot(orderId, snapshot);
+    ): SnapshotAttachmentResult {
+      const result = super.attachOrderSnapshot(orderId, snapshot);
       this.attachments += 1;
       if (this.attachments === 1) {
         assert.equal(
@@ -2157,6 +2172,7 @@ test('stops persisting when strategy state changes during attachment', async (t)
           true
         );
       }
+      return result;
     }
   }
   const repository = new StateChangingRepository(f.repository);

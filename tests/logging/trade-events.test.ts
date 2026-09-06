@@ -59,6 +59,8 @@ const ORDER: StrategyOrderRecord = {
   },
   snapshot: SNAPSHOT,
   status: 'open',
+  submissionDisposition: 'REMOTE_OBSERVED',
+  submissionFailureCode: null,
   createdAt: '2026-08-01T00:00:00.000Z',
   updatedAt: '2026-08-01T00:00:01.000Z'
 };
@@ -165,7 +167,8 @@ test('supports contract position fields without adding unrelated fields', () => 
     },
     snapshot: null,
     exchangeOrderId: null,
-    status: 'planned'
+    status: 'planned',
+    submissionDisposition: 'SUBMISSION_UNCERTAIN'
   };
 
   assert.deepEqual(orderEvent('order_planned', contractOrder), {

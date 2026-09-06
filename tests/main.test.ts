@@ -354,20 +354,20 @@ test('closes an owned database once when schema construction fails', () => {
   let closes = 0;
   let gatewayConstructions = 0;
   const statements: string[] = [];
-  const database = {
-    pragma(): string { return 'exclusive'; },
-    exec(statement: string) {
-      statements.push(statement);
-      if (statements.length === 2) {
-        throw new Error('schema unavailable');
-      }
-      return this;
-    },
-    close() {
-      closes += 1;
-      return this;
+  const database = new Database(':memory:', { timeout: 0 });
+  const originalExec = database.exec.bind(database);
+  const originalClose = database.close.bind(database);
+  database.exec = (statement: string) => {
+    statements.push(statement);
+    if (statements.length === 2) {
+      throw new Error('schema unavailable');
     }
-  } as unknown as Database.Database;
+    return originalExec(statement);
+  };
+  database.close = () => {
+    closes += 1;
+    return originalClose();
+  };
 
   assert.throws(
     () => composeService({
@@ -379,7 +379,9 @@ test('closes an owned database once when schema construction fails', () => {
       },
       logger: false
     }),
-    /^Error: schema unavailable$/
+    (error: unknown) => error instanceof Error
+      && error.message === 'SQLite strategy schema migration failed'
+      && !error.message.includes('schema unavailable')
   );
   assert.equal(statements[0], 'BEGIN EXCLUSIVE; COMMIT');
   assert.equal(gatewayConstructions, 0);

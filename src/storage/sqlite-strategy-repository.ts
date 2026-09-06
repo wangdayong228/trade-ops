@@ -17,6 +17,9 @@ import type {
 import type { PreflightResult } from '../strategy/preflight-service.js';
 import { SQLITE_STRATEGY_SCHEMA } from './schema.js';
 import type {
+  OrderSubmissionDisposition,
+  OrderSubmissionFailureCode,
+  SnapshotAttachmentResult,
   StrategyFailureCode,
   StrategyOrderPlan,
   StrategyOrderRecord,
@@ -24,7 +27,18 @@ import type {
   StrategyRecord,
   StrategyRepository
 } from './strategy-repository.js';
-import { StrategyNotFoundError } from './strategy-repository.js';
+import {
+  OrderSnapshotValidationError,
+  OrderSnapshotWriteConflictError,
+  StrategyNotFoundError
+} from './strategy-repository.js';
+
+const STRATEGY_SCHEMA_ERROR = 'SQLite strategy schema migration failed';
+const REQUIRED_BUSINESS_TABLES = [
+  'strategies',
+  'strategy_orders',
+  'order_events'
+] as const;
 
 const EXECUTION_MODES = new Set<ExecutionMode>([
   'CONCURRENT',
@@ -47,6 +61,7 @@ const STRATEGY_FAILURE_CODES = new Set<StrategyFailureCode>([
   'MISSING_AVERAGE_PRICE',
   'HEDGE_ORDER_REJECTED',
   'HEDGE_ORDER_CANCELED',
+  'HEDGE_RESIDUAL_NOT_TRADABLE',
   'ORDER_RECONCILIATION_FAILED',
   'INCONSISTENT_ORDER_STATE'
 ]);
@@ -73,6 +88,15 @@ const SNAPSHOT_STATUSES = new Set<OrderSnapshot['status']>([
 const ORDER_STATUSES = new Set<StrategyOrderStatus>([
   'planned',
   ...SNAPSHOT_STATUSES
+]);
+const ORDER_SUBMISSION_DISPOSITIONS = new Set<OrderSubmissionDisposition>([
+  'SUBMISSION_UNCERTAIN',
+  'DEFINITELY_NOT_SUBMITTED',
+  'REMOTE_OBSERVED'
+]);
+const ORDER_SUBMISSION_FAILURE_CODES = new Set<OrderSubmissionFailureCode>([
+  'ORDER_SUBMISSION_FAILED',
+  'HEDGE_RESIDUAL_NOT_TRADABLE'
 ]);
 type ConfirmedMarginMode = Exclude<AccountSettings['marginMode'], 'unknown'>;
 const MARGIN_MODES = new Set<ConfirmedMarginMode>([
@@ -221,8 +245,26 @@ interface StrategyOrderDbRow {
   request_json: unknown;
   snapshot_json: unknown;
   status: unknown;
+  submission_disposition: unknown;
+  submission_failure_code: unknown;
   created_at: unknown;
   updated_at: unknown;
+}
+
+interface SqliteMasterRow {
+  type: unknown;
+  name: unknown;
+  tbl_name: unknown;
+  sql: unknown;
+}
+
+interface SchemaMetadataRow {
+  singleton: unknown;
+  version: unknown;
+}
+
+interface TableInfoRow {
+  name: unknown;
 }
 
 interface OrderEventDbRow {
@@ -237,6 +279,8 @@ interface LatestEventDbRow {
 }
 
 type DataObject = Record<string, unknown>;
+
+class StorageValidationError extends Error {}
 
 function sqliteIntegerEquals(value: unknown, expected: number): boolean {
   return (
@@ -272,7 +316,7 @@ function isNonNegativeSqliteInteger(value: unknown): boolean {
 }
 
 function invalid(context: string, detail: string): never {
-  throw new Error(`invalid ${context}: ${detail}`);
+  throw new StorageValidationError(`invalid ${context}: ${detail}`);
 }
 
 function dataObject(
@@ -976,6 +1020,29 @@ function validatedSnapshot(
   return snapshot;
 }
 
+function sameSnapshotSemantics(
+  left: Readonly<OrderSnapshot>,
+  right: Readonly<OrderSnapshot>
+): boolean {
+  return left.exchangeId === right.exchangeId
+    && left.exchangeOrderId === right.exchangeOrderId
+    && left.clientOrderId === right.clientOrderId
+    && left.symbol === right.symbol
+    && left.kind === right.kind
+    && left.type === right.type
+    && left.side === right.side
+    && decimalEqual(left.requestedBaseQuantity, right.requestedBaseQuantity)
+    && decimalEqual(left.filledBaseQuantity, right.filledBaseQuantity)
+    && decimalEqual(left.remainingBaseQuantity, right.remainingBaseQuantity)
+    && (
+      left.averagePrice === null
+        ? right.averagePrice === null
+        : right.averagePrice !== null
+          && decimalEqual(left.averagePrice, right.averagePrice)
+    )
+    && left.status === right.status;
+}
+
 function safely<T>(context: string, operation: () => T): T {
   try {
     return operation();
@@ -984,6 +1051,558 @@ function safely<T>(context: string, operation: () => T): T {
       throw error;
     }
     throw new Error(`invalid ${context}: stored values failed validation`);
+  }
+}
+
+const SQLITE_V1_MIGRATION = `
+  CREATE TABLE strategies_v2 (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN (
+      'PENDING_CONFIRMATION', 'EXECUTING', 'WAITING_HEDGE',
+      'HEDGED', 'HEDGE_INCOMPLETE', 'FAILED'
+    )),
+    mode TEXT NOT NULL CHECK (mode IN (
+      'CONCURRENT', 'CONTRACT_FIRST', 'SPOT_FIRST'
+    )),
+    spot_exchange_id TEXT NOT NULL,
+    contract_exchange_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    requested_base_quantity TEXT NOT NULL,
+    effective_base_quantity TEXT NOT NULL,
+    preflight_json TEXT NOT NULL,
+    failure_code TEXT CHECK (
+      failure_code IS NULL OR failure_code IN (
+        'ORDER_SUBMISSION_FAILED', 'ORDER_SUBMISSION_UNKNOWN',
+        'ORDER_NOT_FOUND', 'NO_FILL', 'MISSING_AVERAGE_PRICE',
+        'HEDGE_ORDER_REJECTED', 'HEDGE_ORDER_CANCELED',
+        'HEDGE_RESIDUAL_NOT_TRADABLE',
+        'ORDER_RECONCILIATION_FAILED', 'INCONSISTENT_ORDER_STATE'
+      )
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (state IN ('HEDGE_INCOMPLETE', 'FAILED') AND failure_code IS NOT NULL)
+      OR
+      (state NOT IN ('HEDGE_INCOMPLETE', 'FAILED') AND failure_code IS NULL)
+    )
+  );
+
+  INSERT INTO strategies_v2 (
+    id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
+    requested_base_quantity, effective_base_quantity, preflight_json,
+    failure_code, created_at, updated_at
+  )
+  SELECT
+    id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
+    requested_base_quantity, effective_base_quantity, preflight_json,
+    failure_code, created_at, updated_at
+  FROM strategies;
+
+  DROP TABLE strategies;
+  ALTER TABLE strategies_v2 RENAME TO strategies;
+
+  ALTER TABLE strategy_orders ADD COLUMN
+    submission_disposition TEXT NOT NULL DEFAULT 'SUBMISSION_UNCERTAIN' CHECK (
+      submission_disposition IN (
+        'SUBMISSION_UNCERTAIN',
+        'DEFINITELY_NOT_SUBMITTED',
+        'REMOTE_OBSERVED'
+      )
+    );
+  ALTER TABLE strategy_orders ADD COLUMN
+    submission_failure_code TEXT CHECK (
+      submission_failure_code IS NULL
+      OR submission_failure_code IN (
+        'ORDER_SUBMISSION_FAILED',
+        'HEDGE_RESIDUAL_NOT_TRADABLE'
+      )
+    );
+
+  UPDATE strategy_orders
+  SET
+    submission_disposition = CASE
+      WHEN snapshot_json IS NULL THEN 'SUBMISSION_UNCERTAIN'
+      ELSE 'REMOTE_OBSERVED'
+    END,
+    submission_failure_code = NULL;
+
+  CREATE TRIGGER strategy_orders_submission_evidence_insert
+  BEFORE INSERT ON strategy_orders
+  WHEN NOT (
+    (
+      (
+        NEW.submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+        AND NEW.submission_failure_code IS NOT NULL
+      )
+      OR
+      (
+        NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
+        AND NEW.submission_failure_code IS NULL
+      )
+    )
+    AND
+    (
+      (
+        NEW.status = 'planned'
+        AND NEW.snapshot_json IS NULL
+        AND NEW.exchange_order_id IS NULL
+        AND NEW.submission_disposition IN (
+          'SUBMISSION_UNCERTAIN', 'DEFINITELY_NOT_SUBMITTED'
+        )
+      )
+      OR
+      (
+        NEW.status <> 'planned'
+        AND NEW.snapshot_json IS NOT NULL
+        AND NEW.exchange_order_id IS NOT NULL
+        AND NEW.submission_disposition = 'REMOTE_OBSERVED'
+      )
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid submission evidence');
+  END;
+
+  CREATE TRIGGER strategy_orders_submission_evidence_update
+  BEFORE UPDATE OF
+    status,
+    snapshot_json,
+    exchange_order_id,
+    submission_disposition,
+    submission_failure_code
+  ON strategy_orders
+  WHEN NOT (
+    (
+      (
+        NEW.submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+        AND NEW.submission_failure_code IS NOT NULL
+      )
+      OR
+      (
+        NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
+        AND NEW.submission_failure_code IS NULL
+      )
+    )
+    AND
+    (
+      (
+        NEW.status = 'planned'
+        AND NEW.snapshot_json IS NULL
+        AND NEW.exchange_order_id IS NULL
+        AND NEW.submission_disposition IN (
+          'SUBMISSION_UNCERTAIN', 'DEFINITELY_NOT_SUBMITTED'
+        )
+      )
+      OR
+      (
+        NEW.status <> 'planned'
+        AND NEW.snapshot_json IS NOT NULL
+        AND NEW.exchange_order_id IS NOT NULL
+        AND NEW.submission_disposition = 'REMOTE_OBSERVED'
+      )
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid submission evidence');
+  END;
+
+  CREATE INDEX strategies_recoverable_idx
+    ON strategies(state, created_at);
+  CREATE INDEX IF NOT EXISTS strategy_orders_strategy_idx
+    ON strategy_orders(strategy_id, created_at);
+  CREATE INDEX IF NOT EXISTS order_events_order_idx
+    ON order_events(strategy_order_id, id);
+`;
+
+const SQLITE_SCHEMA_METADATA = `
+  CREATE TABLE IF NOT EXISTS strategy_schema_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version INTEGER NOT NULL CHECK (version = 2)
+  );
+  INSERT OR IGNORE INTO strategy_schema_metadata (singleton, version)
+  VALUES (1, 2);
+`;
+
+function schemaError(): Error {
+  return new Error(STRATEGY_SCHEMA_ERROR);
+}
+
+function schemaMetadata(database: Database.Database): SchemaMetadataRow[] {
+  return database.prepare(`
+    SELECT singleton, version
+    FROM strategy_schema_metadata
+  `).all() as SchemaMetadataRow[];
+}
+
+function validV2Metadata(rows: readonly SchemaMetadataRow[]): boolean {
+  return rows.length === 1
+    && sqliteIntegerEquals(rows[0]?.singleton, 1)
+    && sqliteIntegerEquals(rows[0]?.version, 2);
+}
+
+function classifyStrategySchema(
+  database: Database.Database
+): 'empty' | 'v1' | 'v2' {
+  const rows = database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all() as SqliteMasterRow[];
+  const tableNames = new Set(rows.map(({ name }) => {
+    if (typeof name !== 'string') {
+      throw schemaError();
+    }
+    return name;
+  }));
+  if (tableNames.size === 0) {
+    return 'empty';
+  }
+  const hasBusinessTables = REQUIRED_BUSINESS_TABLES.every(
+    (name) => tableNames.has(name)
+  );
+  if (!tableNames.has('strategy_schema_metadata')) {
+    if (hasBusinessTables) {
+      return 'v1';
+    }
+    throw schemaError();
+  }
+  if (!hasBusinessTables || !validV2Metadata(schemaMetadata(database))) {
+    throw schemaError();
+  }
+  return 'v2';
+}
+
+function canonicalSql(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw schemaError();
+  }
+  return value
+    .toLowerCase()
+    .replace(/["`\[\]]/g, '')
+    .replace(/[^a-z0-9_']+/g, ' ')
+    .trim();
+}
+
+function assertColumns(
+  database: Database.Database,
+  table: string,
+  expected: readonly string[]
+): void {
+  const rows = database.prepare(
+    `PRAGMA table_info(${table})`
+  ).all() as TableInfoRow[];
+  const actual = rows.map(({ name }) => name);
+  const actualNames = new Set(actual);
+  if (
+    actual.some((name) => typeof name !== 'string')
+    || actual.length !== expected.length
+    || expected.some((name) => !actualNames.has(name))
+  ) {
+    throw schemaError();
+  }
+}
+
+function assertV2BusinessSchema(database: Database.Database): void {
+  const rows = database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name
+  `).all() as SqliteMasterRow[];
+  const object = (type: string, name: string, table: string): SqliteMasterRow => {
+    const row = rows.find((candidate) => (
+      candidate.type === type
+      && candidate.name === name
+      && candidate.tbl_name === table
+    ));
+    if (row === undefined) {
+      throw schemaError();
+    }
+    return row;
+  };
+
+  const strategiesSql = canonicalSql(object(
+    'table',
+    'strategies',
+    'strategies'
+  ).sql);
+  const ordersSql = canonicalSql(object(
+    'table',
+    'strategy_orders',
+    'strategy_orders'
+  ).sql);
+  object('table', 'order_events', 'order_events');
+  const recoverableIndexSql = canonicalSql(object(
+    'index',
+    'strategies_recoverable_idx',
+    'strategies'
+  ).sql);
+  const strategyOrdersIndexSql = canonicalSql(object(
+    'index',
+    'strategy_orders_strategy_idx',
+    'strategy_orders'
+  ).sql);
+  const orderEventsIndexSql = canonicalSql(object(
+    'index',
+    'order_events_order_idx',
+    'order_events'
+  ).sql);
+  const noUpdateSql = canonicalSql(object(
+    'trigger',
+    'order_events_no_update',
+    'order_events'
+  ).sql);
+  const noDeleteSql = canonicalSql(object(
+    'trigger',
+    'order_events_no_delete',
+    'order_events'
+  ).sql);
+
+  assertColumns(database, 'strategies', [
+    'id', 'state', 'mode', 'spot_exchange_id', 'contract_exchange_id',
+    'symbol', 'requested_base_quantity', 'effective_base_quantity',
+    'preflight_json', 'failure_code', 'created_at', 'updated_at'
+  ]);
+  assertColumns(database, 'strategy_orders', [
+    'id', 'strategy_id', 'role', 'exchange_id', 'client_order_id',
+    'exchange_order_id', 'request_json', 'snapshot_json', 'status',
+    'created_at', 'updated_at', 'submission_disposition',
+    'submission_failure_code'
+  ]);
+  assertColumns(database, 'order_events', [
+    'id', 'strategy_order_id', 'snapshot_json', 'recorded_at'
+  ]);
+
+  if (
+    !strategiesSql.includes("'hedge_residual_not_tradable'")
+    || !strategiesSql.includes(
+      "state in 'hedge_incomplete' 'failed' and failure_code is not null"
+    )
+    || !strategiesSql.includes(
+      "state not in 'hedge_incomplete' 'failed' and failure_code is null"
+    )
+    || !ordersSql.includes("'submission_uncertain'")
+    || !ordersSql.includes("'definitely_not_submitted'")
+    || !ordersSql.includes("'remote_observed'")
+    || !ordersSql.includes("'order_submission_failed'")
+    || !ordersSql.includes("'hedge_residual_not_tradable'")
+    || recoverableIndexSql !== (
+      'create index strategies_recoverable_idx on strategies state created_at'
+    )
+    || strategyOrdersIndexSql !== (
+      'create index strategy_orders_strategy_idx '
+      + 'on strategy_orders strategy_id created_at'
+    )
+    || orderEventsIndexSql !== (
+      'create index order_events_order_idx on order_events strategy_order_id id'
+    )
+    || !noUpdateSql.includes(
+      "before update on order_events begin select raise abort 'order events are immutable'"
+    )
+    || !noDeleteSql.includes(
+      "before delete on order_events begin select raise abort 'order events are immutable'"
+    )
+  ) {
+    throw schemaError();
+  }
+
+  const hasSnapshotPairing = ordersSql.includes(
+    "status 'planned' and snapshot_json is null "
+    + 'and exchange_order_id is null'
+  ) && ordersSql.includes(
+    "status 'planned' and snapshot_json is not null "
+    + 'and exchange_order_id is not null'
+  );
+  const hasTableEvidenceChecks = ordersSql.includes(
+    "submission_disposition 'definitely_not_submitted' "
+    + 'and submission_failure_code is not null'
+  ) && ordersSql.includes(
+    "submission_disposition 'definitely_not_submitted' "
+    + 'and submission_failure_code is null'
+  ) && ordersSql.includes(
+    "status 'planned' and submission_disposition in "
+    + "'submission_uncertain' 'definitely_not_submitted'"
+  ) && ordersSql.includes(
+    "status 'planned' and submission_disposition 'remote_observed'"
+  );
+  const evidenceInsert = rows.find(({ type, name, tbl_name: table }) => (
+    type === 'trigger'
+    && name === 'strategy_orders_submission_evidence_insert'
+    && table === 'strategy_orders'
+  ));
+  const evidenceUpdate = rows.find(({ type, name, tbl_name: table }) => (
+    type === 'trigger'
+    && name === 'strategy_orders_submission_evidence_update'
+    && table === 'strategy_orders'
+  ));
+  const hasEvidenceTriggerBody = (value: unknown): boolean => {
+    const sql = canonicalSql(value);
+    return sql.includes(
+      "new submission_disposition 'definitely_not_submitted' "
+      + 'and new submission_failure_code is not null'
+    ) && sql.includes(
+      "new submission_disposition 'definitely_not_submitted' "
+      + 'and new submission_failure_code is null'
+    ) && sql.includes(
+      "new status 'planned' and new snapshot_json is null "
+      + 'and new exchange_order_id is null and new submission_disposition in '
+      + "'submission_uncertain' 'definitely_not_submitted'"
+    ) && sql.includes(
+      "new status 'planned' and new snapshot_json is not null "
+      + 'and new exchange_order_id is not null '
+      + "and new submission_disposition 'remote_observed'"
+    ) && sql.includes("select raise abort 'invalid submission evidence'");
+  };
+  const hasMigrationEvidenceTriggers = evidenceInsert !== undefined
+    && evidenceUpdate !== undefined
+    && canonicalSql(evidenceInsert.sql).includes(
+      "before insert on strategy_orders when not"
+    )
+    && hasEvidenceTriggerBody(evidenceInsert.sql)
+    && canonicalSql(evidenceUpdate.sql).includes(
+      'before update of status snapshot_json exchange_order_id '
+      + 'submission_disposition submission_failure_code on strategy_orders'
+    )
+    && hasEvidenceTriggerBody(evidenceUpdate.sql);
+  if (
+    !hasSnapshotPairing
+    || (!hasTableEvidenceChecks && !hasMigrationEvidenceTriggers)
+  ) {
+    throw schemaError();
+  }
+}
+
+function assertForeignKeysClean(database: Database.Database): void {
+  if (database.prepare('PRAGMA foreign_key_check').all().length !== 0) {
+    throw schemaError();
+  }
+}
+
+function assertCompleteV2Schema(database: Database.Database): void {
+  assertV2BusinessSchema(database);
+  const metadataSql = canonicalSql(database.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'table' AND name = 'strategy_schema_metadata'
+  `).pluck().get());
+  assertColumns(database, 'strategy_schema_metadata', [
+    'singleton',
+    'version'
+  ]);
+  if (
+    !metadataSql.includes('singleton integer primary key check singleton 1')
+    || !metadataSql.includes('version integer not null check version 2')
+    || !validV2Metadata(schemaMetadata(database))
+  ) {
+    throw schemaError();
+  }
+}
+
+function createFreshV2Schema(database: Database.Database): void {
+  try {
+    database.transaction(() => {
+      database.exec(SQLITE_STRATEGY_SCHEMA);
+      assertForeignKeysClean(database);
+      assertCompleteV2Schema(database);
+    })();
+    assertForeignKeysClean(database);
+    assertCompleteV2Schema(database);
+  } catch {
+    throw schemaError();
+  }
+}
+
+function migrateV1Schema(database: Database.Database): void {
+  let migrationFailed = false;
+  try {
+    database.pragma('foreign_keys = OFF');
+    if (!sqliteIntegerEquals(
+      database.pragma('foreign_keys', { simple: true }),
+      0
+    )) {
+      throw schemaError();
+    }
+    database.transaction(() => {
+      database.exec(SQLITE_V1_MIGRATION);
+      assertForeignKeysClean(database);
+      assertV2BusinessSchema(database);
+      database.exec(SQLITE_SCHEMA_METADATA);
+      assertCompleteV2Schema(database);
+    })();
+  } catch {
+    migrationFailed = true;
+  } finally {
+    try {
+      database.pragma('foreign_keys = ON');
+      if (!sqliteIntegerEquals(
+        database.pragma('foreign_keys', { simple: true }),
+        1
+      )) {
+        migrationFailed = true;
+      }
+    } catch {
+      migrationFailed = true;
+    }
+  }
+  if (migrationFailed) {
+    throw schemaError();
+  }
+  try {
+    assertForeignKeysClean(database);
+    assertCompleteV2Schema(database);
+  } catch {
+    throw schemaError();
+  }
+}
+
+function prepareStrategySchema(database: Database.Database): void {
+  if (database.inTransaction) {
+    throw schemaError();
+  }
+  let schemaGeneration: 'empty' | 'v1' | 'v2';
+  try {
+    database.pragma('foreign_keys = ON');
+    if (!sqliteIntegerEquals(
+      database.pragma('foreign_keys', { simple: true }),
+      1
+    )) {
+      throw schemaError();
+    }
+    schemaGeneration = classifyStrategySchema(database);
+  } catch {
+    throw schemaError();
+  }
+
+  try {
+    const journalMode = database.pragma(
+      'journal_mode = WAL',
+      { simple: true }
+    );
+    const expectedJournalMode = database.name === ':memory:'
+      ? 'memory'
+      : 'wal';
+    if (
+      typeof journalMode !== 'string'
+      || journalMode.toLowerCase() !== expectedJournalMode
+    ) {
+      throw schemaError();
+    }
+  } catch {
+    throw schemaError();
+  }
+
+  if (schemaGeneration === 'empty') {
+    createFreshV2Schema(database);
+  } else if (schemaGeneration === 'v1') {
+    migrateV1Schema(database);
+  } else {
+    try {
+      assertForeignKeysClean(database);
+      assertCompleteV2Schema(database);
+    } catch {
+      throw schemaError();
+    }
   }
 }
 
@@ -998,6 +1617,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
   private readonly selectLatestEvent;
   private readonly insertEvent;
   private readonly updateOrderSnapshot;
+  private readonly markOrderDefinitelyNotSubmitted;
   private readonly selectEvents;
   private readonly planOrderTransaction;
   private readonly planOrdersAtomicallyTransaction;
@@ -1007,13 +1627,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     private readonly database: Database.Database,
     private readonly clock: () => Date = () => new Date()
   ) {
-    this.database.exec(SQLITE_STRATEGY_SCHEMA);
-    if (!sqliteIntegerEquals(
-      this.database.pragma('foreign_keys', { simple: true }),
-      1
-    )) {
-      throw new Error('SQLite foreign keys are required for strategy storage');
-    }
+    prepareStrategySchema(this.database);
     this.insertStrategy = this.database.prepare(`
       INSERT INTO strategies (
         id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
@@ -1046,10 +1660,12 @@ export class SqliteStrategyRepository implements StrategyRepository {
       INSERT INTO strategy_orders (
         id, strategy_id, role, exchange_id, client_order_id,
         exchange_order_id, request_json, snapshot_json, status,
+        submission_disposition, submission_failure_code,
         created_at, updated_at
       ) VALUES (
         @id, @strategyId, @role, @exchangeId, @clientOrderId,
-        NULL, @requestJson, NULL, 'planned', @createdAt, @updatedAt
+        NULL, @requestJson, NULL, 'planned',
+        'SUBMISSION_UNCERTAIN', NULL, @createdAt, @updatedAt
       )
     `);
     this.selectOrder = this.database.prepare(
@@ -1085,6 +1701,8 @@ export class SqliteStrategyRepository implements StrategyRepository {
         exchange_order_id = @exchangeOrderId,
         snapshot_json = @snapshotJson,
         status = @status,
+        submission_disposition = 'REMOTE_OBSERVED',
+        submission_failure_code = NULL,
         updated_at = @updatedAt
       WHERE
         id = @id
@@ -1096,6 +1714,35 @@ export class SqliteStrategyRepository implements StrategyRepository {
             AND @previousSnapshotJson IS NULL
           )
         )
+        AND (
+          exchange_order_id = @previousExchangeOrderId
+          OR (
+            exchange_order_id IS NULL
+            AND @previousExchangeOrderId IS NULL
+          )
+        )
+        AND submission_disposition = @previousSubmissionDisposition
+        AND (
+          submission_failure_code = @previousSubmissionFailureCode
+          OR (
+            submission_failure_code IS NULL
+            AND @previousSubmissionFailureCode IS NULL
+          )
+        )
+    `);
+    this.markOrderDefinitelyNotSubmitted = this.database.prepare(`
+      UPDATE strategy_orders
+      SET
+        submission_disposition = 'DEFINITELY_NOT_SUBMITTED',
+        submission_failure_code = @failureCode,
+        updated_at = @updatedAt
+      WHERE
+        id = @id
+        AND status = 'planned'
+        AND snapshot_json IS NULL
+        AND exchange_order_id IS NULL
+        AND submission_disposition = 'SUBMISSION_UNCERTAIN'
+        AND submission_failure_code IS NULL
     `);
     this.selectEvents = this.database.prepare(`
       SELECT id, snapshot_json, recorded_at
@@ -1178,8 +1825,30 @@ export class SqliteStrategyRepository implements StrategyRepository {
   attachOrderSnapshot(
     strategyOrderId: string,
     snapshot: OrderSnapshot
-  ): void {
-    this.attachSnapshotTransaction(strategyOrderId, snapshot);
+  ): SnapshotAttachmentResult {
+    return this.attachSnapshotTransaction(strategyOrderId, snapshot);
+  }
+
+  markDefinitelyNotSubmitted(
+    strategyOrderId: string,
+    failureCode: OrderSubmissionFailureCode
+  ): boolean {
+    const orderId = nonEmptyString(
+      strategyOrderId,
+      'strategy order id',
+      128
+    );
+    const safeFailureCode = enumValue(
+      failureCode,
+      ORDER_SUBMISSION_FAILURE_CODES,
+      'order submission failure code'
+    );
+    const result = this.markOrderDefinitelyNotSubmitted.run({
+      id: orderId,
+      failureCode: safeFailureCode,
+      updatedAt: this.clock().toISOString()
+    });
+    return sqliteIntegerEquals(result.changes, 1);
   }
 
   listOrders(strategyId: string): StrategyOrderRecord[] {
@@ -1317,14 +1986,29 @@ export class SqliteStrategyRepository implements StrategyRepository {
   private attachSnapshotInsideTransaction(
     strategyOrderId: string,
     value: OrderSnapshot
-  ): void {
+  ): SnapshotAttachmentResult {
     const order = this.getOrder(strategyOrderId);
-    const snapshot = validatedSnapshot(
-      value,
-      order,
-      order.snapshot,
-      'order snapshot'
-    );
+    let snapshot: OrderSnapshot;
+    try {
+      snapshot = validatedSnapshot(
+        value,
+        order,
+        order.snapshot,
+        'order snapshot'
+      );
+    } catch (error) {
+      const detail = error instanceof StorageValidationError
+        && error.message.startsWith('invalid order snapshot')
+        ? error.message
+        : 'invalid order snapshot: validation failed';
+      throw new OrderSnapshotValidationError(detail);
+    }
+    if (
+      order.snapshot !== null
+      && sameSnapshotSemantics(order.snapshot, snapshot)
+    ) {
+      return 'unchanged';
+    }
     const snapshotJson = JSON.stringify(snapshot);
     const recordedAt = this.clock().toISOString();
     this.insertEvent.run({
@@ -1341,11 +2025,15 @@ export class SqliteStrategyRepository implements StrategyRepository {
       previousStatus: order.status,
       previousSnapshotJson: order.snapshot === null
         ? null
-        : JSON.stringify(order.snapshot)
+        : JSON.stringify(order.snapshot),
+      previousExchangeOrderId: order.exchangeOrderId,
+      previousSubmissionDisposition: order.submissionDisposition,
+      previousSubmissionFailureCode: order.submissionFailureCode
     });
     if (!sqliteIntegerEquals(result.changes, 1)) {
-      throw new Error('strategy order changed during snapshot attachment');
+      throw new OrderSnapshotWriteConflictError();
     }
+    return 'attached';
   }
 
   private strategyFromRow(row: StrategyDbRow): StrategyRecord {
@@ -1516,6 +2204,27 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ORDER_STATUSES,
         'persisted strategy order status'
       );
+      const submissionDisposition = enumValue(
+        row.submission_disposition,
+        ORDER_SUBMISSION_DISPOSITIONS,
+        'persisted strategy order submission disposition'
+      );
+      const submissionFailureCode = row.submission_failure_code === null
+        ? null
+        : enumValue(
+          row.submission_failure_code,
+          ORDER_SUBMISSION_FAILURE_CODES,
+          'persisted strategy order submission failure code'
+        );
+      if (
+        (submissionDisposition === 'DEFINITELY_NOT_SUBMITTED')
+        !== (submissionFailureCode !== null)
+      ) {
+        return invalid(
+          'persisted strategy order',
+          'submission disposition does not match failure evidence'
+        );
+      }
       const createdAt = isoTimestamp(
         row.created_at,
         'persisted strategy order creation time'
@@ -1540,6 +2249,8 @@ export class SqliteStrategyRepository implements StrategyRepository {
         request: deepFreeze(validated.request),
         snapshot: null,
         status,
+        submissionDisposition,
+        submissionFailureCode,
         createdAt,
         updatedAt
       };
@@ -1549,6 +2260,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         if (
           row.snapshot_json !== null
           || row.exchange_order_id !== null
+          || submissionDisposition === 'REMOTE_OBSERVED'
         ) {
           return invalid(
             'persisted strategy order',
@@ -1559,6 +2271,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         if (
           row.snapshot_json === null
           || row.exchange_order_id === null
+          || submissionDisposition !== 'REMOTE_OBSERVED'
         ) {
           return invalid(
             'persisted strategy order',
