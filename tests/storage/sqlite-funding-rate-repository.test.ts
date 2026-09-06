@@ -76,7 +76,6 @@ interface FundingTestContext {
 }
 
 interface Task5FundingRateRepository extends FundingRateRepository {
-  resumeInterruptedCoverage(market: FundingMarketIdentity): CoverageLease;
   isCoverageLeaseCurrent(lease: CoverageLease): boolean;
   bitgetRoundsEqual(
     lease: CoverageLease,
@@ -114,6 +113,11 @@ interface Task5FundingRateRepository extends FundingRateRepository {
     failedAt: Date
   ): void;
   cancelIncremental(lease: IncrementalLease, canceledAt: Date): void;
+}
+
+interface CoverageProvenanceState extends FundingMarketState {
+  readonly coverageRequiredBitgetBoundaryMs: number | null;
+  readonly coverageInitialOkxAfterMs: number | null;
 }
 
 interface HistoryDbRow {
@@ -183,6 +187,25 @@ function onlyMarketState(
   ));
   if (state === undefined) assert.fail('expected one funding market state');
   return state;
+}
+
+function provenanceState(
+  repository: FundingRateRepository,
+  market: FundingMarketIdentity
+): CoverageProvenanceState {
+  return onlyMarketState(repository, market) as CoverageProvenanceState;
+}
+
+function resumeCoverage(
+  repository: FundingRateRepository,
+  market: FundingMarketIdentity,
+  resumedAt: Date
+): CoverageLease {
+  const resume = repository.resumeInterruptedCoverage as unknown as (
+    market: FundingMarketIdentity,
+    resumedAt: Date
+  ) => CoverageLease;
+  return resume.call(repository, market, resumedAt);
 }
 
 function okxEvidence(
@@ -360,6 +383,62 @@ function startCoverage(
     cutoffMs,
     STARTED_AT
   );
+}
+
+function setupForgedCoverageLease(
+  t: TestContext,
+  exchangeId: 'bitget' | 'okx'
+): FundingTestContext & {
+  readonly lifecycle: Task5FundingRateRepository;
+  readonly actual: CoverageLease;
+  readonly forged: CoverageLease;
+} {
+  const context = setupFundingRepository(t);
+  const { repository } = context;
+  const lifecycle = task5Repository(repository);
+  if (exchangeId === 'bitget') {
+    const boundaryMs = 70;
+    const initial = startCoverage(repository, BITGET_MARKET, 100);
+    const record = rateRecord(BITGET_MARKET, '0.0001', boundaryMs);
+    for (const round of [1, 2] as const) {
+      repository.commitCoveragePage(
+        initial,
+        [record],
+        { exchangeId: 'bitget', round },
+        FIRST_OBSERVED_AT
+      );
+    }
+    lifecycle.completeCoverage(initial, bitgetEvidence(initial), COMPLETED_AT);
+    const actual = repository.startCoverage(
+      BITGET_MARKET,
+      'PERIODIC',
+      101,
+      RESTARTED_AT
+    );
+    return {
+      ...context,
+      lifecycle,
+      actual,
+      forged: { ...actual, requiredBitgetBoundaryMs: null }
+    };
+  }
+
+  const interrupted = startCoverage(repository, OKX_MARKET, 100);
+  commitOkxPage(
+    repository,
+    interrupted,
+    [rateRecord(OKX_MARKET, '0.0001', 78)],
+    FIRST_OBSERVED_AT,
+    78
+  );
+  const actual = resumeCoverage(repository, OKX_MARKET, RESTARTED_AT);
+  if (actual.exchangeId !== 'okx') assert.fail('expected an OKX coverage lease');
+  return {
+    ...context,
+    lifecycle,
+    actual,
+    forged: { ...actual, okxResumeAfterMs: 0 }
+  };
 }
 
 function commitOkxPage(
@@ -824,6 +903,8 @@ test('installs the locked columns, keys, immutable triggers, and basic constrain
     ['coverage_generation', 'INTEGER', 0],
     ['coverage_task_kind', 'TEXT', 0],
     ['coverage_cutoff_ms', 'INTEGER', 0],
+    ['coverage_required_bitget_boundary_ms', 'INTEGER', 0],
+    ['coverage_initial_okx_after_ms', 'INTEGER', 0],
     ['last_caught_up_generation', 'INTEGER', 0],
     ['last_caught_up_cutoff_ms', 'INTEGER', 0],
     ['last_exhausted_at', 'TEXT', 0],
@@ -1881,21 +1962,12 @@ test('rejects exhausted coverage generations without changing lifecycle state', 
   assert.equal(fundingPersistenceSnapshot(database), before);
 });
 
-test('starts and resumes interrupted OKX coverage without changing its generation', (t) => {
-  const { repository } = setupFundingRepository(t);
+test('OKX resume creates a new fenced generation and freezes its task-start anchor', (t) => {
+  const { database, repository } = setupFundingRepository(t);
   const lifecycle = task5Repository(repository);
   const lease = startCoverage(repository, OKX_MARKET);
   const olderTimestamp = FUNDING_TIMESTAMP_MS - 1;
 
-  assert.deepEqual(lease, {
-    ...OKX_MARKET,
-    generation: 1,
-    kind: 'INITIAL',
-    cutoffMs: COVERAGE_CUTOFF_MS,
-    recovered: false,
-    okxResumeAfterMs: null,
-    requiredBitgetBoundaryMs: null
-  });
   commitOkxPage(
     repository,
     lease,
@@ -1906,17 +1978,68 @@ test('starts and resumes interrupted OKX coverage without changing its generatio
     FIRST_OBSERVED_AT,
     FUNDING_TIMESTAMP_MS
   );
+  assert.equal(lifecycle.isCoverageLeaseCurrent(lease), true);
 
-  assert.deepEqual(lifecycle.resumeInterruptedCoverage(OKX_MARKET), {
-    ...lease,
-    recovered: true,
-    okxResumeAfterMs: FUNDING_TIMESTAMP_MS
+  const resumed = resumeCoverage(repository, OKX_MARKET, RESTARTED_AT);
+  assert.deepEqual({
+    generation: resumed.generation,
+    kind: resumed.kind,
+    cutoffMs: resumed.cutoffMs,
+    okxResumeAfterMs: resumed.okxResumeAfterMs,
+    requiredBitgetBoundaryMs: resumed.requiredBitgetBoundaryMs,
+    recoveredPresent: Object.hasOwn(resumed, 'recovered')
+  }, {
+    generation: lease.generation + 1,
+    kind: lease.kind,
+    cutoffMs: lease.cutoffMs,
+    okxResumeAfterMs: FUNDING_TIMESTAMP_MS,
+    requiredBitgetBoundaryMs: null,
+    recoveredPresent: false
   });
-  assert.equal(onlyMarketState(repository, OKX_MARKET).coverageGeneration, 1);
+  let state = provenanceState(repository, OKX_MARKET);
+  assert.deepEqual({
+    generation: state.coverageGeneration,
+    initialAfterMs: state.coverageInitialOkxAfterMs,
+    mutableAfterMs: state.okxResumeAfterMs,
+    mutableGeneration: state.okxResumeGeneration
+  }, {
+    generation: resumed.generation,
+    initialAfterMs: FUNDING_TIMESTAMP_MS,
+    mutableAfterMs: FUNDING_TIMESTAMP_MS,
+    mutableGeneration: resumed.generation
+  });
+  assert.equal(database.prepare(`
+    SELECT updated_at FROM funding_rate_sync_state
+    WHERE exchange_id = ? AND exchange_market_id = ?
+  `).pluck().get(OKX_MARKET.exchangeId, OKX_MARKET.exchangeMarketId), RESTARTED_AT.toISOString());
+  assert.equal(lifecycle.isCoverageLeaseCurrent(lease), false);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumed), true);
+
+  const nextAnchor = olderTimestamp - 1;
+  commitOkxPage(
+    repository,
+    resumed,
+    [rateRecord(OKX_MARKET, '0.0003', nextAnchor)],
+    FINALIZED_AT,
+    nextAnchor
+  );
+  state = provenanceState(repository, OKX_MARKET);
+  assert.equal(state.coverageInitialOkxAfterMs, FUNDING_TIMESTAMP_MS);
+  assert.equal(state.okxResumeAfterMs, nextAnchor);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumed), true);
+
+  const resumedAgain = resumeCoverage(repository, OKX_MARKET, LATER_AT);
+  assert.equal(resumedAgain.generation, resumed.generation + 1);
+  assert.equal(resumedAgain.okxResumeAfterMs, nextAnchor);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumed), false);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumedAgain), true);
+  state = provenanceState(repository, OKX_MARKET);
+  assert.equal(state.coverageInitialOkxAfterMs, nextAnchor);
+  assert.equal(state.okxResumeGeneration, resumedAgain.generation);
 });
 
-test('resumes interrupted Bitget coverage from page one with the persisted oldest boundary', (t) => {
-  const { repository } = setupFundingRepository(t);
+test('Bitget resume creates a new fenced generation and discards old TEMP rounds', (t) => {
+  const { database, repository } = setupFundingRepository(t);
   const lifecycle = task5Repository(repository);
   const lease = startCoverage(repository, BITGET_MARKET);
   const oldestTimestamp = FUNDING_TIMESTAMP_MS - 1;
@@ -1929,14 +2052,114 @@ test('resumes interrupted Bitget coverage from page one with the persisted oldes
     { exchangeId: 'bitget', round: 1 },
     FIRST_OBSERVED_AT
   );
+  assert.equal(lifecycle.isCoverageLeaseCurrent(lease), true);
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) FROM temp.funding_rate_bitget_scan
+    WHERE coverage_generation = ?
+  `).pluck().get(lease.generation), 2);
 
-  assert.deepEqual(lifecycle.resumeInterruptedCoverage(BITGET_MARKET), {
-    ...lease,
-    recovered: true,
+  const resumed = resumeCoverage(repository, BITGET_MARKET, RESTARTED_AT);
+  assert.deepEqual({
+    generation: resumed.generation,
+    kind: resumed.kind,
+    cutoffMs: resumed.cutoffMs,
+    okxResumeAfterMs: resumed.okxResumeAfterMs,
+    requiredBitgetBoundaryMs: resumed.requiredBitgetBoundaryMs,
+    recoveredPresent: Object.hasOwn(resumed, 'recovered')
+  }, {
+    generation: lease.generation + 1,
+    kind: lease.kind,
+    cutoffMs: lease.cutoffMs,
     okxResumeAfterMs: null,
-    requiredBitgetBoundaryMs: oldestTimestamp
+    requiredBitgetBoundaryMs: oldestTimestamp,
+    recoveredPresent: false
   });
-  assert.equal(onlyMarketState(repository, BITGET_MARKET).coverageGeneration, 1);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(lease), false);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumed), true);
+  assert.equal(
+    provenanceState(repository, BITGET_MARKET).coverageRequiredBitgetBoundaryMs,
+    oldestTimestamp
+  );
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) FROM temp.funding_rate_bitget_scan
+    WHERE coverage_generation = ?
+  `).pluck().get(lease.generation), 0);
+
+  repository.commitCoveragePage(
+    resumed,
+    [rateRecord(BITGET_MARKET, '0.0001', oldestTimestamp)],
+    { exchangeId: 'bitget', round: 1 },
+    FINALIZED_AT
+  );
+  const resumedAgain = resumeCoverage(repository, BITGET_MARKET, LATER_AT);
+  assert.equal(resumedAgain.generation, resumed.generation + 1);
+  assert.equal(resumedAgain.requiredBitgetBoundaryMs, oldestTimestamp);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumed), false);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(resumedAgain), true);
+  assert.equal(database.prepare(`
+    SELECT COUNT(*) FROM temp.funding_rate_bitget_scan
+    WHERE coverage_generation = ?
+  `).pluck().get(resumed.generation), 0);
+});
+
+test('Bitget page advancement preserves the persisted task-start boundary', (t) => {
+  const { repository, lifecycle, actual } = setupForgedCoverageLease(t, 'bitget');
+  repository.commitCoveragePage(
+    actual,
+    [rateRecord(BITGET_MARKET, '0.0002', 69)],
+    { exchangeId: 'bitget', round: 1 },
+    FINALIZED_AT
+  );
+  const state = provenanceState(repository, BITGET_MARKET);
+
+  assert.equal(state.coverageRequiredBitgetBoundaryMs, 70);
+  assert.equal(state.coverageInitialOkxAfterMs, null);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(actual), true);
+});
+
+test('fresh OKX page advancement preserves a null task-start after', (t) => {
+  const { repository } = setupFundingRepository(t);
+  const lifecycle = task5Repository(repository);
+  const lease = startCoverage(repository, OKX_MARKET, 100);
+  commitOkxPage(
+    repository,
+    lease,
+    [rateRecord(OKX_MARKET, '0.0001', 78)],
+    FIRST_OBSERVED_AT,
+    78
+  );
+  const state = provenanceState(repository, OKX_MARKET);
+
+  assert.equal(state.coverageInitialOkxAfterMs, null);
+  assert.equal(state.okxResumeAfterMs, 78);
+  assert.equal(lifecycle.isCoverageLeaseCurrent(lease), true);
+});
+
+test('coverage terminal transition clears task-start provenance', (t) => {
+  const { repository, lifecycle, actual } = setupForgedCoverageLease(t, 'okx');
+  lifecycle.failCoverage(
+    actual,
+    fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'),
+    FINALIZED_AT
+  );
+  const state = provenanceState(repository, OKX_MARKET);
+
+  assert.equal(state.coverageRequiredBitgetBoundaryMs, null);
+  assert.equal(state.coverageInitialOkxAfterMs, null);
+});
+
+test('market transition clears task-start provenance', (t) => {
+  const { repository, actual } = setupForgedCoverageLease(t, 'bitget');
+  assert.equal(actual.requiredBitgetBoundaryMs, 70);
+  repository.applyCompleteDiscovery(
+    'bitget',
+    [observation(BITGET_MARKET, false)],
+    TRANSITIONED_AT
+  );
+  const state = provenanceState(repository, BITGET_MARKET);
+
+  assert.equal(state.coverageRequiredBitgetBoundaryMs, null);
+  assert.equal(state.coverageInitialOkxAfterMs, null);
 });
 
 test('fails closed when interrupted coverage recovery fields are inconsistent', (t) => {
@@ -1975,7 +2198,7 @@ test('fails closed when interrupted coverage recovery fields are inconsistent', 
       const before = fundingPersistenceSnapshot(database);
 
       assert.throws(
-        () => lifecycle.resumeInterruptedCoverage(OKX_MARKET),
+        () => resumeCoverage(repository, OKX_MARKET, RESTARTED_AT),
         /invalid funding state|interrupted coverage/i,
         corruptCase.name
       );
@@ -1984,6 +2207,36 @@ test('fails closed when interrupted coverage recovery fields are inconsistent', 
       database.close();
     }
   }
+});
+
+test('rejects an interrupted resume at the maximum coverage generation atomically', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  const lease = startCoverage(repository, OKX_MARKET);
+  commitOkxPage(
+    repository,
+    lease,
+    [rateRecord(OKX_MARKET, '0.0001', 78)],
+    FIRST_OBSERVED_AT,
+    78
+  );
+  const update = database.prepare(`
+    UPDATE funding_rate_sync_state
+    SET coverage_generation = ?, okx_resume_generation = ?
+    WHERE exchange_id = ? AND exchange_market_id = ?
+  `).run(
+    MAX_SQLITE_SAFE_INTEGER,
+    MAX_SQLITE_SAFE_INTEGER,
+    OKX_MARKET.exchangeId,
+    OKX_MARKET.exchangeMarketId
+  );
+  assert.equal(update.changes, 1);
+  const before = fundingPersistenceSnapshot(database);
+
+  assert.throws(
+    () => resumeCoverage(repository, OKX_MARKET, RESTARTED_AT),
+    /generation exhausted/i
+  );
+  assert.equal(fundingPersistenceSnapshot(database), before);
 });
 
 test('checks the full coverage lease identity and fences every stale mutation', (t) => {
@@ -2035,6 +2288,81 @@ test('checks the full coverage lease identity and fences every stale mutation', 
     assert.throws(invoke, /stale funding task/i, operation);
     assert.equal(fundingPersistenceSnapshot(database), before, operation);
   }
+});
+
+for (const exchangeId of ['bitget', 'okx'] as const) {
+  test(`${exchangeId} task-start provenance is part of lease currency`, (t) => {
+    const { lifecycle, actual, forged } = setupForgedCoverageLease(t, exchangeId);
+
+    assert.equal(lifecycle.isCoverageLeaseCurrent(actual), true);
+    assert.equal(lifecycle.isCoverageLeaseCurrent(forged), false);
+  });
+}
+
+for (const operation of ['page', 'complete', 'fail'] as const) {
+  for (const exchangeId of ['bitget', 'okx'] as const) {
+    test(`${exchangeId} ${operation} rejects forged task-start provenance with zero writes`, (t) => {
+      const {
+        database,
+        repository,
+        lifecycle,
+        actual,
+        forged
+      } = setupForgedCoverageLease(t, exchangeId);
+      if (operation === 'complete' && actual.exchangeId === 'bitget') {
+        const record = rateRecord(BITGET_MARKET, '0.0001', 70);
+        for (const round of [1, 2] as const) {
+          repository.commitCoveragePage(
+            actual,
+            [record],
+            { exchangeId: 'bitget', round },
+            FINALIZED_AT
+          );
+        }
+      }
+      const before = fundingPersistenceSnapshot(database);
+      const invoke = operation === 'page'
+        ? (): unknown => repository.commitCoveragePage(
+            forged,
+            [rateRecord(
+              exchangeId === 'bitget' ? BITGET_MARKET : OKX_MARKET,
+              '0.0002',
+              69
+            )],
+            exchangeId === 'bitget'
+              ? { exchangeId: 'bitget', round: 1 }
+              : { exchangeId: 'okx', recoveryAnchorMs: 69 },
+            LATER_AT
+          )
+        : operation === 'complete'
+          ? (): unknown => lifecycle.completeCoverage(
+              forged,
+              exchangeId === 'bitget'
+                ? bitgetEvidence(forged)
+                : okxEvidence(forged, 0),
+              LATER_AT
+            )
+          : (): unknown => lifecycle.failCoverage(
+              forged,
+              fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'),
+              LATER_AT
+            );
+
+      assert.throws(invoke, /stale funding task/i);
+      assert.equal(fundingPersistenceSnapshot(database), before);
+    });
+  }
+}
+
+test('Bitget round comparison rejects forged task-start provenance', (t) => {
+  const { database, lifecycle, forged } = setupForgedCoverageLease(t, 'bitget');
+  const before = fundingPersistenceSnapshot(database);
+
+  assert.throws(
+    () => lifecycle.bitgetRoundsEqual(forged, 1, 2),
+    /stale funding task/i
+  );
+  assert.equal(fundingPersistenceSnapshot(database), before);
 });
 
 test('requires an OKX checkpoint to equal the committed page maximum before any write', (t) => {

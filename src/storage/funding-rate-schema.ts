@@ -201,6 +201,20 @@ const FUNDING_RATE_SYNC_STATE_BODY = ` (
         AND coverage_cutoff_ms BETWEEN 0 AND 8640000000000000
       )
     ),
+    coverage_required_bitget_boundary_ms INTEGER CHECK (
+      coverage_required_bitget_boundary_ms IS NULL
+      OR (
+        typeof(coverage_required_bitget_boundary_ms) = 'integer'
+        AND coverage_required_bitget_boundary_ms BETWEEN 0 AND 8640000000000000
+      )
+    ),
+    coverage_initial_okx_after_ms INTEGER CHECK (
+      coverage_initial_okx_after_ms IS NULL
+      OR (
+        typeof(coverage_initial_okx_after_ms) = 'integer'
+        AND coverage_initial_okx_after_ms BETWEEN 0 AND 8640000000000000
+      )
+    ),
     last_caught_up_generation INTEGER CHECK (
       last_caught_up_generation IS NULL
       OR (
@@ -397,6 +411,23 @@ const FUNDING_RATE_SYNC_STATE_BODY = ` (
         AND coverage_status = 'BACKFILLING'
         AND okx_resume_generation = coverage_generation
       )
+    ),
+    CHECK (
+      (coverage_status = 'BACKFILLING'
+        AND (
+          (exchange_id = 'bitget'
+            AND coverage_initial_okx_after_ms IS NULL)
+          OR (exchange_id = 'okx'
+            AND coverage_required_bitget_boundary_ms IS NULL
+            AND (
+              coverage_initial_okx_after_ms IS NULL
+              OR (okx_resume_after_ms IS NOT NULL
+                AND okx_resume_after_ms <= coverage_initial_okx_after_ms)
+            ))
+        ))
+      OR (coverage_status <> 'BACKFILLING'
+        AND coverage_required_bitget_boundary_ms IS NULL
+        AND coverage_initial_okx_after_ms IS NULL)
     ),
     CHECK (
       (reactivation_required = 0 AND reactivation_after_generation IS NULL)

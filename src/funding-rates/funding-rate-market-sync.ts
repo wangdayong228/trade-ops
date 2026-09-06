@@ -230,12 +230,6 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
     subject,
     invalidCoverageLease
   );
-  const recovered = requiredOwnDataValue(
-    descriptors,
-    'recovered',
-    subject,
-    invalidCoverageLease
-  );
   const okxResumeAfterMs = requiredOwnDataValue(
     descriptors,
     'okxResumeAfterMs',
@@ -272,10 +266,6 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
   if (!nonNegativeSafeInteger(cutoffMs)) {
     return invalidCoverageLease('cutoffMs must be a non-negative safe integer');
   }
-  if (typeof recovered !== 'boolean') {
-    return invalidCoverageLease('recovered must be a boolean');
-  }
-
   if (exchangeId === 'bitget') {
     if (okxResumeAfterMs !== null) {
       return invalidCoverageLease('Bitget okxResumeAfterMs must be null');
@@ -295,7 +285,6 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
       generation,
       kind,
       cutoffMs,
-      recovered,
       okxResumeAfterMs,
       requiredBitgetBoundaryMs
     });
@@ -316,7 +305,6 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
     generation,
     kind,
     cutoffMs,
-    recovered,
     okxResumeAfterMs,
     requiredBitgetBoundaryMs
   });
@@ -1180,6 +1168,9 @@ export class FundingRateMarketSync {
         `funding source and coverage lease exchange identity mismatch: `
         + `expected ${this.sourceExchangeId}, actual ${snapshot.exchangeId}`
       );
+    }
+    if (!this.options.repository.isCoverageLeaseCurrent(snapshot)) {
+      throw new StaleFundingTaskError();
     }
     return new CoveragePageTask(
       this.options.source,

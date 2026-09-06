@@ -28,7 +28,6 @@ interface CommonCoverageLease {
   readonly generation: number;
   readonly kind: FundingCoverageKind;
   readonly cutoffMs: number;
-  readonly recovered: boolean;
 }
 
 export type CoverageLease =
@@ -148,6 +147,8 @@ export interface FundingMarketState extends FundingMarketIdentity {
   readonly coverageGeneration: number;
   readonly coverageTaskKind: FundingCoverageKind | null;
   readonly coverageCutoffMs: number | null;
+  readonly coverageRequiredBitgetBoundaryMs: number | null;
+  readonly coverageInitialOkxAfterMs: number | null;
   readonly lastCaughtUpGeneration: number | null;
   readonly lastCaughtUpCutoffMs: number | null;
   readonly lastExhaustedAt: string | null;
@@ -208,7 +209,10 @@ export interface FundingRateRepository {
     cutoffMs: number,
     startedAt: Date
   ): CoverageLease;
-  resumeInterruptedCoverage(market: FundingMarketIdentity): CoverageLease;
+  resumeInterruptedCoverage(
+    market: FundingMarketIdentity,
+    resumedAt: Date
+  ): CoverageLease;
   isCoverageLeaseCurrent(lease: CoverageLease): boolean;
   commitCoveragePage(
     lease: CoverageLease,

@@ -101,6 +101,8 @@ interface FundingStateDbRow {
   readonly coverage_generation: unknown;
   readonly coverage_task_kind: unknown;
   readonly coverage_cutoff_ms: unknown;
+  readonly coverage_required_bitget_boundary_ms: unknown;
+  readonly coverage_initial_okx_after_ms: unknown;
   readonly last_caught_up_generation: unknown;
   readonly last_caught_up_cutoff_ms: unknown;
   readonly last_exhausted_at: unknown;
@@ -610,6 +612,8 @@ function assertFundingSchema(database: Database.Database): void {
     ['coverage_generation', 'INTEGER', 0],
     ['coverage_task_kind', 'TEXT', 0],
     ['coverage_cutoff_ms', 'INTEGER', 0],
+    ['coverage_required_bitget_boundary_ms', 'INTEGER', 0],
+    ['coverage_initial_okx_after_ms', 'INTEGER', 0],
     ['last_caught_up_generation', 'INTEGER', 0],
     ['last_caught_up_cutoff_ms', 'INTEGER', 0],
     ['last_exhausted_at', 'TEXT', 0],
@@ -879,6 +883,14 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     row.coverage_cutoff_ms,
     `${stateContext} coverage_cutoff_ms`
   );
+  const coverageRequiredBitgetBoundaryMs = nullableTimestampMs(
+    row.coverage_required_bitget_boundary_ms,
+    `${stateContext} coverage_required_bitget_boundary_ms`
+  );
+  const coverageInitialOkxAfterMs = nullableTimestampMs(
+    row.coverage_initial_okx_after_ms,
+    `${stateContext} coverage_initial_okx_after_ms`
+  );
   const lastCaughtUpGeneration = nullableSqliteInteger(
     row.last_caught_up_generation,
     0,
@@ -1026,6 +1038,27 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   ) {
     return corruptState(stateContext, 'OKX anchor generation');
   }
+  if (coverageStatus === 'BACKFILLING') {
+    if (
+      (stateExchangeId === 'bitget' && coverageInitialOkxAfterMs !== null)
+      || (stateExchangeId === 'okx' && coverageRequiredBitgetBoundaryMs !== null)
+      || (
+        stateExchangeId === 'okx'
+        && coverageInitialOkxAfterMs !== null
+        && (
+          okxResumeAfterMs === null
+          || okxResumeAfterMs > coverageInitialOkxAfterMs
+        )
+      )
+    ) {
+      return corruptState(stateContext, 'coverage task-start provenance');
+    }
+  } else if (
+    coverageRequiredBitgetBoundaryMs !== null
+    || coverageInitialOkxAfterMs !== null
+  ) {
+    return corruptState(stateContext, 'terminal coverage task-start provenance');
+  }
 
   if (reactivationRequired !== (reactivationAfterGeneration !== null)) {
     return corruptState(stateContext, 'reactivation fields');
@@ -1157,6 +1190,8 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     coverageGeneration,
     coverageTaskKind,
     coverageCutoffMs,
+    coverageRequiredBitgetBoundaryMs,
+    coverageInitialOkxAfterMs,
     lastCaughtUpGeneration,
     lastCaughtUpCutoffMs,
     lastExhaustedAt,
@@ -1190,9 +1225,6 @@ function coverageLease(lease: CoverageLease): CoverageLease {
   );
   const kind = enumValue(lease.kind, COVERAGE_KINDS, 'coverage lease kind');
   const cutoffMs = timestampMs(lease.cutoffMs, 'coverage lease cutoff_ms');
-  if (typeof lease.recovered !== 'boolean') {
-    throw new Error('invalid coverage lease recovered flag');
-  }
   if (market.exchangeId === 'bitget') {
     if (lease.okxResumeAfterMs !== null) {
       throw new Error('invalid Bitget coverage lease OKX anchor');
@@ -1210,7 +1242,6 @@ function coverageLease(lease: CoverageLease): CoverageLease {
       generation,
       kind,
       cutoffMs,
-      recovered: lease.recovered,
       okxResumeAfterMs: null,
       requiredBitgetBoundaryMs
     };
@@ -1225,7 +1256,6 @@ function coverageLease(lease: CoverageLease): CoverageLease {
     generation,
     kind,
     cutoffMs,
-    recovered: lease.recovered,
     okxResumeAfterMs: lease.okxResumeAfterMs === null
       ? null
       : timestampMs(lease.okxResumeAfterMs, 'coverage lease OKX anchor'),
@@ -1260,7 +1290,10 @@ function coverageStateMatchesLease(
     && state.coverageStatus === 'BACKFILLING'
     && state.coverageGeneration === lease.generation
     && state.coverageTaskKind === lease.kind
-    && state.coverageCutoffMs === lease.cutoffMs;
+    && state.coverageCutoffMs === lease.cutoffMs
+    && state.coverageRequiredBitgetBoundaryMs
+      === lease.requiredBitgetBoundaryMs
+    && state.coverageInitialOkxAfterMs === lease.okxResumeAfterMs;
 }
 
 function coverageStateAllowsLease(
@@ -1306,6 +1339,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
   private readonly updateObservedActiveState;
   private readonly updateDiscoveryTransition;
   private readonly updateCoverageStart;
+  private readonly updateCoverageResume;
   private readonly selectHistoryRecord;
   private readonly selectHistory;
   private readonly insertHistory;
@@ -1346,7 +1380,8 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         reactivation_required, reactivation_after_generation,
         inactive_final_caught_up_at,
         coverage_status, coverage_generation, coverage_task_kind,
-        coverage_cutoff_ms, last_caught_up_generation,
+        coverage_cutoff_ms, coverage_required_bitget_boundary_ms,
+        coverage_initial_okx_after_ms, last_caught_up_generation,
         last_caught_up_cutoff_ms, last_exhausted_at,
         last_exhaustion_evidence_json,
         okx_resume_after_ms, okx_resume_generation,
@@ -1363,7 +1398,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         1, @observedAt, @observedAt,
         0, NULL, NULL,
         'PENDING', 0, NULL,
-        NULL, NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL,
         NULL, NULL, NULL, NULL,
         NULL, NULL, NULL,
         NULL, NULL,
@@ -1393,6 +1428,8 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           coverage_generation = @coverageGeneration,
           coverage_task_kind = @coverageTaskKind,
           coverage_cutoff_ms = @coverageCutoffMs,
+          coverage_required_bitget_boundary_ms = NULL,
+          coverage_initial_okx_after_ms = NULL,
           okx_resume_after_ms = NULL,
           okx_resume_generation = NULL,
           coverage_started_at = @coverageStartedAt,
@@ -1418,6 +1455,8 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           coverage_generation = @generation,
           coverage_task_kind = @kind,
           coverage_cutoff_ms = @cutoffMs,
+          coverage_required_bitget_boundary_ms = @requiredBitgetBoundaryMs,
+          coverage_initial_okx_after_ms = @initialOkxAfterMs,
           okx_resume_after_ms = NULL,
           okx_resume_generation = NULL,
           coverage_started_at = @startedAt,
@@ -1429,6 +1468,30 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND exchange_market_id = @exchangeMarketId
         AND symbol = @symbol
         AND coverage_generation = @previousGeneration
+    `);
+    this.updateCoverageResume = this.database.prepare(`
+      UPDATE funding_rate_sync_state
+      SET coverage_generation = @generation,
+          coverage_required_bitget_boundary_ms = @requiredBitgetBoundaryMs,
+          coverage_initial_okx_after_ms = @initialOkxAfterMs,
+          okx_resume_after_ms = @okxResumeAfterMs,
+          okx_resume_generation = @okxResumeGeneration,
+          updated_at = @resumedAt
+      WHERE exchange_id = @exchangeId
+        AND exchange_market_id = @exchangeMarketId
+        AND symbol = @symbol
+        AND coverage_status = 'BACKFILLING'
+        AND coverage_generation = @previousGeneration
+        AND coverage_task_kind = @kind
+        AND coverage_cutoff_ms = @cutoffMs
+        AND coverage_required_bitget_boundary_ms
+          IS @previousRequiredBitgetBoundaryMs
+        AND coverage_initial_okx_after_ms IS @previousInitialOkxAfterMs
+        AND okx_resume_after_ms IS @previousOkxResumeAfterMs
+        AND okx_resume_generation IS @previousOkxResumeGeneration
+        AND coverage_started_at = @coverageStartedAt
+        AND coverage_ended_at IS NULL
+        AND coverage_error_code IS NULL
     `);
     this.selectHistoryRecord = this.database.prepare(`
       SELECT * FROM funding_rate_history
@@ -1506,6 +1569,9 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND coverage_generation = @generation
         AND coverage_task_kind = @kind
         AND coverage_cutoff_ms = @cutoffMs
+        AND coverage_required_bitget_boundary_ms
+          IS @requiredBitgetBoundaryMs
+        AND coverage_initial_okx_after_ms IS @initialOkxAfterMs
     `);
     this.upsertBitgetScanRecord = this.database.prepare(`
       INSERT INTO funding_rate_bitget_scan (
@@ -1577,6 +1643,8 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           last_caught_up_cutoff_ms = @cutoffMs,
           last_exhausted_at = @completedAt,
           last_exhaustion_evidence_json = @evidenceJson,
+          coverage_required_bitget_boundary_ms = NULL,
+          coverage_initial_okx_after_ms = NULL,
           okx_resume_after_ms = NULL,
           okx_resume_generation = NULL,
           coverage_ended_at = @completedAt,
@@ -1594,10 +1662,15 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND coverage_generation = @generation
         AND coverage_task_kind = @kind
         AND coverage_cutoff_ms = @cutoffMs
+        AND coverage_required_bitget_boundary_ms
+          IS @requiredBitgetBoundaryMs
+        AND coverage_initial_okx_after_ms IS @initialOkxAfterMs
     `);
     this.updateCoverageFailure = this.database.prepare(`
       UPDATE funding_rate_sync_state
       SET coverage_status = 'INCOMPLETE',
+          coverage_required_bitget_boundary_ms = NULL,
+          coverage_initial_okx_after_ms = NULL,
           okx_resume_after_ms = NULL,
           okx_resume_generation = NULL,
           coverage_ended_at = @failedAt,
@@ -1611,6 +1684,9 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         AND coverage_generation = @generation
         AND coverage_task_kind = @kind
         AND coverage_cutoff_ms = @cutoffMs
+        AND coverage_required_bitget_boundary_ms
+          IS @requiredBitgetBoundaryMs
+        AND coverage_initial_okx_after_ms IS @initialOkxAfterMs
     `);
     this.updateIncrementalStart = this.database.prepare(`
       UPDATE funding_rate_sync_state
@@ -1800,9 +1876,14 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
   }
 
   resumeInterruptedCoverage(
-    untrustedMarket: FundingMarketIdentity
+    untrustedMarket: FundingMarketIdentity,
+    resumedAt: Date
   ): CoverageLease {
     const market = marketIdentity(untrustedMarket);
+    const resumedAtText = dateTimestamp(
+      resumedAt,
+      'funding coverage resume time'
+    );
     return this.database.transaction((): CoverageLease => {
       const state = this.stateForMarket(market);
       if (
@@ -1811,32 +1892,62 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         || state.coverageStatus !== 'BACKFILLING'
         || state.coverageTaskKind === null
         || state.coverageCutoffMs === null
+        || state.coverageStartedAt === null
       ) {
         throw new Error('funding market has no interrupted coverage task');
       }
+      if (state.coverageGeneration === MAX_SAFE_INTEGER) {
+        throw new Error('funding coverage generation exhausted');
+      }
+      const generation = state.coverageGeneration + 1;
+      const requiredBitgetBoundaryMs = state.exchangeId === 'bitget'
+        ? state.oldestFundingTimestampMs
+        : null;
+      const initialOkxAfterMs = state.exchangeId === 'okx'
+        ? state.okxResumeAfterMs
+        : null;
       const common = {
         exchangeMarketId: state.exchangeMarketId,
         symbol: state.symbol,
-        generation: state.coverageGeneration,
+        generation,
         kind: state.coverageTaskKind,
-        cutoffMs: state.coverageCutoffMs,
-        recovered: true
+        cutoffMs: state.coverageCutoffMs
       } as const;
       const lease: CoverageLease = state.exchangeId === 'bitget'
         ? {
             ...common,
             exchangeId: 'bitget',
             okxResumeAfterMs: null,
-            requiredBitgetBoundaryMs: state.oldestFundingTimestampMs
+            requiredBitgetBoundaryMs
           }
         : {
             ...common,
             exchangeId: 'okx',
-            okxResumeAfterMs: state.okxResumeAfterMs,
+            okxResumeAfterMs: initialOkxAfterMs,
             requiredBitgetBoundaryMs: null
           };
       if (!coverageStateAllowsLease(state, lease)) {
         throw new Error('interrupted coverage task is no longer eligible');
+      }
+      this.deleteBitgetScansForMarket.run(
+        state.exchangeId,
+        state.exchangeMarketId
+      );
+      const update = this.updateCoverageResume.run({
+        ...lease,
+        initialOkxAfterMs,
+        okxResumeGeneration: initialOkxAfterMs === null ? null : generation,
+        previousGeneration: state.coverageGeneration,
+        previousRequiredBitgetBoundaryMs:
+          state.coverageRequiredBitgetBoundaryMs,
+        previousInitialOkxAfterMs: state.coverageInitialOkxAfterMs,
+        previousOkxResumeAfterMs: state.okxResumeAfterMs,
+        previousOkxResumeGeneration: state.okxResumeGeneration,
+        coverageStartedAt: state.coverageStartedAt,
+        resumedAt: resumedAtText
+      });
+      if (!sqliteIntegerEquals(update.changes, 1)) {
+        throw new StaleFundingTaskError();
       }
       return lease;
     })();
@@ -1949,6 +2060,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       const clearsReactivation = lease.kind === 'REACTIVATION';
       const update = this.updateCoverageComplete.run({
         ...lease,
+        initialOkxAfterMs: lease.okxResumeAfterMs,
         completedAt: completedAtText,
         evidenceJson: JSON.stringify(evidence),
         inactiveFinalCaughtUpAt: lease.kind === 'INACTIVE_FINAL'
@@ -1984,6 +2096,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       );
       const update = this.updateCoverageFailure.run({
         ...lease,
+        initialOkxAfterMs: lease.okxResumeAfterMs,
         failedAt: failedAtText,
         failureCode: failure.code,
         failureSummary: failure.summary
@@ -2417,6 +2530,10 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       cutoffMs,
       startedAt,
       generation,
+      requiredBitgetBoundaryMs: market.exchangeId === 'bitget'
+        ? state.oldestFundingTimestampMs
+        : null,
+      initialOkxAfterMs: null,
       previousGeneration: state.coverageGeneration
     });
     if (!sqliteIntegerEquals(update.changes, 1)) {
@@ -2430,7 +2547,6 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         generation,
         kind,
         cutoffMs,
-        recovered: false,
         okxResumeAfterMs: null,
         requiredBitgetBoundaryMs: state.oldestFundingTimestampMs
       };
@@ -2442,7 +2558,6 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       generation,
       kind,
       cutoffMs,
-      recovered: false,
       okxResumeAfterMs: null,
       requiredBitgetBoundaryMs: null
     };
@@ -2517,6 +2632,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     ));
     const update = this.updateCoverageCheckpoint.run({
       ...lease,
+      initialOkxAfterMs: lease.okxResumeAfterMs,
       pageOldestMs,
       pageLatestMs,
       okxResumeAfterMs: checkpoint.exchangeId === 'okx'
