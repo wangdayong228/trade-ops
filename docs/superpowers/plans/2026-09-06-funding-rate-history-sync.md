@@ -610,7 +610,7 @@ funding_rate_revised
 funding_sync_fatal
 ```
 
-运行时附加 `apiKey/secret/headers/rawResponse/cause` 必须被双层 allowlist 丢弃；凭证值在 exchange/market/symbol/error/request 字段内必须替换为 `[Redacted]`；多字节错误字段按 UTF-8 安全边界截断；sink 抛错不能传播。另断言 `fundingTaskFailure` 对每个 code 只产生锁定的静态 summary，API 不接受原始错误或自由文本。
+运行时附加 `apiKey/secret/headers/rawResponse/cause` 必须被双层 allowlist 丢弃；凭证值在 exchange/market/symbol/error/request 字段内必须替换为 `[Redacted]`；多字节错误字段按 UTF-8 安全边界截断；sink 抛错不能传播。持久化 `fundingTaskFailure` 合同及其测试留在创建 repository 合同的 Task 4，不允许 Task 3 提前创建 storage 模块。
 
 - [ ] **Step 2: 确认 RED**
 
@@ -658,6 +658,7 @@ Expected: tests/build exit 0；提交只含列出的四个文件。
 - `database.defaultSafeIntegers(true)` 下读写仍正确；
 - 直接污染 rate/timestamp/JSON/hash 后读取产生含 exchange + market + field 的精确错误；
 - 自由文本、凭证片段、NUL/control、超过 512 UTF-8 bytes 的多字节 summary 均不能写入；固定 normalizer 的 summary 可以写入且不含原始异常内容。
+- `fundingTaskFailure` 对每个批准 code 只产生锁定的静态 summary；其函数签名不接受原始错误、response、headers、cause、env 或任意自由文本。
 
 - [ ] **Step 2: 确认 RED**
 
