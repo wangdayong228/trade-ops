@@ -185,14 +185,17 @@ function onlyMarketState(
   return state;
 }
 
-function okxEvidence(lease: CoverageLease): FundingExhaustionEvidence {
+function okxEvidence(
+  lease: CoverageLease,
+  finalRequestAfterMs = lease.okxResumeAfterMs
+): FundingExhaustionEvidence {
   if (lease.exchangeId !== 'okx') assert.fail('expected an OKX lease');
   return {
     exchangeId: 'okx',
     generation: lease.generation,
     cutoffMs: lease.cutoffMs,
     explicitEmpty: true,
-    finalRequestAfterMs: lease.okxResumeAfterMs
+    finalRequestAfterMs
   };
 }
 
@@ -246,6 +249,50 @@ function fundingPersistenceSnapshot(database: Database.Database): string {
         coverage_generation, scan_round, funding_timestamp_ms
     `).all()
   });
+}
+
+function invocationError(invoke: () => unknown): unknown {
+  try {
+    invoke();
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
+function errorContains(error: unknown, fragments: readonly string[]): boolean {
+  return error instanceof Error && fragments.every((fragment) => (
+    error.message.toLowerCase().includes(fragment.toLowerCase())
+  ));
+}
+
+function rewritePriorProofGeneration(
+  database: Database.Database,
+  repository: FundingRateRepository,
+  generation: number
+): void {
+  const state = onlyMarketState(repository, OKX_MARKET);
+  if (state.lastCaughtUpCutoffMs === null) {
+    assert.fail('expected prior caught-up proof');
+  }
+  const evidence: FundingExhaustionEvidence = {
+    exchangeId: 'okx',
+    generation,
+    cutoffMs: state.lastCaughtUpCutoffMs,
+    explicitEmpty: true,
+    finalRequestAfterMs: null
+  };
+  const update = database.prepare(`
+    UPDATE funding_rate_sync_state
+    SET last_caught_up_generation = @generation,
+        last_exhaustion_evidence_json = @evidenceJson
+    WHERE exchange_id = 'okx'
+      AND exchange_market_id = 'BTC-USDT-SWAP'
+  `).run({
+    generation,
+    evidenceJson: JSON.stringify(evidence)
+  });
+  assert.equal(update.changes, 1);
 }
 
 function setStateIgnoringChecks(
@@ -1079,7 +1126,7 @@ test('archives every complete old version for an A to B to A revision sequence',
   assert.equal(current.last_observed_at, THIRD_OBSERVED_AT.toISOString());
 });
 
-test('revises canonical field changes even when supplied content hashes are equal', (t) => {
+test('rejects a semantic content hash mismatch before a coverage revision', (t) => {
   const { database, repository } = setupFundingRepository(t);
   const lease = startCoverage(repository, OKX_MARKET);
   const recordA = rateRecord(OKX_MARKET, '0.0001', FUNDING_TIMESTAMP_MS, 'A');
@@ -1089,26 +1136,22 @@ test('revises canonical field changes even when supplied content hashes are equa
     contentHash: recordA.contentHash
   };
   commitOkxPage(repository, lease, [recordA], FIRST_OBSERVED_AT);
+  const before = fundingPersistenceSnapshot(database);
 
-  const result = commitOkxPage(
+  const error = invocationError(() => commitOkxPage(
     repository,
     lease,
     [syntheticCollision],
     SECOND_OBSERVED_AT
-  );
+  ));
 
-  assert.deepEqual(result, {
-    inserted: 0,
-    unchanged: 0,
-    revised: 1,
-    revisedKeys: [{
-      fundingTimestampMs: FUNDING_TIMESTAMP_MS,
-      previousContentHash: recordA.contentHash,
-      currentContentHash: recordA.contentHash
-    }]
+  assert.deepEqual({
+    rejectedForHash: errorContains(error, ['content', 'hash']),
+    persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+  }, {
+    rejectedForHash: true,
+    persistenceUnchanged: true
   });
-  assert.equal(revisionRows(database).length, 1);
-  assert.equal(historyRow(database, OKX_MARKET).funding_rate, '0.0002');
 });
 
 test('rejects both update and delete of an archived revision', (t) => {
@@ -2270,15 +2313,12 @@ test('stages only cutoff-bounded Bitget records and compares every normalized fi
   assert.equal(repository.listHistory(BITGET_MARKET).length, 2);
   assert.equal(lifecycle.bitgetRoundsEqual(lease, 1, 2), true);
 
-  const changedFields = {
-    ...rateRecord(
-      BITGET_MARKET,
-      '-0.0001',
-      bounded.fundingTimestampMs,
-      'changed-fields'
-    ),
-    contentHash: bounded.contentHash
-  };
+  const changedFields = rateRecord(
+    BITGET_MARKET,
+    '-0.0001',
+    bounded.fundingTimestampMs,
+    'changed-fields'
+  );
   repository.commitCoveragePage(
     lease,
     [changedFields],
@@ -2518,7 +2558,11 @@ test('starts incremental only after successful coverage and freezes the pre-task
     [rateRecord(OKX_MARKET, '0.0001')],
     FIRST_OBSERVED_AT
   );
-  lifecycle.completeCoverage(coverage, okxEvidence(coverage), COMPLETED_AT);
+  lifecycle.completeCoverage(
+    coverage,
+    okxEvidence(coverage, FUNDING_TIMESTAMP_MS),
+    COMPLETED_AT
+  );
 
   const lease = lifecycle.startIncremental(OKX_MARKET, RESTARTED_AT);
   assert.deepEqual(lease, {
@@ -2554,7 +2598,11 @@ test('incremental pages revise and insert records without mutating coverage stat
     [rateRecord(OKX_MARKET, '0.0001', FUNDING_TIMESTAMP_MS, 'A')],
     FIRST_OBSERVED_AT
   );
-  lifecycle.completeCoverage(coverage, okxEvidence(coverage), COMPLETED_AT);
+  lifecycle.completeCoverage(
+    coverage,
+    okxEvidence(coverage, FUNDING_TIMESTAMP_MS),
+    COMPLETED_AT
+  );
   const before = onlyMarketState(repository, OKX_MARKET);
   const incremental = lifecycle.startIncremental(OKX_MARKET, RESTARTED_AT);
   const earlierUnknown = FUNDING_TIMESTAMP_MS - 1;
@@ -3031,7 +3079,11 @@ test('rolls back an incremental revision, insert, bounds, and state on page fail
     [original],
     FIRST_OBSERVED_AT
   );
-  lifecycle.completeCoverage(coverage, okxEvidence(coverage), COMPLETED_AT);
+  lifecycle.completeCoverage(
+    coverage,
+    okxEvidence(coverage, FUNDING_TIMESTAMP_MS),
+    COMPLETED_AT
+  );
   const incremental = lifecycle.startIncremental(OKX_MARKET, RESTARTED_AT);
   const failingTimestamp = FUNDING_TIMESTAMP_MS - 1;
   database.exec(`
@@ -3056,4 +3108,373 @@ test('rolls back an incremental revision, insert, bounds, and state on page fail
     /test incremental page failed|funding page transaction failed/i
   );
   assert.equal(fundingPersistenceSnapshot(database), before);
+});
+
+const invalidOkxCompletionRelationCases = [
+  {
+    name: 'non-null final after without a committed anchor',
+    commitAnchor: false,
+    finalRequestAfterMs: FUNDING_TIMESTAMP_MS
+  },
+  {
+    name: 'null final after with a committed anchor',
+    commitAnchor: true,
+    finalRequestAfterMs: null
+  },
+  {
+    name: 'final after greater than the committed anchor',
+    commitAnchor: true,
+    finalRequestAfterMs: FUNDING_TIMESTAMP_MS + 1
+  }
+] as const;
+
+for (const relationCase of invalidOkxCompletionRelationCases) {
+  test(`rejects OKX completion evidence with ${relationCase.name}`, (t) => {
+    const { database, repository } = setupFundingRepository(t);
+    const lifecycle = task5Repository(repository);
+    const lease = startCoverage(repository, OKX_MARKET);
+    if (relationCase.commitAnchor) {
+      commitOkxPage(
+        repository,
+        lease,
+        [rateRecord(OKX_MARKET, '0.0001')],
+        FIRST_OBSERVED_AT,
+        FUNDING_TIMESTAMP_MS
+      );
+    }
+    const before = fundingPersistenceSnapshot(database);
+
+    const error = invocationError(() => lifecycle.completeCoverage(
+      lease,
+      okxEvidence(lease, relationCase.finalRequestAfterMs),
+      COMPLETED_AT
+    ));
+
+    assert.deepEqual({
+      rejectedForEvidenceRelation:
+        error instanceof Error
+        && /evidence|final request|anchor/i.test(error.message),
+      persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+    }, {
+      rejectedForEvidenceRelation: true,
+      persistenceUnchanged: true
+    });
+  });
+}
+
+test('accepts every legal OKX final-after and committed-anchor boundary', (t) => {
+  const legalCases = [
+    { name: 'null/null', timestamps: [] as number[], finalRequestAfterMs: null },
+    {
+      name: 'equal',
+      timestamps: [FUNDING_TIMESTAMP_MS],
+      finalRequestAfterMs: FUNDING_TIMESTAMP_MS
+    },
+    {
+      name: 'strict-less',
+      timestamps: [FUNDING_TIMESTAMP_MS, FUNDING_TIMESTAMP_MS - 2],
+      finalRequestAfterMs: FUNDING_TIMESTAMP_MS - 2
+    }
+  ] as const;
+
+  for (const legalCase of legalCases) {
+    const { repository } = setupFundingRepository(t);
+    const lifecycle = task5Repository(repository);
+    const lease = startCoverage(repository, OKX_MARKET);
+    if (legalCase.timestamps.length > 0) {
+      const records = legalCase.timestamps.map((timestampMs, index) => (
+        rateRecord(OKX_MARKET, `0.000${index + 1}`, timestampMs)
+      ));
+      commitOkxPage(
+        repository,
+        lease,
+        records,
+        FIRST_OBSERVED_AT,
+        FUNDING_TIMESTAMP_MS
+      );
+    }
+
+    lifecycle.completeCoverage(
+      lease,
+      okxEvidence(lease, legalCase.finalRequestAfterMs),
+      COMPLETED_AT
+    );
+    const state = onlyMarketState(repository, OKX_MARKET);
+    assert.equal(state.coverageStatus, 'CAUGHT_UP', legalCase.name);
+    assert.equal(
+      state.lastExhaustionEvidenceJson,
+      JSON.stringify(okxEvidence(lease, legalCase.finalRequestAfterMs)),
+      legalCase.name
+    );
+  }
+});
+
+const invalidPriorProofGenerationCases = [
+  { status: 'BACKFILLING', relation: 'equal' },
+  { status: 'BACKFILLING', relation: 'future' },
+  { status: 'INCOMPLETE', relation: 'equal' },
+  { status: 'INCOMPLETE', relation: 'future' }
+] as const;
+
+for (const proofCase of invalidPriorProofGenerationCases) {
+  test(`rejects ${proofCase.relation} prior proof generation in ${proofCase.status}`, (t) => {
+    const { database, repository } = setupFundingRepository(t);
+    const lifecycle = task5Repository(repository);
+    completeEmptyOkxCoverage(lifecycle);
+    const currentLease = repository.startCoverage(
+      OKX_MARKET,
+      'PERIODIC',
+      COVERAGE_CUTOFF_MS + 1,
+      RESTARTED_AT
+    );
+    if (proofCase.status === 'INCOMPLETE') {
+      lifecycle.failCoverage(
+        currentLease,
+        fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'),
+        FINALIZED_AT
+      );
+    }
+    const invalidGeneration = proofCase.relation === 'equal'
+      ? currentLease.generation
+      : currentLease.generation + 1;
+    rewritePriorProofGeneration(database, repository, invalidGeneration);
+    const before = fundingPersistenceSnapshot(database);
+
+    const listError = invocationError(() => repository.listMarketStates('okx'));
+    const startError = invocationError(() => lifecycle.startIncremental(
+      OKX_MARKET,
+      LATER_AT
+    ));
+
+    assert.deepEqual({
+      listRejectedWithContext: errorContains(listError, [
+        'okx',
+        OKX_MARKET.exchangeMarketId,
+        'generation'
+      ]),
+      leaseRejectedWithContext: errorContains(startError, [
+        'okx',
+        OKX_MARKET.exchangeMarketId,
+        'generation'
+      ]),
+      persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+    }, {
+      listRejectedWithContext: true,
+      leaseRejectedWithContext: true,
+      persistenceUnchanged: true
+    });
+  });
+}
+
+test('allows incremental work when retained proof generation is strictly prior', (t) => {
+  for (const status of ['BACKFILLING', 'INCOMPLETE'] as const) {
+    const { repository } = setupFundingRepository(t);
+    const lifecycle = task5Repository(repository);
+    completeEmptyOkxCoverage(lifecycle);
+    const coverage = repository.startCoverage(
+      OKX_MARKET,
+      'PERIODIC',
+      COVERAGE_CUTOFF_MS + 1,
+      RESTARTED_AT
+    );
+    if (status === 'INCOMPLETE') {
+      lifecycle.failCoverage(
+        coverage,
+        fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'),
+        FINALIZED_AT
+      );
+    }
+    const state = onlyMarketState(repository, OKX_MARKET);
+    assert.equal(state.coverageStatus, status);
+    assert.notEqual(state.lastCaughtUpGeneration, null);
+    if (state.lastCaughtUpGeneration === null) {
+      assert.fail('expected retained prior coverage proof');
+    }
+    assert.ok(state.lastCaughtUpGeneration < state.coverageGeneration);
+
+    const incremental = lifecycle.startIncremental(OKX_MARKET, LATER_AT);
+    assert.equal(incremental.generation, 1);
+    assert.equal(
+      onlyMarketState(repository, OKX_MARKET).incrementalStatus,
+      'RUNNING'
+    );
+  }
+});
+
+test('rejects a semantic content hash mismatch before an incremental revision', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  const lifecycle = task5Repository(repository);
+  const coverage = startCoverage(repository, OKX_MARKET);
+  const recordA = rateRecord(OKX_MARKET, '0.0001', FUNDING_TIMESTAMP_MS, 'A');
+  commitOkxPage(repository, coverage, [recordA], FIRST_OBSERVED_AT);
+  lifecycle.completeCoverage(
+    coverage,
+    okxEvidence(coverage, FUNDING_TIMESTAMP_MS),
+    COMPLETED_AT
+  );
+  const incremental = lifecycle.startIncremental(OKX_MARKET, RESTARTED_AT);
+  const recordB = rateRecord(OKX_MARKET, '0.0002', FUNDING_TIMESTAMP_MS, 'B');
+  const forged = { ...recordB, contentHash: recordA.contentHash };
+  const before = fundingPersistenceSnapshot(database);
+
+  const error = invocationError(() => lifecycle.commitIncrementalPage(
+    incremental,
+    [forged],
+    FINALIZED_AT
+  ));
+
+  assert.deepEqual({
+    rejectedForHash: errorContains(error, ['content', 'hash']),
+    persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+  }, {
+    rejectedForHash: true,
+    persistenceUnchanged: true
+  });
+});
+
+test('fails closed when a stored content hash disagrees with canonical content', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  const lease = startCoverage(repository, OKX_MARKET);
+  commitOkxPage(
+    repository,
+    lease,
+    [rateRecord(OKX_MARKET, '0.0001')],
+    FIRST_OBSERVED_AT
+  );
+  const forgedHash = '0'.repeat(64);
+  const update = database.prepare(`
+    UPDATE funding_rate_history
+    SET content_hash = ?
+    WHERE exchange_id = 'okx'
+      AND exchange_market_id = 'BTC-USDT-SWAP'
+  `).run(forgedHash);
+  assert.equal(update.changes, 1);
+
+  const error = invocationError(() => repository.listHistory(OKX_MARKET));
+
+  assert.equal(errorContains(error, [
+    'okx',
+    OKX_MARKET.exchangeMarketId,
+    'hash'
+  ]), true);
+});
+
+test('rejects an active accessor without executing it or writing discovery state', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  let accessorReads = 0;
+  const accessorObservation = Object.defineProperty(
+    { ...OKX_MARKET },
+    'active',
+    {
+      enumerable: true,
+      get(): unknown {
+        accessorReads += 1;
+        return accessorReads === 1 ? true : 'not-a-boolean';
+      }
+    }
+  ) as unknown as FundingMarketObservation;
+  const before = fundingPersistenceSnapshot(database);
+
+  const error = invocationError(() => repository.applyCompleteDiscovery(
+    'okx',
+    [accessorObservation],
+    DISCOVERED_AT
+  ));
+
+  assert.deepEqual({
+    rejectedForActive: errorContains(error, ['active']),
+    accessorReads,
+    persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+  }, {
+    rejectedForActive: true,
+    accessorReads: 0,
+    persistenceUnchanged: true
+  });
+});
+
+test('uses the intrinsic Date value without calling toISOString overrides', (t) => {
+  class OverriddenDate extends Date {
+    overrideCalls = 0;
+
+    override toISOString(): string {
+      this.overrideCalls += 1;
+      return '2026-99-99T99:99:99.999Z';
+    }
+  }
+
+  let ownOverrideCalls = 0;
+  const ownOverrideDate = new Date(DISCOVERED_AT.getTime());
+  Object.defineProperty(ownOverrideDate, 'toISOString', {
+    value(): string {
+      ownOverrideCalls += 1;
+      return '2026-99-99T99:99:99.999Z';
+    }
+  });
+  const subclassDate = new OverriddenDate(DISCOVERED_AT.getTime());
+  const dateCases = [
+    {
+      name: 'subclass override',
+      date: subclassDate,
+      calls: (): number => subclassDate.overrideCalls
+    },
+    {
+      name: 'instance override',
+      date: ownOverrideDate,
+      calls: (): number => ownOverrideCalls
+    }
+  ] as const;
+
+  for (const dateCase of dateCases) {
+    const { database, repository } = setupFundingRepository(t);
+    const error = invocationError(() => repository.applyCompleteDiscovery(
+      'okx',
+      [observation(OKX_MARKET)],
+      dateCase.date
+    ));
+    const persisted = database.prepare(`
+      SELECT active_observed_at
+      FROM funding_rate_sync_state
+      WHERE exchange_id = 'okx'
+        AND exchange_market_id = 'BTC-USDT-SWAP'
+    `).pluck().get();
+
+    assert.deepEqual({
+      accepted: error === null,
+      overrideCalls: dateCase.calls(),
+      persisted
+    }, {
+      accepted: true,
+      overrideCalls: 0,
+      persisted: DISCOVERED_AT.toISOString()
+    }, dateCase.name);
+  }
+});
+
+test('rejects an intrinsically invalid Date without calling its valid-looking override', (t) => {
+  const { database, repository } = setupFundingRepository(t);
+  const invalidDate = new Date(Number.NaN);
+  let overrideCalls = 0;
+  Object.defineProperty(invalidDate, 'toISOString', {
+    value(): string {
+      overrideCalls += 1;
+      return DISCOVERED_AT.toISOString();
+    }
+  });
+  const before = fundingPersistenceSnapshot(database);
+
+  const error = invocationError(() => repository.applyCompleteDiscovery(
+    'okx',
+    [observation(OKX_MARKET)],
+    invalidDate
+  ));
+
+  assert.deepEqual({
+    rejectedForDate: errorContains(error, ['valid', 'date']),
+    overrideCalls,
+    persistenceUnchanged: fundingPersistenceSnapshot(database) === before
+  }, {
+    rejectedForDate: true,
+    overrideCalls: 0,
+    persistenceUnchanged: true
+  });
 });

@@ -220,7 +220,7 @@ function dateTimestamp(value: Date, context: string): string {
     throw new Error(`invalid ${context}: expected a Date`);
   }
   try {
-    return value.toISOString();
+    return Date.prototype.toISOString.call(value);
   } catch {
     throw new Error(`invalid ${context}: expected a valid Date`);
   }
@@ -389,6 +389,9 @@ function validateHistoryRow(
   } catch {
     return corruptHistory(market, 'content_hash');
   }
+  if (hash !== normalized.contentHash) {
+    return corruptHistory(market, 'content_hash');
+  }
 
   let firstObservedAt: string;
   let lastObservedAt: string;
@@ -415,7 +418,7 @@ function validateHistoryRow(
     fundingTimestampMs,
     fundingRate: normalized.fundingRate,
     rawJson: normalized.rawJson,
-    contentHash: hash,
+    contentHash: normalized.contentHash,
     firstObservedAt,
     lastObservedAt
   };
@@ -447,13 +450,16 @@ function validatePageRecord(
   if (normalized.rawJson !== record.rawJson) {
     throw new Error('invalid funding page record: raw_json is not canonical');
   }
-  return {
-    ...normalized,
-    contentHash: contentHash(
-      record.contentHash,
-      'funding page content_hash'
-    )
-  };
+  const suppliedHash = contentHash(
+    record.contentHash,
+    'funding page content_hash'
+  );
+  if (suppliedHash !== normalized.contentHash) {
+    throw new Error(
+      'invalid funding page record: content_hash does not match canonical content'
+    );
+  }
+  return normalized;
 }
 
 function recordsEqual(
@@ -972,6 +978,13 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   const presentProofValues = proofValues.filter((value) => value !== null).length;
   if (presentProofValues !== 0 && presentProofValues !== proofValues.length) {
     return corruptState(stateContext, 'coverage evidence fields');
+  }
+  if (
+    (coverageStatus === 'BACKFILLING' || coverageStatus === 'INCOMPLETE')
+    && lastCaughtUpGeneration !== null
+    && lastCaughtUpGeneration >= coverageGeneration
+  ) {
+    return corruptState(stateContext, 'coverage proof generation');
   }
   if (
     lastExhaustionEvidenceJson !== null
@@ -1703,15 +1716,21 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       if (market.exchangeId !== discoveryExchangeId) {
         throw new Error('invalid funding discovery: exchange identity mismatch');
       }
-      if (typeof untrusted.active !== 'boolean') {
+      const activeDescriptor = Object.getOwnPropertyDescriptor(untrusted, 'active');
+      if (
+        activeDescriptor === undefined
+        || !('value' in activeDescriptor)
+        || typeof activeDescriptor.value !== 'boolean'
+      ) {
         throw new Error('invalid funding discovery: active must be boolean');
       }
+      const active = activeDescriptor.value;
       if (marketIds.has(market.exchangeMarketId) || symbols.has(market.symbol)) {
         throw new Error('invalid funding discovery: duplicate market identity');
       }
       marketIds.add(market.exchangeMarketId);
       symbols.add(market.symbol);
-      observations.push({ ...market, active: untrusted.active });
+      observations.push({ ...market, active });
     }
     return this.applyDiscoveryTransaction(
       discoveryExchangeId,
@@ -1892,6 +1911,23 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     );
     this.database.transaction(() => {
       const state = this.requireCurrentCoverageState(lease);
+      if (
+        evidence.exchangeId === 'okx'
+        && (
+          (state.okxResumeAfterMs === null
+            && evidence.finalRequestAfterMs !== null)
+          || (state.okxResumeAfterMs !== null
+            && (
+              evidence.finalRequestAfterMs === null
+              || evidence.finalRequestAfterMs > state.okxResumeAfterMs
+            ))
+        )
+      ) {
+        throw new Error(
+          'invalid funding exhaustion evidence: '
+          + 'OKX final request after_ms conflicts with committed anchor'
+        );
+      }
       if (evidence.exchangeId === 'bitget') {
         if (lease.exchangeId !== 'bitget') {
           throw new Error('invalid funding exhaustion evidence: lease mismatch');
