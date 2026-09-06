@@ -952,7 +952,7 @@ Expected: exit 0；测试不使用真实时间等待。
 - Modify: `src/main.ts`
 - Modify: `tests/main.test.ts`
 
-- [ ] **Step 1: 写装配与生命周期红测试**
+- [x] **Step 1: 写装配与生命周期红测试**
 
 在现有 `runnableFixture` 增加 funding sync 计数和事件，覆盖：
 
@@ -966,7 +966,7 @@ Expected: exit 0；测试不使用真实时间等待。
 - funding stop 在完整 join 后 reject 时，仍依次关闭 monitor/server/database、移除 signal listeners 且最终 shutdown reject 原 funding error；若同时处于 startup failure 路径，仍抛最初 startup error；
 - funding worker 运行失败不调用 strategy repository transition、coordinator 或 monitor 的交易行为。
 
-- [ ] **Step 2: 确认 RED**
+- [x] **Step 2: 确认 RED**
 
 ```bash
 npm run build && node --test dist/tests/main.test.js
@@ -974,7 +974,7 @@ npm run build && node --test dist/tests/main.test.js
 
 Expected: exit 非 0，仅新增 funding 装配断言失败；现有生命周期断言仍可解释。
 
-- [ ] **Step 3: 修改生产装配**
+- [x] **Step 3: 修改生产装配**
 
 `RuntimeConfig` 增加 `fundingRateSyncIntervalMs`；`loadRuntimeConfig` 在 credential map、gateway factory 和 database factory 之前完成 interval 校验。
 
@@ -989,7 +989,7 @@ readonly fundingRateSync: {
 
 `startService` 的 `closeResources` 先在独立 try/catch 中 await `fundingRateSync.stop()`，把 rejection 保存为 `firstError`，然后无条件继续现有 monitor/server/database/listener 清理；后续错误只在 firstError 为空时占位。全部资源尝试关闭后再记录/抛 firstError。listen 成功后只在同一同步分支 `if (shutdownPromise === null)` 内调用 `fundingRateSync.start()`，start 与检查之间不得有 `await`；随后才记录 `service_started`。startup catch 即使 cleanup 也失败仍保留并抛原始 startup error。
 
-- [ ] **Step 4: 运行主入口和全套聚焦测试**
+- [x] **Step 4: 运行主入口和全套聚焦测试**
 
 ```bash
 npm run build && node --test dist/tests/main.test.js dist/tests/config/funding-rate-config.test.js dist/tests/funding-rates/*.test.js dist/tests/storage/sqlite-funding-rate-repository.test.js
@@ -997,7 +997,7 @@ npm run build && node --test dist/tests/main.test.js dist/tests/config/funding-r
 
 Expected: exit 0。命令只构造 fake client/临时 DB，不执行 `npm start`。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/main.ts tests/main.test.ts
