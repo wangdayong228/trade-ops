@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | `src/config/funding-rate-config.ts` | interval 默认值、规范整数和边界校验 | 新建 |
 | `src/funding-rates/funding-rate-record.ts` | 领域类型、严格费率/时间、规范 JSON 和语义 hash | 新建 |
-| `src/funding-rates/funding-rate-source.ts` | source、游标、页面和安全请求元数据窄接口 | 新建 |
+| `src/funding-rates/funding-rate-source.ts` | source、游标、页面、安全请求元数据、请求结果名义错误和 retry observer 窄接口 | 新建后在 Task 7 扩展 |
 | `src/funding-rates/funding-market-discovery.ts` | 单次 raw 产品配置响应的精确映射、过滤与身份冲突检测 | 新建 |
 | `src/funding-rates/bitget-funding-rate-source.ts` | Bitget Classic V2 单页 raw 适配器 | 新建 |
 | `src/funding-rates/okx-funding-rate-source.ts` | OKX V5 单页 raw 适配器 | 新建 |
@@ -135,10 +135,31 @@ export interface FundingRateSource {
 export interface FundingRequestExecutor {
   execute<T>(
     request: FundingRequestMetadata,
-    operation: () => Promise<T>
+    operation: () => Promise<T>,
+    onRetry: FundingRequestRetryObserver
   ): Promise<T>;
 }
+
+export interface FundingRequestRetryNotice {
+  readonly retryAttempt: number;
+  readonly retryDelayMs: number;
+  readonly error: unknown;
+}
+
+export type FundingRequestRetryObserver = (
+  notice: FundingRequestRetryNotice
+) => void;
+
+export class FundingRequestCanceledError extends Error {
+  constructor();
+}
+
+export class FundingRequestRetryExhaustedError extends Error {
+  constructor();
+}
 ```
+
+两个名义错误的 message/name 固定，不接收 cause、raw response、headers、credentials 或其他参数，也不携带可变自定义字段。`onRetry` 是必填边界：executor 只给出当次 raw error 和受限重试元数据，coverage/incremental/discovery 调用方补齐任务上下文并立即交给 non-throwing allowlist event sink；不得把 raw error 保存到数据库。取消必须原样传播同一错误实例且零状态写入；重试耗尽必须映射到 `REQUEST_RETRY_EXHAUSTED`，其他 executor/source rejection 映射到 `SOURCE_RESPONSE_INVALID`，禁止按 message 或 `name` 字符串分类。
 
 - Bitget 游标首页是 `{ exchangeId: 'bitget', pageNo: 1 }`，非空页的下一页号必须安全加一；空页返回 `nextCursor: null`。
 - OKX 首页是 `{ exchangeId: 'okx', afterMs: null }`；非空页的 `nextCursor.afterMs` 是页内最小结算时间，`recoveryAnchorMs` 是页内最大结算时间；空页二者均为 null。
@@ -170,7 +191,6 @@ interface CommonCoverageLease {
   readonly generation: number;
   readonly kind: FundingCoverageKind;
   readonly cutoffMs: number;
-  readonly recovered: boolean;
 }
 
 export type CoverageLease =
@@ -740,6 +760,10 @@ Expected: exit 0，所有历史写入测试始终经带 fencing 的生产路径�
 ### Task 6: 实现 Bitget/OKX 全范围覆盖证明
 
 **Files:**
+- Modify: `src/storage/funding-rate-schema.ts`
+- Modify: `src/storage/funding-rate-repository.ts`
+- Modify: `src/storage/sqlite-funding-rate-repository.ts`
+- Modify: `tests/storage/sqlite-funding-rate-repository.test.ts`
 - Create: `src/funding-rates/funding-rate-market-sync.ts`
 - Create: `tests/support/fake-funding-rate-source.ts`
 - Create: `tests/funding-rates/funding-rate-market-sync.test.ts`
@@ -757,6 +781,8 @@ fake source 以每次调用的 cursor 返回脚本页面，并可在任意 reque
 - OKX 提交 [78,77,76,75] 后模拟进程中断，恢复 `after=78` 返回全重复 [77,76,75]，仍继续更旧页和空页；
 - OKX 新 generation 清旧 anchor，首页提交前中断后恢复请求无 `after`；
 - generation 在两页之间变化时，下一请求前丢弃；在页面返回后变 stale 时 commit 零写入；
+- 复制合法 lease 后伪造 Bitget task 启动必见边界或 OKX task 初始 `after` 时，`isCoverageLeaseCurrent`、所有 repository 写操作和 `createCoverageTask` 均 fail-closed；task 创建不发 started event，source/executor 请求数为零；
+- `resumeInterruptedCoverage` 原子验证旧 generation/锚点、递增 generation、保留 cutoff/任务类型并重新固定 task 启动恢复字段；第二次 resume 会 fence 第一次返回的 lease，Bitget 旧 TEMP 轮次不能进入新 generation；
 - 任一失败只影响该 market，传出的 failure code/summary 有限、定位精确。
 
 - [ ] **Step 2: 确认 RED**
@@ -779,7 +805,9 @@ export interface FundingPageTask {
 }
 ```
 
-`FundingRateMarketSync` 构造时必须接收 `FundingRequestExecutor`；不得直接调用 source。每次 `runNextPage` 顺序固定：读持久 lease 资格 -> 用 `source.pageRequest(...)` 生成安全元数据 -> 经 executor 在 transaction 外请求/完整解析 -> 验证 cursor -> 原子 commit -> 只在 commit 成功后修改内存 cursor。Task 6 的测试 executor 只同步转发，Task 8 换成真实的单所串行 policy。
+`FundingRateMarketSync` 构造时必须接收 `FundingRequestExecutor`；不得直接调用 source。`createCoverageTask` 在发 started event 或构造 task 前，先对 data-only lease 做快照并用 repository 权威状态验证完整 generation/kind/cutoff/task 启动恢复字段。每次 `runNextPage` 顺序固定：读持久 lease 资格 -> 用 `source.pageRequest(...)` 生成安全元数据 -> 经 executor 在 transaction 外请求/完整解析 -> 验证 cursor -> 原子 commit -> 只在 commit 成功后修改内存 cursor。Task 6 的测试 executor 只同步转发，Task 8 换成真实的单所串行 policy。
+
+repository 状态新增 task 启动时不可变的 Bitget 必见边界和 OKX 初始 `after`。新 coverage 与中断恢复都在首次请求前递增 `coverage_generation`；恢复保留 cutoff/kind，先验证旧 OKX 锚点 generation，再把安全恢复值写成新 generation 的不可变 task 启动字段，并重绑可变 OKX 锚点。lease 删除未参与任何行为判断的 `recovered` 字段。`coverageStateMatchesLease` 比较所有这些字段，因此页面、完成和失败 repository 入口也拒绝伪造或旧 lease，而不只依赖 market-sync 入口检查。
 
 Bitget task 在内存保存 round/pageNo/前一轮 empty pageNo；每个空页结束一轮，调用 repository 双向比较。只有相邻集合相同且 empty pageNo 相同才用包含 generation、cutoff、三轮内实际轮次和终点的规范 JSON evidence 完成。
 
@@ -789,7 +817,7 @@ OKX task 从 fresh null 或合法 resume anchor 开始。带 `after=A` 的响应
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js
-git add src/funding-rates/funding-rate-market-sync.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-market-sync.test.ts
+git add src/storage/funding-rate-schema.ts src/storage/funding-rate-repository.ts src/storage/sqlite-funding-rate-repository.ts src/funding-rates/funding-rate-market-sync.ts tests/storage/sqlite-funding-rate-repository.test.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-market-sync.test.ts
 git diff --cached --check
 git commit -m "feat: prove funding history coverage"
 ```
@@ -799,7 +827,10 @@ Expected: exit 0。
 ### Task 7: 补齐冻结边界增量算法
 
 **Files:**
+- Modify: `src/funding-rates/funding-rate-source.ts`
 - Modify: `src/funding-rates/funding-rate-market-sync.ts`
+- Modify: `tests/support/fake-funding-rate-source.ts`
+- Modify: `tests/funding-rates/funding-rate-record.test.ts`
 - Modify: `tests/funding-rates/funding-rate-market-sync.test.ts`
 
 - [ ] **Step 1: 写增量红测试**
@@ -814,6 +845,9 @@ Expected: exit 0。
 - coverage 已 INCOMPLETE 时增量成功仍保持 coverage error、旧 cutoff/evidence 不变；
 - inactive/reactivation/generation 资格在下一页前失效时请求计数不增长并 cancel；返回后的 stale commit 零写入；
 - 中断后新 task 从首页开始，不复用内存 cursor。
+- source 合同导出固定、无 cause 的 `FundingRequestCanceledError` 与 `FundingRequestRetryExhaustedError`，并要求显式 retry observer；coverage 与 incremental 都原样传播取消且零状态/失败事件写入，重试耗尽分别只写对应任务的 `REQUEST_RETRY_EXHAUSTED`，其他 rejection 仍为 `SOURCE_RESPONSE_INVALID`；
+- retry observer 在 coverage/incremental task 中补齐各自 generation、cutoff/boundary、cursor 和安全 request metadata，交给 non-throwing allowlist event sink；raw error 不进入 repository；
+- 增量完成事件的 inserted/unchanged/revised 是本 generation 所有已提交非空页的累计值；失败页、空终止页和 stale 页不累计。
 
 - [ ] **Step 2: 确认 RED**
 
@@ -825,18 +859,20 @@ Expected: exit 非 0，仅新增量 case 失败。
 
 - [ ] **Step 3: 实现增量 task**
 
-task 内存字段固定为 `cursor`、`frozenBoundaryMs`、`boundarySeen`、`postBoundaryRequestCompleted`。完成条件只有：
+task 内存字段固定为 `cursor`、`frozenBoundaryMs`、`boundarySeen`、`postBoundaryRequestCompleted` 和三项已提交页面累计计数。完成条件只有：
 
 1. boundary 已观察，且其后的下一次分页请求成功并已提交非空页；或
 2. source 明确返回空页（无论 boundary 是否存在/重现）。
 
 空响应不调用页面写入，但 complete transaction 仍验证 incremental lease。任何增量路径不得调用 coverage 完成/失败方法。
 
+同时扩展请求合同与 coverage 共用错误边界：固定名义取消必须原样抛出，固定名义重试耗尽映射 `REQUEST_RETRY_EXHAUSTED`，其他 executor/source rejection 映射 `SOURCE_RESPONSE_INVALID`。所有 `execute` 调用显式传入 retry observer；observer 只经安全事件 sink 发出上下文完整的 `funding_request_retry`，自身失败不影响任务。fake executor 只实现确定性 notice 驱动，不包含真实计时或 CCXT 判断。
+
 - [ ] **Step 4: GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js
-git add src/funding-rates/funding-rate-market-sync.ts tests/funding-rates/funding-rate-market-sync.test.ts
+git add src/funding-rates/funding-rate-source.ts src/funding-rates/funding-rate-market-sync.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-record.test.ts tests/funding-rates/funding-rate-market-sync.test.ts
 git diff --cached --check
 git commit -m "feat: increment settled funding rates"
 ```
@@ -859,7 +895,7 @@ Expected: exit 0。
 - discovery 和所有 coverage/incremental 页面都经同一个 `FundingRequestExecutor`；不存在 source 直调旁路；
 - 四类队列顺序为持久 round-robin：`discovery -> incremental -> backfill -> reconcile`（空类别跳过），类别一轮内不得二次执行；同类 market 每页后 FIFO 到队尾；
 - key 去重覆盖排队和正在执行状态；持续四类过载、长市场和失败市场都不饿死其他任务；
-- 启动先从 SQLite 恢复遗留 BACKFILLING/RUNNING，再立即排 discovery；RUNNING 增量必须调用 `restartInterruptedIncremental` 原子递增 token，并按新 lease 从安全首页重建任务；
+- 启动先从 SQLite 恢复遗留 BACKFILLING/RUNNING，再立即排 discovery；BACKFILLING coverage 必须调用 `resumeInterruptedCoverage` 原子验证旧恢复状态并递增 generation，RUNNING 增量必须调用 `restartInterruptedIncremental` 原子递增 token；两者都按新 lease 从各自安全位置重建任务；
 - 完整发现后新 active 回填、inactive final、reactivation、已到期 incremental/24h periodic 按持久谓词入队；
 - 已知 market 从 discovery 消失时整轮不应用，但已知任务继续；发现下周期重试；
 - incremental 下次时间按最近 attempt ended + interval；periodic 成功按 last coverage success + 24h，失败按 attempt ended + interval；积压不重复；
@@ -881,7 +917,7 @@ Expected: exit 非 0，新 worker/service 不存在。
 
 worker 为四个 FIFO queue 维护 `Set<taskKey>` 和上次成功取出的 category index。每轮从 index 后最多检查四类，只执行一个 discovery 或一个历史页面；返回 `requeue` 时排到本类尾部，`done` 才删除 key。单一 async loop 是该 exchange 所有 CCXT 调用的唯一入口。
 
-每个 worker 自己实现并独占一个 `FundingRequestExecutor`。discovery task 和由 `FundingRateMarketSync` 创建的所有 page task 必须注入同一个实例；测试用 source 方法调用计数证明无旁路。请求 policy 在每次 attempt 前同时满足 spacing 和取消状态；只捕获 `error instanceof NetworkError` 重试。停止前尚未发出的 attempt 或正在 backoff 的等待抛内部 `FundingRequestCanceledError`，market task 必须原样传播，worker 不写 INCOMPLETE。已经进入不可取消底层请求时，root promise 等待其结束：成功响应仍允许完成该一页验证与原子提交，失败响应在 stop 已请求时不改写任务状态；两种情况都不再 requeue。由此持久状态保持可恢复，而 shutdown 本身不伪装成远端数据失败。
+每个 worker 自己实现并独占一个 `FundingRequestExecutor`。discovery task 和由 `FundingRateMarketSync` 创建的所有 page task 必须注入同一个实例；测试用 source 方法调用计数证明无旁路。请求 policy 在每次 attempt 前同时满足 spacing 和取消状态；只捕获 `error instanceof NetworkError` 重试。停止前尚未发出的 attempt 或正在 backoff 的等待抛从 `funding-rate-source.ts` 导入的 `FundingRequestCanceledError`，market task 必须原样传播，worker 不写 INCOMPLETE。第四次临时网络 attempt 失败后抛同文件导出的 `FundingRequestRetryExhaustedError`，由 market task 写对应任务类型的固定 `REQUEST_RETRY_EXHAUSTED`。每次实际重试调用必填 observer，由调用 task 补齐上下文并经安全事件 sink 记录。已经进入不可取消底层请求时，root promise 等待其结束：成功响应仍允许完成该一页验证与原子提交，失败响应在 stop 已请求时改抛取消错误且不改写任务状态；两种情况都不再 requeue。由此持久状态保持可恢复，而 shutdown 本身不伪装成远端数据失败。
 
 `FundingRateSyncService.start()` 同步建立 timer/root loop 后立即调度恢复与 discovery，不返回网络 promise。`stop()` 幂等共享 Promise，按设计先取消、再 join；内部错误只能在 quiescence 后报告。远端单市场失败不得 reject 整个服务 root 或触碰交易组件。
 

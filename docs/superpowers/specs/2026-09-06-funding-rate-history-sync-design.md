@@ -121,6 +121,8 @@ FundingRateSyncService
 
 该接口不包含凭证、余额、账户设置、价格、订单或持仓能力。现有 `ExchangeGateway` 和 `ExchangeRegistry` 不扩展资金费率方法，避免资金数据失败影响交易执行替身和状态机。
 
+请求 executor 的结果必须通过显式名义类型区分，不允许按 error message、`name` 字符串或任意属性猜测。`FundingRequestCanceledError` 只表示同步器停止导致的正常取消；market task 必须原样传播同一实例，不能写 `INCOMPLETE` 或失败事件。`FundingRequestRetryExhaustedError` 只表示临时网络错误已经完成规定次数的重试；coverage 与 incremental task 分别将其持久化为固定的 `REQUEST_RETRY_EXHAUSTED`。这两个类型不接收 raw error、response、headers 或 credentials，也不暴露可变附加字段。executor 的每次实际重试通过显式 retry observer 把 attempt、delay 和当次 raw error 交还调用 task；task 立即经既有 allowlist/脱敏事件边界记录，observer 不得直接持久化或传播 raw error。其他 executor/source rejection 仍归类为 `SOURCE_RESPONSE_INVALID`。
+
 市场发现不得调用 `loadMarkets/fetchMarkets/fetchCurrencies` 或读取 CCXT market cache。每轮必须经与历史页面相同的单所串行请求 executor，直接调用一次目标 generated raw 方法；因此发现调用本身就是强制刷新，并能对实际 endpoint/query 逐请求执行 spacing、重试和日志。结构匹配但 active 状态缺失/未知、market ID 重复或 unified symbol 身份冲突时，本轮发现不完整；可以继续同步此前已知市场，但不能新增、停用或宣称完整发现。新发现的 inactive 市场不建立同步状态。
 
 币种代码使用同一 CCXT client 的 `safeCurrencyCode` 规范化，不手写 common-currency 映射。进入映射前的 raw market ID、base、quote、settle 候选以及映射后的 base、quote、settle 都必须是无首尾空白的非空字符串；`safeCurrencyCode` 返回空值、非字符串或空白时整轮失败。unified symbol 只能由已验证代码精确构造为 `${base}/${quote}:${settle}`，不能接受 CCXT 对缺失值的字符串插值结果。Bitget 观察只来自 `productType=USDT-FUTURES` 响应：settle 按锁定 CCXT 逻辑依次选择 support-margin list 中的 base、quote、首项，`symbolType=perpetual` 才是 swap；只有官方 `symbolStatus=normal` 明确 active，`listed/maintain/limit_open/restrictedAPI/off` 明确 inactive，缺失或未知状态使整轮不完整。OKX 观察只来自 `instType=SWAP` 响应：base/quote 从恰好两段非空的 `uly` 得出，settle 来自 `settleCcy`，`ctType=linear` 必须与 raw `quoteId=settleId`、`baseId!=settleId` 一致；只有 `state=live` 明确 active，`suspend/rebase/post_only/preopen/test` 明确 inactive，缺失或未知状态使整轮不完整。
@@ -193,6 +195,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 全范围覆盖状态 `coverage_status`：`PENDING`、`BACKFILLING`、`CAUGHT_UP` 或 `INCOMPLETE`；
 - 增量健康状态 `incremental_status`：`IDLE`、`RUNNING` 或 `INCOMPLETE`；
 - 作为 fencing token 的单调递增 `coverage_generation`；
+- 当前 coverage task 实例的不可变 Bitget 必见边界或 OKX 初始 `after`；二者与该 task 的 `coverage_generation` 一同持久化，页面写入不得改变；
 - 已观察的最早、最新结算时间；
 - 当前或最近一次全范围任务固定的 `coverage_cutoff_ms`；
 - 最近一次成功全范围验证对应的 `last_caught_up_cutoff_ms`；
@@ -215,17 +218,17 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - `RUNNING`：增量任务正在执行，或者上次进程在增量任务期间退出；
 - `INCOMPLETE`：增量任务失败，但不改变全范围覆盖结论。
 
-每个新建的全范围任务在第一次网络请求前，必须在同一个短事务中递增 `coverage_generation`，设置 `coverage_status=BACKFILLING`，固定并持久化本次 `coverage_cutoff_ms` 和任务类型，并清空上一 generation 的所有临时分页恢复字段。任务携带创建时的 generation；每个页面提交、错误转换和完成转换都必须在事务内先确认它仍等于状态行当前 generation，不匹配时整次操作失败且旧任务被丢弃。任务成功时，原子设置 `coverage_status=CAUGHT_UP`，把同一 cutoff 写入 `last_caught_up_cutoff_ms`，并保存穷尽证据。后续全范围失败可以把 `coverage_status` 设为 `INCOMPLETE`，但不得删除或覆盖此前的 `last_caught_up_cutoff_ms` 和穷尽证据；这些旧证据只能表述为历史成功，不能表述为本次成功。
+每个新建或中断后重建的全范围 task 实例，在第一次网络请求前都必须在同一个短事务中递增 `coverage_generation`。新任务同时设置 `coverage_status=BACKFILLING`，固定并持久化本次 `coverage_cutoff_ms`、任务类型和 task 启动时的交易所恢复字段，并清空上一 generation 的其他临时分页字段；中断恢复则先验证遗留状态和锚点属于旧 generation，保留原 cutoff/任务类型，将当前安全恢复边界固定为新 generation 的不可变 task 启动字段，并把仍需使用的 OKX 可变锚点原子重绑到新 generation。任务 lease 不携带无行为意义的“是否恢复”标志，只携带当前 generation 和持久化的 task 启动恢复字段。每个页面提交、错误转换和完成转换都必须在事务内比较 lease 的 generation、任务类型、cutoff 以及完整 task 启动恢复字段；任一不匹配时整次操作失败且旧任务被丢弃。任务成功时，原子设置 `coverage_status=CAUGHT_UP`，把同一 cutoff 写入 `last_caught_up_cutoff_ms`，并保存穷尽证据。后续全范围失败可以把 `coverage_status` 设为 `INCOMPLETE`，但不得删除或覆盖此前的 `last_caught_up_cutoff_ms` 和穷尽证据；这些旧证据只能表述为历史成功，不能表述为本次成功。
 
 增量任务只更新 `incremental_status`、增量时间和增量错误字段，不得修改 `coverage_status`、`coverage_cutoff_ms`、`last_caught_up_cutoff_ms` 或全范围错误。除第 7.4 节明确 inactive 后取消未完成增量的生命周期转换外，增量成功是把 `incremental_status` 从 `RUNNING`/`INCOMPLETE` 恢复为 `IDLE` 的唯一正常路径；即使写入了新记录，也不能清除全范围 `INCOMPLETE`。全范围状态只能由同类全范围任务改变，其中 `INCOMPLETE` 只能由后续满足对应终止证明的全范围任务恢复为 `CAUGHT_UP`。
 
-进程启动时遇到遗留 `BACKFILLING` 或 `RUNNING` 必须分别按中断处理并进入对应安全恢复，不得当作成功。意外中断的全范围任务只有在 generation、任务类型、cutoff 和交易所恢复字段相互一致时，才复用同一 `coverage_generation` 与 `coverage_cutoff_ms`；任何缺失或 generation 不匹配都 fail-closed。已经明确写入 `INCOMPLETE`、`CAUGHT_UP` 或其他结束状态的任务不再恢复；下一次调度必须创建新 generation 和新 cutoff。市场只有至少一次成功进入过 `CAUGHT_UP`（即存在 `last_caught_up_cutoff_ms` 和穷尽证据）、当前明确 active 且“重新激活全范围待完成”标记为 false 后，才有资格执行普通增量；后来周期复核失败时，普通增量仍可继续，但两类状态和错误必须分别报告。
+进程启动时遇到遗留 `BACKFILLING` 或 `RUNNING` 必须分别按中断处理并进入对应安全恢复，不得当作成功。意外中断的全范围任务只有在旧 generation、任务类型、cutoff 和交易所恢复字段相互一致时，才保留同一 `coverage_cutoff_ms` 并在恢复事务中递增 `coverage_generation`、重新固定 task 启动恢复字段；任何缺失、generation 不匹配或 generation 无法安全递增都 fail-closed。已经明确写入 `INCOMPLETE`、`CAUGHT_UP` 或其他结束状态的任务不再恢复；下一次调度必须创建新 generation 和新 cutoff。市场只有至少一次成功进入过 `CAUGHT_UP`（即存在 `last_caught_up_cutoff_ms` 和穷尽证据）、当前明确 active 且“重新激活全范围待完成”标记为 false 后，才有资格执行普通增量；后来周期复核失败时，普通增量仍可继续，但两类状态和错误必须分别报告。
 
 ### 6.4 数据约束
 
 - 所有枚举、非空字符串、时间戳、UTC ISO 时间和 JSON 都在写入前验证，并由 SQLite `CHECK`/主键/外键或 trigger 尽量二次约束。
-- `coverage_generation` 从 0 开始，只允许非负安全整数；创建新任务时若无法安全加 1 必须 fail-closed，不得回绕或复用旧 generation。
-- 所有覆盖写操作都必须提供期望 generation 并受 repository 事务级相等检查保护；generation 不匹配时连页面记录也不得部分写入。
+- `coverage_generation` 从 0 开始，只允许非负安全整数；创建新任务或恢复中断任务时若无法安全加 1 必须 fail-closed，不得回绕或复用旧 generation。
+- 所有覆盖写操作都必须提供期望 generation、任务类型、cutoff 和 task 启动恢复字段，并受 repository 事务级完整相等检查保护；任一不匹配时连页面记录也不得部分写入。
 - `funding_rate` 使用 TEXT，禁止 SQLite REAL。
 - raw JSON 只保存单条公共记录，不保存 headers、凭证、完整错误对象或私有响应。
 - `coverage_status=CAUGHT_UP` 必须同时满足 `coverage_cutoff_ms = last_caught_up_cutoff_ms`，且 generation、cutoff、穷尽时间和覆盖成功时间均有效；`PENDING` 不得伪造这些成功证据。OKX 恢复锚点非空时，其 generation 必须等于当前 `coverage_generation`。inactive 最后复核成功时间只有在最近明确状态为 inactive 且同一事务进入 `CAUGHT_UP` 时才能写入；重新激活待完成标记只能由对应 reactivation 全范围任务成功时原子清除。
@@ -237,7 +240,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 
 每个目标市场按交易所适配器显式逐页同步：
 
-1. 新建全范围任务先在短事务中递增 generation、清空旧恢复字段，并固定、持久化本次 `coverage_cutoff_ms`、任务类型和 `BACKFILLING` 状态；仅恢复遗留 `BACKFILLING` 时复用同一 generation；增量任务只设置 `incremental_status=RUNNING`；
+1. 新建全范围任务先在短事务中递增 generation、清空旧恢复字段，并固定、持久化本次 `coverage_cutoff_ms`、任务类型、task 启动恢复字段和 `BACKFILLING` 状态；恢复遗留 `BACKFILLING` 也先验证并递增 generation，但保留原 cutoff/任务类型并原子重绑安全恢复位置；增量任务只设置 `incremental_status=RUNNING`；
 2. 发起单页公共请求；
 3. 验证响应 envelope、market 身份、每条费率和结算时间；
 4. 对页面记录按结算时间排序并在内存去重；同一自然键在同页出现不同内容时整页失败；
@@ -267,7 +270,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 与 Bitget 一样，全范围任务在首个请求前用注入时钟固定并持久化 `coverage_cutoff_ms`。返回的已结算记录可以正常保存，但全范围成功声明只覆盖 `funding_timestamp_ms <= coverage_cutoff_ms` 的本次游标遍历事实。
 - 首页不传 `after`，后续使用本页最小 `fundingTime` 作为下一页 `after`。
 - 请求携带 `after=A` 时，响应中的每个 `fundingTime` 都必须严格小于 `A`；非空页产生的下一 `after` 为该页最小时间，且也必须严格小于 `A`。任一条件不满足都视为游标不推进并把 `coverage_status` 设为 `INCOMPLETE`。
-- 每次提交非空页时，必须同时持久化该页最大 `fundingTime` 作为下一次跨进程恢复使用的 `after` 重叠锚点，并将锚点绑定当前 `coverage_generation`。恢复时只有遗留状态确为 `BACKFILLING` 且锚点 generation 完全匹配才可使用该锚点；它会重读上一已提交页的大部分记录，再继续向更旧范围推进。只保存或直接使用全局最旧时间会跳过重叠，因此禁止。
+- 每次提交非空页时，必须同时持久化该页最大 `fundingTime` 作为下一次跨进程恢复使用的 `after` 重叠锚点，并将锚点绑定当前 `coverage_generation`。恢复时只有遗留状态确为 `BACKFILLING` 且锚点 generation 完全匹配才可使用该锚点；恢复事务递增 generation，把该锚点同时固定为新 task 不可变的初始 `after` 并将可变锚点重绑新 generation。它会重读上一已提交页的大部分记录，再继续向更旧范围推进。只保存或直接使用全局最旧时间会跳过重叠，因此禁止。
 - 恢复后的第一个非空页允许全部是已经提交的重叠记录，例如崩溃前最后一页少于 limit 时；只要所有时间都严格小于本次请求的 `after`，就用该页最小时间继续。不得因为没有出现早于数据库全局最旧时间的新记录而误判不推进。
 - 每个新 generation 必须在设置 `BACKFILLING` 和新 cutoff 的同一事务中清空旧 OKX 锚点；因此即使新任务在首页提交前崩溃，重启后也必须以不带 `after` 的首页恢复。进入任一明确结束状态后，旧锚点不再具有恢复资格。
 - 成功取得空页后，只能把 `coverage_status` 标记为 `CAUGHT_UP`，将本次 cutoff 写入 `last_caught_up_cutoff_ms`，并表述为“已遍历 OKX 本次接口可见窗口中截止该 cutoff 的范围”；不能把约三个月的文档上限表述为精确起点或绝对完整历史。
@@ -281,6 +284,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 增量同步发现早于本地最新时间但自然键未知的记录时必须写入，不能只保留 `timestamp > latest` 的数据。
 - 发现同一自然键内容变化时执行修订事务。
 - 增量任务失败只把 `incremental_status` 设为 `INCOMPLETE`；成功完成规定重叠后只把它恢复为 `IDLE`。两种转换都不得改写任何覆盖状态、cutoff、穷尽证据或覆盖错误。
+- `funding_incremental_completed` 的 `inserted/unchanged/revised` 是本次增量 task 所有已成功提交非空页的累计值，不是最后一页的局部值；空终止页不计数。累计值只在页面事务提交成功后增加，中断恢复的新 generation 从零重新累计。
 - 明确 false 到 true 的重新激活转换必须持久化 reactivation 待完成标记并删除普通增量队列资格。只有任务类型为 reactivation、generation 在该 active 转换后创建且成功进入 `CAUGHT_UP` 的全范围事务，才可清除该标记；失败、旧 generation 成功、普通增量成功或其他任务类型都不得清除。进程重启后若标记仍在，必须先重建 reactivation 全范围任务，且在其成功前不得发出任何普通增量请求。
 - 每个 active 市场除每小时增量外，每 24 小时安排一次从首页到显式空页的全可见范围复核；Bitget 的复核继续使用第 7.2 节双扫描收敛条件，OKX 重新遍历其当时可见窗口。复核会发现浅层增量重叠范围之外的迟到记录和修订。
 - 全范围复核失败时只把 `coverage_status` 设为 `INCOMPLETE`，并保留此前 `last_caught_up_cutoff_ms` 和穷尽证据；每小时增量仍可继续。后续增量成功只恢复 `incremental_status=IDLE`，不得清除覆盖错误，也不得把旧的覆盖成功时间表述为当前复核成功。
@@ -313,6 +317,8 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 在 CCXT 限流之外，每个交易所适配器使用独立保守节流；同一交易所始终只有一个在途请求。节流值必须在 implementation plan 中绑定当前官方限制和可复现测试，不得凭感觉提高吞吐。
 - 临时网络、超时或限流错误立即重试最多 3 次，等待 1、2、4 秒；仍失败时，全范围任务只标记 `coverage_status=INCOMPLETE`，增量任务只标记 `incremental_status=INCOMPLETE`，随后移到其他市场并在下一调度周期重试。
 - 解析、身份、分页或数据完整性错误不通过盲目立即重试掩盖；记录到对应任务类型的独立错误字段并保持 fail-closed，下一周期重新从安全边界尝试。
+- worker 的 request executor 只能捕获当前 CCXT `NetworkError` 类型执行上述重试；第四次 attempt 仍失败时抛固定的 `FundingRequestRetryExhaustedError`。停止发生在未发送 attempt、可取消 spacing/backoff 或底层请求失败返回之后时抛固定的 `FundingRequestCanceledError`；已经成功返回的在途请求仍完成该页验证与原子提交。market task 通过这两个名义类型决定“无状态写入取消”或 `REQUEST_RETRY_EXHAUSTED`，不得检查 message 文本。
+- retry observer 是 `FundingRequestExecutor.execute` 的必填调用参数。它只接收当前 attempt 的受限序号、下一次 delay 和 raw error，并由 coverage、incremental 或 discovery 调用方补齐自身上下文后送入 non-throwing、allowlisted event sink；observer 或日志失败不得改变重试、分页或持久化结果。
 
 ### 8.3 启动失败与运行失败
 
