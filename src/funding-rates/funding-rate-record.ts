@@ -67,7 +67,9 @@ function fundingRate(value: unknown): string {
   } catch {
     return invalid('funding rate', 'expected a finite decimal string');
   }
-  if (!parsed.isFinite()) {
+  const coefficient = normalized.split(/[eE]/, 1)[0] ?? '';
+  const isLexicalZero = !/[1-9]/.test(coefficient);
+  if (!parsed.isFinite() || (parsed.isZero() && !isLexicalZero)) {
     return invalid('funding rate', 'expected a finite decimal string');
   }
   return normalized;

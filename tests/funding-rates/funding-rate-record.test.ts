@@ -141,6 +141,32 @@ test('preserves high-precision and scientific notation without number conversion
   }
 });
 
+test('accepts the minimum Decimal exponent and mathematical zero below it', () => {
+  for (const rate of [
+    '1e-9000000000000000',
+    '0e-9000000000000001',
+    '-0e-9000000000000001'
+  ]) {
+    assert.equal(record(rate).fundingRate, rate);
+  }
+});
+
+test('rejects a positive non-zero rate below the Decimal minimum exponent', () => {
+  assert.throws(
+    () => record('1e-9000000000000001'),
+    /rate/i,
+    'expected the positive rate to be rejected instead of underflowing to zero'
+  );
+});
+
+test('rejects a negative non-zero rate below the Decimal minimum exponent', () => {
+  assert.throws(
+    () => record('-1e-9000000000000001'),
+    /rate/i,
+    'expected the negative rate to be rejected instead of underflowing to zero'
+  );
+});
+
 test('trims outer whitespace from a valid rate while preserving its representation', () => {
   assert.equal(record(' \t-0.0000E+7\n').fundingRate, '-0.0000E+7');
 });
