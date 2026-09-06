@@ -341,7 +341,8 @@ export interface FundingRateRepository {
     startedAt: Date
   ): CoverageLease;
   resumeInterruptedCoverage(
-    market: FundingMarketIdentity
+    market: FundingMarketIdentity,
+    resumedAt: Date
   ): CoverageLease;
   isCoverageLeaseCurrent(lease: CoverageLease): boolean;
   commitCoveragePage(
@@ -782,7 +783,7 @@ fake source 以每次调用的 cursor 返回脚本页面，并可在任意 reque
 - OKX 新 generation 清旧 anchor，首页提交前中断后恢复请求无 `after`；
 - generation 在两页之间变化时，下一请求前丢弃；在页面返回后变 stale 时 commit 零写入；
 - 复制合法 lease 后伪造 Bitget task 启动必见边界或 OKX task 初始 `after` 时，`isCoverageLeaseCurrent`、所有 repository 写操作和 `createCoverageTask` 均 fail-closed；task 创建不发 started event，source/executor 请求数为零；
-- `resumeInterruptedCoverage` 原子验证旧 generation/锚点、递增 generation、保留 cutoff/任务类型并重新固定 task 启动恢复字段；第二次 resume 会 fence 第一次返回的 lease，Bitget 旧 TEMP 轮次不能进入新 generation；
+- `resumeInterruptedCoverage(market, resumedAt)` 使用注入时间原子验证旧 generation/锚点、递增 generation、保留 cutoff/任务类型、更新 `updated_at` 并重新固定 task 启动恢复字段；第二次 resume 会 fence 第一次返回的 lease，Bitget 旧 TEMP 轮次不能进入新 generation；
 - 任一失败只影响该 market，传出的 failure code/summary 有限、定位精确。
 
 - [ ] **Step 2: 确认 RED**
@@ -895,7 +896,7 @@ Expected: exit 0。
 - discovery 和所有 coverage/incremental 页面都经同一个 `FundingRequestExecutor`；不存在 source 直调旁路；
 - 四类队列顺序为持久 round-robin：`discovery -> incremental -> backfill -> reconcile`（空类别跳过），类别一轮内不得二次执行；同类 market 每页后 FIFO 到队尾；
 - key 去重覆盖排队和正在执行状态；持续四类过载、长市场和失败市场都不饿死其他任务；
-- 启动先从 SQLite 恢复遗留 BACKFILLING/RUNNING，再立即排 discovery；BACKFILLING coverage 必须调用 `resumeInterruptedCoverage` 原子验证旧恢复状态并递增 generation，RUNNING 增量必须调用 `restartInterruptedIncremental` 原子递增 token；两者都按新 lease 从各自安全位置重建任务；
+- 启动先从 SQLite 恢复遗留 BACKFILLING/RUNNING，再立即排 discovery；BACKFILLING coverage 必须用注入时钟调用 `resumeInterruptedCoverage(market, resumedAt)`，原子验证旧恢复状态并递增 generation；RUNNING 增量必须调用 `restartInterruptedIncremental` 原子递增 token；两者都按新 lease 从各自安全位置重建任务；
 - 完整发现后新 active 回填、inactive final、reactivation、已到期 incremental/24h periodic 按持久谓词入队；
 - 已知 market 从 discovery 消失时整轮不应用，但已知任务继续；发现下周期重试；
 - incremental 下次时间按最近 attempt ended + interval；periodic 成功按 last coverage success + 24h，失败按 attempt ended + interval；积压不重复；

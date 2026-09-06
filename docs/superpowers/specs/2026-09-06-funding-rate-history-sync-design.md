@@ -222,7 +222,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 
 增量任务只更新 `incremental_status`、增量时间和增量错误字段，不得修改 `coverage_status`、`coverage_cutoff_ms`、`last_caught_up_cutoff_ms` 或全范围错误。除第 7.4 节明确 inactive 后取消未完成增量的生命周期转换外，增量成功是把 `incremental_status` 从 `RUNNING`/`INCOMPLETE` 恢复为 `IDLE` 的唯一正常路径；即使写入了新记录，也不能清除全范围 `INCOMPLETE`。全范围状态只能由同类全范围任务改变，其中 `INCOMPLETE` 只能由后续满足对应终止证明的全范围任务恢复为 `CAUGHT_UP`。
 
-进程启动时遇到遗留 `BACKFILLING` 或 `RUNNING` 必须分别按中断处理并进入对应安全恢复，不得当作成功。意外中断的全范围任务只有在旧 generation、任务类型、cutoff 和交易所恢复字段相互一致时，才保留同一 `coverage_cutoff_ms` 并在恢复事务中递增 `coverage_generation`、重新固定 task 启动恢复字段；任何缺失、generation 不匹配或 generation 无法安全递增都 fail-closed。已经明确写入 `INCOMPLETE`、`CAUGHT_UP` 或其他结束状态的任务不再恢复；下一次调度必须创建新 generation 和新 cutoff。市场只有至少一次成功进入过 `CAUGHT_UP`（即存在 `last_caught_up_cutoff_ms` 和穷尽证据）、当前明确 active 且“重新激活全范围待完成”标记为 false 后，才有资格执行普通增量；后来周期复核失败时，普通增量仍可继续，但两类状态和错误必须分别报告。
+进程启动时遇到遗留 `BACKFILLING` 或 `RUNNING` 必须分别按中断处理并进入对应安全恢复，不得当作成功。意外中断的全范围任务只有在旧 generation、任务类型、cutoff 和交易所恢复字段相互一致时，才保留同一 `coverage_cutoff_ms` 并在带注入恢复时间的事务中递增 `coverage_generation`、更新 `updated_at`、重新固定 task 启动恢复字段；任何缺失、generation 不匹配或 generation 无法安全递增都 fail-closed。已经明确写入 `INCOMPLETE`、`CAUGHT_UP` 或其他结束状态的任务不再恢复；下一次调度必须创建新 generation 和新 cutoff。市场只有至少一次成功进入过 `CAUGHT_UP`（即存在 `last_caught_up_cutoff_ms` 和穷尽证据）、当前明确 active 且“重新激活全范围待完成”标记为 false 后，才有资格执行普通增量；后来周期复核失败时，普通增量仍可继续，但两类状态和错误必须分别报告。
 
 ### 6.4 数据约束
 
