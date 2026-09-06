@@ -7,3 +7,4 @@
 | 增量完成计数 | funding_incremental_completed 的 inserted、unchanged、revised 是本次 generation 所有已提交非空页的累计值，失败页、空终止页和 stale 页不计数。 | 已批准 spec：2026-09-06-funding-rate-history-sync-design.md#7.4-增量同步 | 2026-09-06 |
 | 数据口径 | 只保存已经结算的历史资金费率，Bitget 使用 raw fundingRate，OKX 使用 raw realizedRate，不保存当前、预测或下一期未结算费率。 | 已批准 spec：2026-09-06-funding-rate-history-sync-design.md#3.2-数据类型 | 2026-09-06 |
 | 覆盖恢复 fencing | 每个新建或中断恢复的 coverage task 都在首次请求前递增 generation；Bitget 必见边界或 OKX 初始 after 作为该 generation 的不可变持久 task 启动字段，所有 repository 写入口比较完整 lease，中断恢复保留 cutoff 和任务类型但不复用旧 generation。 | 已批准 spec：2026-09-06-funding-rate-history-sync-design.md#6.3-funding_rate_sync_state | 2026-09-06 |
+| 增量冻结边界 fencing | incremental task 的 generation 与任务启动事务冻结的 latest 一同持久化；资格、页面和所有终态入口 null-safe 比较完整 provenance，页面推进不移动边界，终态/市场转换清空，伪造边界在请求或写入前 fail-closed。 | 已批准 spec：2026-09-06-funding-rate-history-sync-design.md#6.3-funding_rate_sync_state | 2026-09-06 |

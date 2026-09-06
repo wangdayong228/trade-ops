@@ -828,8 +828,12 @@ Expected: exit 0。
 ### Task 7: 补齐冻结边界增量算法
 
 **Files:**
+- Modify: `src/storage/funding-rate-schema.ts`
+- Modify: `src/storage/funding-rate-repository.ts`
+- Modify: `src/storage/sqlite-funding-rate-repository.ts`
 - Modify: `src/funding-rates/funding-rate-source.ts`
 - Modify: `src/funding-rates/funding-rate-market-sync.ts`
+- Modify: `tests/storage/sqlite-funding-rate-repository.test.ts`
 - Modify: `tests/support/fake-funding-rate-source.ts`
 - Modify: `tests/funding-rates/funding-rate-record.test.ts`
 - Modify: `tests/funding-rates/funding-rate-market-sync.test.ts`
@@ -846,6 +850,9 @@ Expected: exit 0。
 - coverage 已 INCOMPLETE 时增量成功仍保持 coverage error、旧 cutoff/evidence 不变；
 - inactive/reactivation/generation 资格在下一页前失效时请求计数不增长并 cancel；返回后的 stale commit 零写入；
 - 中断后新 task 从首页开始，不复用内存 cursor。
+- start/restart 在同一事务递增 generation 并持久化当时 latest 为 `incremental_frozen_boundary_ms`；空历史 `NULL`、时间戳 `0`、页面推进后边界不变和重启重新绑定都必须覆盖；
+- 复制合法 lease 后伪造冻结边界时，currentness、页面、complete/fail/cancel 和 `createIncrementalTask` 全部 fail-closed，task 创建不发事件且 source/executor/SQLite 零副作用；
+- incremental 明确终态与 active/inactive/reactivation 转换原子清空冻结边界；绕过 CHECK 注入 terminal 非空边界、边界大于 latest 或非法范围时，read/restart/全部 mutation 入口 fail-closed；
 - source 合同导出固定、无 cause 的 `FundingRequestCanceledError` 与 `FundingRequestRetryExhaustedError`，并要求显式 retry observer；coverage 与 incremental 都原样传播取消且零状态/失败事件写入，重试耗尽分别只写对应任务的 `REQUEST_RETRY_EXHAUSTED`，其他 rejection 仍为 `SOURCE_RESPONSE_INVALID`；
 - retry observer 在 coverage/incremental task 中补齐各自 generation、cutoff/boundary、cursor 和安全 request metadata，交给 non-throwing allowlist event sink；raw error 不进入 repository；
 - 增量完成事件的 inserted/unchanged/revised 是本 generation 所有已提交非空页的累计值；失败页、空终止页和 stale 页不累计。
@@ -860,6 +867,8 @@ Expected: exit 非 0，仅新增量 case 失败。
 
 - [ ] **Step 3: 实现增量 task**
 
+repository 在 start/restart 事务中将当时 `latest_funding_timestamp_ms` 原样写入 generation-scoped `incremental_frozen_boundary_ms`。`FundingMarketState` 暴露该字段；schema 允许 `RUNNING` 的空历史边界为 `NULL`，但非 `RUNNING` 必须为 `NULL`，非空边界不得大于当前 latest。资格、页面、complete/fail/cancel 的 currentness 与 SQL CAS 都用 SQLite `IS` 比较 generation 和冻结边界；页面推进不改变它，终态和市场转换在成功 CAS 中清空。由此 data-only lease 的伪造边界不能到达请求或写入。
+
 task 内存字段固定为 `cursor`、`frozenBoundaryMs`、`boundarySeen`、`postBoundaryRequestCompleted` 和三项已提交页面累计计数。完成条件只有：
 
 1. boundary 已观察，且其后的下一次分页请求成功并已提交非空页；或
@@ -873,7 +882,7 @@ task 内存字段固定为 `cursor`、`frozenBoundaryMs`、`boundarySeen`、`pos
 
 ```bash
 npm run build && node --test dist/tests/funding-rates/funding-rate-market-sync.test.js
-git add src/funding-rates/funding-rate-source.ts src/funding-rates/funding-rate-market-sync.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-record.test.ts tests/funding-rates/funding-rate-market-sync.test.ts
+git add src/storage/funding-rate-schema.ts src/storage/funding-rate-repository.ts src/storage/sqlite-funding-rate-repository.ts src/funding-rates/funding-rate-source.ts src/funding-rates/funding-rate-market-sync.ts tests/storage/sqlite-funding-rate-repository.test.ts tests/support/fake-funding-rate-source.ts tests/funding-rates/funding-rate-record.test.ts tests/funding-rates/funding-rate-market-sync.test.ts
 git diff --cached --check
 git commit -m "feat: increment settled funding rates"
 ```
