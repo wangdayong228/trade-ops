@@ -695,7 +695,7 @@ Expected: exit 0；测试后所有数据库均为内存库且已关闭。
 - Modify: `src/storage/sqlite-funding-rate-repository.ts`
 - Modify: `tests/storage/sqlite-funding-rate-repository.test.ts`
 
-- [ ] **Step 1: 增加状态机红测试**
+- [x] **Step 1: 增加状态机红测试**
 
 测试至少包含：
 
@@ -710,7 +710,7 @@ Expected: exit 0；测试后所有数据库均为内存库且已关闭。
 - CAUGHT_UP/cutoff/evidence、inactive final 和 reactivation 清除的所有合法/非法组合；
 - 绕过 CHECK 污染每个状态枚举、token、anchor、cutoff 关系后读取 fail-closed。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
 ```bash
 npm run build && node --test dist/tests/storage/sqlite-funding-rate-repository.test.js
@@ -718,7 +718,7 @@ npm run build && node --test dist/tests/storage/sqlite-funding-rate-repository.t
 
 Expected: exit 非 0，失败点对应未实现状态方法/约束，不是 Task 4 回归。
 
-- [ ] **Step 3: 实现原子状态合同**
+- [x] **Step 3: 实现原子状态合同**
 
 `applyCompleteDiscovery` 先在同一 transaction 比较 repository 已知 ID 集合；只要一个已知 ID 缺失就抛 `IncompleteFundingDiscoveryError` 并零写入。active 转换总是安全递增相应 fencing token：除从未成功且仍为 PENDING 的新鲜状态可继续保持 PENDING 外，当前 coverage 一律转为带固定状态转换码的 INCOMPLETE，同时保留上一成功 generation/cutoff/time/evidence；若 incremental RUNNING，转 IDLE、记录结束但不更新成功时间。所有状态错误只接受 `fundingTaskFailure(code)` 的闭集结果；repository 对 code/summary 映射和 512-byte 上限二次验证。
 
@@ -726,7 +726,7 @@ Expected: exit 非 0，失败点对应未实现状态方法/约束，不是 Task
 
 `startIncremental` 在一个 transaction 内复查资格、递增 `incremental_generation` 并冻结任务开始前 latest timestamp；`restartInterruptedIncremental` 只接受遗留 RUNNING 和当前仍满足资格的 market，原子递增 token、替换 started time、从当前持久 latest 重新冻结边界并保持 RUNNING，从而保证重启后从首页重新请求。commit/complete/fail/cancel 都比较 generation 和 RUNNING 状态。
 
-- [ ] **Step 4: GREEN 并提交**
+- [x] **Step 4: GREEN 并提交**
 
 ```bash
 npm run build && node --test dist/tests/storage/sqlite-funding-rate-repository.test.js
