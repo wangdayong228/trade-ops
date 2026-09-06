@@ -2316,6 +2316,38 @@ function captureReconciliationOperations(
   };
 }
 
+function capturedOperationFields(
+  entries: readonly CapturedReconciliationOperation[],
+  level: CapturedReconciliationOperation['level'],
+  event: string
+): Readonly<OperationalFields> {
+  const fields = entries.find((entry) => (
+    entry.level === level && entry.event === event
+  ))?.fields;
+  assert.ok(fields);
+  return fields;
+}
+
+function assertReconciledAmountFields(
+  fields: Readonly<OperationalFields>,
+  expected: Readonly<Pick<
+    OperationalFields,
+    | 'marketSpot'
+    | 'marketContract'
+    | 'preGtcResidual'
+    | 'currentResidual'
+    | 'exposureKnown'
+  >>
+): void {
+  assert.deepEqual({
+    marketSpot: fields.marketSpot,
+    marketContract: fields.marketContract,
+    preGtcResidual: fields.preGtcResidual,
+    currentResidual: fields.currentResidual,
+    exposureKnown: fields.exposureKnown
+  }, expected);
+}
+
 test('deduplicates one pending revision and logs a changed reason', async (t) => {
   const entries: CapturedReconciliationOperation[] = [];
   const f = decisionFixture(
@@ -2644,6 +2676,326 @@ test('blocks a decision when an order revision changes after evidence collection
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
   assert.equal(result.exposureKnown, true);
   assert.equal(transitions, 0);
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assertNoTradingSideEffects(f);
+});
+
+function planWrongDirectionGtc(
+  f: DecisionFixture
+): StrategyOrderRecord {
+  seedClosedConcurrentMarkets(f, {
+    requested: '1',
+    spotFill: '1',
+    spotRemaining: '0',
+    spotAverage: '60000',
+    contractFill: '0.6',
+    contractRemaining: '0.4',
+    contractAverage: '60010'
+  });
+  return planOrder(f, 'SPOT_HEDGE_GTC', '0.4');
+}
+
+test('GTC status priority: unknown blocks a wrong-direction terminal decision', async (t) => {
+  const f = decisionFixture(t, 'CONCURRENT');
+  const gtc = planWrongDirectionGtc(f);
+  scriptFind(f, gtc, snapshotForOrder(gtc, {
+    status: 'unknown',
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '0.4',
+    averagePrice: null
+  }));
+  const originalTransition = f.repository.transition.bind(f.repository);
+  let transitions = 0;
+  Reflect.set(f.repository, 'transition', (...args: Parameters<
+    StrategyRepository['transition']
+  >): boolean => {
+    transitions += 1;
+    return originalTransition(...args);
+  });
+
+  const result = await f.reconciliation.run(f.strategyId);
+
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'GTC_STATUS_UNKNOWN');
+  assert.equal(transitions, 0);
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assertNoTradingSideEffects(f);
+});
+
+test('GTC status priority: rejected zero fill precedes wrong direction', async (t) => {
+  const f = decisionFixture(t, 'CONCURRENT');
+  const gtc = planWrongDirectionGtc(f);
+  scriptFind(f, gtc, snapshotForOrder(gtc, {
+    status: 'rejected',
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '0.4',
+    averagePrice: null
+  }));
+
+  assert.deepEqual(await f.reconciliation.run(f.strategyId), {
+    kind: 'written',
+    state: 'HEDGE_INCOMPLETE',
+    failureCode: 'HEDGE_ORDER_REJECTED'
+  });
+  assertNoTradingSideEffects(f);
+});
+
+test('GTC status priority: definite-null failure precedes wrong direction', async (t) => {
+  const f = decisionFixture(t, 'CONCURRENT');
+  const gtc = planWrongDirectionGtc(f);
+  assert.equal(f.repository.markDefinitelyNotSubmitted(
+    gtc.id,
+    'ORDER_SUBMISSION_FAILED'
+  ), true);
+  scriptFind(f, gtc, null);
+
+  assert.deepEqual(await f.reconciliation.run(f.strategyId), {
+    kind: 'written',
+    state: 'HEDGE_INCOMPLETE',
+    failureCode: 'ORDER_SUBMISSION_FAILED'
+  });
+  assertNoTradingSideEffects(f);
+});
+
+for (const marketFailure of ['rejected', 'definite-null'] as const) {
+  test(`GTC status priority: unknown precedes ${marketFailure} market failure`, async (t) => {
+    const f = decisionFixture(t, 'CONCURRENT');
+    const spot = planOrder(f, 'SPOT_MARKET');
+    const contract = planOrder(f, 'CONTRACT_MARKET');
+    const gtc = planOrder(f, 'CONTRACT_HEDGE_GTC');
+    scriptFind(f, spot, snapshotForOrder(spot, {
+      status: 'closed',
+      filledBaseQuantity: '1',
+      remainingBaseQuantity: '0',
+      averagePrice: '60000'
+    }));
+    if (marketFailure === 'rejected') {
+      scriptFind(f, contract, snapshotForOrder(contract, {
+        status: 'rejected',
+        filledBaseQuantity: '0',
+        remainingBaseQuantity: '1',
+        averagePrice: null
+      }));
+    } else {
+      assert.equal(f.repository.markDefinitelyNotSubmitted(
+        contract.id,
+        'ORDER_SUBMISSION_FAILED'
+      ), true);
+      scriptFind(f, contract, null);
+    }
+    scriptFind(f, gtc, snapshotForOrder(gtc, {
+      status: 'unknown',
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '1',
+      averagePrice: null
+    }));
+    const originalTransition = f.repository.transition.bind(f.repository);
+    let transitions = 0;
+    Reflect.set(f.repository, 'transition', (...args: Parameters<
+      StrategyRepository['transition']
+    >): boolean => {
+      transitions += 1;
+      return originalTransition(...args);
+    });
+
+    const result = await f.reconciliation.run(f.strategyId);
+
+    assert.equal(result.kind, 'pending');
+    assert.equal(result.reason, 'GTC_STATUS_UNKNOWN');
+    assert.equal(transitions, 0);
+    assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+    assertNoTradingSideEffects(f);
+  });
+}
+
+test('failure conclusion logs include actual state and code on first observation', async (t) => {
+  const entries: CapturedReconciliationOperation[] = [];
+  const f = decisionFixture(
+    t,
+    'CONTRACT_FIRST',
+    captureReconciliationOperations(entries)
+  );
+  assert.equal(f.repository.transition(
+    f.strategyId,
+    ['EXECUTING'],
+    'FAILED',
+    'ORDER_SUBMISSION_FAILED'
+  ), true);
+
+  assert.deepEqual(await f.reconciliation.run(f.strategyId), {
+    kind: 'observed_state',
+    state: 'FAILED'
+  });
+  const fields = capturedOperationFields(
+    entries,
+    'info',
+    'hedge_reconciliation_conclusion'
+  );
+  assert.equal(fields.strategyState, 'FAILED');
+  assert.equal(fields.failureCode, 'ORDER_SUBMISSION_FAILED');
+  assertNoGatewayCalls(f);
+});
+
+test('failure conclusion logs include actual state and code after CAS observation', async (t) => {
+  const entries: CapturedReconciliationOperation[] = [];
+  const f = decisionFixture(
+    t,
+    'CONTRACT_FIRST',
+    captureReconciliationOperations(entries)
+  );
+  const order = planOrder(f, 'CONTRACT_MARKET');
+  scriptFind(f, order, snapshotForOrder(order, {
+    status: 'closed',
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '1',
+    averagePrice: null
+  }));
+  const originalTransition = f.repository.transition.bind(f.repository);
+  Reflect.set(f.repository, 'transition', (...args: Parameters<
+    StrategyRepository['transition']
+  >): boolean => {
+    assert.equal(originalTransition(...args), true);
+    return false;
+  });
+
+  assert.deepEqual(await f.reconciliation.run(f.strategyId), {
+    kind: 'observed_state',
+    state: 'FAILED'
+  });
+  const fields = capturedOperationFields(
+    entries,
+    'info',
+    'hedge_reconciliation_conclusion'
+  );
+  assert.equal(fields.strategyState, 'FAILED');
+  assert.equal(fields.failureCode, 'NO_FILL');
+  assertNoTradingSideEffects(f);
+});
+
+test('pending log includes reconciled amounts for an unknown GTC', async (t) => {
+  const entries: CapturedReconciliationOperation[] = [];
+  const f = decisionFixture(
+    t,
+    'CONCURRENT',
+    captureReconciliationOperations(entries)
+  );
+  seedClosedConcurrentMarkets(f, {
+    requested: '1',
+    spotFill: '1',
+    spotRemaining: '0',
+    spotAverage: '60000',
+    contractFill: '0.6',
+    contractRemaining: '0.4',
+    contractAverage: '60010'
+  });
+  const gtc = planOrder(f, 'CONTRACT_HEDGE_GTC', '0.4');
+  scriptFind(f, gtc, snapshotForOrder(gtc, {
+    status: 'unknown',
+    filledBaseQuantity: '0',
+    remainingBaseQuantity: '0.4',
+    averagePrice: null
+  }));
+
+  const result = await f.reconciliation.run(f.strategyId);
+
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'GTC_STATUS_UNKNOWN');
+  assertReconciledAmountFields(capturedOperationFields(
+    entries,
+    'warn',
+    'hedge_reconciliation_pending'
+  ), {
+    marketSpot: '1',
+    marketContract: '0.6',
+    preGtcResidual: '0.4',
+    currentResidual: '0.4',
+    exposureKnown: true
+  });
+});
+
+for (const [name, expectedReason, mutate] of [
+  [
+    'market rules',
+    'MARKET_RULES_UNAVAILABLE',
+    (f: DecisionFixture) => f.contract.markets.clear()
+  ],
+  [
+    'candidate price',
+    'PRICE_QUANTIZATION_FAILED',
+    (f: DecisionFixture) => {
+      f.contract.quantizedPrices.set(`swap:${SYMBOL}`, '60000.05');
+    }
+  ]
+] as const) {
+  test(`pending log includes reconciled amounts for uncertain ${name}`, async (t) => {
+    const entries: CapturedReconciliationOperation[] = [];
+    const f = decisionFixture(
+      t,
+      'CONCURRENT',
+      captureReconciliationOperations(entries)
+    );
+    mutate(f);
+    seedClosedConcurrentMarkets(f, {
+      requested: '1',
+      spotFill: '1',
+      spotRemaining: '0',
+      spotAverage: '60000',
+      contractFill: '0.6',
+      contractRemaining: '0.4',
+      contractAverage: '60010'
+    });
+
+    const result = await f.reconciliation.run(f.strategyId);
+
+    assert.equal(result.kind, 'pending');
+    assert.equal(result.reason, expectedReason);
+    assertReconciledAmountFields(capturedOperationFields(
+      entries,
+      'warn',
+      'hedge_reconciliation_pending'
+    ), {
+      marketSpot: '1',
+      marketContract: '0.6',
+      preGtcResidual: '0.4',
+      currentResidual: '0.4',
+      exposureKnown: true
+    });
+  });
+}
+
+test('pending log includes reconciled amounts for a state write conflict', async (t) => {
+  const entries: CapturedReconciliationOperation[] = [];
+  const f = decisionFixture(
+    t,
+    'CONCURRENT',
+    captureReconciliationOperations(entries)
+  );
+  seedClosedConcurrentMarkets(f, {
+    requested: '1',
+    spotFill: '1',
+    spotRemaining: '0',
+    spotAverage: null,
+    contractFill: '1',
+    contractRemaining: '0',
+    contractAverage: null
+  });
+  Reflect.set(f.repository, 'transition', () => false);
+
+  const result = await f.reconciliation.run(f.strategyId);
+
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'STATE_WRITE_CONFLICT');
+  assertReconciledAmountFields(capturedOperationFields(
+    entries,
+    'warn',
+    'hedge_reconciliation_pending'
+  ), {
+    marketSpot: '1',
+    marketContract: '1',
+    preGtcResidual: '0',
+    currentResidual: '0',
+    exposureKnown: true
+  });
   assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
   assertNoTradingSideEffects(f);
 });

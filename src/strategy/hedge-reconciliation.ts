@@ -573,7 +573,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
     if (current.state !== entered.state) {
       const observed = { kind: 'observed_state', state: current.state } as const;
       if (terminalStrategyState(current.state)) {
-        this.logConclusion(entered, observed);
+        this.logConclusion(current, observed);
       }
       return observed;
     }
@@ -622,6 +622,11 @@ export class HedgeReconciliation implements ReconciliationRunner {
       );
     }
 
+    const gtc = orders.find(isGtcOrder);
+    if (gtc?.snapshot?.status === 'unknown') {
+      return this.decideExistingGtc(entered, orders, gtc, amounts);
+    }
+
     const marketFailure = marketOrders.find((order) => (
       order.snapshot?.status === 'rejected'
       || order.submissionDisposition === 'DEFINITELY_NOT_SUBMITTED'
@@ -649,7 +654,6 @@ export class HedgeReconciliation implements ReconciliationRunner {
       );
     }
 
-    const gtc = orders.find(isGtcOrder);
     if (gtc !== undefined) {
       return this.decideExistingGtc(entered, orders, gtc, amounts);
     }
@@ -758,7 +762,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown)
+        exactUnavailable(amounts.fields.exposureKnown),
+        amounts.fields
       );
     }
     const role = amounts.marketDelta.gt(0)
@@ -779,36 +784,34 @@ export class HedgeReconciliation implements ReconciliationRunner {
     gtc: Readonly<StrategyOrderRecord>,
     amounts: Readonly<ReconciledAmounts>
   ): ReconciliationResult {
-    const expectedRole = amounts.marketDelta.gt(0)
-      ? 'CONTRACT_HEDGE_GTC'
-      : amounts.marketDelta.lt(0)
-        ? 'SPOT_HEDGE_GTC'
-        : null;
-    let request: Decimal;
-    try {
-      request = requiredDecimal(gtc.request.baseQuantity);
-    } catch (error) {
-      if (!(error instanceof ExactArithmeticUnavailable)) throw error;
-      return this.pending(
-        entered,
-        orders,
-        exactUnavailable(amounts.fields.exposureKnown)
-      );
+    const snapshot = gtc.snapshot;
+    if (snapshot?.status === 'unknown') {
+      return this.pending(entered, orders, {
+        kind: 'pending',
+        reason: 'GTC_STATUS_UNKNOWN',
+        exposureKnown: amounts.fields.exposureKnown,
+        strategyOrderId: gtc.id,
+        clientOrderId: gtc.clientOrderId,
+        exchangeId: gtc.exchangeId
+      }, amounts.fields);
     }
-    if (
-      expectedRole === null
-      || gtc.role !== expectedRole
-      || !request.eq(amounts.preGtcResidual)
-    ) {
-      return this.transitionFailure(
-        entered,
-        orders,
-        'HEDGE_INCOMPLETE',
-        'INCONSISTENT_ORDER_STATE',
-        amounts.fields
-      );
+    if (snapshot?.status === 'rejected') {
+      return amounts.gtcFilled.isZero()
+        ? this.transitionFailure(
+            entered,
+            orders,
+            'HEDGE_INCOMPLETE',
+            'HEDGE_ORDER_REJECTED',
+            amounts.fields
+          )
+        : this.transitionFailure(
+            entered,
+            orders,
+            'HEDGE_INCOMPLETE',
+            'INCONSISTENT_ORDER_STATE',
+            amounts.fields
+          );
     }
-
     if (gtc.submissionDisposition === 'DEFINITELY_NOT_SUBMITTED') {
       const failureCode = gtc.submissionFailureCode;
       if (failureCode === null) {
@@ -828,8 +831,6 @@ export class HedgeReconciliation implements ReconciliationRunner {
         amounts.fields
       );
     }
-
-    const snapshot = gtc.snapshot;
     if (snapshot === null) {
       return this.pending(entered, orders, {
         kind: 'pending',
@@ -840,7 +841,38 @@ export class HedgeReconciliation implements ReconciliationRunner {
         exchangeId: gtc.exchangeId,
         expected: 'persisted order snapshot',
         actual: 'missing'
-      });
+      }, amounts.fields);
+    }
+
+    const expectedRole = amounts.marketDelta.gt(0)
+      ? 'CONTRACT_HEDGE_GTC'
+      : amounts.marketDelta.lt(0)
+        ? 'SPOT_HEDGE_GTC'
+        : null;
+    let request: Decimal;
+    try {
+      request = requiredDecimal(gtc.request.baseQuantity);
+    } catch (error) {
+      if (!(error instanceof ExactArithmeticUnavailable)) throw error;
+      return this.pending(
+        entered,
+        orders,
+        exactUnavailable(amounts.fields.exposureKnown),
+        amounts.fields
+      );
+    }
+    if (
+      expectedRole === null
+      || gtc.role !== expectedRole
+      || !request.eq(amounts.preGtcResidual)
+    ) {
+      return this.transitionFailure(
+        entered,
+        orders,
+        'HEDGE_INCOMPLETE',
+        'INCONSISTENT_ORDER_STATE',
+        amounts.fields
+      );
     }
 
     let conserved: boolean;
@@ -852,7 +884,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown)
+        exactUnavailable(amounts.fields.exposureKnown),
+        amounts.fields
       );
     }
     const crossed = amounts.marketDelta.gt(0)
@@ -873,15 +906,6 @@ export class HedgeReconciliation implements ReconciliationRunner {
     }
 
     switch (snapshot.status) {
-      case 'unknown':
-        return this.pending(entered, orders, {
-          kind: 'pending',
-          reason: 'GTC_STATUS_UNKNOWN',
-          exposureKnown: amounts.fields.exposureKnown,
-          strategyOrderId: gtc.id,
-          clientOrderId: gtc.clientOrderId,
-          exchangeId: gtc.exchangeId
-        });
       case 'open':
         if (!amounts.gtcRemaining.gt(0)) {
           return this.transitionFailure(
@@ -933,23 +957,6 @@ export class HedgeReconciliation implements ReconciliationRunner {
           'HEDGE_ORDER_CANCELED',
           amounts.fields
         );
-      case 'rejected':
-        if (!amounts.gtcFilled.isZero()) {
-          return this.transitionFailure(
-            entered,
-            orders,
-            'HEDGE_INCOMPLETE',
-            'INCONSISTENT_ORDER_STATE',
-            amounts.fields
-          );
-        }
-        return this.transitionFailure(
-          entered,
-          orders,
-          'HEDGE_INCOMPLETE',
-          'HEDGE_ORDER_REJECTED',
-          amounts.fields
-        );
     }
   }
 
@@ -984,7 +991,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
         reason: 'MARKET_RULES_UNAVAILABLE',
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
-      });
+      }, amounts.fields);
     }
 
     let rules: ParsedMarketRules | null;
@@ -1010,7 +1017,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
         reason: 'MARKET_RULES_UNAVAILABLE',
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
-      });
+      }, amounts.fields);
     }
 
     let candidateValue: string;
@@ -1026,7 +1033,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
         reason: 'PRICE_QUANTIZATION_FAILED',
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
-      });
+      }, amounts.fields);
     }
     const candidatePrice = positiveDecimal(candidateValue);
     if (candidatePrice === null) {
@@ -1035,7 +1042,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
         reason: 'PRICE_QUANTIZATION_FAILED',
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
-      });
+      }, amounts.fields);
     }
 
     let priceAligned: boolean;
@@ -1048,7 +1055,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
           reason: 'PRICE_QUANTIZATION_FAILED',
           exposureKnown: amounts.fields.exposureKnown,
           exchangeId: target.exchangeId
-        });
+        }, amounts.fields);
       }
       const baseStep = exactProduct(rules.amountStep, rules.contractSize);
       const stepAligned = exactModuloIsZero(
@@ -1080,7 +1087,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown)
+        exactUnavailable(amounts.fields.exposureKnown),
+        amounts.fields
       );
     }
 
@@ -1159,7 +1167,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       && current.failureCode === expectedFailureCode
     ) {
       const observed = { kind: 'observed_state', state: current.state } as const;
-      this.logConclusion(entered, observed, amounts);
+      this.logConclusion(current, observed, amounts);
       return observed;
     }
     return this.pending(entered, this.repository.listOrders(entered.id), {
@@ -1172,13 +1180,14 @@ export class HedgeReconciliation implements ReconciliationRunner {
       actual: current.failureCode === null
         ? current.state
         : `${current.state}:${current.failureCode}`
-    });
+    }, amounts);
   }
 
   private pending(
     entered: Readonly<StrategyRecord>,
     orders: readonly Readonly<StrategyOrderRecord>[],
-    input: Readonly<PendingInput>
+    input: Readonly<PendingInput>,
+    amounts?: Readonly<AmountFields>
   ): ReconciliationResult {
     const strategyState = activeState(entered);
     const result = {
@@ -1201,6 +1210,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
         strategyId: entered.id,
         strategyState,
         reason: input.reason,
+        ...(amounts === undefined ? {} : amounts),
         exposureKnown: input.exposureKnown,
         ...(input.strategyOrderId === undefined
           ? {}
@@ -1223,12 +1233,18 @@ export class HedgeReconciliation implements ReconciliationRunner {
     result: Readonly<ReconciliationResult>,
     amounts?: Readonly<AmountFields>
   ): void {
+    const strategyState = result.kind === 'written'
+      || result.kind === 'observed_state'
+      ? result.state
+      : entered.state;
     const fields: OperationalFields = {
       strategyId: entered.id,
-      strategyState: entered.state,
+      strategyState,
       conclusion: result.kind === 'written' ? result.state : result.kind,
       ...(result.kind === 'written' && 'failureCode' in result
         ? { failureCode: result.failureCode }
+        : result.kind === 'observed_state' && entered.failureCode !== null
+          ? { failureCode: entered.failureCode }
         : {}),
       ...(result.kind === 'need_gtc' ? { role: result.role } : {}),
       ...(amounts === undefined ? {} : amounts)
