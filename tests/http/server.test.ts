@@ -26,6 +26,7 @@ import {
   type OperationalLog
 } from '../../src/logging/logger.js';
 import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
+import { HedgeReconciliation } from '../../src/strategy/hedge-reconciliation.js';
 import type {
   PreflightInput,
   PreflightResult
@@ -54,6 +55,7 @@ function captureOperationalErrors(
 ): OperationalLog {
   return {
     info(): void {},
+    warn(): void {},
     error(event, error, fields): void {
       entries.push({ event, error, fields });
     },
@@ -1576,6 +1578,7 @@ test('two concurrent confirmations create each fake exchange order only once', a
     ['okx', contract]
   ]));
   const strategy = repository.createPending(preflight());
+  spot.markets.set(`spot:${strategy.symbol}`, strategy.preflight.spotMarket);
   const contractRequest = requestFor(
     strategy.id,
     'CONTRACT_MARKET',
@@ -1598,6 +1601,7 @@ test('two concurrent confirmations create each fake exchange order only once', a
     averagePrice: '60010',
     status: 'closed'
   }));
+  const reconciliation = new HedgeReconciliation(registry, repository);
   const server = buildServer({
     registry,
     preflightService: {
@@ -1606,7 +1610,7 @@ test('two concurrent confirmations create each fake exchange order only once', a
       }
     },
     repository,
-    coordinator: new HedgeCoordinator(registry, repository),
+    coordinator: new HedgeCoordinator(registry, repository, reconciliation),
     logger: false
   });
   t.after(async () => {
@@ -1683,6 +1687,7 @@ test('EXECUTING confirmation recovers an existing intent without duplicate creat
     ['okx', contract]
   ]));
   const strategy = repository.createPending(preflight());
+  spot.markets.set(`spot:${strategy.symbol}`, strategy.preflight.spotMarket);
   assert.equal(repository.claimForExecution(strategy.id), true);
   const contractRequest = requestFor(
     strategy.id,
@@ -1707,6 +1712,7 @@ test('EXECUTING confirmation recovers an existing intent without duplicate creat
     averagePrice: '60010',
     status: 'closed'
   }));
+  const reconciliation = new HedgeReconciliation(registry, repository);
   const server = buildServer({
     registry,
     preflightService: {
@@ -1715,7 +1721,7 @@ test('EXECUTING confirmation recovers an existing intent without duplicate creat
       }
     },
     repository,
-    coordinator: new HedgeCoordinator(registry, repository),
+    coordinator: new HedgeCoordinator(registry, repository, reconciliation),
     logger: false
   });
   t.after(async () => {
@@ -1886,6 +1892,10 @@ test('status uses only latest snapshots and preserves exact high precision fills
   assert.equal(body.strategy.id, strategy.id);
   assert.equal(body.preflight.effectiveBaseQuantity, quantity);
   assert.equal(body.orders.length, 2);
+  for (const order of body.orders as Array<Record<string, unknown>>) {
+    assert.equal(Object.hasOwn(order, 'submissionDisposition'), false);
+    assert.equal(Object.hasOwn(order, 'submissionFailureCode'), false);
+  }
   assert.deepEqual(body.actualFills, {
     spotBuyBaseQuantity: '0.9000000000000000000000000000000000000001',
     contractShortBaseQuantity: '0.8999999999999999999999999999999999999999',
@@ -1991,6 +2001,7 @@ test('a throwing operational log cannot replace an HTTP 500 response', async (t)
     repository: tamperedRepository,
     operationalLog: {
       info(): void {},
+      warn(): void {},
       error(): never {
         throw new Error('logging unavailable');
       },

@@ -21,6 +21,27 @@ function isNoOrderSubmitted(error: unknown): boolean {
   return true;
 }
 
+test('exposes only the closed no-order-submitted reason set', () => {
+  const unclassified = new NoOrderSubmittedError();
+  const untradable = new NoOrderSubmittedError('UNTRADABLE_REQUEST');
+
+  assert.deepEqual({
+    name: unclassified.name,
+    message: unclassified.message,
+    code: unclassified.code,
+    reason: unclassified.reason
+  }, {
+    name: 'NoOrderSubmittedError',
+    message: 'order was not submitted',
+    code: 'NO_ORDER_SUBMITTED',
+    reason: 'UNCLASSIFIED'
+  });
+  assert.equal(untradable.code, 'NO_ORDER_SUBMITTED');
+  assert.equal(untradable.reason, 'UNTRADABLE_REQUEST');
+  assert.equal('cause' in unclassified, false);
+  assert.equal('cause' in untradable, false);
+});
+
 test('converts perpetual contracts to and from base quantity', () => {
   assert.equal(baseToExchangeAmount('0.015', '0.001'), '15');
   assert.equal(exchangeAmountToBase('15', '0.001'), '0.015');

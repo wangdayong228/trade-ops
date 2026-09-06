@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
 import type {
   MarketKind,
@@ -14,7 +15,15 @@ import type {
   OrderSnapshot,
   StrategyState
 } from '../../src/domain/types.js';
+import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
+import type { TradeEvent } from '../../src/logging/trade-events.js';
 import { composeService } from '../../src/main.js';
+import { claimSqliteProcessOwnership } from '../../src/storage/sqlite-process-owner.js';
+import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
+import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
+import { HedgeReconciliation } from '../../src/strategy/hedge-reconciliation.js';
+import { OrderMonitor } from '../../src/strategy/order-monitor.js';
+import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
@@ -77,6 +86,75 @@ function snapshot(
     status: 'open',
     updatedAt: '2026-07-31T08:00:00.000Z',
     ...overrides
+  };
+}
+
+function recoveryRequest(
+  strategyId: string,
+  role: OrderRole,
+  baseQuantity: string
+): OrderRequest {
+  const clientOrderId = makeClientOrderId(strategyId, role);
+  if (role === 'SPOT_MARKET') {
+    return {
+      symbol: SYMBOL,
+      kind: 'spot',
+      type: 'market',
+      side: 'buy',
+      baseQuantity,
+      clientOrderId
+    };
+  }
+  if (role === 'CONTRACT_MARKET') {
+    return {
+      symbol: SYMBOL,
+      kind: 'swap',
+      type: 'market',
+      side: 'sell',
+      baseQuantity,
+      clientOrderId,
+      positionSide: 'SHORT',
+      marginMode: 'cross'
+    };
+  }
+  if (role === 'CONTRACT_HEDGE_GTC') {
+    return {
+      symbol: SYMBOL,
+      kind: 'swap',
+      type: 'limit',
+      side: 'sell',
+      baseQuantity,
+      price: '60000',
+      timeInForce: 'GTC',
+      clientOrderId,
+      positionSide: 'SHORT',
+      marginMode: 'cross'
+    };
+  }
+  throw new Error('this recovery fixture only supports a contract GTC');
+}
+
+function recoveryPreflight(): PreflightResult {
+  return {
+    spotExchangeId: 'bitget',
+    contractExchangeId: 'okx',
+    symbol: SYMBOL,
+    requestedBaseQuantity: '1',
+    effectiveBaseQuantity: '1',
+    mode: 'CONCURRENT',
+    spotMarket: market('bitget', 'spot'),
+    contractMarket: market('okx', 'swap'),
+    accountSettings: {
+      marginMode: 'cross',
+      positionMode: 'hedged',
+      leverage: '2'
+    },
+    spotFreeUsdt: '100000',
+    contractFreeUsdt: '50000',
+    spotReferencePrice: '60000',
+    contractReferencePrice: '60010',
+    riskAcknowledgementRequired: true,
+    createdAt: '2026-09-05T00:00:00.000Z'
   };
 }
 
@@ -323,6 +401,228 @@ test(
     );
   }
 );
+
+const RESTART_GTC_CASES = [
+  {
+    name: 'closed',
+    remote: {
+      status: 'closed',
+      filledBaseQuantity: '0.4',
+      remainingBaseQuantity: '0',
+      averagePrice: '60000'
+    },
+    expectedState: 'HEDGED',
+    expectedFailureCode: null,
+    expectedGtcEvents: 2,
+    expectedTerminalEvents: 1
+  },
+  {
+    name: 'rejected',
+    remote: {
+      status: 'rejected',
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: '0.4',
+      averagePrice: null
+    },
+    expectedState: 'HEDGE_INCOMPLETE',
+    expectedFailureCode: 'HEDGE_ORDER_REJECTED',
+    expectedGtcEvents: 2,
+    expectedTerminalEvents: 1
+  },
+  {
+    name: 'canceled partial',
+    remote: {
+      status: 'canceled',
+      filledBaseQuantity: '0.1',
+      remainingBaseQuantity: '0.3',
+      averagePrice: '60000'
+    },
+    expectedState: 'HEDGE_INCOMPLETE',
+    expectedFailureCode: 'HEDGE_ORDER_CANCELED',
+    expectedGtcEvents: 2,
+    expectedTerminalEvents: 1
+  },
+  {
+    name: 'lookup failure',
+    remote: null,
+    expectedState: 'WAITING_HEDGE',
+    expectedFailureCode: null,
+    expectedGtcEvents: 1,
+    expectedTerminalEvents: 0
+  }
+] as const;
+
+for (const testCase of RESTART_GTC_CASES) {
+  test(`restart reconciles ${testCase.name} GTC without submission`, async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), 'trade-ops-restart-'));
+    const databasePath = join(directory, 'recovery.sqlite');
+    let initialDatabase: Database.Database | undefined = new Database(
+      databasePath,
+      { timeout: 0 }
+    );
+    let restartedDatabase: Database.Database | undefined;
+    t.after(async () => {
+      if (restartedDatabase?.open === true) restartedDatabase.close();
+      if (initialDatabase?.open === true) initialDatabase.close();
+      await rm(directory, { recursive: true, force: true });
+    });
+    claimSqliteProcessOwnership(initialDatabase, databasePath);
+    const initialRepository = new SqliteStrategyRepository(initialDatabase);
+    const strategyId = initialRepository.createPending(recoveryPreflight()).id;
+    assert.equal(initialRepository.claimForExecution(strategyId), true);
+    const [spotMarket, contractMarket] =
+      initialRepository.planOrdersAtomically(strategyId, [
+        {
+          role: 'SPOT_MARKET',
+          request: recoveryRequest(strategyId, 'SPOT_MARKET', '1')
+        },
+        {
+          role: 'CONTRACT_MARKET',
+          request: recoveryRequest(strategyId, 'CONTRACT_MARKET', '1')
+        }
+      ]);
+    assert.ok(spotMarket);
+    assert.ok(contractMarket);
+    initialRepository.attachOrderSnapshot(spotMarket.id, snapshot(
+      strategyId,
+      'SPOT_MARKET',
+      {
+        exchangeOrderId: 'spot-market-restart',
+        requestedBaseQuantity: '1',
+        filledBaseQuantity: '1',
+        remainingBaseQuantity: '0',
+        averagePrice: '60000',
+        status: 'closed'
+      }
+    ));
+    initialRepository.attachOrderSnapshot(contractMarket.id, snapshot(
+      strategyId,
+      'CONTRACT_MARKET',
+      {
+        exchangeOrderId: 'contract-market-restart',
+        requestedBaseQuantity: '1',
+        filledBaseQuantity: '0.6',
+        remainingBaseQuantity: '0.4',
+        averagePrice: '60010',
+        status: 'closed'
+      }
+    ));
+    const gtc = initialRepository.planOrder(
+      strategyId,
+      'CONTRACT_HEDGE_GTC',
+      recoveryRequest(strategyId, 'CONTRACT_HEDGE_GTC', '0.4')
+    );
+    initialRepository.attachOrderSnapshot(gtc.id, snapshot(
+      strategyId,
+      'CONTRACT_HEDGE_GTC',
+      {
+        exchangeOrderId: 'contract-gtc-restart',
+        requestedBaseQuantity: '0.4',
+        filledBaseQuantity: '0',
+        remainingBaseQuantity: '0.4',
+        averagePrice: null,
+        status: 'open'
+      }
+    ));
+    assert.equal(initialRepository.transition(
+      strategyId,
+      ['EXECUTING'],
+      'WAITING_HEDGE'
+    ), true);
+    initialDatabase.close();
+    initialDatabase = undefined;
+
+    restartedDatabase = new Database(databasePath, { timeout: 0 });
+    claimSqliteProcessOwnership(restartedDatabase, databasePath);
+    const restartedRepository = new SqliteStrategyRepository(
+      restartedDatabase
+    );
+    const restartedSpot = new FakeExchangeGateway('bitget');
+    const restartedContract = new FakeExchangeGateway('okx');
+    restartedSpot.markets.set(`spot:${SYMBOL}`, market('bitget', 'spot'));
+    restartedContract.markets.set(
+      `swap:${SYMBOL}`,
+      market('okx', 'swap')
+    );
+    restartedSpot.fetchResults.set('spot-market-restart', [snapshot(
+      strategyId,
+      'SPOT_MARKET',
+      {
+        exchangeOrderId: 'spot-market-restart',
+        requestedBaseQuantity: '1',
+        filledBaseQuantity: '1',
+        remainingBaseQuantity: '0',
+        averagePrice: '60000',
+        status: 'closed'
+      }
+    )]);
+    restartedContract.fetchResults.set('contract-market-restart', [snapshot(
+      strategyId,
+      'CONTRACT_MARKET',
+      {
+        exchangeOrderId: 'contract-market-restart',
+        requestedBaseQuantity: '1',
+        filledBaseQuantity: '0.6',
+        remainingBaseQuantity: '0.4',
+        averagePrice: '60010',
+        status: 'closed'
+      }
+    )]);
+    if (testCase.remote !== null) {
+      restartedContract.fetchResults.set('contract-gtc-restart', [snapshot(
+        strategyId,
+        'CONTRACT_HEDGE_GTC',
+        {
+          exchangeOrderId: 'contract-gtc-restart',
+          requestedBaseQuantity: '0.4',
+          updatedAt: '2026-09-05T00:02:00.000Z',
+          ...testCase.remote
+        }
+      )]);
+    }
+    const registry = new ExchangeRegistry(new Map([
+      ['bitget', restartedSpot],
+      ['okx', restartedContract]
+    ]));
+    const restartedTradeEvents: TradeEvent[] = [];
+    const reconciliation = new HedgeReconciliation(
+      registry,
+      restartedRepository,
+      {
+        record(event): void {
+          restartedTradeEvents.push(structuredClone(event));
+        }
+      }
+    );
+    const coordinator = new HedgeCoordinator(
+      registry,
+      restartedRepository,
+      reconciliation
+    );
+    const monitor = new OrderMonitor(
+      restartedRepository,
+      coordinator
+    );
+
+    await monitor.recover();
+
+    const persisted = restartedRepository.getStrategy(strategyId);
+    assert.equal(persisted.state, testCase.expectedState);
+    assert.equal(persisted.failureCode, testCase.expectedFailureCode);
+    assert.equal(restartedSpot.createdRequests.length, 0);
+    assert.equal(restartedContract.createdRequests.length, 0);
+    assert.equal(
+      restartedRepository.listOrderEvents(gtc.id).length,
+      testCase.expectedGtcEvents
+    );
+    assert.equal(
+      restartedTradeEvents.filter(
+        ({ event }) => event === 'order_terminal'
+      ).length,
+      testCase.expectedTerminalEvents
+    );
+  });
+}
 
 test(
   'restarted monitor automatically continues only the persisted sequential intent',

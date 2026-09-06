@@ -4,7 +4,6 @@ import type {
   AccountSettings,
   MarketKind,
   OrderRequest,
-  OrderRole,
   OrderSnapshot
 } from '../domain/types.js';
 import {
@@ -12,6 +11,10 @@ import {
   type ExchangeGateway
 } from '../exchanges/exchange-gateway.js';
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
+import {
+  nonThrowingOperationalLog,
+  type OperationalLog
+} from '../logging/logger.js';
 import {
   NOOP_TRADE_EVENT_SINK,
   nonThrowingTradeEventSink,
@@ -21,11 +24,17 @@ import {
   type TradeEventSink
 } from '../logging/trade-events.js';
 import type {
+  OrderSubmissionFailureCode,
   StrategyFailureCode,
+  StrategyOrderPlan,
   StrategyOrderRecord,
   StrategyRecord,
   StrategyRepository
 } from '../storage/strategy-repository.js';
+import type {
+  ReconciliationResult,
+  ReconciliationRunner
+} from './hedge-reconciliation.js';
 import {
   releaseStrategyOperation,
   tryAcquireStrategyOperation
@@ -35,57 +44,15 @@ type ConfirmedMarginMode = 'isolated' | 'cross';
 
 interface PreparedOrder {
   readonly gateway: ExchangeGateway;
-  readonly record: StrategyOrderRecord;
-  readonly existedBeforePreparation: boolean;
+  readonly record: Readonly<StrategyOrderRecord>;
   readonly strategy: Pick<StrategyRecord, 'mode' | 'state'>;
 }
 
-interface SnapshotOutcome {
-  readonly kind: 'snapshot';
-  readonly snapshot: OrderSnapshot;
-}
-
-interface FailureOutcome {
-  readonly kind: 'failure';
-  readonly failureCode: StrategyFailureCode;
-  readonly exposureKnown: boolean;
-}
-
-interface PendingOutcome {
-  readonly kind: 'pending';
-  readonly exposureKnown: boolean;
-}
-
-type SubmissionOutcome = SnapshotOutcome | FailureOutcome | PendingOutcome;
-type NewPreparationOutcome = (
-  | { readonly kind: 'prepared'; readonly prepared: PreparedOrder }
-  | FailureOutcome
-  | PendingOutcome
-);
-type ExecutionStateObservation = 'executing' | 'ended' | 'unavailable';
-type ExposureCertainty = 'excluded' | 'possible' | 'unavailable';
-
-interface SnapshotValidation {
-  readonly valid: boolean;
-  readonly exposureKnown: boolean;
-  readonly failureCode: StrategyFailureCode;
-}
-
-const SNAPSHOT_STATUSES = new Set<OrderSnapshot['status']>([
-  'open',
-  'closed',
-  'canceled',
-  'rejected',
-  'unknown'
-]);
-const MAX_COORDINATOR_PRECISION = 1_000_000;
-const COORDINATOR_MIN_EXPONENT = -9_000_000_000_000_000;
-const COORDINATOR_MAX_EXPONENT = 9_000_000_000_000_000;
 const CoordinatorDecimal = Decimal.clone({
   precision: 80,
   rounding: Decimal.ROUND_DOWN,
-  minE: COORDINATOR_MIN_EXPONENT,
-  maxE: COORDINATOR_MAX_EXPONENT,
+  minE: -9_000_000_000_000_000,
+  maxE: 9_000_000_000_000_000,
   toExpNeg: -7,
   toExpPos: 21
 });
@@ -113,86 +80,8 @@ function parsedDecimal(
   return parsed;
 }
 
-function exactConstructor(values: readonly Decimal[]): Decimal.Constructor | null {
-  const highestExponent = Math.max(...values.map((value) => value.e));
-  const lowestSignificantExponent = Math.min(...values.map(
-    (value) => value.e - value.sd() + 1
-  ));
-  const requiredPrecision = highestExponent - lowestSignificantExponent + 4;
-  if (
-    !Number.isSafeInteger(requiredPrecision)
-    || requiredPrecision <= 0
-    || requiredPrecision > MAX_COORDINATOR_PRECISION
-  ) {
-    return null;
-  }
-  return CoordinatorDecimal.clone({
-    precision: Math.max(CoordinatorDecimal.precision, requiredPrecision),
-    rounding: Decimal.ROUND_DOWN,
-    minE: COORDINATOR_MIN_EXPONENT,
-    maxE: COORDINATOR_MAX_EXPONENT,
-    toExpNeg: -7,
-    toExpPos: 21
-  });
-}
-
-function exactQuantityDifference(
-  largerValue: string,
-  smallerValue: string
-): string | null {
-  const larger = parsedDecimal(largerValue, true);
-  const smaller = parsedDecimal(smallerValue, true);
-  if (larger === null || smaller === null || larger.lte(smaller)) {
-    return null;
-  }
-  const ExactDecimal = exactConstructor([larger, smaller]);
-  if (ExactDecimal === null) {
-    return null;
-  }
-  const difference = new ExactDecimal(largerValue).minus(smallerValue);
-  if (!difference.isFinite() || difference.lte(0)) {
-    return null;
-  }
-  return difference.toFixed();
-}
-
-function decimalEquals(leftValue: string, rightValue: string): boolean {
-  const left = parsedDecimal(leftValue, true);
-  const right = parsedDecimal(rightValue, true);
-  return left !== null && right !== null && left.eq(right);
-}
-
 function positivePrice(value: unknown): value is string {
   return parsedDecimal(value, false) !== null;
-}
-
-function positiveFillKnown(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
-  try {
-    return (
-      parsedDecimal(
-        Reflect.get(value, 'filledBaseQuantity'),
-        true
-      )?.gt(0) ?? false
-    );
-  } catch {
-    return false;
-  }
-}
-
-function snapshotExposurePossible(snapshot: Readonly<OrderSnapshot>): boolean {
-  const filled = parsedDecimal(snapshot.filledBaseQuantity, true);
-  return (
-    filled === null
-    || filled.gt(0)
-    || (
-      snapshot.status !== 'closed'
-      && snapshot.status !== 'canceled'
-      && snapshot.status !== 'rejected'
-    )
-  );
 }
 
 function accountSettingsMatch(
@@ -215,129 +104,6 @@ function accountSettingsMatch(
   );
 }
 
-function requestMatches(
-  actual: Readonly<OrderRequest>,
-  expected: Readonly<OrderRequest>
-): boolean {
-  return (
-    actual.symbol === expected.symbol
-    && actual.kind === expected.kind
-    && actual.type === expected.type
-    && actual.side === expected.side
-    && decimalEquals(actual.baseQuantity, expected.baseQuantity)
-    && actual.clientOrderId === expected.clientOrderId
-    && actual.timeInForce === expected.timeInForce
-    && actual.positionSide === expected.positionSide
-    && actual.marginMode === expected.marginMode
-    && (
-      actual.price === undefined
-        ? expected.price === undefined
-        : (
-          expected.price !== undefined
-          && decimalEquals(actual.price, expected.price)
-        )
-    )
-  );
-}
-
-function validateSnapshot(
-  snapshot: Readonly<OrderSnapshot>,
-  request: Readonly<OrderRequest>,
-  exchangeId: string
-): SnapshotValidation {
-  const filled = parsedDecimal(snapshot.filledBaseQuantity, true);
-  const exposureKnown = filled?.gt(0) ?? false;
-  const requested = parsedDecimal(snapshot.requestedBaseQuantity, false);
-  const remaining = parsedDecimal(snapshot.remainingBaseQuantity, true);
-  if (
-    snapshot.exchangeId !== exchangeId
-    || snapshot.clientOrderId !== request.clientOrderId
-    || snapshot.symbol !== request.symbol
-    || snapshot.kind !== request.kind
-    || snapshot.type !== request.type
-    || snapshot.side !== request.side
-    || typeof snapshot.exchangeOrderId !== 'string'
-    || snapshot.exchangeOrderId.length === 0
-    || snapshot.exchangeOrderId.trim() !== snapshot.exchangeOrderId
-    || requested === null
-    || filled === null
-    || remaining === null
-    || !requested.eq(request.baseQuantity)
-    || filled.gt(requested)
-    || remaining.gt(requested)
-    || !SNAPSHOT_STATUSES.has(snapshot.status)
-  ) {
-    return {
-      valid: false,
-      exposureKnown,
-      failureCode: 'INCONSISTENT_ORDER_STATE'
-    };
-  }
-  const ExactDecimal = exactConstructor([requested, filled, remaining]);
-  if (
-    ExactDecimal === null
-    || !new ExactDecimal(snapshot.filledBaseQuantity)
-      .plus(snapshot.remainingBaseQuantity)
-      .eq(snapshot.requestedBaseQuantity)
-  ) {
-    return {
-      valid: false,
-      exposureKnown,
-      failureCode: 'INCONSISTENT_ORDER_STATE'
-    };
-  }
-  if (snapshot.averagePrice !== null && !positivePrice(snapshot.averagePrice)) {
-    return {
-      valid: false,
-      exposureKnown,
-      failureCode: (
-        request.type === 'market' && exposureKnown
-          ? 'MISSING_AVERAGE_PRICE'
-          : 'INCONSISTENT_ORDER_STATE'
-      )
-    };
-  }
-  try {
-    if (new Date(snapshot.updatedAt).toISOString() !== snapshot.updatedAt) {
-      throw new Error('non-canonical timestamp');
-    }
-  } catch {
-    return {
-      valid: false,
-      exposureKnown,
-      failureCode: 'INCONSISTENT_ORDER_STATE'
-    };
-  }
-  return {
-    valid: true,
-    exposureKnown,
-    failureCode: 'INCONSISTENT_ORDER_STATE'
-  };
-}
-
-function failed(
-  failureCode: StrategyFailureCode,
-  exposureKnown: boolean
-): FailureOutcome {
-  return {
-    kind: 'failure',
-    failureCode,
-    exposureKnown
-  };
-}
-
-function pending(exposureKnown: boolean): PendingOutcome {
-  return { kind: 'pending', exposureKnown };
-}
-
-function reliableMarketTerminal(snapshot: Readonly<OrderSnapshot>): boolean {
-  return snapshot.status === 'closed' || snapshot.status === 'canceled';
-}
-
-function terminalOrderStatus(status: OrderSnapshot['status']): boolean {
-  return status === 'closed' || status === 'canceled' || status === 'rejected';
-}
-
 function safeStringProperty(
   value: unknown,
   property: string
@@ -355,59 +121,18 @@ function safeStringProperty(
 
 export class HedgeCoordinator {
   private readonly tradeEvents: TradeEventSink;
+  private readonly operationalLog: OperationalLog | undefined;
+  private readonly guardWarningKeys = new Set<string>();
 
   constructor(
     private readonly registry: ExchangeRegistry,
     private readonly repository: StrategyRepository,
-    tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK
+    private readonly reconciliation: ReconciliationRunner,
+    tradeEvents: TradeEventSink = NOOP_TRADE_EVENT_SINK,
+    operationalLog?: OperationalLog
   ) {
     this.tradeEvents = nonThrowingTradeEventSink(tradeEvents);
-  }
-
-  private recordOrderEvent(
-    name: OrderLifecycleEventName,
-    prepared: Readonly<PreparedOrder>,
-    snapshot?: Readonly<OrderSnapshot> | null,
-    details: Readonly<OrderEventDetails> = {}
-  ): void {
-    try {
-      this.tradeEvents.record(orderEvent(
-        name,
-        prepared.record,
-        snapshot,
-        {
-          mode: prepared.strategy.mode,
-          strategyState: prepared.strategy.state,
-          ...(details.failureCode === undefined
-            ? {}
-            : { failureCode: details.failureCode }),
-          ...(details.errorType === undefined
-            ? {}
-            : { errorType: details.errorType }),
-          ...(details.errorCode === undefined
-            ? {}
-            : { errorCode: details.errorCode })
-        }
-      ));
-    } catch {
-      // Logging is never allowed to change order execution behavior.
-    }
-  }
-
-  private recordSubmissionFailure(
-    name: 'order_rejected_before_submit' | 'order_submit_uncertain',
-    prepared: Readonly<PreparedOrder>,
-    failureCode: 'ORDER_SUBMISSION_FAILED' | 'ORDER_SUBMISSION_UNKNOWN',
-    error: unknown
-  ): void {
-    const errorCode = safeStringProperty(error, 'code');
-    this.recordOrderEvent(name, prepared, null, {
-      failureCode,
-      errorType: safeStringProperty(error, 'name') ?? 'UnknownError',
-      ...(errorCode === undefined
-        ? {}
-        : { errorCode })
-    });
+    this.operationalLog = nonThrowingOperationalLog(operationalLog);
   }
 
   async confirmAndExecute(strategyId: string): Promise<void> {
@@ -423,50 +148,33 @@ export class HedgeCoordinator {
 
   private async confirmAndExecuteOwned(strategyId: string): Promise<void> {
     let strategy = this.repository.getStrategy(strategyId);
-    if (strategy.preflight.accountSettings.positionMode !== 'hedged') {
-      return;
-    }
-    const recovering = strategy.state === 'EXECUTING';
     if (strategy.state === 'PENDING_CONFIRMATION') {
-      if (this.repository.listOrders(strategyId).length !== 0) {
-        return;
-      }
-      if (!this.repository.claimForExecution(strategyId)) {
-        return;
-      }
+      if (!this.repository.claimForExecution(strategyId)) return;
       strategy = this.repository.getStrategy(strategyId);
-    } else if (!recovering) {
+    }
+    if (strategy.state !== 'EXECUTING' && strategy.state !== 'WAITING_HEDGE') {
       return;
     }
 
-    const marginMode = strategy.preflight.accountSettings.marginMode;
-    if (marginMode !== 'isolated' && marginMode !== 'cross') {
-      this.failStrategy(strategy.id, false, 'INCONSISTENT_ORDER_STATE');
-      return;
+    let result = await this.reconciliation.run(strategyId);
+    if (result.kind === 'awaiting_market_submission') {
+      if (!await this.newSubmissionAllowed(strategy, false)) return;
+      const orders = this.planInitialMarketOrders(strategy);
+      const settled = await Promise.allSettled(
+        orders.map((order) => this.submitNew(strategy, order))
+      );
+      this.warnRejectedSubmissions(strategy, orders, settled);
+      result = await this.reconciliation.run(strategyId);
     }
-
-    const freshSettings = await this.freshSettingsGuard(strategy);
-    if (freshSettings !== null) {
-      if (freshSettings.kind === 'failure') {
-        this.failStrategy(
-          strategy.id,
-          freshSettings.exposureKnown,
-          freshSettings.failureCode
-        );
-      }
-      return;
-    }
-
-    switch (strategy.preflight.mode) {
-      case 'CONTRACT_FIRST':
-        await this.executeSequential(strategy, 'contract', marginMode);
-        return;
-      case 'SPOT_FIRST':
-        await this.executeSequential(strategy, 'spot', marginMode);
-        return;
-      case 'CONCURRENT':
-        await this.executeConcurrent(strategy, marginMode, recovering);
-        return;
+    if (result.kind === 'need_gtc') {
+      if (!await this.newSubmissionAllowed(strategy, true)) return;
+      const order = await this.planAuthorizedGtc(strategy, result);
+      if (order === null) return;
+      const settled = await Promise.allSettled([
+        this.submitNew(strategy, order)
+      ]);
+      this.warnRejectedSubmissions(strategy, [order], settled);
+      await this.reconciliation.run(strategyId);
     }
   }
 
@@ -516,46 +224,6 @@ export class HedgeCoordinator {
     return request;
   }
 
-  private prepare(
-    strategy: Readonly<StrategyRecord>,
-    role: OrderRole,
-    request: OrderRequest
-  ): PreparedOrder {
-    const existing = this.repository.listOrders(strategy.id)
-      .filter((order) => order.role === role);
-    if (existing.length > 1) {
-      throw new Error('strategy order role is not unique');
-    }
-    const gateway = this.registry.get(
-      role.startsWith('SPOT_')
-        ? strategy.spotExchangeId
-        : strategy.contractExchangeId
-    );
-    const existingOrder = existing[0];
-    if (existingOrder !== undefined) {
-      if (!requestMatches(existingOrder.request, request)) {
-        throw new Error('persisted order intent does not match execution role');
-      }
-      return {
-        gateway,
-        record: existingOrder,
-        existedBeforePreparation: true,
-        strategy
-      };
-    }
-    if (!this.isExecuting(strategy.id)) {
-      throw new Error('strategy execution ended before order planning');
-    }
-    const prepared: PreparedOrder = {
-      gateway,
-      record: this.repository.planOrder(strategy.id, role, request),
-      existedBeforePreparation: false,
-      strategy
-    };
-    this.recordOrderEvent('order_planned', prepared);
-    return prepared;
-  }
-
   private prepareExisting(
     strategy: Readonly<StrategyRecord>,
     order: Readonly<StrategyOrderRecord>
@@ -568,366 +236,106 @@ export class HedgeCoordinator {
     return {
       gateway,
       record: order,
-      existedBeforePreparation: true,
       strategy
     };
   }
 
-  private preparePlanned(
+  private planInitialMarketOrders(
+    strategy: Readonly<StrategyRecord>
+  ): StrategyOrderRecord[] {
+    if (this.repository.listOrders(strategy.id).length !== 0) return [];
+    const marginMode = strategy.preflight.accountSettings.marginMode;
+    if (marginMode !== 'isolated' && marginMode !== 'cross') return [];
+    const plans: StrategyOrderPlan[] = strategy.mode === 'CONCURRENT'
+      ? [
+          {
+            role: 'SPOT_MARKET',
+            request: this.marketRequest(strategy, 'spot', marginMode)
+          },
+          {
+            role: 'CONTRACT_MARKET',
+            request: this.marketRequest(strategy, 'contract', marginMode)
+          }
+        ]
+      : strategy.mode === 'CONTRACT_FIRST'
+        ? [{
+            role: 'CONTRACT_MARKET',
+            request: this.marketRequest(strategy, 'contract', marginMode)
+          }]
+        : [{
+            role: 'SPOT_MARKET',
+            request: this.marketRequest(strategy, 'spot', marginMode)
+          }];
+    const records = strategy.mode === 'CONCURRENT'
+      ? this.repository.planOrdersAtomically(strategy.id, plans)
+      : plans.map(({ role, request }) => (
+          this.repository.planOrder(strategy.id, role, request)
+        ));
+    for (const record of records) {
+      this.recordOrderEvent(
+        'order_planned',
+        this.prepareExisting(strategy, record)
+      );
+    }
+    return records;
+  }
+
+  private async planAuthorizedGtc(
     strategy: Readonly<StrategyRecord>,
-    role: OrderRole,
-    request: OrderRequest,
-    order: Readonly<StrategyOrderRecord>
-  ): PreparedOrder {
-    if (order.role !== role || !requestMatches(order.request, request)) {
-      throw new Error('atomically planned order does not match execution role');
-    }
-    return {
-      ...this.prepareExisting(strategy, order),
-      existedBeforePreparation: false
-    };
-  }
-
-  private async prepareNew(
-    strategy: Readonly<StrategyRecord>,
-    role: OrderRole,
-    request: OrderRequest,
-    fallbackExposureKnown = false
-  ): Promise<NewPreparationOutcome> {
-    const freshSettings = await this.freshSettingsGuard(
-      strategy,
-      fallbackExposureKnown
-    );
-    if (freshSettings !== null) {
-      return freshSettings;
-    }
-    return {
-      kind: 'prepared',
-      prepared: this.prepare(strategy, role, request)
-    };
-  }
-
-  private orderForRole(
-    strategyId: string,
-    role: OrderRole
-  ): StrategyOrderRecord | undefined {
-    const matches = this.repository.listOrders(strategyId)
-      .filter((order) => order.role === role);
-    if (matches.length > 1) {
-      throw new Error('strategy order role is not unique');
-    }
-    return matches[0];
-  }
-
-  private async reconcileUnexpectedTopology(
-    strategy: Readonly<StrategyRecord>,
-    orders: readonly StrategyOrderRecord[],
-    failureCode: StrategyFailureCode = 'INCONSISTENT_ORDER_STATE'
-  ): Promise<void> {
-    const settled = await Promise.allSettled(orders.map((order) => (
-      this.submit(this.prepareExisting(strategy, order))
-    )));
-    const rejected = settled.find(
-      (result): result is PromiseRejectedResult => result.status === 'rejected'
-    );
-    if (rejected !== undefined) {
-      this.failStrategyBestEffort(strategy.id, true, failureCode);
-      throw rejected.reason;
-    }
-    const outcomes = settled.map((result) => (
-      (result as PromiseFulfilledResult<SubmissionOutcome>).value
-    ));
-    if (outcomes.some((outcome) => outcome.kind === 'pending')) {
-      return;
-    }
-    this.failStrategy(strategy.id, true, failureCode);
-  }
-
-  private async lookupAndPersist(
-    prepared: Readonly<PreparedOrder>,
-    fallbackExposureKnown = false
-  ): Promise<SubmissionOutcome> {
-    if (!this.isExecuting(prepared.record.strategyId)) {
-      return pending(fallbackExposureKnown);
-    }
-    let found: OrderSnapshot | null;
-    try {
-      found = await prepared.gateway.findOrderByClientId(
-        prepared.record.clientOrderId,
-        prepared.record.request.symbol,
-        prepared.record.request.kind
-      );
-    } catch {
-      return pending(fallbackExposureKnown);
-    }
-    if (found === null) {
-      return pending(fallbackExposureKnown);
-    }
-    return this.persistSnapshot(
-      prepared,
-      found,
-      'lookup',
-      fallbackExposureKnown
-    );
-  }
-
-  private persistSnapshot(
-    prepared: Readonly<PreparedOrder>,
-    snapshot: OrderSnapshot,
-    source: 'submission' | 'lookup',
-    fallbackExposureKnown = false
-  ): SubmissionOutcome {
-    let exposureKnown = (
-      fallbackExposureKnown
-      || positiveFillKnown(snapshot)
-      || positiveFillKnown(prepared.record.snapshot)
-    );
-    let validation: SnapshotValidation;
-    try {
-      validation = validateSnapshot(
-        snapshot,
-        prepared.record.request,
-        prepared.gateway.exchangeId
-      );
-    } catch {
-      return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-    }
-    exposureKnown = exposureKnown || validation.exposureKnown;
-    if (!validation.valid) {
-      return failed(validation.failureCode, exposureKnown);
-    }
-
-    let persistedSnapshot = prepared.record.snapshot;
-    try {
-      const persistedOrder = this.repository
-        .listOrders(prepared.record.strategyId)
-        .find((order) => order.id === prepared.record.id);
-      if (persistedOrder === undefined) {
-        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-      }
-      if (
-        persistedOrder.role !== prepared.record.role
-        || persistedOrder.exchangeId !== prepared.record.exchangeId
-        || persistedOrder.clientOrderId !== prepared.record.clientOrderId
-        || !requestMatches(persistedOrder.request, prepared.record.request)
-      ) {
-        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-      }
-      persistedSnapshot = persistedOrder.snapshot;
-      exposureKnown = exposureKnown || positiveFillKnown(persistedSnapshot);
-    } catch {
-      return pending(exposureKnown);
-    }
-    if (persistedSnapshot !== null) {
-      const persistedFill = parsedDecimal(
-        persistedSnapshot.filledBaseQuantity,
-        true
-      );
-      const candidateFill = parsedDecimal(
-        snapshot.filledBaseQuantity,
-        true
-      );
-      if (
-        persistedFill === null
-        || candidateFill === null
-        || candidateFill.lt(persistedFill)
-      ) {
-        return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-      }
-    }
-    const executionState = this.executionState(prepared.record.strategyId);
-    if (executionState === 'unavailable') {
-      return pending(exposureKnown);
-    }
-    if (executionState === 'ended') {
-      return failed('INCONSISTENT_ORDER_STATE', exposureKnown);
-    }
-    try {
-      this.repository.attachOrderSnapshot(prepared.record.id, snapshot);
-    } catch {
-      return pending(exposureKnown);
-    }
-    if (source === 'submission') {
-      this.recordOrderEvent('order_submit_succeeded', prepared, snapshot);
-    }
-    this.recordOrderEvent('order_status_changed', prepared, snapshot);
-    if (terminalOrderStatus(snapshot.status)) {
-      this.recordOrderEvent('order_terminal', prepared, snapshot);
-    }
-    if (snapshot.status === 'unknown') {
-      return pending(exposureKnown);
-    }
-    return { kind: 'snapshot', snapshot };
-  }
-
-  private async submit(
-    prepared: Readonly<PreparedOrder>
-  ): Promise<SubmissionOutcome> {
-    const persistedExposureKnown = (
-      prepared.record.snapshot !== null
-      && (
-        parsedDecimal(
-          prepared.record.snapshot.filledBaseQuantity,
-          true
-        )?.gt(0) ?? false
-      )
-    );
-    const executionState = this.executionState(prepared.record.strategyId);
-    if (executionState === 'unavailable') {
-      return pending(persistedExposureKnown);
-    }
-    if (executionState === 'ended') {
-      return failed('INCONSISTENT_ORDER_STATE', persistedExposureKnown);
-    }
-    if (prepared.record.snapshot !== null) {
-      if (prepared.record.snapshot.status === 'unknown') {
-        return this.lookupAndPersist(
-          prepared,
-          persistedExposureKnown
-        );
-      }
-      return {
-        kind: 'snapshot',
-        snapshot: prepared.record.snapshot
-      };
-    }
-    if (prepared.existedBeforePreparation) {
-      return this.lookupAndPersist(prepared);
-    }
-
-    let snapshot: OrderSnapshot;
-    this.recordOrderEvent('order_submit_started', prepared, null);
-    try {
-      snapshot = await prepared.gateway.createOrder(prepared.record.request);
-    } catch (error) {
-      if (error instanceof NoOrderSubmittedError) {
-        this.recordSubmissionFailure(
-          'order_rejected_before_submit',
-          prepared,
-          'ORDER_SUBMISSION_FAILED',
-          error
-        );
-        return failed('ORDER_SUBMISSION_FAILED', persistedExposureKnown);
-      }
-      this.recordSubmissionFailure(
-        'order_submit_uncertain',
-        prepared,
-        'ORDER_SUBMISSION_UNKNOWN',
-        error
-      );
-      return this.lookupAndPersist(prepared);
-    }
-    if (snapshot.status === 'unknown') {
-      const persisted = this.persistSnapshot(
-        prepared,
-        snapshot,
-        'submission'
-      );
-      if (persisted.kind === 'failure') {
-        return persisted;
-      }
-      return this.lookupAndPersist(
-        prepared,
-        persisted.kind === 'pending'
-          ? persisted.exposureKnown
-          : positiveFillKnown(snapshot)
-      );
-    }
-    return this.persistSnapshot(prepared, snapshot, 'submission');
-  }
-
-  private isExecuting(strategyId: string): boolean {
-    return this.executionState(strategyId) === 'executing';
-  }
-
-  private executionState(strategyId: string): ExecutionStateObservation {
-    try {
-      return this.repository.getStrategy(strategyId).state === 'EXECUTING'
-        ? 'executing'
-        : 'ended';
-    } catch {
-      return 'unavailable';
-    }
-  }
-
-  private exposureCertainty(
-    strategyId: string,
-    fallbackExposureKnown: boolean
-  ): ExposureCertainty {
-    if (fallbackExposureKnown) {
-      return 'possible';
-    }
-    let orders: StrategyOrderRecord[];
-    try {
-      orders = this.repository.listOrders(strategyId);
-    } catch {
-      return 'unavailable';
-    }
-    if (orders.length === 0) {
-      return 'excluded';
-    }
-    for (const order of orders) {
-      const snapshot = order.snapshot;
-      if (snapshot === null) {
-        return 'possible';
-      }
-      if (snapshotExposurePossible(snapshot)) {
-        return 'possible';
-      }
-    }
-    return 'excluded';
-  }
-
-  private async freshSettingsGuard(
-    strategy: Readonly<StrategyRecord>,
-    fallbackExposureKnown = false
-  ): Promise<FailureOutcome | PendingOutcome | null> {
-    const contractGateway = this.registry.get(strategy.contractExchangeId);
-    let current: AccountSettings;
-    try {
-      current = await contractGateway.fetchAccountSettings(strategy.symbol);
-    } catch {
-      return pending(fallbackExposureKnown);
-    }
-    if (accountSettingsMatch(strategy.preflight.accountSettings, current)) {
+    authorization: Extract<ReconciliationResult, { kind: 'need_gtc' }>
+  ): Promise<StrategyOrderRecord | null> {
+    if (
+      this.repository.listOrders(strategy.id)
+        .some(({ role }) => role.endsWith('_HEDGE_GTC'))
+    ) {
       return null;
     }
-    const exposure = this.exposureCertainty(
+    const leg = authorization.role === 'SPOT_HEDGE_GTC'
+      ? 'spot'
+      : 'contract';
+    const kind = leg === 'spot' ? 'spot' : 'swap';
+    const gateway = this.registry.get(
+      leg === 'spot'
+        ? strategy.spotExchangeId
+        : strategy.contractExchangeId
+    );
+    const price = await this.quantizedPrice(
+      gateway,
+      strategy.symbol,
+      kind,
+      authorization.referencePrice
+    );
+    if (price === null) {
+      this.operationalLog?.warn('hedge_submission_price_pending', {
+        strategyId: strategy.id,
+        strategyState: strategy.state,
+        conclusion: 'pending',
+        reason: 'PRICE_QUANTIZATION_FAILED',
+        role: authorization.role,
+        exchangeId: gateway.exchangeId,
+        exposureKnown: true
+      });
+      return null;
+    }
+    const marginMode = strategy.preflight.accountSettings.marginMode;
+    if (marginMode !== 'isolated' && marginMode !== 'cross') return null;
+    const request = this.hedgeRequest(
+      strategy,
+      leg,
+      authorization.baseQuantity,
+      price,
+      marginMode
+    );
+    const record = this.repository.planOrder(
       strategy.id,
-      fallbackExposureKnown
+      authorization.role,
+      request
     );
-    if (exposure === 'unavailable') {
-      return pending(fallbackExposureKnown);
-    }
-    return failed(
-      'INCONSISTENT_ORDER_STATE',
-      exposure === 'possible'
+    this.recordOrderEvent(
+      'order_planned',
+      this.prepareExisting(strategy, record)
     );
-  }
-
-  private failStrategy(
-    strategyId: string,
-    exposureKnown: boolean,
-    failureCode: StrategyFailureCode
-  ): void {
-    this.repository.transition(
-      strategyId,
-      ['EXECUTING'],
-      exposureKnown ? 'HEDGE_INCOMPLETE' : 'FAILED',
-      failureCode
-    );
-  }
-
-  private failStrategyBestEffort(
-    strategyId: string,
-    exposureKnown: boolean,
-    failureCode: StrategyFailureCode
-  ): void {
-    try {
-      this.failStrategy(strategyId, exposureKnown, failureCode);
-    } catch {
-      // Preserve the fixed typed carrier without retaining the unsafe cause.
-    }
+    return record;
   }
 
   private async quantizedPrice(
@@ -945,577 +353,226 @@ export class HedgeCoordinator {
     return positivePrice(quantized) ? quantized : null;
   }
 
-  private finishHedge(
-    strategyId: string,
-    targetQuantity: string,
-    outcome: SubmissionOutcome
-  ): void {
-    if (outcome.kind === 'pending') {
-      return;
+  private safeAccountSettingsSummary(
+    settings: Readonly<AccountSettings>
+  ): string {
+    const marginMode = settings.marginMode === 'isolated'
+      || settings.marginMode === 'cross'
+      || settings.marginMode === 'unknown'
+      ? settings.marginMode
+      : 'invalid';
+    const positionMode = settings.positionMode === 'hedged'
+      || settings.positionMode === 'one-way'
+      || settings.positionMode === 'unknown'
+      ? settings.positionMode
+      : 'invalid';
+    let leverage = 'invalid';
+    if (typeof settings.leverage === 'string') {
+      try {
+        const parsed = new Decimal(settings.leverage);
+        if (parsed.isFinite() && parsed.gt(0)) leverage = parsed.toString();
+      } catch {
+        // Invalid runtime data is represented only by the fixed token above.
+      }
     }
-    if (outcome.kind === 'failure') {
-      this.failStrategy(strategyId, true, outcome.failureCode);
-      return;
-    }
-    const { snapshot } = outcome;
-    if (snapshot.status === 'rejected') {
-      this.failStrategy(strategyId, true, 'HEDGE_ORDER_REJECTED');
-      return;
-    }
-    if (snapshot.status === 'canceled') {
-      this.failStrategy(strategyId, true, 'HEDGE_ORDER_CANCELED');
-      return;
-    }
-    if (snapshot.status === 'open') {
-      this.repository.transition(
-        strategyId,
-        ['EXECUTING'],
-        'WAITING_HEDGE'
-      );
-      return;
-    }
-    if (
-      snapshot.status === 'closed'
-      && decimalEquals(snapshot.filledBaseQuantity, targetQuantity)
-      && decimalEquals(snapshot.remainingBaseQuantity, '0')
-    ) {
-      this.repository.transition(strategyId, ['EXECUTING'], 'HEDGED');
-      return;
-    }
-    this.failStrategy(strategyId, true, 'INCONSISTENT_ORDER_STATE');
+    return [
+      `marginMode=${marginMode}`,
+      `positionMode=${positionMode}`,
+      `leverage=${leverage}`
+    ].join(',');
   }
 
-  private async executeSequential(
+  private warnSubmissionGuard(
     strategy: Readonly<StrategyRecord>,
-    firstLeg: 'spot' | 'contract',
-    marginMode: ConfirmedMarginMode
-  ): Promise<void> {
-    const firstRole: OrderRole = firstLeg === 'spot'
-      ? 'SPOT_MARKET'
-      : 'CONTRACT_MARKET';
-    const secondLeg = firstLeg === 'spot' ? 'contract' : 'spot';
-    const secondRole: OrderRole = secondLeg === 'spot'
-      ? 'SPOT_HEDGE_GTC'
-      : 'CONTRACT_HEDGE_GTC';
-    const existingOrders = this.repository.listOrders(strategy.id);
-    const expectedRoles = new Set<OrderRole>([firstRole, secondRole]);
-    if (existingOrders.some((order) => !expectedRoles.has(order.role))) {
-      await this.reconcileUnexpectedTopology(strategy, existingOrders);
-      return;
-    }
-    const existingFirst = this.orderForRole(strategy.id, firstRole);
-    const existingSecond = this.orderForRole(strategy.id, secondRole);
-    if (existingFirst === undefined && existingSecond !== undefined) {
-      const unexpected = await this.submit(
-        this.prepareExisting(strategy, existingSecond)
-      );
-      if (unexpected.kind === 'failure') {
-        this.failStrategy(
-          strategy.id,
-          true,
-          unexpected.failureCode
-        );
-      } else {
-        this.failStrategy(
-          strategy.id,
-          true,
-          'INCONSISTENT_ORDER_STATE'
-        );
-      }
-      return;
-    }
-    const expectedFirstRequest = this.marketRequest(
-      strategy,
-      firstLeg,
-      marginMode
-    );
-    let first: PreparedOrder;
-    if (existingFirst === undefined) {
-      const preparation = await this.prepareNew(
+    event: 'hedge_submission_guard_pending' | 'hedge_submission_guard_changed',
+    reason: 'ACCOUNT_SETTINGS_UNAVAILABLE' | 'ACCOUNT_SETTINGS_CHANGED',
+    exposureKnown: boolean,
+    current?: Readonly<AccountSettings>
+  ): void {
+    const key = `${strategy.id}:${reason}:${strategy.updatedAt}`;
+    if (this.guardWarningKeys.has(key)) return;
+    this.guardWarningKeys.add(key);
+    this.operationalLog?.warn(event, {
+      strategyId: strategy.id,
+      strategyState: strategy.state,
+      conclusion: 'pending',
+      reason,
+      expected: this.safeAccountSettingsSummary(
+        strategy.preflight.accountSettings
+      ),
+      ...(current === undefined
+        ? {}
+        : { actual: this.safeAccountSettingsSummary(current) }),
+      exposureKnown
+    });
+  }
+
+  private async newSubmissionAllowed(
+    strategy: Readonly<StrategyRecord>,
+    exposureKnown: boolean
+  ): Promise<boolean> {
+    let current: AccountSettings;
+    try {
+      current = await this.registry.get(strategy.contractExchangeId)
+        .fetchAccountSettings(strategy.symbol);
+    } catch {
+      this.warnSubmissionGuard(
         strategy,
-        firstRole,
-        expectedFirstRequest
+        'hedge_submission_guard_pending',
+        'ACCOUNT_SETTINGS_UNAVAILABLE',
+        exposureKnown
       );
-      if (preparation.kind !== 'prepared') {
-        if (preparation.kind === 'failure') {
-          this.failStrategy(
-            strategy.id,
-            preparation.exposureKnown,
-            preparation.failureCode
+      return false;
+    }
+    if (!accountSettingsMatch(strategy.preflight.accountSettings, current)) {
+      this.warnSubmissionGuard(
+        strategy,
+        'hedge_submission_guard_changed',
+        'ACCOUNT_SETTINGS_CHANGED',
+        exposureKnown,
+        current
+      );
+      return false;
+    }
+    return true;
+  }
+
+  private warnRejectedSubmissions(
+    strategy: Readonly<StrategyRecord>,
+    orders: readonly StrategyOrderRecord[],
+    settled: readonly PromiseSettledResult<void>[]
+  ): void {
+    for (const [index, result] of settled.entries()) {
+      if (result.status !== 'rejected') continue;
+      const order = orders[index];
+      if (order === undefined) continue;
+      this.operationalLog?.warn('hedge_submission_internal_failure', {
+        strategyId: strategy.id,
+        strategyState: strategy.state,
+        conclusion: 'pending',
+        reason: 'SUBMISSION_INTERNAL_FAILURE',
+        role: order.role,
+        exchangeId: order.exchangeId,
+        strategyOrderId: order.id,
+        clientOrderId: order.clientOrderId,
+        exposureKnown: order.role.endsWith('_HEDGE_GTC')
+      });
+    }
+  }
+
+  private warnSubmissionEvidenceConflict(
+    strategy: Readonly<StrategyRecord>,
+    order: Readonly<StrategyOrderRecord>,
+    exposureKnown: boolean
+  ): void {
+    this.operationalLog?.warn('hedge_submission_evidence_conflict', {
+      strategyId: strategy.id,
+      strategyState: strategy.state,
+      conclusion: 'pending',
+      reason: 'SUBMISSION_EVIDENCE_WRITE_CONFLICT',
+      role: order.role,
+      exchangeId: order.exchangeId,
+      strategyOrderId: order.id,
+      clientOrderId: order.clientOrderId,
+      exposureKnown
+    });
+  }
+
+  private async submitNew(
+    strategy: Readonly<StrategyRecord>,
+    order: Readonly<StrategyOrderRecord>
+  ): Promise<void> {
+    const prepared = this.prepareExisting(strategy, order);
+    this.recordOrderEvent('order_submit_started', prepared, null);
+    let snapshot: OrderSnapshot;
+    try {
+      snapshot = await prepared.gateway.createOrder(order.request);
+    } catch (error) {
+      if (error instanceof NoOrderSubmittedError) {
+        const failureCode: OrderSubmissionFailureCode =
+          error.reason === 'UNTRADABLE_REQUEST'
+          && order.role.endsWith('_HEDGE_GTC')
+            ? 'HEDGE_RESIDUAL_NOT_TRADABLE'
+            : 'ORDER_SUBMISSION_FAILED';
+        this.recordSubmissionFailure(
+          'order_rejected_before_submit',
+          prepared,
+          failureCode,
+          error
+        );
+        try {
+          const written = this.repository.markDefinitelyNotSubmitted(
+            order.id,
+            failureCode
+          );
+          if (!written) {
+            this.warnSubmissionEvidenceConflict(
+              strategy,
+              order,
+              order.role.endsWith('_HEDGE_GTC')
+            );
+          }
+        } catch {
+          this.warnSubmissionEvidenceConflict(
+            strategy,
+            order,
+            order.role.endsWith('_HEDGE_GTC')
           );
         }
         return;
       }
-      first = preparation.prepared;
-    } else {
-      first = this.prepareExisting(strategy, existingFirst);
-    }
-    const firstOutcome = await this.submit(first);
-    if (firstOutcome.kind === 'pending') {
-      return;
-    }
-    if (firstOutcome.kind === 'failure') {
-      this.failStrategy(
-        strategy.id,
-        firstOutcome.exposureKnown,
-        firstOutcome.failureCode
+      this.recordSubmissionFailure(
+        'order_submit_uncertain',
+        prepared,
+        'ORDER_SUBMISSION_UNKNOWN',
+        error
       );
       return;
     }
-
-    if (!requestMatches(first.record.request, expectedFirstRequest)) {
-      this.failStrategy(
-        strategy.id,
-        parsedDecimal(
-          firstOutcome.snapshot.filledBaseQuantity,
-          true
-        )?.gt(0) ?? false,
-        'INCONSISTENT_ORDER_STATE'
-      );
-      return;
-    }
-    const firstSnapshot = firstOutcome.snapshot;
-    const filled = parsedDecimal(firstSnapshot.filledBaseQuantity, true);
-    if (filled === null) {
-      this.failStrategy(strategy.id, false, 'INCONSISTENT_ORDER_STATE');
-      return;
-    }
-    if (firstSnapshot.status === 'open' || firstSnapshot.status === 'unknown') {
-      return;
-    }
-    if (firstSnapshot.status === 'rejected') {
-      this.failStrategy(
-        strategy.id,
-        filled.gt(0),
-        filled.gt(0)
-          ? 'INCONSISTENT_ORDER_STATE'
-          : 'ORDER_SUBMISSION_FAILED'
-      );
-      return;
-    }
-    if (!reliableMarketTerminal(firstSnapshot)) {
-      this.failStrategy(
-        strategy.id,
-        filled.gt(0),
-        'INCONSISTENT_ORDER_STATE'
-      );
-      return;
-    }
-    if (filled.isZero()) {
-      this.failStrategy(strategy.id, false, 'NO_FILL');
-      return;
-    }
-    if (
-      firstSnapshot.averagePrice === null
-      || !positivePrice(firstSnapshot.averagePrice)
-    ) {
-      this.failStrategy(strategy.id, true, 'MISSING_AVERAGE_PRICE');
-      return;
-    }
-    const targetQuantity = firstSnapshot.filledBaseQuantity;
-    if (existingSecond !== undefined) {
-      const second = this.prepareExisting(strategy, existingSecond);
-      const secondOutcome = await this.submit(second);
-      if (!decimalEquals(
-        second.record.request.baseQuantity,
-        targetQuantity
-      )) {
-        this.failStrategy(
-          strategy.id,
-          true,
-          'INCONSISTENT_ORDER_STATE'
-        );
-        return;
-      }
-      this.finishHedge(strategy.id, targetQuantity, secondOutcome);
-      return;
-    }
-    const secondGateway = this.registry.get(
-      secondLeg === 'spot'
-        ? strategy.spotExchangeId
-        : strategy.contractExchangeId
-    );
-    const price = await this.quantizedPrice(
-      secondGateway,
-      strategy.symbol,
-      secondLeg === 'spot' ? 'spot' : 'swap',
-      firstSnapshot.averagePrice
-    );
-    if (price === null) {
-      this.failStrategy(strategy.id, true, 'ORDER_RECONCILIATION_FAILED');
-      return;
-    }
-    const secondPreparation = await this.prepareNew(
-      strategy,
-      secondRole,
-      this.hedgeRequest(
-        strategy,
-        secondLeg,
-        targetQuantity,
-        price,
-        marginMode
-      ),
-      true
-    );
-    if (secondPreparation.kind !== 'prepared') {
-      if (secondPreparation.kind === 'failure') {
-        this.failStrategy(
-          strategy.id,
-          secondPreparation.exposureKnown,
-          secondPreparation.failureCode
-        );
-      }
-      return;
-    }
-    const second = secondPreparation.prepared;
-    const secondOutcome = await this.submit(second);
-    this.finishHedge(strategy.id, targetQuantity, secondOutcome);
+    this.recordOrderEvent('order_submit_succeeded', prepared, snapshot);
   }
 
-  private async executeConcurrent(
-    strategy: Readonly<StrategyRecord>,
-    marginMode: ConfirmedMarginMode,
-    recovering: boolean
-  ): Promise<void> {
-    const existingOrders = this.repository.listOrders(strategy.id);
-    const marketOrders = existingOrders.filter(
-      (order) => (
-        order.role === 'SPOT_MARKET'
-        || order.role === 'CONTRACT_MARKET'
-      )
-    );
-    const hedgeOrders = existingOrders.filter(
-      (order) => order.role.endsWith('_HEDGE_GTC')
-    );
-    if (
-      recovering
-      && (
-        hedgeOrders.length > 1
-        || (marketOrders.length < 2 && hedgeOrders.length !== 0)
-      )
-    ) {
-      await this.reconcileUnexpectedTopology(strategy, existingOrders);
-      return;
-    }
-    if (recovering && marketOrders.length === 1) {
-      const incomplete = await this.submit(
-        this.prepareExisting(strategy, marketOrders[0] as StrategyOrderRecord)
-      );
-      if (incomplete.kind === 'pending') {
-        return;
-      }
-      if (incomplete.kind === 'failure') {
-        this.failStrategy(
-          strategy.id,
-          incomplete.exposureKnown,
-          incomplete.failureCode
-        );
-      } else {
-        const exposureKnown = parsedDecimal(
-          incomplete.snapshot.filledBaseQuantity,
-          true
-        )?.gt(0) ?? false;
-        if (
-          incomplete.snapshot.status === 'open'
-          || incomplete.snapshot.status === 'unknown'
-        ) {
-          return;
+  private recordOrderEvent(
+    name: OrderLifecycleEventName,
+    prepared: Readonly<PreparedOrder>,
+    snapshot?: Readonly<OrderSnapshot> | null,
+    details: Readonly<OrderEventDetails> = {}
+  ): void {
+    try {
+      this.tradeEvents.record(orderEvent(
+        name,
+        prepared.record,
+        snapshot,
+        {
+          mode: prepared.strategy.mode,
+          strategyState: prepared.strategy.state,
+          ...(details.failureCode === undefined
+            ? {}
+            : { failureCode: details.failureCode }),
+          ...(details.errorType === undefined
+            ? {}
+            : { errorType: details.errorType }),
+          ...(details.errorCode === undefined
+            ? {}
+            : { errorCode: details.errorCode })
         }
-        this.failStrategy(
-          strategy.id,
-          exposureKnown,
-          'INCONSISTENT_ORDER_STATE'
-        );
-      }
-      return;
-    }
-    if (
-      recovering
-      && marketOrders.length === 0
-      && existingOrders.length !== 0
-    ) {
-      const unexpected = await this.submit(
-        this.prepareExisting(
-          strategy,
-          existingOrders[0] as StrategyOrderRecord
-        )
-      );
-      if (unexpected.kind === 'pending') {
-        return;
-      }
-      this.failStrategy(
-        strategy.id,
-        true,
-        unexpected.kind === 'failure'
-          ? unexpected.failureCode
-          : 'INCONSISTENT_ORDER_STATE'
-      );
-      return;
-    }
-    const newOrderSettings = await Promise.all([
-      this.freshSettingsGuard(strategy),
-      this.freshSettingsGuard(strategy)
-    ]);
-    const settingsFailure = newOrderSettings.find(
-      (outcome): outcome is FailureOutcome => outcome?.kind === 'failure'
-    );
-    if (settingsFailure !== undefined) {
-      this.failStrategy(
-        strategy.id,
-        settingsFailure.exposureKnown,
-        settingsFailure.failureCode
-      );
-      return;
-    }
-    if (newOrderSettings.some((outcome) => outcome?.kind === 'pending')) {
-      return;
-    }
-
-    let spot: PreparedOrder;
-    let contract: PreparedOrder;
-    if (recovering && marketOrders.length === 2) {
-      const spotRecord = marketOrders.find(
-        (order) => order.role === 'SPOT_MARKET'
-      );
-      const contractRecord = marketOrders.find(
-        (order) => order.role === 'CONTRACT_MARKET'
-      );
-      if (spotRecord === undefined || contractRecord === undefined) {
-        await this.reconcileUnexpectedTopology(strategy, marketOrders);
-        return;
-      }
-      spot = this.prepareExisting(strategy, spotRecord);
-      contract = this.prepareExisting(strategy, contractRecord);
-    } else {
-      if (!this.isExecuting(strategy.id)) {
-        throw new Error('strategy execution ended before order planning');
-      }
-      const spotRequest = this.marketRequest(strategy, 'spot', marginMode);
-      const contractRequest = this.marketRequest(strategy, 'contract', marginMode);
-      const [spotRecord, contractRecord] = this.repository.planOrdersAtomically(
-        strategy.id,
-        [
-          { role: 'SPOT_MARKET', request: spotRequest },
-          { role: 'CONTRACT_MARKET', request: contractRequest }
-        ]
-      );
-      if (spotRecord === undefined || contractRecord === undefined) {
-        throw new Error('atomic concurrent planning did not return both roles');
-      }
-      spot = this.preparePlanned(
-        strategy,
-        'SPOT_MARKET',
-        spotRequest,
-        spotRecord
-      );
-      contract = this.preparePlanned(
-        strategy,
-        'CONTRACT_MARKET',
-        contractRequest,
-        contractRecord
-      );
-      this.recordOrderEvent('order_planned', spot);
-      this.recordOrderEvent('order_planned', contract);
-    }
-
-    const settled = await Promise.allSettled([
-      this.submit(spot),
-      this.submit(contract)
-    ]);
-    const knownExposure = settled.some((result) => (
-      result.status === 'fulfilled'
-        ? (
-          result.value.kind === 'snapshot'
-            ? positiveFillKnown(result.value.snapshot)
-            : result.value.exposureKnown
-        )
-        : false
-    ));
-    const rejected = settled.find(
-      (result): result is PromiseRejectedResult => result.status === 'rejected'
-    );
-    if (rejected !== undefined) {
-      this.failStrategyBestEffort(
-        strategy.id,
-        knownExposure,
-        'INCONSISTENT_ORDER_STATE'
-      );
-      throw rejected.reason;
-    }
-
-    const outcomes = settled.map((result) => (
-      (result as PromiseFulfilledResult<SubmissionOutcome>).value
-    ));
-    const submissionFailure = outcomes.find(
-      (outcome): outcome is FailureOutcome => outcome.kind === 'failure'
-    );
-    if (submissionFailure !== undefined) {
-      if (hedgeOrders.length !== 0) {
-        await this.reconcileUnexpectedTopology(strategy, hedgeOrders);
-        return;
-      }
-      const exposureKnown = outcomes.some((outcome) => (
-        outcome.kind === 'pending'
-          ? true
-          : outcome.kind === 'snapshot'
-            ? snapshotExposurePossible(outcome.snapshot)
-            : outcome.exposureKnown
       ));
-      this.failStrategy(
-        strategy.id,
-        exposureKnown,
-        submissionFailure.failureCode
-      );
-      return;
+    } catch {
+      // Logging is never allowed to change order execution behavior.
     }
-    if (outcomes.some((outcome) => outcome.kind === 'pending')) {
-      return;
-    }
+  }
 
-    const spotSnapshot = (outcomes[0] as SnapshotOutcome).snapshot;
-    const contractSnapshot = (outcomes[1] as SnapshotOutcome).snapshot;
-    const spotFilled = parsedDecimal(
-      spotSnapshot.filledBaseQuantity,
-      true
-    );
-    const contractFilled = parsedDecimal(
-      contractSnapshot.filledBaseQuantity,
-      true
-    );
-    if (spotFilled === null || contractFilled === null) {
-      this.failStrategy(strategy.id, false, 'INCONSISTENT_ORDER_STATE');
-      return;
-    }
-    const marketSnapshots = [spotSnapshot, contractSnapshot];
-    const rejectedMarket = marketSnapshots.find(
-      (snapshot) => snapshot.status === 'rejected'
-    );
-    if (rejectedMarket !== undefined) {
-      const exposureKnown = spotFilled.gt(0) || contractFilled.gt(0);
-      this.failStrategy(
-        strategy.id,
-        exposureKnown,
-        exposureKnown
-          ? 'INCONSISTENT_ORDER_STATE'
-          : 'ORDER_SUBMISSION_FAILED'
-      );
-      return;
-    }
-    if (marketSnapshots.some((snapshot) => (
-      snapshot.status === 'open' || snapshot.status === 'unknown'
-    ))) {
-      return;
-    }
-    if (marketSnapshots.some((snapshot) => !reliableMarketTerminal(snapshot))) {
-      this.failStrategy(
-        strategy.id,
-        spotFilled.gt(0) || contractFilled.gt(0),
-        'INCONSISTENT_ORDER_STATE'
-      );
-      return;
-    }
-    if (spotFilled.isZero() && contractFilled.isZero()) {
-      if (hedgeOrders.length !== 0) {
-        await this.reconcileUnexpectedTopology(strategy, existingOrders);
-      } else {
-        this.failStrategy(strategy.id, false, 'NO_FILL');
-      }
-      return;
-    }
-    if (spotFilled.eq(contractFilled)) {
-      if (hedgeOrders.length !== 0) {
-        await this.reconcileUnexpectedTopology(strategy, existingOrders);
-      } else {
-        this.repository.transition(strategy.id, ['EXECUTING'], 'HEDGED');
-      }
-      return;
-    }
-
-    const spotIsLarger = spotFilled.gt(contractFilled);
-    const largerSnapshot = spotIsLarger ? spotSnapshot : contractSnapshot;
-    const difference = exactQuantityDifference(
-      largerSnapshot.filledBaseQuantity,
-      spotIsLarger
-        ? contractSnapshot.filledBaseQuantity
-        : spotSnapshot.filledBaseQuantity
-    );
-    if (difference === null) {
-      this.failStrategy(strategy.id, true, 'INCONSISTENT_ORDER_STATE');
-      return;
-    }
-    if (
-      largerSnapshot.averagePrice === null
-      || !positivePrice(largerSnapshot.averagePrice)
-    ) {
-      this.failStrategy(strategy.id, true, 'MISSING_AVERAGE_PRICE');
-      return;
-    }
-    const smallerLeg = spotIsLarger ? 'contract' : 'spot';
-    const differenceRole: OrderRole = spotIsLarger
-      ? 'CONTRACT_HEDGE_GTC'
-      : 'SPOT_HEDGE_GTC';
-    if (
-      hedgeOrders.some((order) => order.role !== differenceRole)
-    ) {
-      await this.reconcileUnexpectedTopology(strategy, existingOrders);
-      return;
-    }
-    const smallerGateway = spotIsLarger ? contract.gateway : spot.gateway;
-    const existingDifference = this.orderForRole(
-      strategy.id,
-      differenceRole
-    );
-    if (existingDifference !== undefined) {
-      const hedge = this.prepareExisting(strategy, existingDifference);
-      const hedgeOutcome = await this.submit(hedge);
-      if (!decimalEquals(
-        hedge.record.request.baseQuantity,
-        difference
-      )) {
-        this.failStrategy(
-          strategy.id,
-          true,
-          'INCONSISTENT_ORDER_STATE'
-        );
-        return;
-      }
-      this.finishHedge(strategy.id, difference, hedgeOutcome);
-      return;
-    }
-    const price = await this.quantizedPrice(
-      smallerGateway,
-      strategy.symbol,
-      smallerLeg === 'spot' ? 'spot' : 'swap',
-      largerSnapshot.averagePrice
-    );
-    if (price === null) {
-      this.failStrategy(strategy.id, true, 'ORDER_RECONCILIATION_FAILED');
-      return;
-    }
-    const hedgePreparation = await this.prepareNew(
-      strategy,
-      differenceRole,
-      this.hedgeRequest(
-        strategy,
-        smallerLeg,
-        difference,
-        price,
-        marginMode
-      ),
-      true
-    );
-    if (hedgePreparation.kind !== 'prepared') {
-      if (hedgePreparation.kind === 'failure') {
-        this.failStrategy(
-          strategy.id,
-          hedgePreparation.exposureKnown,
-          hedgePreparation.failureCode
-        );
-      }
-      return;
-    }
-    const hedge = hedgePreparation.prepared;
-    const hedgeOutcome = await this.submit(hedge);
-    this.finishHedge(strategy.id, difference, hedgeOutcome);
+  private recordSubmissionFailure(
+    name: 'order_rejected_before_submit' | 'order_submit_uncertain',
+    prepared: Readonly<PreparedOrder>,
+    failureCode: StrategyFailureCode,
+    error: unknown
+  ): void {
+    const errorCode = safeStringProperty(error, 'code');
+    this.recordOrderEvent(name, prepared, null, {
+      failureCode,
+      errorType: safeStringProperty(error, 'name') ?? 'UnknownError',
+      ...(errorCode === undefined ? {} : { errorCode })
+    });
   }
 }

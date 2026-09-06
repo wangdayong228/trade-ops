@@ -41,6 +41,22 @@ export interface OperationalFields {
   readonly databasePath?: string;
   readonly exchangeIds?: readonly string[];
   readonly strategyId?: string;
+  readonly strategyState?: string;
+  readonly conclusion?: string;
+  readonly failureCode?: string;
+  readonly reason?: string;
+  readonly role?: string;
+  readonly exchangeId?: string;
+  readonly strategyOrderId?: string;
+  readonly clientOrderId?: string;
+  readonly exchangeOrderId?: string;
+  readonly expected?: string;
+  readonly actual?: string;
+  readonly exposureKnown?: boolean;
+  readonly marketSpot?: string;
+  readonly marketContract?: string;
+  readonly preGtcResidual?: string;
+  readonly currentResidual?: string;
   readonly requestId?: string;
   readonly method?: string;
   readonly url?: string;
@@ -48,6 +64,7 @@ export interface OperationalFields {
 
 export interface OperationalLog {
   info(event: string, fields?: Readonly<OperationalFields>): void;
+  warn(event: string, fields?: Readonly<OperationalFields>): void;
   error(
     event: string,
     error: unknown,
@@ -145,6 +162,54 @@ function operationalFields(
   if (fields?.strategyId !== undefined) {
     output.strategyId = redactText(fields.strategyId, secrets);
   }
+  if (fields?.strategyState !== undefined) {
+    output.strategyState = redactText(fields.strategyState, secrets);
+  }
+  if (fields?.conclusion !== undefined) {
+    output.conclusion = redactText(fields.conclusion, secrets);
+  }
+  if (fields?.failureCode !== undefined) {
+    output.failureCode = redactText(fields.failureCode, secrets);
+  }
+  if (fields?.reason !== undefined) {
+    output.reason = redactText(fields.reason, secrets);
+  }
+  if (fields?.role !== undefined) {
+    output.role = redactText(fields.role, secrets);
+  }
+  if (fields?.exchangeId !== undefined) {
+    output.exchangeId = redactText(fields.exchangeId, secrets);
+  }
+  if (fields?.strategyOrderId !== undefined) {
+    output.strategyOrderId = redactText(fields.strategyOrderId, secrets);
+  }
+  if (fields?.clientOrderId !== undefined) {
+    output.clientOrderId = redactText(fields.clientOrderId, secrets);
+  }
+  if (fields?.exchangeOrderId !== undefined) {
+    output.exchangeOrderId = redactText(fields.exchangeOrderId, secrets);
+  }
+  if (fields?.expected !== undefined) {
+    output.expected = redactText(fields.expected, secrets);
+  }
+  if (fields?.actual !== undefined) {
+    output.actual = redactText(fields.actual, secrets);
+  }
+  if (fields?.exposureKnown !== undefined) {
+    output.exposureKnown = fields.exposureKnown;
+  }
+  if (fields?.marketSpot !== undefined) {
+    output.marketSpot = redactText(fields.marketSpot, secrets);
+  }
+  if (fields?.marketContract !== undefined) {
+    output.marketContract = redactText(fields.marketContract, secrets);
+  }
+  if (fields?.preGtcResidual !== undefined) {
+    output.preGtcResidual = redactText(fields.preGtcResidual, secrets);
+  }
+  if (fields?.currentResidual !== undefined) {
+    output.currentResidual = redactText(fields.currentResidual, secrets);
+  }
   if (fields?.requestId !== undefined) {
     output.requestId = redactText(fields.requestId, secrets);
   }
@@ -209,6 +274,15 @@ export function createOperationalLog(
         // Logging is never allowed to change service behavior.
       }
     },
+    warn(event, fields): void {
+      try {
+        const secrets = secretProvider();
+        const safeEvent = redactText(event, secrets);
+        logger.warn(operationalFields(event, fields, secrets), safeEvent);
+      } catch {
+        // Logging is never allowed to change service behavior.
+      }
+    },
     error(event, error, fields): void {
       try {
         const secrets = secretProvider();
@@ -246,6 +320,14 @@ export function nonThrowingOperationalLog(
     info(event, fields): void {
       try {
         const result: unknown = logger.info(event, fields);
+        void Promise.resolve(result).catch(() => {});
+      } catch {
+        // Injected logging is never allowed to change service behavior.
+      }
+    },
+    warn(event, fields): void {
+      try {
+        const result: unknown = logger.warn(event, fields);
         void Promise.resolve(result).catch(() => {});
       } catch {
         // Injected logging is never allowed to change service behavior.

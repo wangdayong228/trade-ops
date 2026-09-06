@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import {
@@ -18,6 +18,10 @@ import type {
   OperationalFields,
   OperationalLog
 } from '../src/logging/logger.js';
+import {
+  claimSqliteProcessOwnership,
+  SqliteOwnershipError
+} from '../src/storage/sqlite-process-owner.js';
 import { FakeExchangeGateway } from './support/fake-exchange-gateway.js';
 
 const VALID_ENV = {
@@ -29,6 +33,31 @@ const VALID_ENV = {
   TRADING_OKX_SECRET: 'okx-secret-value',
   TRADING_OKX_PASSWORD: 'okx-password-value'
 } as const;
+
+async function closeCompositionForCleanup(
+  composition: ReturnType<typeof composeService> | undefined
+): Promise<void> {
+  if (composition === undefined) return;
+  try {
+    await composition.server.close();
+  } catch {
+    // Best-effort cleanup must not replace the test's primary failure.
+  }
+  try {
+    if (composition.database.open) composition.database.close();
+  } catch {
+    // Best-effort cleanup must not replace the test's primary failure.
+  }
+}
+
+async function directoryExists(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
 
 test('loads the exact two-exchange release configuration', () => {
   const config = loadRuntimeConfig({
@@ -182,47 +211,266 @@ test('configuration failure happens before gateway or database construction', ()
   assert.equal(databaseConstructions, 0);
 });
 
-test('gateway construction failure happens before opening SQLite', () => {
+for (const databasePath of [
+  ':memory:',
+  ' :memory: ',
+  'file:trade-ops.sqlite',
+  'FILE:trade-ops.sqlite?mode=memory&cache=shared'
+] as const) {
+  test(`rejects non-file production database path ${databasePath}`, () => {
+    let gatewayConstructions = 0;
+    let databaseConstructions = 0;
+    assert.throws(
+      () => composeService({
+        env: { ...VALID_ENV, TRADING_DATABASE_PATH: databasePath },
+        gatewayFactory: (exchangeId) => {
+          gatewayConstructions += 1;
+          return new FakeExchangeGateway(exchangeId);
+        },
+        databaseFactory: () => {
+          databaseConstructions += 1;
+          throw new Error('database factory must not be called');
+        },
+        logger: false
+      }),
+      /^Error: invalid TRADING_DATABASE_PATH configuration$/
+    );
+    assert.equal(databaseConstructions, 0);
+    assert.equal(gatewayConstructions, 0);
+  });
+}
+
+test('normalizes a production database path before directory and database use', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-main-path-'));
+  const trimmedPath = './state/trade-ops.sqlite';
+  const rawPath = ` ${trimmedPath} `;
+  const trimmedDirectory = dirname(resolve(directory, trimmedPath));
+  const rawDirectory = dirname(resolve(directory, rawPath));
+  let compositionForCleanup: ReturnType<typeof composeService> | undefined;
+  t.after(async () => {
+    await closeCompositionForCleanup(compositionForCleanup);
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup must not replace the test's primary failure.
+    }
+  });
+
+  const config = loadRuntimeConfig({
+    ...VALID_ENV,
+    TRADING_DATABASE_PATH: rawPath
+  });
+  let databaseFactoryPath: string | undefined;
+  const originalWorkingDirectory = process.cwd();
+  try {
+    process.chdir(directory);
+    compositionForCleanup = composeService({
+      env: { ...VALID_ENV, TRADING_DATABASE_PATH: rawPath },
+      databaseFactory: (path) => {
+        databaseFactoryPath = path;
+        return new Database(':memory:', { timeout: 0 });
+      },
+      gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+      logger: false
+    });
+  } finally {
+    process.chdir(originalWorkingDirectory);
+  }
+
+  assert.deepEqual({
+    loadedPath: config.databasePath,
+    composedPath: compositionForCleanup?.config.databasePath,
+    databaseFactoryPath,
+    trimmedDirectoryExists: await directoryExists(trimmedDirectory),
+    rawDirectoryExists: await directoryExists(rawDirectory)
+  }, {
+    loadedPath: trimmedPath,
+    composedPath: trimmedPath,
+    databaseFactoryPath: trimmedPath,
+    trimmedDirectoryExists: true,
+    rawDirectoryExists: false
+  });
+});
+
+test('opens and claims SQLite before gateway construction', () => {
   let databaseConstructions = 0;
+  let database: Database.Database | undefined;
 
   assert.throws(
     () => composeService({
       env: VALID_ENV,
-      gatewayFactory: () => {
-        throw new Error('gateway construction failed');
-      },
       databaseFactory: () => {
         databaseConstructions += 1;
-        return new Database(':memory:');
+        database = new Database(':memory:', { timeout: 0 });
+        return database;
+      },
+      gatewayFactory: () => {
+        throw new Error('gateway construction failed');
       },
       logger: false
     }),
     /^Error: gateway construction failed$/
   );
-  assert.equal(databaseConstructions, 0);
+  assert.equal(databaseConstructions, 1);
+  assert.equal(database?.open, false);
 });
 
-test('schema construction failure closes an opened database', () => {
-  let closed = 0;
+test('closes SQLite once when exclusive ownership is busy', () => {
+  let closes = 0;
+  let gatewayConstructions = 0;
   const database = {
+    pragma(): string { return 'exclusive'; },
     exec(): never {
-      throw new Error('schema unavailable');
+      throw Object.assign(new Error('raw busy detail'), {
+        code: 'SQLITE_BUSY'
+      });
     },
     close(): void {
-      closed += 1;
+      closes += 1;
     }
   } as unknown as Database.Database;
 
   assert.throws(
     () => composeService({
       env: VALID_ENV,
-      gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
       databaseFactory: () => database,
+      gatewayFactory: (exchangeId) => {
+        gatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
       logger: false
     }),
-    /^Error: schema unavailable$/
+    (error: unknown) => error instanceof SqliteOwnershipError
+      && (error as { readonly code: string }).code
+        === 'DATABASE_OWNERSHIP_BUSY'
+      && !(error as { readonly message: string }).message
+        .includes('raw busy detail')
   );
-  assert.equal(closed, 1);
+  assert.equal(gatewayConstructions, 0);
+  assert.equal(closes, 1);
+});
+
+test('closes an owned database once when schema construction fails', () => {
+  let closes = 0;
+  let gatewayConstructions = 0;
+  const statements: string[] = [];
+  const database = new Database(':memory:', { timeout: 0 });
+  const originalExec = database.exec.bind(database);
+  const originalClose = database.close.bind(database);
+  database.exec = (statement: string) => {
+    statements.push(statement);
+    if (statements.length === 2) {
+      throw new Error('schema unavailable');
+    }
+    return originalExec(statement);
+  };
+  database.close = () => {
+    closes += 1;
+    return originalClose();
+  };
+
+  assert.throws(
+    () => composeService({
+      env: VALID_ENV,
+      databaseFactory: () => database,
+      gatewayFactory: (exchangeId) => {
+        gatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
+      logger: false
+    }),
+    (error: unknown) => error instanceof Error
+      && error.message === 'SQLite strategy schema migration failed'
+      && !error.message.includes('schema unavailable')
+  );
+  assert.equal(statements[0], 'BEGIN EXCLUSIVE; COMMIT');
+  assert.equal(gatewayConstructions, 0);
+  assert.equal(closes, 1);
+});
+
+test('claims SQLite before gateway construction and releases after close', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-main-owner-'));
+  const databasePath = join(directory, 'trade-ops.sqlite');
+  let ownerForCleanup: ReturnType<typeof composeService> | undefined;
+  let successorForCleanup: ReturnType<typeof composeService> | undefined;
+  t.after(async () => {
+    await closeCompositionForCleanup(successorForCleanup);
+    await closeCompositionForCleanup(ownerForCleanup);
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup must not replace the test's primary failure.
+    }
+  });
+  const env = { ...VALID_ENV, TRADING_DATABASE_PATH: databasePath };
+  const owner = composeService({
+    env,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    logger: false
+  });
+  ownerForCleanup = owner;
+
+  let blockedGatewayConstructions = 0;
+  assert.throws(
+    () => composeService({
+      env,
+      gatewayFactory: (exchangeId) => {
+        blockedGatewayConstructions += 1;
+        return new FakeExchangeGateway(exchangeId);
+      },
+      logger: false
+    }),
+    (error: unknown) => error instanceof SqliteOwnershipError
+      && (error as { readonly code: string }).code
+        === 'DATABASE_OWNERSHIP_BUSY'
+  );
+  assert.equal(blockedGatewayConstructions, 0);
+
+  await owner.server.close();
+  owner.database.close();
+  ownerForCleanup = undefined;
+  const successor = composeService({
+    env,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    logger: false
+  });
+  successorForCleanup = successor;
+  await successor.server.close();
+  successor.database.close();
+  successorForCleanup = undefined;
+});
+
+test('releases claimed ownership when gateway construction fails', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-main-owner-'));
+  const databasePath = join(directory, 'trade-ops.sqlite');
+  let successorForCleanup: ReturnType<typeof composeService> | undefined;
+  t.after(async () => {
+    await closeCompositionForCleanup(successorForCleanup);
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup must not replace the test's primary failure.
+    }
+  });
+  const env = { ...VALID_ENV, TRADING_DATABASE_PATH: databasePath };
+
+  assert.throws(
+    () => composeService({
+      env,
+      gatewayFactory: () => { throw new Error('gateway construction failed'); },
+      logger: false
+    }),
+    /^Error: gateway construction failed$/
+  );
+  const successor = composeService({
+    env,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    logger: false
+  });
+  successorForCleanup = successor;
+  await successor.server.close();
+  successor.database.close();
+  successorForCleanup = undefined;
 });
 
 test('database open failure is propagated before a server can listen', () => {
@@ -305,7 +553,7 @@ test('composition redacts all configured credentials from detailed HTTP errors',
   }
 });
 
-test('composition shares one safe injected trade sink with coordinator and monitor', async (t) => {
+test('composition shares one safe trade sink with submission and evidence owners', async (t) => {
   const tradeEvents = { record(): void {} };
   const composition = composeService({
     env: VALID_ENV,
@@ -319,10 +567,21 @@ test('composition shares one safe injected trade sink with coordinator and monit
     composition.database.close();
   });
 
-  const coordinatorSink = Reflect.get(composition.coordinator, 'tradeEvents');
-  const monitorSink = Reflect.get(composition.monitor, 'tradeEvents');
-  assert.equal(coordinatorSink, monitorSink);
+  const coordinatorSink = Reflect.get(
+    composition.coordinator,
+    'tradeEvents'
+  );
+  const reconciliation = Reflect.get(
+    composition.coordinator,
+    'reconciliation'
+  ) as object;
+  const evidence = Reflect.get(reconciliation, 'evidence') as object;
+  const evidenceSink = Reflect.get(evidence, 'tradeEvents');
+
+  assert.equal(coordinatorSink, evidenceSink);
   assert.notEqual(coordinatorSink, tradeEvents);
+  assert.equal(Reflect.has(composition.monitor, 'tradeEvents'), false);
+  assert.equal(Reflect.has(composition.monitor, 'registry'), false);
 });
 
 test('creates the database parent directory during normal composition', async (t) => {
@@ -352,7 +611,7 @@ class SignalTarget extends EventEmitter {
 }
 
 interface CapturedOperation {
-  readonly level: 'info' | 'error' | 'fatal';
+  readonly level: 'info' | 'warn' | 'error' | 'fatal';
   readonly event: string;
   readonly error?: unknown;
   readonly fields: Readonly<OperationalFields> | undefined;
@@ -362,6 +621,9 @@ function captureOperationalLog(entries: CapturedOperation[]): OperationalLog {
   return {
     info(event, fields): void {
       entries.push({ level: 'info', event, fields });
+    },
+    warn(event, fields): void {
+      entries.push({ level: 'warn', event, fields });
     },
     error(event, error, fields): void {
       entries.push({ level: 'error', event, error, fields });
@@ -673,6 +935,9 @@ test('a throwing operational log cannot interrupt startup or cleanup', async () 
     info(): never {
       throw new Error('logging unavailable');
     },
+    warn(): never {
+      throw new Error('logging unavailable');
+    },
     error(): never {
       throw new Error('logging unavailable');
     },
@@ -833,4 +1098,55 @@ test('shutdown still closes SQLite when Fastify close fails', async () => {
     (operations[3]?.error as Error | undefined)?.message,
     'server close failed'
   );
+});
+
+test('releases SQLite ownership when server close fails', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-stop-owner-'));
+  const databasePath = join(directory, 'trade-ops.sqlite');
+  let databaseForCleanup: Database.Database | undefined;
+  let successorForCleanup: Database.Database | undefined;
+  t.after(async () => {
+    for (const candidate of [successorForCleanup, databaseForCleanup]) {
+      try {
+        if (candidate?.open) candidate.close();
+      } catch {
+        // Best-effort cleanup must not replace the test's primary failure.
+      }
+    }
+    try {
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup must not replace the test's primary failure.
+    }
+  });
+  const database = new Database(databasePath, { timeout: 0 });
+  databaseForCleanup = database;
+  claimSqliteProcessOwnership(database, databasePath);
+
+  const started = await startService({
+    config: { host: '127.0.0.1', port: 3000 },
+    monitor: {
+      start: () => () => {},
+      stop: async () => {}
+    },
+    server: {
+      listen: async () => 'unused',
+      close: async () => { throw new Error('server close failed'); }
+    },
+    database
+  }, {
+    signalTarget: new SignalTarget(),
+    listen: async () => {}
+  });
+  await assert.rejects(started.shutdown(), /^Error: server close failed$/);
+  assert.equal(database.open, false);
+  databaseForCleanup = undefined;
+
+  const successor = new Database(databasePath, { timeout: 0 });
+  successorForCleanup = successor;
+  assert.doesNotThrow(() => {
+    claimSqliteProcessOwnership(successor, databasePath);
+  });
+  successor.close();
+  successorForCleanup = undefined;
 });

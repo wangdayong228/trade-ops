@@ -1,6 +1,9 @@
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
@@ -15,6 +18,10 @@ import type {
 } from '../../src/domain/types.js';
 import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
+import {
+  OrderSnapshotValidationError,
+  OrderSnapshotWriteConflictError
+} from '../../src/storage/strategy-repository.js';
 
 const SYMBOL = 'BTC/USDT';
 
@@ -162,30 +169,1342 @@ function snapshotFor(
   };
 }
 
+const LEGACY_SCHEMA = `
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE strategies (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN (
+      'PENDING_CONFIRMATION', 'EXECUTING', 'WAITING_HEDGE',
+      'HEDGED', 'HEDGE_INCOMPLETE', 'FAILED'
+    )),
+    mode TEXT NOT NULL CHECK (mode IN (
+      'CONCURRENT', 'CONTRACT_FIRST', 'SPOT_FIRST'
+    )),
+    spot_exchange_id TEXT NOT NULL,
+    contract_exchange_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    requested_base_quantity TEXT NOT NULL,
+    effective_base_quantity TEXT NOT NULL,
+    preflight_json TEXT NOT NULL,
+    failure_code TEXT CHECK (
+      failure_code IS NULL OR failure_code IN (
+        'ORDER_SUBMISSION_FAILED', 'ORDER_SUBMISSION_UNKNOWN',
+        'ORDER_NOT_FOUND', 'NO_FILL', 'MISSING_AVERAGE_PRICE',
+        'HEDGE_ORDER_REJECTED', 'HEDGE_ORDER_CANCELED',
+        'ORDER_RECONCILIATION_FAILED', 'INCONSISTENT_ORDER_STATE'
+      )
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (state IN ('HEDGE_INCOMPLETE', 'FAILED') AND failure_code IS NOT NULL)
+      OR
+      (state NOT IN ('HEDGE_INCOMPLETE', 'FAILED') AND failure_code IS NULL)
+    )
+  );
+  CREATE TABLE strategy_orders (
+    id TEXT PRIMARY KEY,
+    strategy_id TEXT NOT NULL REFERENCES strategies(id),
+    role TEXT NOT NULL CHECK (role IN (
+      'SPOT_MARKET', 'CONTRACT_MARKET',
+      'SPOT_HEDGE_GTC', 'CONTRACT_HEDGE_GTC'
+    )),
+    exchange_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL UNIQUE,
+    exchange_order_id TEXT,
+    request_json TEXT NOT NULL,
+    snapshot_json TEXT,
+    status TEXT NOT NULL CHECK (status IN (
+      'planned', 'open', 'closed', 'canceled', 'rejected', 'unknown'
+    )),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(strategy_id, role),
+    CHECK (
+      (status = 'planned' AND snapshot_json IS NULL
+        AND exchange_order_id IS NULL)
+      OR
+      (status <> 'planned' AND snapshot_json IS NOT NULL
+        AND exchange_order_id IS NOT NULL)
+    )
+  );
+  CREATE TABLE order_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_order_id TEXT NOT NULL REFERENCES strategy_orders(id),
+    snapshot_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+  );
+  CREATE INDEX strategies_recoverable_idx
+    ON strategies(state, created_at);
+  CREATE INDEX strategy_orders_strategy_idx
+    ON strategy_orders(strategy_id, created_at);
+  CREATE INDEX order_events_order_idx
+    ON order_events(strategy_order_id, id);
+  CREATE TRIGGER order_events_no_update
+  BEFORE UPDATE ON order_events
+  BEGIN
+    SELECT RAISE(ABORT, 'order events are immutable');
+  END;
+  CREATE TRIGGER order_events_no_delete
+  BEFORE DELETE ON order_events
+  BEGIN
+    SELECT RAISE(ABORT, 'order events are immutable');
+  END;
+`;
+
+function legacyDatabase(t: TestContext): Database.Database {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec(LEGACY_SCHEMA);
+  return database;
+}
+
+function seedLegacyExecutingStrategy(
+  database: Database.Database,
+  strategyId: string
+): void {
+  const preview = preflight();
+  database.prepare(`
+    INSERT INTO strategies (
+      id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
+      requested_base_quantity, effective_base_quantity, preflight_json,
+      failure_code, created_at, updated_at
+    ) VALUES (?, 'EXECUTING', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+  `).run(
+    strategyId,
+    preview.mode,
+    preview.spotExchangeId,
+    preview.contractExchangeId,
+    preview.symbol,
+    preview.requestedBaseQuantity,
+    preview.effectiveBaseQuantity,
+    JSON.stringify(preview),
+    preview.createdAt,
+    preview.createdAt
+  );
+}
+
+function seedLegacyPlannedOrder(
+  database: Database.Database,
+  strategyId: string,
+  orderId: string
+): void {
+  const request = requestFor(strategyId, 'CONTRACT_MARKET');
+  database.prepare(`
+    INSERT INTO strategy_orders (
+      id, strategy_id, role, exchange_id, client_order_id,
+      exchange_order_id, request_json, snapshot_json, status,
+      created_at, updated_at
+    ) VALUES (?, ?, 'CONTRACT_MARKET', 'okx', ?, NULL, ?, NULL,
+      'planned', ?, ?)
+  `).run(
+    orderId,
+    strategyId,
+    request.clientOrderId,
+    JSON.stringify(request),
+    '2026-07-26T00:00:00.000Z',
+    '2026-07-26T00:00:00.000Z'
+  );
+}
+
+function seedLegacyObservedOrder(
+  database: Database.Database,
+  strategyId: string,
+  orderId: string
+): void {
+  const request = requestFor(strategyId, 'SPOT_HEDGE_GTC', {
+    baseQuantity: '0.4'
+  });
+  const snapshot = snapshotFor(request, 'bitget', {
+    exchangeOrderId: 'legacy-observed-exchange-order',
+    requestedBaseQuantity: '0.4',
+    remainingBaseQuantity: '0.4'
+  });
+  database.prepare(`
+    INSERT INTO strategy_orders (
+      id, strategy_id, role, exchange_id, client_order_id,
+      exchange_order_id, request_json, snapshot_json, status,
+      created_at, updated_at
+    ) VALUES (?, ?, 'SPOT_HEDGE_GTC', 'bitget', ?, ?, ?, ?, 'open', ?, ?)
+  `).run(
+    orderId,
+    strategyId,
+    request.clientOrderId,
+    snapshot.exchangeOrderId,
+    JSON.stringify(request),
+    JSON.stringify(snapshot),
+    '2026-07-26T00:00:00.000Z',
+    snapshot.updatedAt
+  );
+  database.prepare(`
+    INSERT INTO order_events (strategy_order_id, snapshot_json, recorded_at)
+    VALUES (?, ?, ?)
+  `).run(orderId, JSON.stringify(snapshot), snapshot.updatedAt);
+}
+
+function legacyFingerprint(database: Database.Database): string {
+  return JSON.stringify({
+    schema: database.prepare(`
+      SELECT type, name, tbl_name, sql
+      FROM sqlite_master
+      WHERE name NOT LIKE 'sqlite_%'
+      ORDER BY type, name
+    `).all(),
+    strategies: database.prepare('SELECT * FROM strategies ORDER BY id').all(),
+    orders: database.prepare('SELECT * FROM strategy_orders ORDER BY id').all(),
+    events: database.prepare('SELECT * FROM order_events ORDER BY id').all()
+  });
+}
+
+function schemaObjectDefinition(
+  database: Database.Database,
+  type: 'table' | 'trigger',
+  name: string
+): string {
+  const sql = database.prepare(`
+    SELECT sql
+    FROM sqlite_master
+    WHERE type = ? AND name = ?
+  `).pluck().get(type, name);
+  if (typeof sql !== 'string') {
+    assert.fail(`missing SQLite ${type} definition: ${name}`);
+  }
+  return sql;
+}
+
+function rewriteSchemaObjectDefinition(
+  database: Database.Database,
+  type: 'table' | 'trigger',
+  name: string,
+  rewrite: (sql: string) => string
+): void {
+  const original = schemaObjectDefinition(database, type, name);
+  const rewritten = rewrite(original);
+  assert.notEqual(rewritten, original);
+  database.unsafeMode(true);
+  try {
+    database.pragma('writable_schema = ON');
+    const result = database.prepare(`
+      UPDATE sqlite_master
+      SET sql = ?
+      WHERE type = ? AND name = ?
+    `).run(rewritten, type, name);
+    assert.equal(result.changes, 1);
+  } finally {
+    try {
+      database.pragma('writable_schema = OFF');
+    } finally {
+      database.unsafeMode(false);
+    }
+  }
+}
+
+function tableDefinition(
+  database: Database.Database,
+  table: string
+): string {
+  return schemaObjectDefinition(database, 'table', table);
+}
+
+function rewriteTableDefinition(
+  database: Database.Database,
+  table: string,
+  rewrite: (sql: string) => string
+): void {
+  rewriteSchemaObjectDefinition(database, 'table', table, rewrite);
+}
+
+const SUBMISSION_EVIDENCE_CHECK_SQL = `CHECK (
+  (
+    submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+    AND submission_failure_code IS NOT NULL
+  )
+  OR
+  (
+    submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
+    AND submission_failure_code IS NULL
+  )
+)`;
+
+const CANONICAL_SUBMISSION_EVIDENCE_CHECK_SQL =
+  "check((submission_disposition='DEFINITELY_NOT_SUBMITTED' and "
+  + 'submission_failure_code is not null)or('
+  + "submission_disposition<>'DEFINITELY_NOT_SUBMITTED' and "
+  + 'submission_failure_code is null))';
+
+function makeMalformedLegacyStrategies(database: Database.Database): void {
+  database.pragma('foreign_keys = OFF');
+  database.exec(`
+    CREATE TABLE strategies_bad (
+      id TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      spot_exchange_id TEXT NOT NULL,
+      contract_exchange_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      requested_base_quantity TEXT NOT NULL,
+      effective_base_quantity TEXT NOT NULL,
+      failure_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO strategies_bad
+    SELECT
+      id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
+      requested_base_quantity, effective_base_quantity, failure_code,
+      created_at, updated_at
+    FROM strategies;
+    DROP TABLE strategies;
+    ALTER TABLE strategies_bad RENAME TO strategies;
+    CREATE INDEX strategies_recoverable_idx
+      ON strategies(state, created_at);
+  `);
+  database.pragma('foreign_keys = ON');
+}
+
 test('enables foreign keys for every repository connection', (t) => {
   const { database } = setup(t);
 
   assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
 });
 
-test('fails construction when foreign keys cannot be enabled in an active transaction', (t) => {
-  const database = new Database(':memory:');
-  t.after(() => database.close());
-  database.pragma('foreign_keys = OFF');
-  database.exec('BEGIN');
+test('creates a fresh file database in WAL before installing v2 schema', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-schema-'));
+  const database = new Database(join(directory, 'strategies.sqlite'));
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
 
+  new SqliteStrategyRepository(database);
+
+  assert.equal(
+    database.pragma('journal_mode', { simple: true }),
+    'wal'
+  );
+  assert.deepEqual(database.prepare(`
+    SELECT singleton, version FROM strategy_schema_metadata
+  `).all(), [{ singleton: 1, version: 2 }]);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('rejects v2 submission evidence checks with the wrong inequality operator', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-wrong-check-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const repository = new SqliteStrategyRepository(database);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const order = repository.planOrder(
+    strategyId,
+    'CONTRACT_MARKET',
+    requestFor(strategyId, 'CONTRACT_MARKET')
+  );
+  const correctOperator =
+    "submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+  const wrongOperator =
+    "submission_disposition = 'DEFINITELY_NOT_SUBMITTED'";
+
+  rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+    assert.equal(sql.split(correctOperator).length - 1, 1);
+    return sql.replace(correctOperator, wrongOperator);
+  });
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = tableDefinition(database, 'strategy_orders');
+  assert.equal(reloadedSql.includes(correctOperator), false);
+  assert.equal(reloadedSql.includes(wrongOperator), true);
+  database.exec('SAVEPOINT invalid_evidence_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+      WHERE id = ?
+    `).run(order.id).changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO invalid_evidence_probe');
+    database.exec('RELEASE invalid_evidence_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = ?
+  `).get(order.id), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+});
+
+test('rejects v2 evidence CHECK with a case-changed quoted literal', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-check-case-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const repository = new SqliteStrategyRepository(database);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const order = repository.planOrder(
+    strategyId,
+    'CONTRACT_MARKET',
+    requestFor(strategyId, 'CONTRACT_MARKET')
+  );
+  const correctLiteral =
+    "submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+  const caseChangedLiteral =
+    "submission_disposition <> 'definitely_not_submitted'";
+
+  rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+    assert.equal(sql.split(correctLiteral).length - 1, 1);
+    return sql.replace(correctLiteral, caseChangedLiteral);
+  });
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = tableDefinition(database, 'strategy_orders');
+  assert.equal(reloadedSql.includes(correctLiteral), false);
+  assert.equal(reloadedSql.includes(caseChangedLiteral), true);
+  database.exec('SAVEPOINT invalid_literal_case_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+      WHERE id = ?
+    `).run(order.id).changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO invalid_literal_case_probe');
+    database.exec('RELEASE invalid_literal_case_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = ?
+  `).get(order.id), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+});
+
+for (const inactiveCheck of [
+  {
+    name: 'inactive block-comment text',
+    directoryPrefix: 'trade-ops-check-comment-',
+    insertion: `\n/* ${SUBMISSION_EVIDENCE_CHECK_SQL} */\n`
+  },
+  {
+    name: 'an inactive quoted constraint name',
+    directoryPrefix: 'trade-ops-check-name-',
+    insertion: `,\nCONSTRAINT "${CANONICAL_SUBMISSION_EVIDENCE_CHECK_SQL}"
+      CHECK (1)\n`
+  }
+] as const) {
+  test(`rejects broken v2 evidence CHECK disguised by ${inactiveCheck.name}`, (t) => {
+    const directory = mkdtempSync(join(tmpdir(), inactiveCheck.directoryPrefix));
+    const databasePath = join(directory, 'strategies.sqlite');
+    let database = new Database(databasePath);
+    t.after(() => {
+      if (database.open) database.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const repository = new SqliteStrategyRepository(database);
+    const strategyId = repository.createPending(preflight()).id;
+    assert.equal(repository.claimForExecution(strategyId), true);
+    const order = repository.planOrder(
+      strategyId,
+      'CONTRACT_MARKET',
+      requestFor(strategyId, 'CONTRACT_MARKET')
+    );
+    const correctOperator =
+      "submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+    const wrongOperator =
+      "submission_disposition = 'DEFINITELY_NOT_SUBMITTED'";
+
+    rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+      assert.equal(sql.split(correctOperator).length - 1, 1);
+      const brokenSql = sql.replace(correctOperator, wrongOperator);
+      const finalParenthesis = brokenSql.lastIndexOf(')');
+      assert.notEqual(finalParenthesis, -1);
+      return brokenSql.slice(0, finalParenthesis)
+        + inactiveCheck.insertion
+        + brokenSql.slice(finalParenthesis);
+    });
+    database.close();
+    database = new Database(databasePath);
+    database.pragma('foreign_keys = ON');
+
+    const reloadedSql = tableDefinition(database, 'strategy_orders');
+    assert.equal(reloadedSql.includes(wrongOperator), true);
+    assert.equal(reloadedSql.includes(inactiveCheck.insertion.trim()), true);
+    database.exec('SAVEPOINT inactive_check_probe');
+    try {
+      assert.equal(database.prepare(`
+        UPDATE strategy_orders
+        SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+        WHERE id = ?
+      `).run(order.id).changes, 1);
+    } finally {
+      database.exec('ROLLBACK TO inactive_check_probe');
+      database.exec('RELEASE inactive_check_probe');
+    }
+    const before = legacyFingerprint(database);
+
+    assert.throws(
+      () => new SqliteStrategyRepository(database),
+      /^Error: SQLite strategy schema migration failed$/
+    );
+
+    assert.equal(legacyFingerprint(database), before);
+    assert.deepEqual(database.prepare(`
+      SELECT singleton, version FROM strategy_schema_metadata
+    `).all(), [{ singleton: 1, version: 2 }]);
+    assert.deepEqual(database.prepare(`
+      SELECT submission_disposition, submission_failure_code
+      FROM strategy_orders
+      WHERE id = ?
+    `).get(order.id), {
+      submission_disposition: 'SUBMISSION_UNCERTAIN',
+      submission_failure_code: null
+    });
+    assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+    assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+  });
+}
+
+test('migrates v1 failure constraints and order submission evidence atomically', (t) => {
+  const database = legacyDatabase(t);
+  seedLegacyExecutingStrategy(database, 'legacy-strategy');
+  seedLegacyPlannedOrder(database, 'legacy-strategy', 'planned-order');
+  seedLegacyObservedOrder(database, 'legacy-strategy', 'observed-order');
+
+  const repository = new SqliteStrategyRepository(database);
+  const [planned, observed] = repository.listOrders('legacy-strategy');
+
+  assert.equal(planned?.submissionDisposition, 'SUBMISSION_UNCERTAIN');
+  assert.equal(planned?.submissionFailureCode, null);
+  assert.equal(observed?.submissionDisposition, 'REMOTE_OBSERVED');
+  assert.equal(observed?.submissionFailureCode, null);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+  assert.equal(
+    repository.transition(
+      'legacy-strategy',
+      ['EXECUTING'],
+      'HEDGE_INCOMPLETE',
+      'HEDGE_RESIDUAL_NOT_TRADABLE'
+    ),
+    true
+  );
+});
+
+test('rejects migrated v1 evidence trigger with a case-changed quoted literal', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-trigger-case-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  database.exec(LEGACY_SCHEMA);
+  seedLegacyExecutingStrategy(database, 'legacy-case-strategy');
+  seedLegacyPlannedOrder(
+    database,
+    'legacy-case-strategy',
+    'legacy-case-order'
+  );
+  new SqliteStrategyRepository(database);
+  const triggerName = 'strategy_orders_submission_evidence_update';
+  const correctLiteral =
+    "NEW.submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+  const caseChangedLiteral =
+    "NEW.submission_disposition <> 'definitely_not_submitted'";
+
+  rewriteSchemaObjectDefinition(
+    database,
+    'trigger',
+    triggerName,
+    (sql) => {
+      assert.equal(sql.split(correctLiteral).length - 1, 1);
+      return sql.replace(correctLiteral, caseChangedLiteral);
+    }
+  );
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = schemaObjectDefinition(
+    database,
+    'trigger',
+    triggerName
+  );
+  assert.equal(reloadedSql.includes(correctLiteral), false);
+  assert.equal(reloadedSql.includes(caseChangedLiteral), true);
+  database.exec('SAVEPOINT invalid_trigger_literal_case_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+      WHERE id = 'legacy-case-order'
+    `).run().changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO invalid_trigger_literal_case_probe');
+    database.exec('RELEASE invalid_trigger_literal_case_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT singleton, version FROM strategy_schema_metadata
+  `).all(), [{ singleton: 1, version: 2 }]);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = 'legacy-case-order'
+  `).get(), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('rejects migrated v1 schema with an expanded submission failure-code allowlist', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-failure-allowlist-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  database.exec(LEGACY_SCHEMA);
+  seedLegacyExecutingStrategy(database, 'legacy-allowlist-strategy');
+  seedLegacyPlannedOrder(
+    database,
+    'legacy-allowlist-strategy',
+    'legacy-allowlist-order'
+  );
+  new SqliteStrategyRepository(database);
+  const triggerNames = [
+    'strategy_orders_submission_evidence_insert',
+    'strategy_orders_submission_evidence_update'
+  ] as const;
+  const evidenceTriggersBefore = triggerNames.map((name) => ({
+    name,
+    sql: schemaObjectDefinition(database, 'trigger', name)
+  }));
+  const lastAllowedFailureCode = "'HEDGE_RESIDUAL_NOT_TRADABLE'";
+
+  rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+    assert.equal(sql.split(lastAllowedFailureCode).length - 1, 1);
+    return sql.replace(
+      lastAllowedFailureCode,
+      `${lastAllowedFailureCode},\n        'BOGUS_FAILURE'`
+    );
+  });
+  database.close();
+  database = new Database(databasePath);
+  database.pragma('foreign_keys = ON');
+
+  const reloadedSql = tableDefinition(database, 'strategy_orders');
+  assert.equal(reloadedSql.split("'BOGUS_FAILURE'").length - 1, 1);
+  for (const trigger of evidenceTriggersBefore) {
+    assert.equal(
+      schemaObjectDefinition(database, 'trigger', trigger.name),
+      trigger.sql
+    );
+  }
+  database.exec('SAVEPOINT bogus_failure_code_probe');
+  try {
+    assert.equal(database.prepare(`
+      UPDATE strategy_orders
+      SET
+        submission_disposition = 'DEFINITELY_NOT_SUBMITTED',
+        submission_failure_code = 'BOGUS_FAILURE'
+      WHERE id = 'legacy-allowlist-order'
+    `).run().changes, 1);
+  } finally {
+    database.exec('ROLLBACK TO bogus_failure_code_probe');
+    database.exec('RELEASE bogus_failure_code_probe');
+  }
+  const before = legacyFingerprint(database);
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT singleton, version FROM strategy_schema_metadata
+  `).all(), [{ singleton: 1, version: 2 }]);
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code
+    FROM strategy_orders
+    WHERE id = 'legacy-allowlist-order'
+  `).get(), {
+    submission_disposition: 'SUBMISSION_UNCERTAIN',
+    submission_failure_code: null
+  });
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+for (const missingForeignKey of [
+  {
+    name: 'strategy order parent',
+    table: 'strategy_orders',
+    from: 'strategy_id',
+    parent: 'strategies',
+    referenceClause: 'REFERENCES strategies(id)',
+    insertOrphan(database: Database.Database) {
+      const request = requestFor('missing-strategy', 'SPOT_MARKET');
+      return database.prepare(`
+        INSERT INTO strategy_orders (
+          id, strategy_id, role, exchange_id, client_order_id,
+          exchange_order_id, request_json, snapshot_json, status,
+          created_at, updated_at
+        ) VALUES (?, ?, 'SPOT_MARKET', 'bitget', ?, NULL, ?, NULL,
+          'planned', ?, ?)
+      `).run(
+        'orphan-order',
+        'missing-strategy',
+        request.clientOrderId,
+        JSON.stringify(request),
+        '2026-07-26T00:00:00.000Z',
+        '2026-07-26T00:00:00.000Z'
+      ).changes;
+    }
+  },
+  {
+    name: 'order event parent',
+    table: 'order_events',
+    from: 'strategy_order_id',
+    parent: 'strategy_orders',
+    referenceClause: 'REFERENCES strategy_orders(id)',
+    insertOrphan(database: Database.Database) {
+      return database.prepare(`
+        INSERT INTO order_events (
+          strategy_order_id, snapshot_json, recorded_at
+        ) VALUES (?, ?, ?)
+      `).run(
+        'missing-order',
+        '{}',
+        '2026-07-26T00:00:00.000Z'
+      ).changes;
+    }
+  }
+] as const) {
+  test(`rejects v1 migration without required ${missingForeignKey.name} foreign key`, (t) => {
+    const directory = mkdtempSync(join(tmpdir(), 'trade-ops-missing-fk-'));
+    const databasePath = join(directory, 'strategies.sqlite');
+    let database = new Database(databasePath);
+    t.after(() => {
+      if (database.open) database.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    database.exec(LEGACY_SCHEMA);
+    seedLegacyExecutingStrategy(database, 'legacy-strategy');
+    seedLegacyPlannedOrder(database, 'legacy-strategy', 'planned-order');
+    seedLegacyObservedOrder(database, 'legacy-strategy', 'observed-order');
+
+    rewriteTableDefinition(database, missingForeignKey.table, (sql) => {
+      assert.equal(
+        sql.split(missingForeignKey.referenceClause).length - 1,
+        1
+      );
+      return sql.replace(missingForeignKey.referenceClause, '');
+    });
+    database.close();
+    database = new Database(databasePath);
+    database.pragma('foreign_keys = ON');
+
+    const foreignKeys = database.prepare(
+      `PRAGMA foreign_key_list(${missingForeignKey.table})`
+    ).all() as Array<{ from: unknown; table: unknown; to: unknown }>;
+    assert.equal(foreignKeys.some((foreignKey) => (
+      foreignKey.from === missingForeignKey.from
+      && foreignKey.table === missingForeignKey.parent
+      && foreignKey.to === 'id'
+    )), false);
+    database.exec('SAVEPOINT orphan_probe');
+    try {
+      assert.equal(missingForeignKey.insertOrphan(database), 1);
+    } finally {
+      database.exec('ROLLBACK TO orphan_probe');
+      database.exec('RELEASE orphan_probe');
+    }
+    const before = legacyFingerprint(database);
+
+    assert.throws(
+      () => new SqliteStrategyRepository(database),
+      /^Error: SQLite strategy schema migration failed$/
+    );
+
+    assert.equal(legacyFingerprint(database), before);
+    assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+    assert.equal(database.prepare(`
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'table' AND name = 'strategy_schema_metadata'
+    `).get(), undefined);
+  });
+}
+
+test('persists definite no-submit evidence with a single compare-and-set', (t) => {
+  const { repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const order = repository.planOrder(
+    strategyId,
+    'CONTRACT_MARKET',
+    requestFor(strategyId, 'CONTRACT_MARKET')
+  );
+
+  assert.equal(
+    repository.markDefinitelyNotSubmitted(order.id, 'ORDER_SUBMISSION_FAILED'),
+    true
+  );
+  assert.equal(
+    repository.markDefinitelyNotSubmitted(
+      order.id,
+      'HEDGE_RESIDUAL_NOT_TRADABLE'
+    ),
+    false
+  );
+  assert.deepEqual(
+    repository.listOrders(strategyId).map((row) => ({
+      disposition: row.submissionDisposition,
+      failureCode: row.submissionFailureCode
+    })),
+    [{
+      disposition: 'DEFINITELY_NOT_SUBMITTED',
+      failureCode: 'ORDER_SUBMISSION_FAILED'
+    }]
+  );
+});
+
+test('returns false for an unknown order in definite no-submit CAS', (t) => {
+  const { repository } = setup(t);
+
+  assert.equal(repository.markDefinitelyNotSubmitted(
+    'missing-order',
+    'ORDER_SUBMISSION_FAILED'
+  ), false);
+});
+
+test('rejects invalid definite no-submit CAS failure codes before SQL', (t) => {
+  const { database, repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const order = repository.planOrder(
+    strategyId,
+    'CONTRACT_MARKET',
+    requestFor(strategyId, 'CONTRACT_MARKET')
+  );
+  const before = database.prepare(`
+    SELECT submission_disposition, submission_failure_code, updated_at
+    FROM strategy_orders
+    WHERE id = ?
+  `).get(order.id);
+  database.exec(`
+    CREATE TEMP TRIGGER detect_unsafe_no_submit_sql
+    BEFORE UPDATE OF submission_disposition, submission_failure_code
+    ON strategy_orders
+    BEGIN
+      SELECT RAISE(ABORT, 'unsafe no-submit SQL reached');
+    END;
+  `);
+  const unsafeRepository = repository as unknown as {
+    markDefinitelyNotSubmitted(
+      strategyOrderId: string,
+      failureCode: unknown
+    ): boolean;
+  };
+
+  assert.throws(
+    () => unsafeRepository.markDefinitelyNotSubmitted(
+      order.id,
+      'UNSAFE_FAILURE_CODE'
+    ),
+    /order submission failure code/i
+  );
+  assert.deepEqual(database.prepare(`
+    SELECT submission_disposition, submission_failure_code, updated_at
+    FROM strategy_orders
+    WHERE id = ?
+  `).get(order.id), before);
+});
+
+test('attaches only semantic snapshot changes and promotes evidence atomically', (t) => {
+  const { repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const order = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+  const first = snapshotFor(request, 'bitget', {
+    filledBaseQuantity: '0.4',
+    remainingBaseQuantity: '0.6',
+    averagePrice: '60000'
+  });
+  const semanticallyEquivalent = {
+    ...first,
+    requestedBaseQuantity: '1.0',
+    filledBaseQuantity: '0.40',
+    remainingBaseQuantity: '0.600',
+    averagePrice: '6e4',
+    updatedAt: '2026-07-26T00:02:00.000Z'
+  };
+
+  assert.equal(repository.attachOrderSnapshot(order.id, first), 'attached');
+  assert.equal(
+    repository.attachOrderSnapshot(order.id, semanticallyEquivalent),
+    'unchanged'
+  );
+  assert.equal(repository.listOrderEvents(order.id).length, 1);
+  assert.equal(
+    repository.listOrders(strategyId)[0]?.submissionDisposition,
+    'REMOTE_OBSERVED'
+  );
+});
+
+test('rejects invalid semantic snapshot with a typed validation error and no writes', (t) => {
+  const { repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const order = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+
+  assert.throws(
+    () => repository.attachOrderSnapshot(
+      order.id,
+      snapshotFor(request, 'bitget', {
+        requestedBaseQuantity: '2',
+        remainingBaseQuantity: '2'
+      })
+    ),
+    OrderSnapshotValidationError
+  );
+  assert.deepEqual(repository.listOrderEvents(order.id), []);
+  const persisted = repository.listOrders(strategyId)[0];
+  assert.equal(persisted?.status, 'planned');
+  assert.equal(persisted?.submissionDisposition, 'SUBMISSION_UNCERTAIN');
+});
+
+test('rolls back semantic snapshot event and evidence after a CAS conflict', (t) => {
+  const { database, repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const order = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+  const competing = snapshotFor(request, 'bitget', {
+    status: 'unknown',
+    updatedAt: '2026-07-26T00:01:30.000Z'
+  });
+  database.exec(`
+    CREATE TEMP TABLE snapshot_write_conflict_fixture (
+      exchange_order_id TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TEMP TRIGGER force_snapshot_write_conflict
+    AFTER INSERT ON main.order_events
+    BEGIN
+      UPDATE strategy_orders
+      SET
+        exchange_order_id = (
+          SELECT exchange_order_id FROM snapshot_write_conflict_fixture
+        ),
+        snapshot_json = (
+          SELECT snapshot_json FROM snapshot_write_conflict_fixture
+        ),
+        status = (SELECT status FROM snapshot_write_conflict_fixture),
+        submission_disposition = 'REMOTE_OBSERVED',
+        submission_failure_code = NULL,
+        updated_at = (SELECT updated_at FROM snapshot_write_conflict_fixture)
+      WHERE id = NEW.strategy_order_id;
+    END;
+  `);
+  database.prepare(`
+    INSERT INTO snapshot_write_conflict_fixture (
+      exchange_order_id, snapshot_json, status, updated_at
+    ) VALUES (?, ?, ?, ?)
+  `).run(
+    competing.exchangeOrderId,
+    JSON.stringify(competing),
+    competing.status,
+    competing.updatedAt
+  );
+
+  assert.throws(
+    () => repository.attachOrderSnapshot(
+      order.id,
+      snapshotFor(request, 'bitget')
+    ),
+    OrderSnapshotWriteConflictError
+  );
+  assert.deepEqual(repository.listOrderEvents(order.id), []);
+  const persisted = repository.listOrders(strategyId)[0];
+  assert.equal(persisted?.status, 'planned');
+  assert.equal(persisted?.snapshot, null);
+  assert.equal(persisted?.submissionDisposition, 'SUBMISSION_UNCERTAIN');
+});
+
+test('never marks a remotely observed order as definitely not submitted', (t) => {
+  const { repository } = setup(t);
+  const strategyId = repository.createPending(preflight()).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const request = requestFor(strategyId, 'SPOT_MARKET');
+  const order = repository.planOrder(strategyId, 'SPOT_MARKET', request);
+  assert.equal(
+    repository.attachOrderSnapshot(order.id, snapshotFor(request, 'bitget')),
+    'attached'
+  );
+
+  assert.equal(repository.markDefinitelyNotSubmitted(
+    order.id,
+    'ORDER_SUBMISSION_FAILED'
+  ), false);
+  const persisted = repository.listOrders(strategyId)[0];
+  assert.equal(persisted?.submissionDisposition, 'REMOTE_OBSERVED');
+  assert.equal(persisted?.submissionFailureCode, null);
+});
+
+function evidenceConstraintFixture(
+  t: TestContext,
+  schema: 'fresh v2' | 'migrated v1'
+) {
+  if (schema === 'fresh v2') {
+    const { database, repository } = setup(t);
+    const strategyId = repository.createPending(preflight()).id;
+    assert.equal(repository.claimForExecution(strategyId), true);
+    return {
+      database,
+      repository,
+      strategyId,
+      order: repository.planOrder(
+        strategyId,
+        'CONTRACT_MARKET',
+        requestFor(strategyId, 'CONTRACT_MARKET')
+      )
+    };
+  }
+
+  const database = legacyDatabase(t);
+  const strategyId = 'migrated-constraint-strategy';
+  seedLegacyExecutingStrategy(database, strategyId);
+  seedLegacyPlannedOrder(database, strategyId, 'migrated-planned-order');
+  const repository = new SqliteStrategyRepository(database);
+  const [order] = repository.listOrders(strategyId);
+  assert.ok(order);
+  return { database, repository, strategyId, order };
+}
+
+for (const schema of ['fresh v2', 'migrated v1'] as const) {
+  test(`enforces submission evidence constraints for ${schema}`, (t) => {
+    const {
+      database,
+      repository,
+      strategyId,
+      order
+    } = evidenceConstraintFixture(t, schema);
+
+    for (const statement of [
+      `UPDATE strategy_orders
+       SET submission_failure_code = 'ORDER_SUBMISSION_FAILED'
+       WHERE id = ?`,
+      `UPDATE strategy_orders
+       SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+       WHERE id = ?`,
+      `UPDATE strategy_orders
+       SET submission_disposition = 'REMOTE_OBSERVED'
+       WHERE id = ?`
+    ]) {
+      assert.throws(
+        () => database.prepare(statement).run(order.id),
+        /constraint|submission evidence/i
+      );
+    }
+
+    const insertRequest = requestFor(strategyId, 'SPOT_MARKET');
+    const insertSnapshot = snapshotFor(insertRequest, 'bitget', {
+      status: 'open',
+      remainingBaseQuantity: insertRequest.baseQuantity
+    });
+    const invalidInserts = [
+      {
+        status: 'planned',
+        exchangeOrderId: null,
+        snapshotJson: null,
+        disposition: 'DEFINITELY_NOT_SUBMITTED',
+        failureCode: null
+      },
+      {
+        status: 'planned',
+        exchangeOrderId: null,
+        snapshotJson: null,
+        disposition: 'SUBMISSION_UNCERTAIN',
+        failureCode: 'ORDER_SUBMISSION_FAILED'
+      },
+      {
+        status: 'planned',
+        exchangeOrderId: null,
+        snapshotJson: null,
+        disposition: 'REMOTE_OBSERVED',
+        failureCode: null
+      },
+      {
+        status: 'open',
+        exchangeOrderId: insertSnapshot.exchangeOrderId,
+        snapshotJson: JSON.stringify(insertSnapshot),
+        disposition: 'SUBMISSION_UNCERTAIN',
+        failureCode: null
+      },
+      {
+        status: 'open',
+        exchangeOrderId: insertSnapshot.exchangeOrderId,
+        snapshotJson: JSON.stringify(insertSnapshot),
+        disposition: 'DEFINITELY_NOT_SUBMITTED',
+        failureCode: 'HEDGE_RESIDUAL_NOT_TRADABLE'
+      }
+    ] as const;
+
+    for (const [index, invalid] of invalidInserts.entries()) {
+      assert.throws(
+        () => database.prepare(`
+          INSERT INTO strategy_orders (
+            id, strategy_id, role, exchange_id, client_order_id,
+            exchange_order_id, request_json, snapshot_json, status,
+            submission_disposition, submission_failure_code,
+            created_at, updated_at
+          ) VALUES (?, ?, 'SPOT_MARKET', 'bitget', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          `invalid-evidence-${index}`,
+          strategyId,
+          insertRequest.clientOrderId,
+          invalid.exchangeOrderId,
+          JSON.stringify(insertRequest),
+          invalid.snapshotJson,
+          invalid.status,
+          invalid.disposition,
+          invalid.failureCode,
+          '2026-07-26T00:00:00.000Z',
+          '2026-07-26T00:00:00.000Z'
+        ),
+        /constraint|submission evidence/i
+      );
+    }
+
+    const request = requestFor(strategyId, 'CONTRACT_MARKET');
+    assert.equal(
+      repository.attachOrderSnapshot(
+        order.id,
+        snapshotFor(request, 'okx')
+      ),
+      'attached'
+    );
+    for (const statement of [
+      `UPDATE strategy_orders
+       SET submission_disposition = 'SUBMISSION_UNCERTAIN'
+       WHERE id = ?`,
+      `UPDATE strategy_orders
+       SET status = 'planned'
+       WHERE id = ?`,
+      `UPDATE strategy_orders
+       SET snapshot_json = NULL
+       WHERE id = ?`,
+      `UPDATE strategy_orders
+       SET exchange_order_id = NULL
+       WHERE id = ?`
+    ]) {
+      assert.throws(
+        () => database.prepare(statement).run(order.id),
+        /constraint|submission evidence/i
+      );
+    }
+    const persisted = repository.listOrders(strategyId)
+      .find(({ id }) => id === order.id);
+    assert.ok(persisted);
+    assert.equal(persisted.status, 'open');
+    assert.equal(persisted.submissionDisposition, 'REMOTE_OBSERVED');
+    assert.notEqual(persisted.snapshot, null);
+    assert.equal(repository.listOrderEvents(order.id).length, 1);
+  });
+}
+
+test('rejects an unknown schema version without modifying the database', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'trade-ops-unknown-schema-'));
+  const database = new Database(join(directory, 'strategies.sqlite'));
+  t.after(() => {
+    if (database.open) database.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  database.exec(LEGACY_SCHEMA);
+  seedLegacyExecutingStrategy(database, 'unknown-version-strategy');
+  database.exec(`
+    CREATE TABLE strategy_schema_metadata (
+      singleton INTEGER PRIMARY KEY,
+      version INTEGER NOT NULL
+    );
+    INSERT INTO strategy_schema_metadata (singleton, version) VALUES (1, 99);
+  `);
+  const before = legacyFingerprint(database);
+  const journalModeBefore = database.pragma(
+    'journal_mode',
+    { simple: true }
+  );
+  assert.equal(journalModeBefore, 'delete');
+
+  assert.throws(
+    () => new SqliteStrategyRepository(database),
+    /^Error: SQLite strategy schema migration failed$/
+  );
+
+  assert.equal(legacyFingerprint(database), before);
+  assert.equal(
+    database.pragma('journal_mode', { simple: true }),
+    journalModeBefore
+  );
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+});
+
+test('rejects migration inside an external transaction without taking ownership of it', (t) => {
+  const database = legacyDatabase(t);
+  seedLegacyExecutingStrategy(database, 'external-transaction-strategy');
+  const before = legacyFingerprint(database);
+  database.exec('BEGIN');
   try {
     assert.throws(
       () => new SqliteStrategyRepository(database),
-      /foreign keys.*required/i
+      /^Error: SQLite strategy schema migration failed$/
     );
-    assert.equal(database.pragma('foreign_keys', { simple: true }), 0);
+    assert.equal(database.inTransaction, true);
+    assert.equal(legacyFingerprint(database), before);
+    assert.equal(
+      database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'strategy_schema_metadata'
+      `).get(),
+      undefined
+    );
   } finally {
-    if (database.inTransaction) {
-      database.exec('ROLLBACK');
-    }
+    database.exec('ROLLBACK');
   }
 });
+
+test('constructs a v2 repository twice without changing migrated data', (t) => {
+  const database = legacyDatabase(t);
+  seedLegacyExecutingStrategy(database, 'legacy-strategy');
+  seedLegacyPlannedOrder(database, 'legacy-strategy', 'planned-order');
+  seedLegacyObservedOrder(database, 'legacy-strategy', 'observed-order');
+  const first = new SqliteStrategyRepository(database);
+  const firstOrders = first.listOrders('legacy-strategy');
+  const firstEvents = first.listOrderEvents('observed-order');
+
+  const second = new SqliteStrategyRepository(database);
+
+  assert.deepEqual(second.listOrders('legacy-strategy'), firstOrders);
+  assert.deepEqual(second.listOrderEvents('observed-order'), firstEvents);
+  assert.deepEqual(database.prepare(`
+    SELECT singleton, version FROM strategy_schema_metadata
+  `).all(), [{ singleton: 1, version: 2 }]);
+  assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+for (const failurePoint of ['early malformed copy', 'late index install'] as const) {
+  test(`rolls back the whole v1 migration after ${failurePoint}`, (t) => {
+    const database = legacyDatabase(t);
+    seedLegacyExecutingStrategy(database, 'legacy-strategy');
+    seedLegacyPlannedOrder(database, 'legacy-strategy', 'planned-order');
+    seedLegacyObservedOrder(database, 'legacy-strategy', 'observed-order');
+    if (failurePoint === 'early malformed copy') {
+      makeMalformedLegacyStrategies(database);
+    } else {
+      database.exec(`
+        DROP INDEX strategies_recoverable_idx;
+        CREATE TABLE strategies_recoverable_idx (blocker TEXT NOT NULL);
+      `);
+    }
+    const before = legacyFingerprint(database);
+
+    assert.throws(
+      () => new SqliteStrategyRepository(database),
+      /SQLite strategy schema migration failed/
+    );
+
+    assert.equal(legacyFingerprint(database), before);
+    assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+    assert.equal(
+      database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'strategy_schema_metadata'
+      `).get(),
+      undefined
+    );
+    assert.equal(
+      database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'strategies_v2'
+      `).get(),
+      undefined
+    );
+    assert.equal(
+      (database.prepare('PRAGMA table_info(strategy_orders)').all() as Array<{
+        name: string;
+      }>).some(({ name }) => (
+        name === 'submission_disposition'
+        || name === 'submission_failure_code'
+      )),
+      false
+    );
+    assert.deepEqual(database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'trigger'
+        AND name LIKE 'strategy_orders_submission_evidence_%'
+      ORDER BY name
+    `).all(), []);
+    assert.equal(
+      database.prepare('SELECT COUNT(*) FROM strategies').pluck().get(),
+      1
+    );
+    assert.equal(
+      database.prepare('SELECT COUNT(*) FROM strategy_orders').pluck().get(),
+      2
+    );
+    assert.equal(
+      database.prepare('SELECT COUNT(*) FROM order_events').pluck().get(),
+      1
+    );
+  });
+}
 
 test('supports foreign keys and event persistence with SQLite safe integers', (t) => {
   const database = new Database(':memory:');
@@ -989,6 +2308,62 @@ test('uses exact snapshot arithmetic independently of global Decimal precision',
             '0.99999999999999999999999999999999999999999',
           remainingBaseQuantity:
             '0.00000000000000000000000000000000000000001'
+        })
+      );
+      assert.equal(repository.listOrderEvents(row.id).length, 1);
+    });
+  }
+});
+
+test('accepts an extreme supported quantity when either sum operand is zero', async (t) => {
+  const quantity = '2e-9000000000000000';
+  for (const testCase of [
+    {
+      name: 'zero remaining after a full fill',
+      filledBaseQuantity: quantity,
+      remainingBaseQuantity: '0',
+      averagePrice: '60000',
+      status: 'closed'
+    },
+    {
+      name: 'zero fill with the full quantity remaining',
+      filledBaseQuantity: '0',
+      remainingBaseQuantity: quantity,
+      averagePrice: null,
+      status: 'open'
+    }
+  ] as const) {
+    await t.test(testCase.name, (child) => {
+      const { repository } = setup(child);
+      const strategyId = repository.createPending(preflight({
+        requestedBaseQuantity: quantity,
+        effectiveBaseQuantity: quantity
+      })).id;
+      const request = requestFor(strategyId, 'SPOT_MARKET', {
+        baseQuantity: quantity
+      });
+      const row = repository.planOrder(
+        strategyId,
+        'SPOT_MARKET',
+        request
+      );
+
+      assert.equal(repository.attachOrderSnapshot(
+        row.id,
+        snapshotFor(request, 'bitget', {
+          filledBaseQuantity: testCase.filledBaseQuantity,
+          remainingBaseQuantity: testCase.remainingBaseQuantity,
+          averagePrice: testCase.averagePrice,
+          status: testCase.status
+        })
+      ), 'attached');
+      assert.deepEqual(
+        repository.listOrders(strategyId)[0]?.snapshot,
+        snapshotFor(request, 'bitget', {
+          filledBaseQuantity: testCase.filledBaseQuantity,
+          remainingBaseQuantity: testCase.remainingBaseQuantity,
+          averagePrice: testCase.averagePrice,
+          status: testCase.status
         })
       );
       assert.equal(repository.listOrderEvents(row.id).length, 1);

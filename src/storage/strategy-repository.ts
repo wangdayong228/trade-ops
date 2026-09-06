@@ -23,8 +23,36 @@ export type StrategyFailureCode =
   | 'MISSING_AVERAGE_PRICE'
   | 'HEDGE_ORDER_REJECTED'
   | 'HEDGE_ORDER_CANCELED'
+  | 'HEDGE_RESIDUAL_NOT_TRADABLE'
   | 'ORDER_RECONCILIATION_FAILED'
   | 'INCONSISTENT_ORDER_STATE';
+
+export type OrderSubmissionDisposition =
+  | 'SUBMISSION_UNCERTAIN'
+  | 'DEFINITELY_NOT_SUBMITTED'
+  | 'REMOTE_OBSERVED';
+
+export type OrderSubmissionFailureCode =
+  | 'ORDER_SUBMISSION_FAILED'
+  | 'HEDGE_RESIDUAL_NOT_TRADABLE';
+
+export type SnapshotAttachmentResult = 'attached' | 'unchanged';
+
+export class OrderSnapshotValidationError extends Error {
+  readonly name = 'OrderSnapshotValidationError';
+
+  constructor(detail: string) {
+    super(detail);
+  }
+}
+
+export class OrderSnapshotWriteConflictError extends Error {
+  readonly name = 'OrderSnapshotWriteConflictError';
+
+  constructor() {
+    super('strategy order changed during snapshot attachment');
+  }
+}
 
 export interface StrategyRecord {
   readonly id: string;
@@ -53,6 +81,8 @@ export interface StrategyOrderRecord {
   readonly request: OrderRequest;
   readonly snapshot: OrderSnapshot | null;
   readonly status: StrategyOrderStatus;
+  readonly submissionDisposition: OrderSubmissionDisposition;
+  readonly submissionFailureCode: OrderSubmissionFailureCode | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -79,7 +109,11 @@ export interface StrategyRepository {
   attachOrderSnapshot(
     strategyOrderId: string,
     snapshot: OrderSnapshot
-  ): void;
+  ): SnapshotAttachmentResult;
+  markDefinitelyNotSubmitted(
+    strategyOrderId: string,
+    failureCode: OrderSubmissionFailureCode
+  ): boolean;
   listOrders(strategyId: string): StrategyOrderRecord[];
   listOrderEvents(strategyOrderId: string): OrderSnapshot[];
   transition(
