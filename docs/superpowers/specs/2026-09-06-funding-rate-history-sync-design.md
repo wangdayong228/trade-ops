@@ -8,6 +8,8 @@
 
 后续 implementation plan、代码、测试和运维文档必须以本设计为目标行为依据。若实现需要扩大交易所、市场类型、数据口径、接口或页面范围，必须先修改本设计并重新确认。
 
+2026-09-06 implementation-plan 风险审查证明：锁定的 CCXT 4.5.68 `loadMarkets(true)` 会额外加载 currencies，并在 Bitget/OKX 内部通过 `Promise.all` 并发加载多个非目标市场类别，无法满足本设计的“同一交易所最多一个实际公共请求”、逐请求限流/重试和精确请求日志不变量。依据用户已授权的正确性自动确认，本设计改为使用同一无凭证 CCXT client 的 generated raw 公共方法各执行一个目标产品发现请求；该变更不扩大交易所或市场范围。
+
 ## 2. 目标
 
 在现有单进程 trade-ops 服务中新增一条与交易执行隔离的只读资金费率同步链路：
@@ -25,7 +27,7 @@
 ### 3.1 交易所与市场
 
 - 交易所固定为 `bitget` 与 `okx`。
-- 只接受 CCXT 市场元数据同时满足以下条件的市场：
+- 只接受由 raw 产品配置按锁定 CCXT 语义构造、且同时满足以下条件的市场观察：
   - `active === true`；
   - `swap === true`；
   - `future === false`；
@@ -37,7 +39,7 @@
 - `active` 缺失或无法证明为 `true` 时不得猜测为 active。
 - 每轮重新发现市场。新出现的目标合约进入回填；已经纳入回填的合约即使后来变为 inactive，也继续完成其仍可获取的历史和最后一次全范围复核，成功后不再执行增量或周期复核。
 - 已完成最后复核的市场后来又被明确观察为 active 时，视为重新激活：在市场发现事务中清除“inactive 最后复核已完成”标记并设置“重新激活全范围待完成”，重新执行专用 reactivation 全范围任务；只有该任务成功后才恢复增量与周期复核。
-- 某个既有市场从 `loadMarkets()` 结果中消失时，不得据此猜测其已下线；本轮市场发现标记为不完整，保留已有状态并在后续重试。
+- 某个既有市场从本轮 raw 产品配置响应中消失时，不得据此猜测其已下线；本轮市场发现标记为不完整，保留已有状态并在后续重试。
 
 ### 3.2 数据类型
 
@@ -63,6 +65,7 @@
 
 ### 4.1 Bitget Classic V2
 
+- 市场发现使用公共端点 `GET /api/v2/mix/market/contracts`，只传 `productType=USDT-FUTURES` 且不传可选 symbol。该端点当前没有 cursor、page 或 limit 参数，一次返回该 product type 的接口可见产品列表；当前限流为 20 次/秒/IP。
 - 使用公共端点 `GET /api/v2/mix/market/history-fund-rate`。
 - `symbol` 与 `productType` 必填。
 - `pageNo` 为页码；`pageSize` 默认 20、最大 100。
@@ -72,6 +75,7 @@
 
 ### 4.2 OKX V5
 
+- 市场发现使用公共端点 `GET /api/v5/public/instruments`，只传 `instType=SWAP`。该端点当前没有 cursor、page 或 limit 参数，一次返回该 instrument type 的接口可见 open-contract 列表；当前限流为 20 次/2 秒，规则为 IP + Instrument Type。
 - 使用公共端点 `GET /api/v5/public/funding-rate-history`。
 - `instId` 必填。
 - `after` 用于请求比给定 `fundingTime` 更旧的数据；每页 `limit` 最大 400。
@@ -81,13 +85,15 @@
 
 ### 4.3 结论
 
-生产实现继续使用 CCXT 的市场加载、HTTP 请求基础设施、错误类型和基础限流能力，但通过 Bitget、OKX 两个专用适配器显式控制单页请求、字段解析、覆盖检查和断点语义。不引入两家交易所的官方 SDK，也不自行实现底层 HTTP 客户端。
+生产实现继续使用 CCXT 的 generated raw 公共请求方法、`safeCurrencyCode`、HTTP 请求基础设施、错误类型和基础限流能力，但不使用 `loadMarkets/fetchMarkets`。Bitget、OKX 两个专用适配器显式控制单次市场发现、历史单页请求、字段解析、覆盖检查和断点语义。不引入两家交易所的官方 SDK，也不自行实现底层 HTTP 客户端。
 
 参考资料：
 
 - Bitget 历史资金费率：<https://www.bitget.com/api-doc/classic/contract/market/Get-History-Funding-Rate>
+- Bitget 合约配置：<https://www.bitget.com/api-doc/classic/contract/market/Get-All-Symbols-Contracts>
 - Bitget 公共接口说明：<https://www.bitget.com/api-doc/classic/quickStart/intro>
 - OKX Funding Rate History：<https://app.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate-history>
+- OKX Instruments：<https://www.okx.com/docs-v5/en/#public-data-rest-api-get-instruments>
 - OKX Pagination：<https://www.okx.com/docs-v5/trick_en/>
 - CCXT Funding Rate Manual：<https://github.com/ccxt/ccxt/wiki/manual#funding-rate>
 - 本地 CCXT Bitget 实现：`node_modules/ccxt/js/src/bitget.js` 的 `fetchFundingRateHistory()`
@@ -108,21 +114,24 @@ FundingRateSyncService
 
 定义只读窄接口，职责仅包括：
 
-- 强制刷新市场，并返回结构符合 USDT 线性永续口径且 `active` 明确为 boolean 的市场观察；新市场只有 `active === true` 才能进入同步，已知市场的 `active === false` 用于触发最后复核；
+- 每轮直接请求目标 raw 产品配置端点，并返回结构符合 USDT 线性永续口径且 `active` 明确为 boolean 的市场观察；新市场只有 `active === true` 才能进入同步，已知市场的 `active === false` 用于触发最后复核；
 - 为单个目标市场请求一页历史已结算资金费率；
 - 返回该页记录、当前分页位置和构造下一页所需信息；
 - 提供脱敏且精确的请求元数据，用于错误日志。
 
 该接口不包含凭证、余额、账户设置、价格、订单或持仓能力。现有 `ExchangeGateway` 和 `ExchangeRegistry` 不扩展资金费率方法，避免资金数据失败影响交易执行替身和状态机。
 
-市场发现必须显式要求 CCXT 重新加载市场（等价于 `loadMarkets(true)`），不得复用上一轮缓存后声称已经发现新上线或状态变化的合约。结构匹配但 `active` 缺失/非 boolean、market ID 重复或 unified symbol 身份冲突时，本轮发现不完整；可以继续同步此前已知市场，但不能新增、停用或宣称完整发现。新发现的 inactive 市场不建立同步状态。
+市场发现不得调用 `loadMarkets/fetchMarkets/fetchCurrencies` 或读取 CCXT market cache。每轮必须经与历史页面相同的单所串行请求 executor，直接调用一次目标 generated raw 方法；因此发现调用本身就是强制刷新，并能对实际 endpoint/query 逐请求执行 spacing、重试和日志。结构匹配但 active 状态缺失/未知、market ID 重复或 unified symbol 身份冲突时，本轮发现不完整；可以继续同步此前已知市场，但不能新增、停用或宣称完整发现。新发现的 inactive 市场不建立同步状态。
+
+币种代码使用同一 CCXT client 的 `safeCurrencyCode` 规范化，不手写 common-currency 映射。进入映射前的 raw market ID、base、quote、settle 候选以及映射后的 base、quote、settle 都必须是无首尾空白的非空字符串；`safeCurrencyCode` 返回空值、非字符串或空白时整轮失败。unified symbol 只能由已验证代码精确构造为 `${base}/${quote}:${settle}`，不能接受 CCXT 对缺失值的字符串插值结果。Bitget 观察只来自 `productType=USDT-FUTURES` 响应：settle 按锁定 CCXT 逻辑依次选择 support-margin list 中的 base、quote、首项，`symbolType=perpetual` 才是 swap；只有官方 `symbolStatus=normal` 明确 active，`listed/maintain/limit_open/restrictedAPI/off` 明确 inactive，缺失或未知状态使整轮不完整。OKX 观察只来自 `instType=SWAP` 响应：base/quote 从恰好两段非空的 `uly` 得出，settle 来自 `settleCcy`，`ctType=linear` 必须与 raw `quoteId=settleId`、`baseId!=settleId` 一致；只有 `state=live` 明确 active，`suspend/rebase/post_only/preopen/test` 明确 inactive，缺失或未知状态使整轮不完整。
 
 ### 5.2 交易所适配器
 
-- `BitgetFundingRateSource` 使用无凭证 CCXT Bitget 客户端和其生成的 `publicMixGetV2MixMarketHistoryFundRate()` 单页方法，固定 Classic V2，显式传入 `symbol`、`productType=USDT-FUTURES`、`pageNo` 与 `pageSize=100`。
-- `OkxFundingRateSource` 使用无凭证 CCXT OKX 客户端和其生成的 `publicGetPublicFundingRateHistory()` 单页方法，显式传入 `instId`、可选 `after` 与 `limit=400`。
+- `BitgetFundingRateSource` 使用无凭证 CCXT Bitget 客户端：发现调用 generated `publicMixGetV2MixMarketContracts({ productType: 'USDT-FUTURES' })`；历史调用 generated `publicMixGetV2MixMarketHistoryFundRate()`，固定 Classic V2，显式传入 `symbol`、`productType=USDT-FUTURES`、`pageNo` 与 `pageSize=100`。
+- `OkxFundingRateSource` 使用无凭证 CCXT OKX 客户端：发现调用 generated `publicGetPublicInstruments({ instType: 'SWAP' })`；历史调用 generated `publicGetPublicFundingRateHistory()`，显式传入 `instId`、可选 `after` 与 `limit=400`。
 - 两个适配器直接验证公共响应 envelope 和每条 raw record，再产生领域记录；不得先通过 CCXT unified `number` 字段丢失十进制表示。
 - 适配器只接受响应中的 market ID 与请求 market ID 精确一致的记录；额外市场、缺失 ID 或身份冲突使本页失败。
+- 两个发现端点的文档都没有分页参数，因此一次成功响应定义为“本轮接口可见列表”，而不是交易所绝对全量快照。若未来出现分页参数、截断标记或响应结构变化，旧实现必须 fail-closed 并先更新设计，不得静默假设单页仍完整。
 
 ### 5.3 `FundingRateSyncService`
 
@@ -289,7 +298,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 - 每个交易所一个串行 worker，两个交易所可并行。
 - 市场发现也必须作为对应交易所 worker 的任务执行；它与该交易所的历史页面请求共享“最多一个在途请求”约束，不得在独立 timer 回调中直接联网。
 - 单个市场先回填、后增量；同一市场不并行执行两类任务。
-- worker 在页面边界调度。市场发现、到期增量、首次/恢复回填和周期复核使用持久轮转游标：每个非空类别都取得一次执行机会后，任何类别才能取得下一轮机会；历史任务的一次机会为一页，发现任务的一次机会为一轮 `loadMarkets(true)`。同一历史类别内的 market 使用 FIFO，一页完成后续页排到队尾。由此任何持续任务都不能饿死发现、增量、回填或复核，单个长市场也不能饿死同类其他市场。
+- worker 在页面边界调度。市场发现、到期增量、首次/恢复回填和周期复核使用持久轮转游标：每个非空类别都取得一次执行机会后，任何类别才能取得下一轮机会；历史任务的一次机会为一页，发现任务的一次机会为一次目标 raw 产品配置请求及完整响应校验。同一历史类别内的 market 使用 FIFO，一页完成后续页排到队尾。由此任何持续任务都不能饿死发现、增量、回填或复核，单个长市场也不能饿死同类其他市场。
 - 历史任务队列按 exchange、market ID 和任务类型去重，发现任务按 exchange 和发现类型去重。同一调度周期尚未完成时不再添加相同任务。
 - 普通增量入队资格必须同时检查：当前明确 active、至少一次成功覆盖、无 reactivation 待完成标记且无 inactive 最后复核待完成条件。该持久化谓词在启动恢复和每轮调度都使用，不能仅依赖内存队列；周期复核失败后的重试任务已排队时，普通增量仍可按页面边界与其串行交错执行。
 - 已排队增量在每次公共请求前必须重新读取并检查同一资格谓词；资格失效时不发请求，丢弃该任务并按第 7.4 节完成生命周期状态转换。覆盖任务在每次请求前也检查其 fencing generation，失配时不发请求并丢弃旧任务。
@@ -391,7 +400,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 12. shutdown 返回后不存在仍可能访问 SQLite 的资金费率任务。
 13. 任何“完整”声明都限定为交易所接口可见范围和持久化 cutoff，不扩张为 cutoff 之后、上市以来或服务端未返回的数据。
 14. 资金费率失败不推进或重试任何订单，不改变对冲状态。
-15. 每轮市场发现绕过 CCXT 市场缓存；OKX 跨进程恢复使用已持久化的上一页重叠锚点。
+15. 每轮市场发现直接调用一条锁定的 generated raw 公共方法，既不使用 CCXT 市场缓存，也不触发 currencies 或其他产品类型请求；OKX 跨进程恢复使用已持久化的上一页重叠锚点。
 16. active 市场的全范围复核不会被持续增量饿死；inactive 市场完成最后复核后不再承诺发现新修订。
 17. signal 在 listen 期间触发 shutdown 时同步器永不启动；`stop()` 返回时 timer、退避、发现任务和 worker root Promise 全部结束。
 18. 同一交易所的市场发现与历史页面请求不并发；明确重新激活的市场会清除旧的 inactive 完成标记并重新建立覆盖。
@@ -405,7 +414,10 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 
 ### 12.1 适配器测试
 
-- 市场过滤完整条件及每个反例；
+- Bitget 发现只调用 `publicMixGetV2MixMarketContracts({ productType: 'USDT-FUTURES' })`，OKX 发现只调用 `publicGetPublicInstruments({ instType: 'SWAP' })`，每轮各自恰好一条实际 HTTP 请求；
+- 两所发现不得调用 `loadMarkets/fetchMarkets/fetchCurrencies`，不得读取 CCXT market cache；
+- Bitget `symbolType/symbolStatus/supportMarginCoins` 与 OKX `instType/ctType/state/uly/settleCcy` 的完整映射条件及每个反例；raw 或 normalized market/base/quote/settle 缺失、非字符串、空白，状态缺失或未知，重复 ID 或身份冲突都使整轮 fail-closed；
+- 发现统一币种代码只经 CCXT `safeCurrencyCode`，目标集合严格限定为 raw endpoint 当前返回的 active USDT 线性永续，不宣称不可观察的交易所绝对全集；
 - Bitget Classic V2 请求 method/path/query、页号、page size 和 raw 字段解析；
 - OKX V5 请求 method/path/query、`after`、limit 和 `realizedRate` 解析；
 - 正、零、负费率以及极小/极大有限十进制保持原始字符串；
@@ -493,6 +505,7 @@ Bitget 与 OKX worker 可以彼此并行。同一交易所任何时刻只允许�
 后续实现只有同时满足以下条件，才可宣称完成：
 
 - Bitget 与 OKX 所有成功发现的 active USDT 线性永续市场都拥有独立同步状态；
+- 每轮发现分别只调用一条锁定的 raw 产品配置接口，并以其完整响应定义当轮 API 可见目标集合；不触发 currencies、其他产品类别或 CCXT 市场缓存；
 - 每个市场能安全回填至接口显式空页，并在完成后每小时增量同步；
 - 已结算费率字段、单位、符号和时间戳严格符合交易所证据；
 - 不使用 CCXT 自动分页，不把 unified JS number 作为持久化费率来源；
