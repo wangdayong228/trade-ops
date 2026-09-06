@@ -1,5 +1,41 @@
-export const SQLITE_FUNDING_RATE_SCHEMA = `
-  CREATE TABLE IF NOT EXISTS funding_rate_history (
+export type SqliteFundingRateSchemaScope = 'main' | 'temp';
+export type SqliteFundingRateSchemaObjectType = 'table' | 'trigger';
+
+export interface SqliteFundingRateSchemaObject {
+  readonly scope: SqliteFundingRateSchemaScope;
+  readonly type: SqliteFundingRateSchemaObjectType;
+  readonly name: string;
+  readonly tableName: string;
+  readonly installSql: string;
+  readonly storedSql: string;
+}
+
+interface FundingRateSchemaDefinition {
+  readonly scope: SqliteFundingRateSchemaScope;
+  readonly type: SqliteFundingRateSchemaObjectType;
+  readonly name: string;
+  readonly tableName: string;
+  readonly installPrefix: string;
+  readonly storedPrefix: string;
+  readonly body: string;
+}
+
+function fundingRateSchemaObject(
+  definition: FundingRateSchemaDefinition
+): SqliteFundingRateSchemaObject {
+  return Object.freeze({
+    scope: definition.scope,
+    type: definition.type,
+    name: definition.name,
+    tableName: definition.tableName,
+    installSql:
+      `${definition.installPrefix} ${definition.name}${definition.body};`,
+    storedSql:
+      `${definition.storedPrefix} ${definition.name}${definition.body}`
+  });
+}
+
+const FUNDING_RATE_HISTORY_BODY = ` (
     exchange_id TEXT NOT NULL CHECK (exchange_id IN ('bitget', 'okx')),
     exchange_market_id TEXT NOT NULL CHECK (
       typeof(exchange_market_id) = 'text'
@@ -47,9 +83,9 @@ export const SQLITE_FUNDING_RATE_SCHEMA = `
     ),
     PRIMARY KEY (exchange_id, exchange_market_id, funding_timestamp_ms),
     CHECK (first_observed_at <= last_observed_at)
-  );
+  )`;
 
-  CREATE TABLE IF NOT EXISTS funding_rate_revisions (
+const FUNDING_RATE_REVISIONS_BODY = ` (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     exchange_id TEXT NOT NULL CHECK (exchange_id IN ('bitget', 'okx')),
     exchange_market_id TEXT NOT NULL CHECK (
@@ -103,9 +139,9 @@ export const SQLITE_FUNDING_RATE_SCHEMA = `
     ),
     CHECK (first_observed_at <= last_observed_at),
     CHECK (last_observed_at <= replaced_at)
-  );
+  )`;
 
-  CREATE TABLE IF NOT EXISTS funding_rate_sync_state (
+const FUNDING_RATE_SYNC_STATE_BODY = ` (
     exchange_id TEXT NOT NULL CHECK (exchange_id IN ('bitget', 'okx')),
     exchange_market_id TEXT NOT NULL CHECK (
       typeof(exchange_market_id) = 'text'
@@ -450,17 +486,101 @@ export const SQLITE_FUNDING_RATE_SCHEMA = `
         AND incremental_ended_at IS NOT NULL
         AND incremental_error_code IS NOT NULL)
     )
-  );
+  )`;
 
-  CREATE TRIGGER IF NOT EXISTS funding_rate_revisions_no_update
+const FUNDING_RATE_REVISIONS_NO_UPDATE_BODY = `
   BEFORE UPDATE ON funding_rate_revisions
   BEGIN
     SELECT RAISE(ABORT, 'funding rate revisions are immutable');
-  END;
+  END`;
 
-  CREATE TRIGGER IF NOT EXISTS funding_rate_revisions_no_delete
+const FUNDING_RATE_REVISIONS_NO_DELETE_BODY = `
   BEFORE DELETE ON funding_rate_revisions
   BEGIN
     SELECT RAISE(ABORT, 'funding rate revisions are immutable');
-  END;
-`;
+  END`;
+
+const FUNDING_RATE_BITGET_SCAN_BODY = ` (
+        exchange_id TEXT NOT NULL CHECK (exchange_id = 'bitget'),
+        exchange_market_id TEXT NOT NULL,
+        coverage_generation INTEGER NOT NULL CHECK (
+          coverage_generation BETWEEN 0 AND 9007199254740991
+        ),
+        scan_round INTEGER NOT NULL CHECK (scan_round IN (1, 2, 3)),
+        funding_timestamp_ms INTEGER NOT NULL CHECK (
+          funding_timestamp_ms BETWEEN 0 AND 8640000000000000
+        ),
+        symbol TEXT NOT NULL,
+        funding_rate TEXT NOT NULL,
+        raw_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        PRIMARY KEY (
+          exchange_id,
+          exchange_market_id,
+          coverage_generation,
+          scan_round,
+          funding_timestamp_ms
+        )
+      ) WITHOUT ROWID`;
+
+export const SQLITE_FUNDING_RATE_SCHEMA_OBJECTS = Object.freeze([
+  fundingRateSchemaObject({
+    scope: 'main',
+    type: 'table',
+    name: 'funding_rate_history',
+    tableName: 'funding_rate_history',
+    installPrefix: 'CREATE TABLE IF NOT EXISTS',
+    storedPrefix: 'CREATE TABLE',
+    body: FUNDING_RATE_HISTORY_BODY
+  }),
+  fundingRateSchemaObject({
+    scope: 'main',
+    type: 'table',
+    name: 'funding_rate_revisions',
+    tableName: 'funding_rate_revisions',
+    installPrefix: 'CREATE TABLE IF NOT EXISTS',
+    storedPrefix: 'CREATE TABLE',
+    body: FUNDING_RATE_REVISIONS_BODY
+  }),
+  fundingRateSchemaObject({
+    scope: 'main',
+    type: 'table',
+    name: 'funding_rate_sync_state',
+    tableName: 'funding_rate_sync_state',
+    installPrefix: 'CREATE TABLE IF NOT EXISTS',
+    storedPrefix: 'CREATE TABLE',
+    body: FUNDING_RATE_SYNC_STATE_BODY
+  }),
+  fundingRateSchemaObject({
+    scope: 'main',
+    type: 'trigger',
+    name: 'funding_rate_revisions_no_update',
+    tableName: 'funding_rate_revisions',
+    installPrefix: 'CREATE TRIGGER IF NOT EXISTS',
+    storedPrefix: 'CREATE TRIGGER',
+    body: FUNDING_RATE_REVISIONS_NO_UPDATE_BODY
+  }),
+  fundingRateSchemaObject({
+    scope: 'main',
+    type: 'trigger',
+    name: 'funding_rate_revisions_no_delete',
+    tableName: 'funding_rate_revisions',
+    installPrefix: 'CREATE TRIGGER IF NOT EXISTS',
+    storedPrefix: 'CREATE TRIGGER',
+    body: FUNDING_RATE_REVISIONS_NO_DELETE_BODY
+  }),
+  fundingRateSchemaObject({
+    scope: 'temp',
+    type: 'table',
+    name: 'funding_rate_bitget_scan',
+    tableName: 'funding_rate_bitget_scan',
+    installPrefix: 'CREATE TEMP TABLE IF NOT EXISTS',
+    storedPrefix: 'CREATE TABLE',
+    body: FUNDING_RATE_BITGET_SCAN_BODY
+  })
+] satisfies readonly SqliteFundingRateSchemaObject[]);
+
+export const SQLITE_FUNDING_RATE_SCHEMA = SQLITE_FUNDING_RATE_SCHEMA_OBJECTS
+  .filter(({ scope }) => scope === 'main')
+  .map(({ installSql }) => installSql)
+  .join('\n\n');

@@ -6,7 +6,11 @@ import {
   type FundingMarketObservation,
   type SettledFundingRate
 } from '../funding-rates/funding-rate-record.js';
-import { SQLITE_FUNDING_RATE_SCHEMA } from './funding-rate-schema.js';
+import {
+  SQLITE_FUNDING_RATE_SCHEMA,
+  SQLITE_FUNDING_RATE_SCHEMA_OBJECTS,
+  type SqliteFundingRateSchemaObject
+} from './funding-rate-schema.js';
 import {
   StaleFundingTaskError,
   fundingTaskFailure,
@@ -57,6 +61,13 @@ interface TableInfoDbRow {
   readonly name: unknown;
   readonly type: unknown;
   readonly pk: unknown;
+}
+
+interface SqliteMasterDbRow {
+  readonly type: unknown;
+  readonly name: unknown;
+  readonly tbl_name: unknown;
+  readonly sql: unknown;
 }
 
 interface HistoryDbRow {
@@ -500,6 +511,29 @@ function assertTableContract(
   }
 }
 
+function assertSchemaObject(
+  database: Database.Database,
+  object: SqliteFundingRateSchemaObject
+): void {
+  const catalog = object.scope === 'main'
+    ? 'sqlite_master'
+    : 'sqlite_temp_master';
+  const row = database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM ${catalog}
+    WHERE name = ?
+  `).get(object.name) as SqliteMasterDbRow | undefined;
+  if (
+    row === undefined
+    || row.type !== object.type
+    || row.name !== object.name
+    || row.tbl_name !== object.tableName
+    || row.sql !== object.storedSql
+  ) {
+    throw schemaError();
+  }
+}
+
 function assertFundingSchema(database: Database.Database): void {
   assertTableContract(database, 'funding_rate_history', [
     ['exchange_id', 'TEXT', 1],
@@ -562,19 +596,8 @@ function assertFundingSchema(database: Database.Database): void {
     ['created_at', 'TEXT', 0],
     ['updated_at', 'TEXT', 0]
   ]);
-  const triggerSql = database.prepare(`
-    SELECT sql FROM sqlite_master
-    WHERE type = 'trigger' AND tbl_name = 'funding_rate_revisions'
-    ORDER BY name
-  `).pluck().all();
-  if (
-    triggerSql.length !== 2
-    || triggerSql.some((sql) => (
-      typeof sql !== 'string'
-      || !sql.includes('funding rate revisions are immutable')
-    ))
-  ) {
-    throw schemaError();
+  for (const object of SQLITE_FUNDING_RATE_SCHEMA_OBJECTS) {
+    if (object.scope === 'main') assertSchemaObject(database, object);
   }
 }
 
@@ -606,30 +629,14 @@ function prepareFundingSchema(database: Database.Database): void {
 
 function createBitgetScanTable(database: Database.Database): void {
   try {
-    database.exec(`
-      CREATE TEMP TABLE IF NOT EXISTS funding_rate_bitget_scan (
-        exchange_id TEXT NOT NULL CHECK (exchange_id = 'bitget'),
-        exchange_market_id TEXT NOT NULL,
-        coverage_generation INTEGER NOT NULL CHECK (
-          coverage_generation BETWEEN 0 AND 9007199254740991
-        ),
-        scan_round INTEGER NOT NULL CHECK (scan_round IN (1, 2, 3)),
-        funding_timestamp_ms INTEGER NOT NULL CHECK (
-          funding_timestamp_ms BETWEEN 0 AND 8640000000000000
-        ),
-        symbol TEXT NOT NULL,
-        funding_rate TEXT NOT NULL,
-        raw_json TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        PRIMARY KEY (
-          exchange_id,
-          exchange_market_id,
-          coverage_generation,
-          scan_round,
-          funding_timestamp_ms
-        )
-      ) WITHOUT ROWID;
-    `);
+    const scanSchema = SQLITE_FUNDING_RATE_SCHEMA_OBJECTS.find((object) => (
+      object.scope === 'temp'
+      && object.type === 'table'
+      && object.name === 'funding_rate_bitget_scan'
+    ));
+    if (scanSchema === undefined) throw schemaError();
+    database.exec(scanSchema.installSql);
+    assertSchemaObject(database, scanSchema);
     assertTableContract(database, 'temp.funding_rate_bitget_scan', [
       ['exchange_id', 'TEXT', 1],
       ['exchange_market_id', 'TEXT', 2],

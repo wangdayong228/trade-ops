@@ -167,6 +167,15 @@ function persistentTableNames(database: Database.Database): string[] {
   `).all() as Array<{ readonly name: string }>).map(({ name }) => name);
 }
 
+function fundingSchemaObjects(database: Database.Database): unknown[] {
+  return database.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    WHERE name LIKE 'funding_rate_%'
+    ORDER BY type, name
+  `).all();
+}
+
 function strategyFingerprint(database: Database.Database): string {
   return JSON.stringify({
     schema: database.prepare(`
@@ -343,6 +352,110 @@ test('rejects construction inside an external transaction before creating any sc
   } finally {
     database.exec('ROLLBACK');
   }
+});
+
+test('rejects a column-compatible funding history table without required constraints', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec(`
+    CREATE TABLE funding_rate_history (
+      exchange_id TEXT,
+      exchange_market_id TEXT,
+      symbol TEXT,
+      funding_timestamp_ms INTEGER,
+      funding_rate TEXT,
+      raw_json TEXT,
+      content_hash TEXT,
+      first_observed_at TEXT,
+      last_observed_at TEXT,
+      PRIMARY KEY (
+        exchange_id,
+        exchange_market_id,
+        funding_timestamp_ms
+      )
+    );
+  `);
+  assertColumnContract(database, 'funding_rate_history', [
+    ['exchange_id', 'TEXT', 1],
+    ['exchange_market_id', 'TEXT', 2],
+    ['symbol', 'TEXT', 0],
+    ['funding_timestamp_ms', 'INTEGER', 3],
+    ['funding_rate', 'TEXT', 0],
+    ['raw_json', 'TEXT', 0],
+    ['content_hash', 'TEXT', 0],
+    ['first_observed_at', 'TEXT', 0],
+    ['last_observed_at', 'TEXT', 0]
+  ]);
+  const before = fundingSchemaObjects(database);
+  const weakTableSql = database.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'table' AND name = 'funding_rate_history'
+  `).pluck().get();
+  assert.equal(typeof weakTableSql, 'string');
+  assert.doesNotMatch(String(weakTableSql), /\bNOT NULL\b|\bCHECK\b/i);
+
+  assert.throws(
+    () => new SqliteFundingRateRepository(database),
+    /SQLite funding rate schema initialization failed/
+  );
+
+  assert.deepEqual(fundingSchemaObjects(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT type, name
+    FROM sqlite_temp_master
+    WHERE name LIKE 'funding_rate_%'
+    ORDER BY type, name
+  `).all(), []);
+});
+
+test('rejects immutable trigger names whose bodies do not abort mutations', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec(SQLITE_FUNDING_RATE_SCHEMA);
+  database.exec(`
+    DROP TRIGGER funding_rate_revisions_no_update;
+    DROP TRIGGER funding_rate_revisions_no_delete;
+
+    CREATE TRIGGER funding_rate_revisions_no_update
+    BEFORE UPDATE ON funding_rate_revisions
+    BEGIN
+      SELECT 'funding rate revisions are immutable';
+    END;
+
+    CREATE TRIGGER funding_rate_revisions_no_delete
+    BEFORE DELETE ON funding_rate_revisions
+    BEGIN
+      SELECT 'funding rate revisions are immutable';
+    END;
+  `);
+  const fakeTriggers = database.prepare(`
+    SELECT name, sql
+    FROM sqlite_master
+    WHERE type = 'trigger' AND tbl_name = 'funding_rate_revisions'
+    ORDER BY name
+  `).all() as Array<{ readonly name: string; readonly sql: string }>;
+  assert.deepEqual(fakeTriggers.map(({ name }) => name), [
+    'funding_rate_revisions_no_delete',
+    'funding_rate_revisions_no_update'
+  ]);
+  for (const { sql } of fakeTriggers) {
+    assert.match(sql, /funding rate revisions are immutable/);
+    assert.doesNotMatch(sql, /RAISE\s*\(/i);
+  }
+  const before = fundingSchemaObjects(database);
+
+  assert.throws(
+    () => new SqliteFundingRateRepository(database),
+    /SQLite funding rate schema initialization failed/
+  );
+
+  assert.deepEqual(fundingSchemaObjects(database), before);
+  assert.deepEqual(database.prepare(`
+    SELECT type, name
+    FROM sqlite_temp_master
+    WHERE name LIKE 'funding_rate_%'
+    ORDER BY type, name
+  `).all(), []);
 });
 
 test('installs the locked columns, keys, immutable triggers, and basic constraints', (t) => {
@@ -951,6 +1064,52 @@ test('rejects prototype-chain failure codes at runtime with a fixed safe error',
         return true;
       }
     );
+  }
+});
+
+test('rejects non-string failure codes without executing coercion', () => {
+  const runtimeFundingTaskFailure = fundingTaskFailure as unknown as (
+    code: unknown
+  ) => FundingTaskFailure;
+  let coercibleCalls = 0;
+  let throwingCalls = 0;
+  const coercible = {
+    secret: 'synthetic-sensitive-coercible',
+    [Symbol.toPrimitive](): string {
+      coercibleCalls += 1;
+      return 'DATABASE_WRITE_FAILED';
+    }
+  };
+  const throwing = {
+    [Symbol.toPrimitive](): never {
+      throwingCalls += 1;
+      throw new Error('synthetic-sensitive-coercion-error');
+    }
+  };
+  const invoke = (value: unknown): unknown => {
+    try {
+      return runtimeFundingTaskFailure(value);
+    } catch (error) {
+      return error;
+    }
+  };
+  const outcomes = [invoke(coercible), invoke(throwing)];
+
+  assert.deepEqual({
+    coercionCalls: [coercibleCalls, throwingCalls],
+    fixedSafeErrors: outcomes.map((outcome) => (
+      outcome instanceof Error
+      && outcome.message === 'unsupported funding task failure code'
+    ))
+  }, {
+    coercionCalls: [0, 0],
+    fixedSafeErrors: [true, true]
+  });
+  for (const outcome of outcomes) {
+    assert.equal(outcome instanceof Error, true);
+    if (!(outcome instanceof Error)) continue;
+    assert.equal(outcome.message, 'unsupported funding task failure code');
+    assert.equal(outcome.message.includes('synthetic-sensitive'), false);
   }
 });
 

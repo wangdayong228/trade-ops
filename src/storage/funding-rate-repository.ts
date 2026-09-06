@@ -108,7 +108,10 @@ const FUNDING_TASK_FAILURE_SUMMARIES: Readonly<Record<
 export function fundingTaskFailure(
   code: FundingTaskFailureCode
 ): FundingTaskFailure {
-  if (!Object.hasOwn(FUNDING_TASK_FAILURE_SUMMARIES, code)) {
+  if (
+    typeof code !== 'string'
+    || !Object.hasOwn(FUNDING_TASK_FAILURE_SUMMARIES, code)
+  ) {
     throw new Error('unsupported funding task failure code');
   }
   const summary = FUNDING_TASK_FAILURE_SUMMARIES[code];
