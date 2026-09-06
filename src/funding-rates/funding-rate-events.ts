@@ -54,6 +54,14 @@ interface FundingCoverageEventFields {
   readonly generation: number;
 }
 
+interface FundingIncrementalEventFields {
+  readonly exchangeId: FundingExchangeId;
+  readonly exchangeMarketId: string;
+  readonly symbol: string;
+  readonly phase: string;
+  readonly generation: number;
+}
+
 interface FundingCoverageStartedEvent extends FundingCoverageEventFields {
   readonly event: 'funding_coverage_started';
   readonly coverageCutoffMs: number;
@@ -74,44 +82,75 @@ interface FundingCoverageCompletedEvent extends FundingCoverageEventFields {
   readonly lastCaughtUpCutoffMs: number;
 }
 
-interface FundingIncrementalCompletedEvent {
+interface FundingIncrementalCompletedEvent extends FundingIncrementalEventFields {
   readonly event: 'funding_incremental_completed';
-  readonly exchangeId: FundingExchangeId;
-  readonly exchangeMarketId: string;
-  readonly symbol: string;
-  readonly phase: string;
-  readonly generation: number;
   readonly inserted: number;
   readonly unchanged: number;
   readonly revised: number;
 }
 
-interface FundingIncrementalBlockedEvent {
+interface FundingIncrementalBlockedEvent extends FundingIncrementalEventFields {
   readonly event: 'funding_incremental_blocked';
-  readonly exchangeId: FundingExchangeId;
-  readonly exchangeMarketId: string;
-  readonly symbol: string;
-  readonly phase: string;
-  readonly generation: number;
 }
 
-interface FundingRequestRetryEvent extends FundingCoverageEventFields {
-  readonly event: 'funding_request_retry';
-  readonly coverageCutoffMs: number;
-  readonly cursor: FundingPageCursor;
+interface FundingRequestRetryFields {
   readonly retryAttempt: number;
   readonly retryDelayMs: number;
   readonly request: FundingRequestMetadata;
   readonly error: SafeError;
 }
 
-interface FundingTaskIncompleteEvent extends FundingCoverageEventFields {
+interface FundingCoverageRequestRetryEvent
+  extends FundingCoverageEventFields, FundingRequestRetryFields {
+  readonly event: 'funding_request_retry';
+  readonly taskCategory: 'coverage';
+  readonly coverageCutoffMs: number;
+  readonly cursor: FundingPageCursor;
+}
+
+interface FundingIncrementalRequestRetryEvent
+  extends FundingIncrementalEventFields, FundingRequestRetryFields {
+  readonly event: 'funding_request_retry';
+  readonly taskCategory: 'incremental';
+  readonly frozenBoundaryMs: number | null;
+  readonly cursor: FundingPageCursor;
+}
+
+interface FundingDiscoveryRequestRetryEvent extends FundingRequestRetryFields {
+  readonly event: 'funding_request_retry';
+  readonly taskCategory: 'discovery';
+  readonly exchangeId: FundingExchangeId;
+  readonly phase: string;
+}
+
+type FundingRequestRetryEvent =
+  | FundingCoverageRequestRetryEvent
+  | FundingIncrementalRequestRetryEvent
+  | FundingDiscoveryRequestRetryEvent;
+
+interface FundingCoverageTaskIncompleteEvent
+  extends FundingCoverageEventFields {
   readonly event: 'funding_task_incomplete';
+  readonly taskCategory: 'coverage';
   readonly coverageCutoffMs: number;
   readonly cursor: FundingPageCursor;
   readonly request: FundingRequestMetadata;
   readonly error: SafeError;
 }
+
+interface FundingIncrementalTaskIncompleteEvent
+  extends FundingIncrementalEventFields {
+  readonly event: 'funding_task_incomplete';
+  readonly taskCategory: 'incremental';
+  readonly frozenBoundaryMs: number | null;
+  readonly cursor: FundingPageCursor;
+  readonly request: FundingRequestMetadata;
+  readonly error: SafeError;
+}
+
+type FundingTaskIncompleteEvent =
+  | FundingCoverageTaskIncompleteEvent
+  | FundingIncrementalTaskIncompleteEvent;
 
 interface FundingRateRevisedEvent {
   readonly event: 'funding_rate_revised';
@@ -233,44 +272,365 @@ function allowlistedError(
   };
 }
 
-function allowlistedQuery(
-  query: FundingRequestMetadata['query']
-): Readonly<Record<string, string | number | boolean>> {
-  const output: Record<string, string | number | boolean> = {};
-  for (const key of APPROVED_QUERY_KEYS) {
-    const value = query[key];
-    if (
-      typeof value === 'string'
-      || typeof value === 'number'
-      || typeof value === 'boolean'
-    ) {
-      output[key] = value;
-    }
+type UnknownRecord = Readonly<Record<string, unknown>>;
+
+function invalidEventField(field: string, expected: string): never {
+  throw new Error(`invalid funding rate event ${field}: expected ${expected}`);
+}
+
+function plainRecord(value: unknown, field: string): UnknownRecord {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return invalidEventField(field, 'a plain object');
   }
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    return invalidEventField(field, 'a plain object');
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    return invalidEventField(field, 'a plain object');
+  }
+  return value as UnknownRecord;
+}
+
+function ownValue(
+  record: UnknownRecord,
+  property: string,
+  field: string = property
+): unknown {
+  let present: boolean;
+  try {
+    present = Object.prototype.hasOwnProperty.call(record, property);
+  } catch {
+    return invalidEventField(field, 'an own field');
+  }
+  if (!present) {
+    return invalidEventField(field, 'an own field');
+  }
+  try {
+    return Reflect.get(record, property);
+  } catch {
+    return invalidEventField(field, 'a readable own field');
+  }
+}
+
+function optionalOwnValue(
+  record: UnknownRecord,
+  property: string,
+  field: string
+): unknown | undefined {
+  let present: boolean;
+  try {
+    present = Object.prototype.hasOwnProperty.call(record, property);
+  } catch {
+    return invalidEventField(field, 'a readable optional field');
+  }
+  return present ? ownValue(record, property, field) : undefined;
+}
+
+function requiredString(value: unknown, field: string): string {
+  return typeof value === 'string'
+    ? value
+    : invalidEventField(field, 'a string');
+}
+
+function nonNegativeSafeInteger(value: unknown, field: string): number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+    ? value
+    : invalidEventField(field, 'a non-negative safe integer');
+}
+
+function nullableNonNegativeSafeInteger(
+  value: unknown,
+  field: string
+): number | null {
+  return value === null ? null : nonNegativeSafeInteger(value, field);
+}
+
+function fundingExchangeId(
+  value: unknown,
+  field: string = 'exchangeId'
+): FundingExchangeId {
+  if (value === 'bitget' || value === 'okx') {
+    return value;
+  }
+  return invalidEventField(field, 'bitget or okx');
+}
+
+function coverageKind(value: unknown): FundingCoverageKind {
+  switch (value) {
+    case 'INITIAL':
+    case 'PERIODIC':
+    case 'INACTIVE_FINAL':
+    case 'REACTIVATION':
+      return value;
+    default:
+      return invalidEventField('taskKind', 'an approved coverage task kind');
+  }
+}
+
+function retryTaskCategory(
+  value: unknown
+): FundingRequestRetryEvent['taskCategory'] {
+  if (value === 'coverage' || value === 'incremental' || value === 'discovery') {
+    return value;
+  }
+  return invalidEventField(
+    'taskCategory',
+    'coverage, incremental, or discovery'
+  );
+}
+
+function incompleteTaskCategory(
+  value: unknown
+): FundingTaskIncompleteEvent['taskCategory'] {
+  if (value === 'coverage' || value === 'incremental') {
+    return value;
+  }
+  return invalidEventField('taskCategory', 'coverage or incremental');
+}
+
+function fundingRateEventName(value: unknown): FundingRateEvent['event'] {
+  switch (value) {
+    case 'funding_sync_started':
+    case 'funding_sync_stopped':
+    case 'funding_market_discovery_completed':
+    case 'funding_market_discovery_incomplete':
+    case 'funding_coverage_started':
+    case 'funding_page_committed':
+    case 'funding_coverage_completed':
+    case 'funding_incremental_completed':
+    case 'funding_incremental_blocked':
+    case 'funding_request_retry':
+    case 'funding_task_incomplete':
+    case 'funding_rate_revised':
+    case 'funding_sync_fatal':
+      return value;
+    default:
+      return invalidEventField('event', 'an approved event name');
+  }
+}
+
+function optionalStringQueryField(
+  query: UnknownRecord,
+  output: Record<string, string | number | boolean>,
+  key: typeof APPROVED_QUERY_KEYS[number],
+  exactValue?: string
+): void {
+  const value = optionalOwnValue(query, key, `request.query.${key}`);
+  if (
+    typeof value === 'string'
+    && (exactValue === undefined || value === exactValue)
+  ) {
+    output[key] = value;
+  }
+}
+
+function optionalIntegerQueryField(
+  query: UnknownRecord,
+  output: Record<string, string | number | boolean>,
+  key: 'pageNo' | 'pageSize' | 'limit'
+): void {
+  const value = optionalOwnValue(query, key, `request.query.${key}`);
+  if (
+    typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+  ) {
+    output[key] = value;
+  }
+}
+
+function allowlistedQuery(
+  value: unknown
+): Readonly<Record<string, string | number | boolean>> {
+  const query = plainRecord(value, 'request.query');
+  const output: Record<string, string | number | boolean> = {};
+  optionalStringQueryField(query, output, 'symbol');
+  optionalStringQueryField(query, output, 'productType', 'USDT-FUTURES');
+  optionalIntegerQueryField(query, output, 'pageNo');
+  optionalIntegerQueryField(query, output, 'pageSize');
+  optionalStringQueryField(query, output, 'instType', 'SWAP');
+  optionalStringQueryField(query, output, 'instId');
+  optionalStringQueryField(query, output, 'after');
+  optionalIntegerQueryField(query, output, 'limit');
   return output;
 }
 
-function allowlistedRequest(
-  request: FundingRequestMetadata
-): FundingRequestMetadata {
+function allowlistedRequest(value: unknown): FundingRequestMetadata {
+  const request = plainRecord(value, 'request');
+  const method = ownValue(request, 'method', 'request.method');
+  if (method !== 'GET') {
+    return invalidEventField('request.method', 'GET');
+  }
   return {
-    method: request.method,
-    path: request.path,
-    query: allowlistedQuery(request.query),
+    method,
+    path: requiredString(
+      ownValue(request, 'path', 'request.path'),
+      'request.path'
+    ),
+    query: allowlistedQuery(
+      ownValue(request, 'query', 'request.query')
+    ),
     body: null
   };
 }
 
-function allowlistedCursor(cursor: FundingPageCursor): FundingPageCursor {
-  if ('pageNo' in cursor) {
+function allowlistedCursor(value: unknown): FundingPageCursor {
+  const cursor = plainRecord(value, 'cursor');
+  const exchangeId = fundingExchangeId(
+    ownValue(cursor, 'exchangeId', 'cursor.exchangeId'),
+    'cursor.exchangeId'
+  );
+  if (exchangeId === 'bitget') {
     return {
-      exchangeId: cursor.exchangeId,
-      pageNo: cursor.pageNo
+      exchangeId,
+      pageNo: nonNegativeSafeInteger(
+        ownValue(cursor, 'pageNo', 'cursor.pageNo'),
+        'cursor.pageNo'
+      )
     };
   }
   return {
-    exchangeId: cursor.exchangeId,
-    afterMs: cursor.afterMs
+    exchangeId,
+    afterMs: nullableNonNegativeSafeInteger(
+      ownValue(cursor, 'afterMs', 'cursor.afterMs'),
+      'cursor.afterMs'
+    )
+  };
+}
+
+function coverageEventFields(record: UnknownRecord): FundingCoverageEventFields {
+  return {
+    exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
+    exchangeMarketId: requiredString(
+      ownValue(record, 'exchangeMarketId'),
+      'exchangeMarketId'
+    ),
+    symbol: requiredString(ownValue(record, 'symbol'), 'symbol'),
+    phase: requiredString(ownValue(record, 'phase'), 'phase'),
+    taskKind: coverageKind(ownValue(record, 'taskKind')),
+    generation: nonNegativeSafeInteger(
+      ownValue(record, 'generation'),
+      'generation'
+    )
+  };
+}
+
+function incrementalEventFields(
+  record: UnknownRecord
+): FundingIncrementalEventFields {
+  return {
+    exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
+    exchangeMarketId: requiredString(
+      ownValue(record, 'exchangeMarketId'),
+      'exchangeMarketId'
+    ),
+    symbol: requiredString(ownValue(record, 'symbol'), 'symbol'),
+    phase: requiredString(ownValue(record, 'phase'), 'phase'),
+    generation: nonNegativeSafeInteger(
+      ownValue(record, 'generation'),
+      'generation'
+    )
+  };
+}
+
+function requestRetryFields(
+  record: UnknownRecord,
+  secrets: readonly string[]
+): FundingRequestRetryFields {
+  return {
+    retryAttempt: nonNegativeSafeInteger(
+      ownValue(record, 'retryAttempt'),
+      'retryAttempt'
+    ),
+    retryDelayMs: nonNegativeSafeInteger(
+      ownValue(record, 'retryDelayMs'),
+      'retryDelayMs'
+    ),
+    request: allowlistedRequest(ownValue(record, 'request')),
+    error: allowlistedError(ownValue(record, 'error'), secrets)
+  };
+}
+
+function fundingRequestRetryEvent(
+  record: UnknownRecord,
+  secrets: readonly string[]
+): FundingRequestRetryEvent {
+  const taskCategory = retryTaskCategory(ownValue(record, 'taskCategory'));
+  const retryFields = requestRetryFields(record, secrets);
+  if (taskCategory === 'coverage') {
+    return {
+      event: 'funding_request_retry',
+      taskCategory,
+      ...coverageEventFields(record),
+      coverageCutoffMs: nonNegativeSafeInteger(
+        ownValue(record, 'coverageCutoffMs'),
+        'coverageCutoffMs'
+      ),
+      cursor: allowlistedCursor(ownValue(record, 'cursor')),
+      ...retryFields
+    };
+  }
+  if (taskCategory === 'incremental') {
+    return {
+      event: 'funding_request_retry',
+      taskCategory,
+      ...incrementalEventFields(record),
+      frozenBoundaryMs: nullableNonNegativeSafeInteger(
+        ownValue(record, 'frozenBoundaryMs'),
+        'frozenBoundaryMs'
+      ),
+      cursor: allowlistedCursor(ownValue(record, 'cursor')),
+      ...retryFields
+    };
+  }
+  return {
+    event: 'funding_request_retry',
+    taskCategory,
+    exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
+    phase: requiredString(ownValue(record, 'phase'), 'phase'),
+    ...retryFields
+  };
+}
+
+function fundingTaskIncompleteEvent(
+  record: UnknownRecord,
+  secrets: readonly string[]
+): FundingTaskIncompleteEvent {
+  const taskCategory = incompleteTaskCategory(
+    ownValue(record, 'taskCategory')
+  );
+  const request = allowlistedRequest(ownValue(record, 'request'));
+  const error = allowlistedError(ownValue(record, 'error'), secrets);
+  if (taskCategory === 'coverage') {
+    return {
+      event: 'funding_task_incomplete',
+      taskCategory,
+      ...coverageEventFields(record),
+      coverageCutoffMs: nonNegativeSafeInteger(
+        ownValue(record, 'coverageCutoffMs'),
+        'coverageCutoffMs'
+      ),
+      cursor: allowlistedCursor(ownValue(record, 'cursor')),
+      request,
+      error
+    };
+  }
+  return {
+    event: 'funding_task_incomplete',
+    taskCategory,
+    ...incrementalEventFields(record),
+    frozenBoundaryMs: nullableNonNegativeSafeInteger(
+      ownValue(record, 'frozenBoundaryMs'),
+      'frozenBoundaryMs'
+    ),
+    cursor: allowlistedCursor(ownValue(record, 'cursor')),
+    request,
+    error
   };
 }
 
@@ -278,133 +638,116 @@ function allowlistedFundingRateEvent(
   input: Readonly<FundingRateEventInput>,
   secrets: readonly string[]
 ): FundingRateEvent {
-  switch (input.event) {
+  const record = plainRecord(input, 'input');
+  const event = fundingRateEventName(ownValue(record, 'event'));
+  switch (event) {
     case 'funding_sync_started':
-      return { event: input.event, phase: input.phase };
     case 'funding_sync_stopped':
-      return { event: input.event, phase: input.phase };
+      return {
+        event,
+        phase: requiredString(ownValue(record, 'phase'), 'phase')
+      };
     case 'funding_market_discovery_completed':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        phase: input.phase
+        event,
+        exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
+        phase: requiredString(ownValue(record, 'phase'), 'phase')
       };
     case 'funding_market_discovery_incomplete':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        phase: input.phase,
-        request: allowlistedRequest(input.request),
-        error: allowlistedError(input.error, secrets)
+        event,
+        exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
+        phase: requiredString(ownValue(record, 'phase'), 'phase'),
+        request: allowlistedRequest(ownValue(record, 'request')),
+        error: allowlistedError(ownValue(record, 'error'), secrets)
       };
     case 'funding_coverage_started':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        taskKind: input.taskKind,
-        generation: input.generation,
-        coverageCutoffMs: input.coverageCutoffMs,
-        cursor: allowlistedCursor(input.cursor)
+        event,
+        ...coverageEventFields(record),
+        coverageCutoffMs: nonNegativeSafeInteger(
+          ownValue(record, 'coverageCutoffMs'),
+          'coverageCutoffMs'
+        ),
+        cursor: allowlistedCursor(ownValue(record, 'cursor'))
       };
     case 'funding_page_committed':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        taskKind: input.taskKind,
-        generation: input.generation,
-        cursor: allowlistedCursor(input.cursor),
-        inserted: input.inserted,
-        unchanged: input.unchanged,
-        revised: input.revised
+        event,
+        ...coverageEventFields(record),
+        cursor: allowlistedCursor(ownValue(record, 'cursor')),
+        inserted: nonNegativeSafeInteger(
+          ownValue(record, 'inserted'),
+          'inserted'
+        ),
+        unchanged: nonNegativeSafeInteger(
+          ownValue(record, 'unchanged'),
+          'unchanged'
+        ),
+        revised: nonNegativeSafeInteger(ownValue(record, 'revised'), 'revised')
       };
     case 'funding_coverage_completed':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        taskKind: input.taskKind,
-        generation: input.generation,
-        coverageCutoffMs: input.coverageCutoffMs,
-        lastCaughtUpCutoffMs: input.lastCaughtUpCutoffMs
+        event,
+        ...coverageEventFields(record),
+        coverageCutoffMs: nonNegativeSafeInteger(
+          ownValue(record, 'coverageCutoffMs'),
+          'coverageCutoffMs'
+        ),
+        lastCaughtUpCutoffMs: nonNegativeSafeInteger(
+          ownValue(record, 'lastCaughtUpCutoffMs'),
+          'lastCaughtUpCutoffMs'
+        )
       };
     case 'funding_incremental_completed':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        generation: input.generation,
-        inserted: input.inserted,
-        unchanged: input.unchanged,
-        revised: input.revised
+        event,
+        ...incrementalEventFields(record),
+        inserted: nonNegativeSafeInteger(
+          ownValue(record, 'inserted'),
+          'inserted'
+        ),
+        unchanged: nonNegativeSafeInteger(
+          ownValue(record, 'unchanged'),
+          'unchanged'
+        ),
+        revised: nonNegativeSafeInteger(ownValue(record, 'revised'), 'revised')
       };
     case 'funding_incremental_blocked':
-      return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        generation: input.generation
-      };
+      return { event, ...incrementalEventFields(record) };
     case 'funding_request_retry':
-      return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        taskKind: input.taskKind,
-        generation: input.generation,
-        coverageCutoffMs: input.coverageCutoffMs,
-        cursor: allowlistedCursor(input.cursor),
-        retryAttempt: input.retryAttempt,
-        retryDelayMs: input.retryDelayMs,
-        request: allowlistedRequest(input.request),
-        error: allowlistedError(input.error, secrets)
-      };
+      return fundingRequestRetryEvent(record, secrets);
     case 'funding_task_incomplete':
-      return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        taskKind: input.taskKind,
-        generation: input.generation,
-        coverageCutoffMs: input.coverageCutoffMs,
-        cursor: allowlistedCursor(input.cursor),
-        request: allowlistedRequest(input.request),
-        error: allowlistedError(input.error, secrets)
-      };
+      return fundingTaskIncompleteEvent(record, secrets);
     case 'funding_rate_revised':
       return {
-        event: input.event,
-        exchangeId: input.exchangeId,
-        exchangeMarketId: input.exchangeMarketId,
-        symbol: input.symbol,
-        phase: input.phase,
-        fundingTimestampMs: input.fundingTimestampMs,
-        previousContentHash: input.previousContentHash,
-        currentContentHash: input.currentContentHash
+        event,
+        exchangeId: fundingExchangeId(ownValue(record, 'exchangeId')),
+        exchangeMarketId: requiredString(
+          ownValue(record, 'exchangeMarketId'),
+          'exchangeMarketId'
+        ),
+        symbol: requiredString(ownValue(record, 'symbol'), 'symbol'),
+        phase: requiredString(ownValue(record, 'phase'), 'phase'),
+        fundingTimestampMs: nonNegativeSafeInteger(
+          ownValue(record, 'fundingTimestampMs'),
+          'fundingTimestampMs'
+        ),
+        previousContentHash: requiredString(
+          ownValue(record, 'previousContentHash'),
+          'previousContentHash'
+        ),
+        currentContentHash: requiredString(
+          ownValue(record, 'currentContentHash'),
+          'currentContentHash'
+        )
       };
     case 'funding_sync_fatal':
       return {
-        event: input.event,
-        phase: input.phase,
-        error: allowlistedError(input.error, secrets)
+        event,
+        phase: requiredString(ownValue(record, 'phase'), 'phase'),
+        error: allowlistedError(ownValue(record, 'error'), secrets)
       };
-    default:
-      throw new Error('unsupported funding rate event');
   }
 }
 
@@ -467,11 +810,20 @@ export function fundingRateEvent(
   input: Readonly<FundingIncrementalBlockedEvent>
 ): FundingIncrementalBlockedEvent;
 export function fundingRateEvent(
-  input: Readonly<FundingRateEventInputFor<FundingRequestRetryEvent>>
-): FundingRequestRetryEvent;
+  input: Readonly<FundingRateEventInputFor<FundingCoverageRequestRetryEvent>>
+): FundingCoverageRequestRetryEvent;
 export function fundingRateEvent(
-  input: Readonly<FundingRateEventInputFor<FundingTaskIncompleteEvent>>
-): FundingTaskIncompleteEvent;
+  input: Readonly<FundingRateEventInputFor<FundingIncrementalRequestRetryEvent>>
+): FundingIncrementalRequestRetryEvent;
+export function fundingRateEvent(
+  input: Readonly<FundingRateEventInputFor<FundingDiscoveryRequestRetryEvent>>
+): FundingDiscoveryRequestRetryEvent;
+export function fundingRateEvent(
+  input: Readonly<FundingRateEventInputFor<FundingCoverageTaskIncompleteEvent>>
+): FundingCoverageTaskIncompleteEvent;
+export function fundingRateEvent(
+  input: Readonly<FundingRateEventInputFor<FundingIncrementalTaskIncompleteEvent>>
+): FundingIncrementalTaskIncompleteEvent;
 export function fundingRateEvent(
   input: Readonly<FundingRateRevisedEvent>
 ): FundingRateRevisedEvent;

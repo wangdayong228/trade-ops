@@ -57,8 +57,117 @@ type EnforcedEventUnionContract = IsAny<FundingRateEvent> extends true
   : IsExactDiscriminatedEventUnion;
 const IS_EXACT_DISCRIMINATED_EVENT_UNION: EnforcedEventUnionContract = true;
 
+type TypeEqual<Left, Right> = (
+  <Value>() => Value extends Left ? 1 : 2
+) extends (
+  <Value>() => Value extends Right ? 1 : 2
+) ? true : false;
+type AssertType<Condition extends true> = Condition;
+type EventWithName<Name extends FundingRateEvent['event']> = Extract<
+  FundingRateEvent,
+  { readonly event: Name }
+>;
+type EventWithCategory<Event, Category extends string> = Extract<
+  Event,
+  { readonly taskCategory: Category }
+>;
+type TaskCategoryOf<Event> = Event extends {
+  readonly taskCategory: infer Category;
+} ? Category : never;
+
+type RetryEvent = EventWithName<'funding_request_retry'>;
+type IncompleteEvent = EventWithName<'funding_task_incomplete'>;
+type RetryCategoriesAreExact = AssertType<TypeEqual<
+  TaskCategoryOf<RetryEvent>,
+  'coverage' | 'incremental' | 'discovery'
+>>;
+type IncompleteCategoriesAreExact = AssertType<TypeEqual<
+  TaskCategoryOf<IncompleteEvent>,
+  'coverage' | 'incremental'
+>>;
+type CoverageRetryKeysAreExact = AssertType<TypeEqual<
+  keyof EventWithCategory<RetryEvent, 'coverage'>,
+  | 'event'
+  | 'taskCategory'
+  | 'exchangeId'
+  | 'exchangeMarketId'
+  | 'symbol'
+  | 'phase'
+  | 'taskKind'
+  | 'generation'
+  | 'coverageCutoffMs'
+  | 'cursor'
+  | 'retryAttempt'
+  | 'retryDelayMs'
+  | 'request'
+  | 'error'
+>>;
+type IncrementalRetryKeysAreExact = AssertType<TypeEqual<
+  keyof EventWithCategory<RetryEvent, 'incremental'>,
+  | 'event'
+  | 'taskCategory'
+  | 'exchangeId'
+  | 'exchangeMarketId'
+  | 'symbol'
+  | 'phase'
+  | 'generation'
+  | 'frozenBoundaryMs'
+  | 'cursor'
+  | 'retryAttempt'
+  | 'retryDelayMs'
+  | 'request'
+  | 'error'
+>>;
+type DiscoveryRetryKeysAreExact = AssertType<TypeEqual<
+  keyof EventWithCategory<RetryEvent, 'discovery'>,
+  | 'event'
+  | 'taskCategory'
+  | 'exchangeId'
+  | 'phase'
+  | 'retryAttempt'
+  | 'retryDelayMs'
+  | 'request'
+  | 'error'
+>>;
+type CoverageIncompleteKeysAreExact = AssertType<TypeEqual<
+  keyof EventWithCategory<IncompleteEvent, 'coverage'>,
+  | 'event'
+  | 'taskCategory'
+  | 'exchangeId'
+  | 'exchangeMarketId'
+  | 'symbol'
+  | 'phase'
+  | 'taskKind'
+  | 'generation'
+  | 'coverageCutoffMs'
+  | 'cursor'
+  | 'request'
+  | 'error'
+>>;
+type IncrementalIncompleteKeysAreExact = AssertType<TypeEqual<
+  keyof EventWithCategory<IncompleteEvent, 'incremental'>,
+  | 'event'
+  | 'taskCategory'
+  | 'exchangeId'
+  | 'exchangeMarketId'
+  | 'symbol'
+  | 'phase'
+  | 'generation'
+  | 'frozenBoundaryMs'
+  | 'cursor'
+  | 'request'
+  | 'error'
+>>;
+
 const SYNTHETIC_ERROR = {
   name: 'SyntheticExchangeError',
+  message: 'public request failed',
+  code: 'ETIMEDOUT',
+  stack: 'SyntheticExchangeError: public request failed\n    at synthetic:test'
+};
+
+const SAFE_SYNTHETIC_ERROR = {
+  type: 'SyntheticExchangeError',
   message: 'public request failed',
   code: 'ETIMEDOUT',
   stack: 'SyntheticExchangeError: public request failed\n    at synthetic:test'
@@ -84,6 +193,13 @@ const OKX_REQUEST = {
     after: '1700000000000',
     limit: 400
   },
+  body: null
+} as const;
+
+const OKX_DISCOVERY_REQUEST = {
+  method: 'GET',
+  path: '/api/v5/public/instruments',
+  query: { instType: 'SWAP' },
   body: null
 } as const;
 
@@ -175,8 +291,9 @@ test('builds the closed discriminated union of thirteen production events', () =
       phase: 'incremental',
       generation: 8
     },
-    {
+    ({
       event: 'funding_request_retry',
+      taskCategory: 'coverage',
       exchangeId: 'okx',
       exchangeMarketId: 'BTC-USDT-SWAP',
       symbol: 'BTC/USDT:USDT',
@@ -189,9 +306,10 @@ test('builds the closed discriminated union of thirteen production events', () =
       retryDelayMs: 2_000,
       request: OKX_REQUEST,
       error: SYNTHETIC_ERROR
-    },
-    {
+    } as unknown as FundingRateEventInput),
+    ({
       event: 'funding_task_incomplete',
+      taskCategory: 'coverage',
       exchangeId: 'bitget',
       exchangeMarketId: 'BTCUSDT',
       symbol: 'BTC/USDT:USDT',
@@ -202,7 +320,7 @@ test('builds the closed discriminated union of thirteen production events', () =
       cursor: { exchangeId: 'bitget', pageNo: 4 },
       request: BITGET_REQUEST,
       error: SYNTHETIC_ERROR
-    },
+    } as unknown as FundingRateEventInput),
     {
       event: 'funding_rate_revised',
       exchangeId: 'bitget',
@@ -263,6 +381,7 @@ test('builds the closed discriminated union of thirteen production events', () =
 test('builder allowlists event, request, query, and safe error fields independently', () => {
   const unsafeInput = {
     event: 'funding_request_retry',
+    taskCategory: 'coverage',
     exchangeId: 'okx',
     exchangeMarketId: 'BTC-USDT-SWAP',
     symbol: 'BTC/USDT:USDT',
@@ -307,8 +426,12 @@ test('builder allowlists event, request, query, and safe error fields independen
   } as unknown as FundingRateEventInput;
 
   const event = fundingRateEvent(unsafeInput);
+  const {
+    taskCategory: _taskCategory,
+    ...eventWithoutTaskCategory
+  } = event as FundingRateEvent & { readonly taskCategory?: unknown };
 
-  assert.deepEqual(event, {
+  assert.deepEqual(eventWithoutTaskCategory, {
     event: 'funding_request_retry',
     exchangeId: 'okx',
     exchangeMarketId: 'BTC-USDT-SWAP',
@@ -383,6 +506,7 @@ test('Pino sink reapplies nested allowlists, redacts every emitted string, and t
   const longMessage = `${secret}${asciiAfterRedaction}界`;
   const unsafeEvent = Object.assign(fundingRateEvent({
     event: 'funding_request_retry',
+    taskCategory: 'coverage',
     exchangeId: 'okx',
     exchangeMarketId: 'BTC-USDT-SWAP',
     symbol: 'BTC/USDT:USDT',
@@ -395,23 +519,23 @@ test('Pino sink reapplies nested allowlists, redacts every emitted string, and t
     retryDelayMs: 1_000,
     request: OKX_REQUEST,
     error: SYNTHETIC_ERROR
-  }), {
+  } as unknown as FundingRateEventInput), {
     apiKey: forbidden,
     secret: forbidden,
     headers: { authorization: forbidden },
     rawResponse: forbidden,
     cause: new Error(forbidden),
-    exchangeId: `okx-${secret}`,
+    exchangeId: 'okx',
     exchangeMarketId: `BTC-${secret}-SWAP`,
     symbol: `BTC/${secret}:USDT`,
     phase: `coverage-${secret}`,
     cursor: {
-      exchangeId: `okx-${secret}`,
+      exchangeId: 'okx',
       afterMs: 1_700_000_000_000,
       apiKey: forbidden
     },
     request: {
-      method: `GET-${secret}`,
+      method: 'GET',
       path: `/api/${secret}/funding-rate-history`,
       query: {
         symbol: `BTC-${secret}`,
@@ -443,16 +567,16 @@ test('Pino sink reapplies nested allowlists, redacts every emitted string, and t
   assert.ok(MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES > 0);
   const line = JSON.parse(output.join('').trim()) as Record<string, unknown>;
   assert.equal(line.component, 'funding-rates');
-  assert.equal(line.exchangeId, 'okx-[Redacted]');
+  assert.equal(line.exchangeId, 'okx');
   assert.equal(line.exchangeMarketId, 'BTC-[Redacted]-SWAP');
   assert.equal(line.symbol, 'BTC/[Redacted]:USDT');
   assert.equal(line.phase, 'coverage-[Redacted]');
   assert.deepEqual(line.cursor, {
-    exchangeId: 'okx-[Redacted]',
+    exchangeId: 'okx',
     afterMs: 1_700_000_000_000
   });
   assert.deepEqual(line.request, {
-    method: 'GET-[Redacted]',
+    method: 'GET',
     path: '/api/[Redacted]/funding-rate-history',
     query: {
       symbol: 'BTC-[Redacted]',
@@ -478,6 +602,330 @@ test('Pino sink reapplies nested allowlists, redacts every emitted string, and t
     JSON.stringify(line),
     new RegExp(`${secret}|${forbidden}|apiKey|headers|rawResponse|cause|authorization`)
   );
+});
+
+test('builder rejects object-valued scalars and sink emits nothing for the same pollution', () => {
+  const secret = 'SYNTHETIC-SCALAR-SECRET';
+  const pollution = {
+    apiKey: secret,
+    headers: { authorization: secret },
+    cause: { message: secret }
+  };
+  const validInput = {
+    event: 'funding_request_retry',
+    taskCategory: 'coverage',
+    exchangeId: 'bitget',
+    exchangeMarketId: 'BTCUSDT',
+    symbol: 'BTC/USDT:USDT',
+    phase: 'coverage',
+    taskKind: 'INITIAL',
+    generation: 14,
+    coverageCutoffMs: 1_700_000_000_005,
+    cursor: { exchangeId: 'bitget', pageNo: 2 },
+    retryAttempt: 1,
+    retryDelayMs: 1_000,
+    request: BITGET_REQUEST,
+    error: SYNTHETIC_ERROR
+  };
+  const invalidInputs: readonly [string, FundingRateEventInput][] = [
+    ['phase', { ...validInput, phase: pollution } as unknown as FundingRateEventInput],
+    [
+      'exchangeId',
+      { ...validInput, exchangeId: pollution } as unknown as FundingRateEventInput
+    ],
+    [
+      'exchangeMarketId',
+      {
+        ...validInput,
+        exchangeMarketId: pollution
+      } as unknown as FundingRateEventInput
+    ],
+    [
+      'symbol',
+      { ...validInput, symbol: pollution } as unknown as FundingRateEventInput
+    ],
+    [
+      'request.method',
+      {
+        ...validInput,
+        request: { ...BITGET_REQUEST, method: pollution }
+      } as unknown as FundingRateEventInput
+    ],
+    [
+      'request.path',
+      {
+        ...validInput,
+        request: { ...BITGET_REQUEST, path: pollution }
+      } as unknown as FundingRateEventInput
+    ],
+    [
+      'cursor.exchangeId',
+      {
+        ...validInput,
+        cursor: { exchangeId: pollution, pageNo: 2 }
+      } as unknown as FundingRateEventInput
+    ],
+    [
+      'cursor.pageNo',
+      {
+        ...validInput,
+        cursor: { exchangeId: 'bitget', pageNo: pollution }
+      } as unknown as FundingRateEventInput
+    ]
+  ];
+  const acceptedScalarFields: string[] = [];
+
+  for (const [field, input] of invalidInputs) {
+    try {
+      fundingRateEvent(input);
+      acceptedScalarFields.push(field);
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.doesNotMatch(error.message, new RegExp(secret));
+    }
+  }
+
+  const output: string[] = [];
+  const sink = new PinoFundingRateEventSink(
+    createAppLogger(captureDestination(output)),
+    () => [secret]
+  );
+  const pollutedEvent = {
+    event: 'funding_request_retry',
+    taskCategory: 'coverage',
+    exchangeId: pollution,
+    exchangeMarketId: pollution,
+    symbol: pollution,
+    phase: pollution,
+    taskKind: 'INITIAL',
+    generation: 14,
+    coverageCutoffMs: 1_700_000_000_005,
+    cursor: { exchangeId: pollution, pageNo: pollution },
+    retryAttempt: 1,
+    retryDelayMs: 1_000,
+    request: {
+      ...BITGET_REQUEST,
+      method: pollution,
+      path: pollution,
+      apiKey: secret,
+      headers: { authorization: secret },
+      cause: { message: secret }
+    },
+    error: SAFE_SYNTHETIC_ERROR,
+    apiKey: secret,
+    headers: { authorization: secret },
+    cause: { message: secret }
+  } as unknown as FundingRateEvent;
+
+  sink.record(pollutedEvent);
+
+  assert.deepEqual({
+    acceptedScalarFields,
+    loggedLineCount: output.length,
+    sensitiveOutput: output.join('').includes(secret)
+  }, {
+    acceptedScalarFields: [],
+    loggedLineCount: 0,
+    sensitiveOutput: false
+  });
+});
+
+test('retry and incomplete events preserve only their discovery, coverage, or incremental contract', () => {
+  const expectedEvents = [
+    {
+      event: 'funding_request_retry',
+      taskCategory: 'coverage',
+      exchangeId: 'bitget',
+      exchangeMarketId: 'BTCUSDT',
+      symbol: 'BTC/USDT:USDT',
+      phase: 'coverage',
+      taskKind: 'PERIODIC',
+      generation: 15,
+      coverageCutoffMs: 1_700_000_000_006,
+      cursor: { exchangeId: 'bitget', pageNo: 3 },
+      retryAttempt: 2,
+      retryDelayMs: 2_000,
+      request: BITGET_REQUEST,
+      error: SAFE_SYNTHETIC_ERROR
+    },
+    {
+      event: 'funding_request_retry',
+      taskCategory: 'incremental',
+      exchangeId: 'okx',
+      exchangeMarketId: 'BTC-USDT-SWAP',
+      symbol: 'BTC/USDT:USDT',
+      phase: 'incremental',
+      generation: 16,
+      frozenBoundaryMs: 1_699_999_999_999,
+      cursor: { exchangeId: 'okx', afterMs: 1_700_000_000_000 },
+      retryAttempt: 3,
+      retryDelayMs: 4_000,
+      request: OKX_REQUEST,
+      error: SAFE_SYNTHETIC_ERROR
+    },
+    {
+      event: 'funding_request_retry',
+      taskCategory: 'discovery',
+      exchangeId: 'okx',
+      phase: 'discovery',
+      retryAttempt: 1,
+      retryDelayMs: 1_000,
+      request: OKX_DISCOVERY_REQUEST,
+      error: SAFE_SYNTHETIC_ERROR
+    },
+    {
+      event: 'funding_task_incomplete',
+      taskCategory: 'coverage',
+      exchangeId: 'bitget',
+      exchangeMarketId: 'BTCUSDT',
+      symbol: 'BTC/USDT:USDT',
+      phase: 'coverage',
+      taskKind: 'INACTIVE_FINAL',
+      generation: 17,
+      coverageCutoffMs: 1_700_000_000_007,
+      cursor: { exchangeId: 'bitget', pageNo: 4 },
+      request: BITGET_REQUEST,
+      error: SAFE_SYNTHETIC_ERROR
+    },
+    {
+      event: 'funding_task_incomplete',
+      taskCategory: 'incremental',
+      exchangeId: 'okx',
+      exchangeMarketId: 'BTC-USDT-SWAP',
+      symbol: 'BTC/USDT:USDT',
+      phase: 'incremental',
+      generation: 18,
+      frozenBoundaryMs: 1_699_999_999_998,
+      cursor: { exchangeId: 'okx', afterMs: 1_699_999_999_999 },
+      request: OKX_REQUEST,
+      error: SAFE_SYNTHETIC_ERROR
+    }
+  ] as const;
+  const builderInputs = [
+    {
+      ...expectedEvents[0],
+      error: SYNTHETIC_ERROR,
+      frozenBoundaryMs: 9
+    },
+    {
+      ...expectedEvents[1],
+      error: SYNTHETIC_ERROR,
+      taskKind: 'PERIODIC',
+      coverageCutoffMs: 9
+    },
+    {
+      ...expectedEvents[2],
+      error: SYNTHETIC_ERROR,
+      exchangeMarketId: 'MUST-BE-DROPPED',
+      symbol: 'MUST-BE-DROPPED',
+      taskKind: 'INITIAL',
+      generation: 9,
+      coverageCutoffMs: 9,
+      frozenBoundaryMs: 9,
+      cursor: { exchangeId: 'okx', afterMs: null }
+    },
+    {
+      ...expectedEvents[3],
+      error: SYNTHETIC_ERROR,
+      frozenBoundaryMs: 9
+    },
+    {
+      ...expectedEvents[4],
+      error: SYNTHETIC_ERROR,
+      taskKind: 'REACTIVATION',
+      coverageCutoffMs: 9
+    }
+  ] as const;
+  const builtEvents = builderInputs.map((input) => {
+    try {
+      return fundingRateEvent(input as unknown as FundingRateEventInput);
+    } catch (error) {
+      return {
+        threw: error instanceof Error ? error.message : 'non-Error thrown'
+      };
+    }
+  });
+  const ambiguousInput = {
+    ...builderInputs[0],
+    taskCategory: undefined
+  } as unknown as FundingRateEventInput;
+  let ambiguousBuilderRejected = false;
+  try {
+    fundingRateEvent(ambiguousInput);
+  } catch {
+    ambiguousBuilderRejected = true;
+  }
+
+  const output: string[] = [];
+  const sink = new PinoFundingRateEventSink(
+    createAppLogger(captureDestination(output))
+  );
+  const sinkInputs = [
+    { ...expectedEvents[0], frozenBoundaryMs: 9 },
+    {
+      ...expectedEvents[1],
+      taskKind: 'PERIODIC',
+      coverageCutoffMs: 9
+    },
+    {
+      ...expectedEvents[2],
+      exchangeMarketId: 'MUST-BE-DROPPED',
+      symbol: 'MUST-BE-DROPPED',
+      taskKind: 'INITIAL',
+      generation: 9,
+      coverageCutoffMs: 9,
+      frozenBoundaryMs: 9,
+      cursor: { exchangeId: 'okx', afterMs: null }
+    },
+    { ...expectedEvents[3], frozenBoundaryMs: 9 },
+    {
+      ...expectedEvents[4],
+      taskKind: 'REACTIVATION',
+      coverageCutoffMs: 9
+    }
+  ] as const;
+  for (const input of sinkInputs) {
+    sink.record(input as unknown as FundingRateEvent);
+  }
+
+  const ambiguousOutput: string[] = [];
+  const ambiguousSink = new PinoFundingRateEventSink(
+    createAppLogger(captureDestination(ambiguousOutput))
+  );
+  ambiguousSink.record({
+    ...expectedEvents[0],
+    taskCategory: undefined
+  } as unknown as FundingRateEvent);
+
+  const loggedEvents = output.map((entry) => {
+    const parsed = JSON.parse(entry) as Record<string, unknown>;
+    const event: Record<string, unknown> = {};
+    for (const [field, value] of Object.entries(parsed)) {
+      if (![
+        'level',
+        'time',
+        'service',
+        'version',
+        'component',
+        'msg'
+      ].includes(field)) {
+        event[field] = value;
+      }
+    }
+    return event;
+  });
+
+  assert.deepEqual({
+    builtEvents,
+    loggedEvents,
+    ambiguousBuilderRejected,
+    ambiguousSinkLineCount: ambiguousOutput.length
+  }, {
+    builtEvents: expectedEvents,
+    loggedEvents: expectedEvents,
+    ambiguousBuilderRejected: true,
+    ambiguousSinkLineCount: 0
+  });
 });
 
 test('logger, secret provider, and synchronous or asynchronous sink failures never propagate', async () => {
