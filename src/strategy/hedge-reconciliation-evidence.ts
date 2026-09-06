@@ -394,7 +394,11 @@ export class HedgeOrderEvidenceCollector {
         this.recordAttachedEvents(strategy, order, snapshot);
       }
       if (originalDisposition === 'DEFINITELY_NOT_SUBMITTED') {
-        firstPending ??= orderPending(order, 'ORDER_EVIDENCE_MISMATCH');
+        firstPending ??= orderPending(
+          order,
+          'ORDER_EVIDENCE_MISMATCH',
+          scalarMismatch('DEFINITELY_NOT_SUBMITTED', 'REMOTE_OBSERVED')
+        );
       }
     }
 

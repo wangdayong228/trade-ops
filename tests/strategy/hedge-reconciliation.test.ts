@@ -669,6 +669,8 @@ test('persists a remote contradiction to definite no-submit then blocks', async 
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(result.expected, 'DEFINITELY_NOT_SUBMITTED');
+  assert.equal(result.actual, 'REMOTE_OBSERVED');
   const persisted = f.repository.listOrders(f.strategyId)[0];
   assert.equal(persisted?.submissionDisposition, 'REMOTE_OBSERVED');
   assert.equal(persisted?.status, 'closed');
@@ -690,6 +692,8 @@ test('uses the latest definite no-submit disposition with a stale planned input'
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(result.expected, 'DEFINITELY_NOT_SUBMITTED');
+  assert.equal(result.actual, 'REMOTE_OBSERVED');
   const persisted = f.repository.listOrders(f.strategyId)[0];
   assert.equal(persisted?.submissionDisposition, 'REMOTE_OBSERVED');
   assert.equal(persisted?.status, 'closed');
