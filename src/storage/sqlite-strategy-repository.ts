@@ -15,7 +15,10 @@ import type {
   StrategyState
 } from '../domain/types.js';
 import type { PreflightResult } from '../strategy/preflight-service.js';
-import { SQLITE_STRATEGY_SCHEMA } from './schema.js';
+import {
+  SQLITE_STRATEGY_ORDERS_TABLE,
+  SQLITE_STRATEGY_SCHEMA
+} from './schema.js';
 import type {
   OrderSubmissionDisposition,
   OrderSubmissionFailureCode,
@@ -1515,49 +1518,8 @@ function assertV2BusinessSchema(database: Database.Database): void {
     throw schemaError();
   }
 
-  const hasSnapshotPairing = ordersSql.includes(canonicalSql(`
-    CHECK (
-      (
-        status = 'planned'
-        AND snapshot_json IS NULL
-        AND exchange_order_id IS NULL
-      )
-      OR
-      (
-        status <> 'planned'
-        AND snapshot_json IS NOT NULL
-        AND exchange_order_id IS NOT NULL
-      )
-    )
-  `));
-  const hasTableEvidenceChecks = ordersSql.includes(canonicalSql(`
-    CHECK (
-      (
-        submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
-        AND submission_failure_code IS NOT NULL
-      )
-      OR
-      (
-        submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
-        AND submission_failure_code IS NULL
-      )
-    )
-  `)) && ordersSql.includes(canonicalSql(`
-    CHECK (
-      (
-        status = 'planned'
-        AND submission_disposition IN (
-          'SUBMISSION_UNCERTAIN',
-          'DEFINITELY_NOT_SUBMITTED'
-        )
-      )
-      OR
-      (
-        status <> 'planned'
-        AND submission_disposition = 'REMOTE_OBSERVED'
-      )
-    )
-  `));
+  const hasFreshOrderTable = ordersSql
+    === canonicalSql(SQLITE_STRATEGY_ORDERS_TABLE);
   const evidenceInsert = rows.find(({ type, name, tbl_name: table }) => (
     type === 'trigger'
     && name === 'strategy_orders_submission_evidence_insert'
@@ -1574,10 +1536,7 @@ function assertV2BusinessSchema(database: Database.Database): void {
       === canonicalSql(SUBMISSION_EVIDENCE_INSERT_TRIGGER)
     && canonicalSql(evidenceUpdate.sql)
       === canonicalSql(SUBMISSION_EVIDENCE_UPDATE_TRIGGER);
-  if (
-    !hasSnapshotPairing
-    || (!hasTableEvidenceChecks && !hasMigrationEvidenceTriggers)
-  ) {
+  if (!hasFreshOrderTable && !hasMigrationEvidenceTriggers) {
     throw schemaError();
   }
 }

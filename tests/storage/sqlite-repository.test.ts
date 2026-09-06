@@ -414,6 +414,24 @@ function rewriteTableDefinition(
   rewriteSchemaObjectDefinition(database, 'table', table, rewrite);
 }
 
+const SUBMISSION_EVIDENCE_CHECK_SQL = `CHECK (
+  (
+    submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+    AND submission_failure_code IS NOT NULL
+  )
+  OR
+  (
+    submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'
+    AND submission_failure_code IS NULL
+  )
+)`;
+
+const CANONICAL_SUBMISSION_EVIDENCE_CHECK_SQL =
+  "check((submission_disposition='DEFINITELY_NOT_SUBMITTED' and "
+  + 'submission_failure_code is not null)or('
+  + "submission_disposition<>'DEFINITELY_NOT_SUBMITTED' and "
+  + 'submission_failure_code is null))';
+
 function makeMalformedLegacyStrategies(database: Database.Database): void {
   database.pragma('foreign_keys = OFF');
   database.exec(`
@@ -593,6 +611,91 @@ test('rejects v2 evidence CHECK with a case-changed quoted literal', (t) => {
   });
   assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
 });
+
+for (const inactiveCheck of [
+  {
+    name: 'inactive block-comment text',
+    directoryPrefix: 'trade-ops-check-comment-',
+    insertion: `\n/* ${SUBMISSION_EVIDENCE_CHECK_SQL} */\n`
+  },
+  {
+    name: 'an inactive quoted constraint name',
+    directoryPrefix: 'trade-ops-check-name-',
+    insertion: `,\nCONSTRAINT "${CANONICAL_SUBMISSION_EVIDENCE_CHECK_SQL}"
+      CHECK (1)\n`
+  }
+] as const) {
+  test(`rejects broken v2 evidence CHECK disguised by ${inactiveCheck.name}`, (t) => {
+    const directory = mkdtempSync(join(tmpdir(), inactiveCheck.directoryPrefix));
+    const databasePath = join(directory, 'strategies.sqlite');
+    let database = new Database(databasePath);
+    t.after(() => {
+      if (database.open) database.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const repository = new SqliteStrategyRepository(database);
+    const strategyId = repository.createPending(preflight()).id;
+    assert.equal(repository.claimForExecution(strategyId), true);
+    const order = repository.planOrder(
+      strategyId,
+      'CONTRACT_MARKET',
+      requestFor(strategyId, 'CONTRACT_MARKET')
+    );
+    const correctOperator =
+      "submission_disposition <> 'DEFINITELY_NOT_SUBMITTED'";
+    const wrongOperator =
+      "submission_disposition = 'DEFINITELY_NOT_SUBMITTED'";
+
+    rewriteTableDefinition(database, 'strategy_orders', (sql) => {
+      assert.equal(sql.split(correctOperator).length - 1, 1);
+      const brokenSql = sql.replace(correctOperator, wrongOperator);
+      const finalParenthesis = brokenSql.lastIndexOf(')');
+      assert.notEqual(finalParenthesis, -1);
+      return brokenSql.slice(0, finalParenthesis)
+        + inactiveCheck.insertion
+        + brokenSql.slice(finalParenthesis);
+    });
+    database.close();
+    database = new Database(databasePath);
+    database.pragma('foreign_keys = ON');
+
+    const reloadedSql = tableDefinition(database, 'strategy_orders');
+    assert.equal(reloadedSql.includes(wrongOperator), true);
+    assert.equal(reloadedSql.includes(inactiveCheck.insertion.trim()), true);
+    database.exec('SAVEPOINT inactive_check_probe');
+    try {
+      assert.equal(database.prepare(`
+        UPDATE strategy_orders
+        SET submission_disposition = 'DEFINITELY_NOT_SUBMITTED'
+        WHERE id = ?
+      `).run(order.id).changes, 1);
+    } finally {
+      database.exec('ROLLBACK TO inactive_check_probe');
+      database.exec('RELEASE inactive_check_probe');
+    }
+    const before = legacyFingerprint(database);
+
+    assert.throws(
+      () => new SqliteStrategyRepository(database),
+      /^Error: SQLite strategy schema migration failed$/
+    );
+
+    assert.equal(legacyFingerprint(database), before);
+    assert.deepEqual(database.prepare(`
+      SELECT singleton, version FROM strategy_schema_metadata
+    `).all(), [{ singleton: 1, version: 2 }]);
+    assert.deepEqual(database.prepare(`
+      SELECT submission_disposition, submission_failure_code
+      FROM strategy_orders
+      WHERE id = ?
+    `).get(order.id), {
+      submission_disposition: 'SUBMISSION_UNCERTAIN',
+      submission_failure_code: null
+    });
+    assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+    assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+  });
+}
 
 test('migrates v1 failure constraints and order submission evidence atomically', (t) => {
   const database = legacyDatabase(t);

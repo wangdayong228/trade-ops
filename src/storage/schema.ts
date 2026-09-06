@@ -1,55 +1,4 @@
-export const SQLITE_STRATEGY_SCHEMA = `
-  CREATE TABLE strategies (
-    id TEXT PRIMARY KEY,
-    state TEXT NOT NULL CHECK (state IN (
-      'PENDING_CONFIRMATION',
-      'EXECUTING',
-      'WAITING_HEDGE',
-      'HEDGED',
-      'HEDGE_INCOMPLETE',
-      'FAILED'
-    )),
-    mode TEXT NOT NULL CHECK (mode IN (
-      'CONCURRENT',
-      'CONTRACT_FIRST',
-      'SPOT_FIRST'
-    )),
-    spot_exchange_id TEXT NOT NULL,
-    contract_exchange_id TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    requested_base_quantity TEXT NOT NULL,
-    effective_base_quantity TEXT NOT NULL,
-    preflight_json TEXT NOT NULL,
-    failure_code TEXT CHECK (
-      failure_code IS NULL
-      OR failure_code IN (
-        'ORDER_SUBMISSION_FAILED',
-        'ORDER_SUBMISSION_UNKNOWN',
-        'ORDER_NOT_FOUND',
-        'NO_FILL',
-        'MISSING_AVERAGE_PRICE',
-        'HEDGE_ORDER_REJECTED',
-        'HEDGE_ORDER_CANCELED',
-        'HEDGE_RESIDUAL_NOT_TRADABLE',
-        'ORDER_RECONCILIATION_FAILED',
-        'INCONSISTENT_ORDER_STATE'
-      )
-    ),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    CHECK (
-      (
-        state IN ('HEDGE_INCOMPLETE', 'FAILED')
-        AND failure_code IS NOT NULL
-      )
-      OR
-      (
-        state NOT IN ('HEDGE_INCOMPLETE', 'FAILED')
-        AND failure_code IS NULL
-      )
-    )
-  );
-
+export const SQLITE_STRATEGY_ORDERS_TABLE = `
   CREATE TABLE strategy_orders (
     id TEXT PRIMARY KEY,
     strategy_id TEXT NOT NULL REFERENCES strategies(id),
@@ -128,6 +77,61 @@ export const SQLITE_STRATEGY_SCHEMA = `
       )
     )
   );
+`;
+
+export const SQLITE_STRATEGY_SCHEMA = `
+  CREATE TABLE strategies (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN (
+      'PENDING_CONFIRMATION',
+      'EXECUTING',
+      'WAITING_HEDGE',
+      'HEDGED',
+      'HEDGE_INCOMPLETE',
+      'FAILED'
+    )),
+    mode TEXT NOT NULL CHECK (mode IN (
+      'CONCURRENT',
+      'CONTRACT_FIRST',
+      'SPOT_FIRST'
+    )),
+    spot_exchange_id TEXT NOT NULL,
+    contract_exchange_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    requested_base_quantity TEXT NOT NULL,
+    effective_base_quantity TEXT NOT NULL,
+    preflight_json TEXT NOT NULL,
+    failure_code TEXT CHECK (
+      failure_code IS NULL
+      OR failure_code IN (
+        'ORDER_SUBMISSION_FAILED',
+        'ORDER_SUBMISSION_UNKNOWN',
+        'ORDER_NOT_FOUND',
+        'NO_FILL',
+        'MISSING_AVERAGE_PRICE',
+        'HEDGE_ORDER_REJECTED',
+        'HEDGE_ORDER_CANCELED',
+        'HEDGE_RESIDUAL_NOT_TRADABLE',
+        'ORDER_RECONCILIATION_FAILED',
+        'INCONSISTENT_ORDER_STATE'
+      )
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (
+        state IN ('HEDGE_INCOMPLETE', 'FAILED')
+        AND failure_code IS NOT NULL
+      )
+      OR
+      (
+        state NOT IN ('HEDGE_INCOMPLETE', 'FAILED')
+        AND failure_code IS NULL
+      )
+    )
+  );
+
+  ${SQLITE_STRATEGY_ORDERS_TABLE}
 
   CREATE TABLE order_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
