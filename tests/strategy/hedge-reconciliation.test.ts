@@ -674,6 +674,29 @@ test('persists a remote contradiction to definite no-submit then blocks', async 
   assert.equal(persisted?.status, 'closed');
 });
 
+test('uses the latest definite no-submit disposition with a stale planned input', async (t) => {
+  const f = fixture(t, 'CONTRACT_FIRST');
+  const stalePlanned = planOrder(f, 'CONTRACT_MARKET');
+  assert.equal(f.repository.markDefinitelyNotSubmitted(
+    stalePlanned.id,
+    'ORDER_SUBMISSION_FAILED'
+  ), true);
+  scriptFind(f, stalePlanned, snapshotForOrder(stalePlanned));
+
+  const result = await f.collector.collect(
+    f.repository.getStrategy(f.strategyId),
+    [stalePlanned]
+  );
+
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  const persisted = f.repository.listOrders(f.strategyId)[0];
+  assert.equal(persisted?.submissionDisposition, 'REMOTE_OBSERVED');
+  assert.equal(persisted?.status, 'closed');
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assert.equal(f.contract.createdRequests.length, 0);
+});
+
 for (const [name, patch] of [
   ['exchange identity', { exchangeId: 'bitget' }],
   ['client identity', { clientOrderId: 'different-client-id' }],
@@ -700,6 +723,34 @@ for (const [name, patch] of [
     assert.equal(f.repository.listOrders(f.strategyId)[0]?.status, 'planned');
   });
 }
+
+test('reports safe scalar diagnostics for a client identity mismatch', async (t) => {
+  const f = fixture(t, 'CONTRACT_FIRST');
+  const order = planOrder(f, 'CONTRACT_MARKET');
+  const remoteClientOrderId = 'different-client-id';
+  scriptFind(f, order, snapshotForOrder(order, {
+    clientOrderId: remoteClientOrderId,
+    averagePrice: '87654.321',
+    updatedAt: '2026-09-05T00:09:00.000Z'
+  }));
+
+  const result = await f.collector.collect(
+    f.repository.getStrategy(f.strategyId),
+    [order]
+  );
+
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(result.expected, order.clientOrderId);
+  assert.equal(result.actual, remoteClientOrderId);
+  assert.doesNotMatch(
+    JSON.stringify(result),
+    /87654\.321|2026-09-05T00:09:00\.000Z/
+  );
+  assert.equal(f.repository.listOrderEvents(order.id).length, 0);
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assert.equal(f.contract.createdRequests.length, 0);
+});
 
 for (const [name, patch] of [
   ['quantity conservation', {
@@ -801,6 +852,34 @@ test('maps an attach compare-and-set conflict without retaining its cause', asyn
   assert.doesNotMatch(JSON.stringify(result), /strategy order changed/);
 });
 
+test('rethrows an unknown snapshot attachment failure unchanged', async (t) => {
+  const f = fixture(t, 'CONTRACT_FIRST');
+  const order = planOrder(f, 'CONTRACT_MARKET');
+  scriptFind(f, order, snapshotForOrder(order));
+  const sentinel = new Error('synthetic storage failure');
+  const originalAttach = f.repository.attachOrderSnapshot.bind(f.repository);
+  Reflect.set(f.repository, 'attachOrderSnapshot', () => {
+    throw sentinel;
+  });
+  t.after(() => Reflect.set(
+    f.repository,
+    'attachOrderSnapshot',
+    originalAttach
+  ));
+
+  await assert.rejects(
+    f.collector.collect(
+      f.repository.getStrategy(f.strategyId),
+      [order]
+    ),
+    (error: unknown) => error === sentinel
+  );
+  assert.equal(f.repository.listOrderEvents(order.id).length, 0);
+  assert.equal(f.tradeEvents.length, 0);
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assert.equal(f.contract.createdRequests.length, 0);
+});
+
 for (const [name, localPatch, remotePatch] of [
   ['status regression', {
     status: 'closed',
@@ -853,6 +932,50 @@ for (const [name, localPatch, remotePatch] of [
     assert.equal(f.repository.listOrderEvents(planned.id).length, 1);
   });
 }
+
+test('uses the latest status for safe mismatch diagnostics with stale input', async (t) => {
+  const f = fixture(t, 'CONTRACT_FIRST');
+  const stalePlanned = planOrder(f, 'CONTRACT_MARKET');
+  const persistedClosed = snapshotForOrder(stalePlanned, {
+    exchangeOrderId: 'status-baseline',
+    status: 'closed',
+    filledBaseQuantity: '1',
+    remainingBaseQuantity: '0'
+  });
+  assert.equal(f.repository.attachOrderSnapshot(
+    stalePlanned.id,
+    persistedClosed
+  ), 'attached');
+  scriptFind(f, stalePlanned, snapshotForOrder(stalePlanned, {
+    exchangeOrderId: 'status-baseline',
+    status: 'open',
+    filledBaseQuantity: '1',
+    remainingBaseQuantity: '0',
+    averagePrice: '98765.4321',
+    updatedAt: '2026-09-05T00:02:00.000Z'
+  }));
+
+  const result = await f.collector.collect(
+    f.repository.getStrategy(f.strategyId),
+    [stalePlanned]
+  );
+
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(result.expected, 'closed');
+  assert.equal(result.actual, 'open');
+  assert.doesNotMatch(
+    JSON.stringify(result),
+    /98765\.4321|2026-09-05T00:02:00\.000Z/
+  );
+  assert.deepEqual(
+    f.repository.listOrders(f.strategyId)[0]?.snapshot,
+    persistedClosed
+  );
+  assert.equal(f.repository.listOrderEvents(stalePlanned.id).length, 1);
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assert.equal(f.contract.createdRequests.length, 0);
+});
 
 test('reports both exchange-id and client-id lookup failure safely', async (t) => {
   const f = fixture(t, 'CONTRACT_FIRST');
@@ -997,5 +1120,49 @@ test('emits lifecycle events only for semantic snapshot changes', async (t) => {
   )).kind, 'ready');
   assert.equal(f.repository.listOrderEvents(order.id).length, 3);
   assert.equal(f.tradeEvents.length, 4);
+  assert.equal(f.contract.createdRequests.length, 0);
+});
+
+test('emits one terminal event across attached closed snapshots from stale input', async (t) => {
+  const f = fixture(t, 'CONTRACT_FIRST');
+  const stalePlanned = planOrder(f, 'CONTRACT_MARKET');
+  const firstClosed = snapshotForOrder(stalePlanned, {
+    exchangeOrderId: 'stale-lifecycle',
+    status: 'closed',
+    filledBaseQuantity: '0.4',
+    remainingBaseQuantity: '0.6',
+    updatedAt: '2026-09-05T00:01:00.000Z'
+  });
+  const secondClosed = {
+    ...firstClosed,
+    filledBaseQuantity: '1',
+    remainingBaseQuantity: '0',
+    updatedAt: '2026-09-05T00:02:00.000Z'
+  };
+  f.contract.scriptedFind.set(stalePlanned.clientOrderId, [
+    firstClosed,
+    secondClosed
+  ]);
+
+  assert.equal((await f.collector.collect(
+    f.repository.getStrategy(f.strategyId),
+    [stalePlanned]
+  )).kind, 'ready');
+  assert.equal((await f.collector.collect(
+    f.repository.getStrategy(f.strategyId),
+    [stalePlanned]
+  )).kind, 'ready');
+
+  assert.equal(f.repository.listOrderEvents(stalePlanned.id).length, 2);
+  assert.equal(
+    f.tradeEvents.filter(({ event }) => event === 'order_status_changed').length,
+    2
+  );
+  assert.equal(
+    f.tradeEvents.filter(({ event }) => event === 'order_terminal').length,
+    1
+  );
+  assert.equal(f.repository.listOrders(f.strategyId)[0]?.status, 'closed');
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
   assert.equal(f.contract.createdRequests.length, 0);
 });

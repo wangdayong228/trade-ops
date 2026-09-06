@@ -53,6 +53,13 @@ interface PendingContext {
   readonly strategyOrderId?: string;
   readonly clientOrderId?: string;
   readonly exchangeId?: string;
+  readonly expected?: string;
+  readonly actual?: string;
+}
+
+interface MismatchContext {
+  readonly expected: string;
+  readonly actual: string;
 }
 
 const LEGAL_ROLE_SETS: Readonly<Record<
@@ -191,14 +198,18 @@ function gtcFollowsRequiredMarkets(
 
 function orderPending(
   order: Readonly<StrategyOrderRecord>,
-  reason: EvidencePendingReason
+  reason: EvidencePendingReason,
+  mismatch?: Readonly<MismatchContext>
 ): PendingContext {
-  return {
+  const context: PendingContext = {
     reason,
     strategyOrderId: order.id,
     clientOrderId: order.clientOrderId,
     exchangeId: order.exchangeId
   };
+  return mismatch === undefined
+    ? context
+    : { ...context, ...mismatch };
 }
 
 function withExposure(
@@ -218,19 +229,34 @@ function terminalOrderStatus(
   return status !== undefined && TERMINAL_ORDER_STATUSES.has(status);
 }
 
-function remoteEvidenceMatches(
+function scalarMismatch(
+  expected: string,
+  actual: string
+): MismatchContext {
+  return { expected, actual };
+}
+
+function remoteEvidenceMismatch(
   order: Readonly<StrategyOrderRecord>,
   snapshot: Readonly<OrderSnapshot>
-): boolean {
-  if (
-    snapshot.exchangeId !== order.exchangeId
-    || snapshot.clientOrderId !== order.clientOrderId
-    || snapshot.symbol !== order.request.symbol
-    || snapshot.kind !== order.request.kind
-    || snapshot.type !== order.request.type
-    || snapshot.side !== order.request.side
-  ) {
-    return false;
+): MismatchContext | null {
+  if (snapshot.exchangeId !== order.exchangeId) {
+    return scalarMismatch(order.exchangeId, snapshot.exchangeId);
+  }
+  if (snapshot.clientOrderId !== order.clientOrderId) {
+    return scalarMismatch(order.clientOrderId, snapshot.clientOrderId);
+  }
+  if (snapshot.symbol !== order.request.symbol) {
+    return scalarMismatch(order.request.symbol, snapshot.symbol);
+  }
+  if (snapshot.kind !== order.request.kind) {
+    return scalarMismatch(order.request.kind, snapshot.kind);
+  }
+  if (snapshot.type !== order.request.type) {
+    return scalarMismatch(order.request.type, snapshot.type);
+  }
+  if (snapshot.side !== order.request.side) {
+    return scalarMismatch(order.request.side, snapshot.side);
   }
 
   const requested = parsedDecimal(snapshot.requestedBaseQuantity);
@@ -241,16 +267,24 @@ function remoteEvidenceMatches(
       order.request.baseQuantity
     )
   ) {
-    return false;
+    return scalarMismatch(
+      order.request.baseQuantity,
+      snapshot.requestedBaseQuantity
+    );
   }
   if (
     order.exchangeOrderId !== null
     && snapshot.exchangeOrderId !== order.exchangeOrderId
   ) {
-    return false;
+    return scalarMismatch(order.exchangeOrderId, snapshot.exchangeOrderId);
   }
-  return !SNAPSHOT_STATUSES.has(snapshot.status)
-    || STATUS_TRANSITIONS[order.status].has(snapshot.status);
+  if (
+    SNAPSHOT_STATUSES.has(snapshot.status)
+    && !STATUS_TRANSITIONS[order.status].has(snapshot.status)
+  ) {
+    return scalarMismatch(order.status, snapshot.status);
+  }
+  return null;
 }
 
 export function inspectLocalTopology(
@@ -301,12 +335,23 @@ export class HedgeOrderEvidenceCollector {
     let firstPending: PendingContext | null = null;
     let validatedUnpersistedExposure = false;
 
-    for (const order of orders) {
+    for (const lookupOrder of orders) {
       let snapshot: OrderSnapshot | null;
       try {
-        snapshot = await this.lookup(order);
+        snapshot = await this.lookup(lookupOrder);
       } catch {
-        firstPending ??= orderPending(order, 'ORDER_LOOKUP_FAILED');
+        firstPending ??= orderPending(lookupOrder, 'ORDER_LOOKUP_FAILED');
+        continue;
+      }
+
+      const order = this.repository.listOrders(strategy.id)
+        .find(({ id }) => id === lookupOrder.id);
+      if (order === undefined) {
+        firstPending ??= orderPending(
+          lookupOrder,
+          'ORDER_EVIDENCE_MISMATCH',
+          scalarMismatch(lookupOrder.id, 'missing')
+        );
         continue;
       }
 
@@ -318,8 +363,13 @@ export class HedgeOrderEvidenceCollector {
         continue;
       }
 
-      if (!remoteEvidenceMatches(order, snapshot)) {
-        firstPending ??= orderPending(order, 'ORDER_EVIDENCE_MISMATCH');
+      const mismatch = remoteEvidenceMismatch(order, snapshot);
+      if (mismatch !== null) {
+        firstPending ??= orderPending(
+          order,
+          'ORDER_EVIDENCE_MISMATCH',
+          mismatch
+        );
         continue;
       }
 
@@ -330,12 +380,12 @@ export class HedgeOrderEvidenceCollector {
       } catch (error) {
         if (error instanceof OrderSnapshotValidationError) {
           firstPending ??= orderPending(order, 'ORDER_SNAPSHOT_INVALID');
-        } else {
-          if (error instanceof OrderSnapshotWriteConflictError) {
-            const filled = parsedDecimal(snapshot.filledBaseQuantity);
-            validatedUnpersistedExposure ||= filled !== null && filled.gt(0);
-          }
+        } else if (error instanceof OrderSnapshotWriteConflictError) {
+          const filled = parsedDecimal(snapshot.filledBaseQuantity);
+          validatedUnpersistedExposure ||= filled !== null && filled.gt(0);
           firstPending ??= orderPending(order, 'SNAPSHOT_WRITE_CONFLICT');
+        } else {
+          throw error;
         }
         continue;
       }
