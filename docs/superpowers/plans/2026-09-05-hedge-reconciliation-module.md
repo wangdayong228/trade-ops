@@ -222,7 +222,7 @@ export interface ReconciliationRunner {
 
 权威语义固定取自 [SQLite `locking_mode`](https://www.sqlite.org/pragma.html#pragma_locking_mode) 与 [WAL exclusive mode](https://www.sqlite.org/wal.html#use_of_wal_without_shared_memory)：设置模式本身不等于持锁，第一次写才取得并保留排他锁，连接关闭释放；因此禁止删掉显式空写事务或把 claim 移到 `journal_mode=WAL` 之后。
 
-- [ ] **Step 1: 写所有权错误、调用顺序和真实子进程竞争的红测试**
+- [x] **Step 1: 写所有权错误、调用顺序和真实子进程竞争的红测试**
 
 创建 `tests/support/sqlite-owner-child.ts`。该文件不是 `*.test.ts`，只由父测试 fork；它不得导入 `main.ts`、加载 `.env` 或构造 gateway：
 
@@ -510,7 +510,7 @@ test('classifies ownership failures without retaining SQLite messages', () => {
 });
 ```
 
-- [ ] **Step 2: 运行所有权测试并确认模块缺失**
+- [x] **Step 2: 运行所有权测试并确认模块缺失**
 
 Run:
 
@@ -520,7 +520,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；TypeScript 报 `src/storage/sqlite-process-owner.js` 不存在。不能接受由 child 路径、IPC 或 fixture 清理错误造成的红灯。
 
-- [ ] **Step 3: 实现最小 SQLite 所有权模块**
+- [x] **Step 3: 实现最小 SQLite 所有权模块**
 
 创建 `src/storage/sqlite-process-owner.ts`，不保存原始 cause，不提供 release 方法：
 
@@ -557,6 +557,13 @@ function sqliteErrorCode(error: unknown): string | undefined {
   }
 }
 
+function isSqliteContentionCode(code: string | undefined): boolean {
+  return code === 'SQLITE_BUSY'
+    || code?.startsWith('SQLITE_BUSY_') === true
+    || code === 'SQLITE_LOCKED'
+    || code?.startsWith('SQLITE_LOCKED_') === true;
+}
+
 export function claimSqliteProcessOwnership(
   database: Database.Database,
   databasePath: string
@@ -577,7 +584,7 @@ export function claimSqliteProcessOwnership(
     if (error instanceof SqliteOwnershipError) throw error;
     const code = sqliteErrorCode(error);
     throw new SqliteOwnershipError(
-      code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED'
+      isSqliteContentionCode(code)
         ? 'DATABASE_OWNERSHIP_BUSY'
         : 'DATABASE_OWNERSHIP_UNAVAILABLE',
       databasePath
@@ -586,7 +593,7 @@ export function claimSqliteProcessOwnership(
 }
 ```
 
-- [ ] **Step 4: 运行真实子进程所有权测试**
+- [x] **Step 4: 运行真实子进程所有权测试**
 
 Run:
 
@@ -596,7 +603,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: PASS；4 tests，0 failures；低层进程竞争得到 `DATABASE_OWNERSHIP_BUSY`，正常关闭和 `SIGKILL` 后均可接管。
 
-- [ ] **Step 5: 写配置、组合顺序和失败释放的红测试**
+- [x] **Step 5: 写配置、组合顺序和失败释放的红测试**
 
 创建 `tests/support/sqlite-service-contender-child.ts`。它只使用显式临时环境和 `FakeExchangeGateway`，通过注入的监听函数运行完整 `run()`；不得读取 `.env` 或访问任何交易所：
 
@@ -990,7 +997,7 @@ test('releases SQLite ownership when server close fails', async (t) => {
 });
 ```
 
-- [ ] **Step 6: 运行 main 测试并确认启动顺序仍旧错误**
+- [x] **Step 6: 运行 main 测试并确认启动顺序仍旧错误**
 
 Run:
 
@@ -1000,7 +1007,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；低层所有权用例仍通过，但竞争服务、配置路径或 main 顺序用例失败：当前配置接受内存/URI 路径，且 gateway 在数据库所有权之前构造。
 
-- [ ] **Step 7: 重排生产组合并记录运维约束**
+- [x] **Step 7: 重排生产组合并记录运维约束**
 
 在 `src/main.ts` 导入 `claimSqliteProcessOwnership`，配置路径校验固定为：
 
@@ -1016,7 +1023,7 @@ function databasePath(raw: string | undefined): string {
   ) {
     return invalidConfiguration('TRADING_DATABASE_PATH');
   }
-  return raw;
+  return trimmed;
 }
 
 function defaultDatabaseFactory(path: string): Database.Database {
@@ -1126,7 +1133,7 @@ README 的 `TRADING_DATABASE_PATH` 行改为：
 数据库必须位于正确支持 SQLite/VFS 文件锁的本地文件系统，不支持 NFS、SMB 或其他网络挂载。同一个数据库文件同一时刻只能由一个 trade-ops 进程持有；服务运行时，其他 SQLite 工具也不能并行读取。检查、迁移和备份前必须先停止服务并等待数据库关闭。进程崩溃后，新实例通过 SQLite 原生锁接管并执行恢复；应用不创建或清理 PID 文件或独立 lock 文件。
 ```
 
-- [ ] **Step 8: 运行所有权与组合回归并提交**
+- [x] **Step 8: 运行所有权与组合回归并提交**
 
 Run:
 
@@ -1158,7 +1165,7 @@ git commit -m "feat: enforce exclusive SQLite process ownership"
 - Consumes: Task 1 已独占的生产连接，以及现有 `StrategyRepository`、`StrategyOrderRecord`、`validatedSnapshot`、SQLite 状态 CAS 与不可变 `order_events`；仓储本身不得再次 claim 或新开连接。
 - Produces: `OrderSubmissionDisposition`、`OrderSubmissionFailureCode`、`SnapshotAttachmentResult`、`OrderSnapshotValidationError`、`OrderSnapshotWriteConflictError`、`markDefinitelyNotSubmitted(id, failureCode): boolean`。
 
-- [ ] **Step 1: 写 v1 迁移、提交证据 CAS 和语义快照的失败测试**
+- [x] **Step 1: 写 v1 迁移、提交证据 CAS 和语义快照的失败测试**
 
 在 `tests/storage/sqlite-repository.test.ts` 扩展临时文件 import：
 
@@ -1820,7 +1827,7 @@ for (const failurePoint of ['early malformed copy', 'late index install'] as con
 }
 ```
 
-- [ ] **Step 2: 运行测试并确认按预期变红**
+- [x] **Step 2: 运行测试并确认按预期变红**
 
 Run:
 
@@ -1830,7 +1837,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；首先出现 `submissionDisposition`、`markDefinitelyNotSubmitted` 或 `HEDGE_RESIDUAL_NOT_TRADABLE` 尚未定义的 TypeScript 错误，而不是原生模块 ABI 错误。公共接口接通后继续运行同一命令，必须看到 fresh v2 的 CHECK 与 migrated v1 的触发器矩阵都因非法 INSERT/UPDATE 变红，且未知版本和外部事务用例仍失败；不能只以新库约束失败作为迁移红灯。
 
-- [ ] **Step 3: 扩展仓储类型和类型化错误**
+- [x] **Step 3: 扩展仓储类型和类型化错误**
 
 在 `src/storage/strategy-repository.ts` 按“接口锁定”代码加入三个类型和两个字段，并加入以下错误与方法签名：
 
@@ -1854,7 +1861,7 @@ export class OrderSnapshotWriteConflictError extends Error {
 
 把 `HEDGE_RESIDUAL_NOT_TRADABLE` 加入 `StrategyFailureCode`。`attachOrderSnapshot` 返回 `SnapshotAttachmentResult`，`markDefinitelyNotSubmitted` 只接受 `OrderSubmissionFailureCode`。
 
-- [ ] **Step 4: 实现版本化、可回滚的 SQLite v1 到 v2 迁移**
+- [x] **Step 4: 实现版本化、可回滚的 SQLite v1 到 v2 迁移**
 
 先从 `SQLITE_STRATEGY_SCHEMA` 删除 `PRAGMA foreign_keys = ON` 和 `PRAGMA journal_mode = WAL`；该常量只保留可放进事务的 v2 DDL。生产文件连接此时已经由 Task 1 在 `main.ts` 中取得独占所有权；仓储不得再次 claim。
 
@@ -2063,7 +2070,7 @@ END;
 
 迁移入口用固定错误包住列验证、事务执行和提交后验证；所有 catch 都新建 `Error('SQLite strategy schema migration failed')`，`finally` 在该错误离开方法前执行 `database.pragma('foreign_keys = ON')`。
 
-- [ ] **Step 5: 实现证据 CAS 与语义快照事务**
+- [x] **Step 5: 实现证据 CAS 与语义快照事务**
 
 `markDefinitelyNotSubmitted` 使用一条 UPDATE，WHERE 必须同时包含 `status = 'planned'`、`snapshot_json IS NULL`、`exchange_order_id IS NULL`、`submission_disposition = 'SUBMISSION_UNCERTAIN'` 和 `submission_failure_code IS NULL`。只有 `changes === 1` 返回 `true`。
 
@@ -2098,7 +2105,7 @@ function sameSnapshotSemantics(
 
 同步扩展 `STRATEGY_FAILURE_CODES`、`StrategyOrderDbRow`、订单 disposition enum set、`insertOrder` 和 `orderFromRow`。新 plan 必须显式写 `SUBMISSION_UNCERTAIN/null`；row mapper 必须验证三种 disposition、failure allowlist、快照与 `REMOTE_OBSERVED` 的配对关系，以及无快照行不能为 `REMOTE_OBSERVED`，然后把两个必填字段放入冻结后的 `StrategyOrderRecord`。
 
-- [ ] **Step 6: 更新现有类型替身并运行目标测试**
+- [x] **Step 6: 更新现有类型替身并运行目标测试**
 
 `tests/strategy/order-monitor.test.ts` 的 `RepositoryProxy` 使用以下两个方法：
 
@@ -2161,7 +2168,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: PASS；退出码 `0`。迁移测试同时断言 `PRAGMA foreign_key_check` 为空。
 
-- [ ] **Step 7: 提交仓储底座**
+- [x] **Step 7: 提交仓储底座**
 
 ```bash
 git add src/storage/strategy-repository.ts src/storage/schema.ts src/storage/sqlite-strategy-repository.ts tests/storage/sqlite-repository.test.ts tests/logging/trade-events.test.ts tests/strategy/order-monitor.test.ts tests/strategy/hedge-coordinator.test.ts
@@ -2183,7 +2190,7 @@ git commit -m "feat: persist hedge submission evidence"
 - Consumes: 现有 `OperationalLog`、`operationalFields`、`redactText` 和 `nonThrowingOperationalLog`。
 - Produces: 必填 `OperationalLog.warn(event, fields?)`，以及对账结论需要的显式 allowlist 字段。
 
-- [ ] **Step 1: 写 warning 字段、脱敏和失败隔离的红测试**
+- [x] **Step 1: 写 warning 字段、脱敏和失败隔离的红测试**
 
 在 `tests/logging/logger.test.ts` 增加：
 
@@ -2245,7 +2252,7 @@ test('absorbs synchronous and asynchronous warning failures', async () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认缺少 warn 时失败**
+- [x] **Step 2: 运行测试并确认缺少 warn 时失败**
 
 Run:
 
@@ -2255,7 +2262,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；TypeScript 报 `OperationalLog` 没有 `warn`，或测试替身缺少必填方法。
 
-- [ ] **Step 3: 实现显式字段白名单和 warn 包装**
+- [x] **Step 3: 实现显式字段白名单和 warn 包装**
 
 在 `OperationalFields` 加入以下字段，全部为只读标量，不允许任意对象、原始响应或异常文本：
 
@@ -2317,7 +2324,7 @@ warn(event, fields): void {
 warn(): void {}
 ```
 
-- [ ] **Step 4: 运行日志与全仓编译检查**
+- [x] **Step 4: 运行日志与全仓编译检查**
 
 Run:
 
@@ -2327,7 +2334,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: PASS；退出码 `0`。warning 输出只有 allowlist 字段，secret 被替换为 `[Redacted]`。
 
-- [ ] **Step 5: 提交可观察性合同**
+- [x] **Step 5: 提交可观察性合同**
 
 ```bash
 git add src/logging/logger.ts tests/logging/logger.test.ts tests/main.test.ts tests/http/server.test.ts tests/strategy/order-monitor.test.ts
@@ -2346,7 +2353,7 @@ git commit -m "feat: add reconciliation warning fields"
 - Consumes: `ExchangeRegistry.get(exchangeId)`、Task 2 的仓储证据和快照结果、`nonThrowingTradeEventSink`、`orderEvent`。
 - Produces: `inspectLocalTopology(strategy, orders): LocalTopologyResult` 与 `HedgeOrderEvidenceCollector.collect(strategy, orders): Promise<EvidenceCollectionResult>`；只供 Task 5 的 `HedgeReconciliation` 使用。
 
-- [ ] **Step 1: 建立真实形状的对账 fixture 与证据矩阵红测试**
+- [x] **Step 1: 建立真实形状的对账 fixture 与证据矩阵红测试**
 
 新测试文件复用 `FakeExchangeGateway`，但在文件内定义 tracking 子类，不把测试 helper 暴露到生产代码：
 
@@ -3098,7 +3105,7 @@ test('reports both exchange-id and client-id lookup failure safely', async (t) =
 }
 ```
 
-- [ ] **Step 2: 运行证据测试并确认新模块缺失**
+- [x] **Step 2: 运行证据测试并确认新模块缺失**
 
 Run:
 
@@ -3108,7 +3115,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；导入 `hedge-reconciliation-evidence.js` 失败，或预期类型尚未导出。
 
-- [ ] **Step 3: 建立闭集结果与可编译失败封闭骨架**
+- [x] **Step 3: 建立闭集结果与可编译失败封闭骨架**
 
 在 `src/strategy/hedge-reconciliation-evidence.ts` 定义：
 
@@ -3191,7 +3198,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；模块已经可以导入，但测试在具体行为断言处失败：成功快照未落库、definite-null 未返回 `ready`、身份/快照/CAS 原因不匹配。不能接受编译错误或 fixture 错误作为本轮红灯。
 
-- [ ] **Step 4: 实现严格角色集合与仓储顺序拓扑预检**
+- [x] **Step 4: 实现严格角色集合与仓储顺序拓扑预检**
 
 `inspectLocalTopology` 使用严格角色集合，不使用“缺什么就补什么”的逻辑。合法集合只有：
 
@@ -3215,7 +3222,7 @@ const LEGAL_ROLE_SETS: Readonly<Record<ExecutionMode, ReadonlySet<string>>> = {
 
 角色先按字符串排序再用 `|` 连接。除集合匹配外，每张 `*_MARKET` 的 `request.baseQuantity` 必须用精确十进制比较等于 `strategy.effectiveBaseQuantity`；不能接受更小的旧意图并据此错误宣称已完全对冲。GTC 数量不在这里和策略目标量比较，而由 Task 5 与补单前残差比较。还要保留 repository 的订单顺序并断言每张 GTC 的索引大于该模式全部必需市价角色的索引；不能仅比较 `createdAt`，因为同一原子事务中的时间戳可能相同。空集合仅在策略为 `EXECUTING` 时返回 `empty`；`WAITING_HEDGE` 空集合直接返回 `pending / INVALID_LOCAL_TOPOLOGY`。任何非空非法集合或市价请求数量不一致都立即返回 pending，不能访问 registry；其 `exposureKnown` 从已由仓储验证的本地 snapshot 正成交量计算，不能固定为 false。
 
-- [ ] **Step 5: 实现固定查所顺序、三方一致和事件唯一所有权**
+- [x] **Step 5: 实现固定查所顺序、三方一致和事件唯一所有权**
 
 `HedgeOrderEvidenceCollector` 的构造器固定为：
 
@@ -3291,7 +3298,7 @@ if (
 
 若 definite 证据反而查到远端，正常 attach 后强制返回 `ORDER_EVIDENCE_MISMATCH`；不能因 disposition 已被 attach 改成 `REMOTE_OBSERVED` 而吞掉矛盾。
 
-- [ ] **Step 6: 加入重复快照和生命周期事件测试并跑绿**
+- [x] **Step 6: 加入重复快照和生命周期事件测试并跑绿**
 
 加入五轮 collect，锁定时间戳变化不写库、真实语义变化只写一次，以及终态事件的唯一所有权：
 
@@ -3392,7 +3399,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: 当前证据收集测试全部 PASS；退出码 `0`。本任务没有任何 `createOrder` 调用。
 
-- [ ] **Step 7: 提交证据收集器**
+- [x] **Step 7: 提交证据收集器**
 
 ```bash
 git add src/strategy/hedge-reconciliation-evidence.ts tests/strategy/hedge-reconciliation.test.ts
@@ -3412,7 +3419,7 @@ git commit -m "feat: collect complete hedge order evidence"
 - Consumes: Task 4 的 `inspectLocalTopology` 和 `HedgeOrderEvidenceCollector`，Task 2 仓储 CAS，Task 3 `OperationalLog.warn/info`，现有 `ExchangeGateway.loadMarket/quantizePrice`。
 - Produces: `ReconciliationPendingReason`、`ReconciliationDiagnostic`、`ReconciliationResult`、`ReconciliationRunner`、`HedgeReconciliation.run(strategyId)`。
 
-- [ ] **Step 1: 写入口、无 GTC 和高精度决策表的红测试**
+- [x] **Step 1: 写入口、无 GTC 和高精度决策表的红测试**
 
 在 Task 4 的 fixture 中构造真实 `HedgeReconciliation`，并加入以下辅助函数。后续每个测试都必须通过 fake 的查回结果形成证据，不能直接调用私有决策方法：
 
@@ -3906,7 +3913,7 @@ test(
 
 该用例验证输入虽然可解析且加减 precision 预算很小，规范化输出仍受独立资源上限保护。实现必须在任何 `toFixed()` 前返回上述固定诊断，不能把指数或推算出的巨大宽度写入日志。
 
-- [ ] **Step 2: 写已有 GTC、可交易边界和 CAS 竞争的红测试**
+- [x] **Step 2: 写已有 GTC、可交易边界和 CAS 竞争的红测试**
 
 已有 GTC 的固定矩阵为：
 
@@ -4587,7 +4594,7 @@ for (const [name, operationalLog] of [
 }
 ```
 
-- [ ] **Step 3: 运行新模块测试并确认缺少公共合同**
+- [x] **Step 3: 运行新模块测试并确认缺少公共合同**
 
 Run:
 
@@ -4597,7 +4604,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；`hedge-reconciliation.js` 或 `HedgeReconciliation` 尚不存在。
 
-- [ ] **Step 4: 建立公共判别联合与可编译失败封闭骨架**
+- [x] **Step 4: 建立公共判别联合与可编译失败封闭骨架**
 
 公共类型严格采用“接口锁定”代码。`ReconciliationDiagnostic` 定义为：
 
@@ -4667,7 +4674,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；模块和 fixture 已成功编译，但市价/GTC 结果、精确 `0.4`、交易边界和 CAS 断言分别收到固定 pending 而失败。不能接受导入、类型或测试数据校验错误作为本轮红灯。
 
-- [ ] **Step 5: 实现入口顺序、证据重读与 pending 去重**
+- [x] **Step 5: 实现入口顺序、证据重读与 pending 去重**
 
 `run` 的固定骨架必须保持以下顺序：
 
@@ -4725,7 +4732,7 @@ pending warning key 固定为 `strategyId|reason|strategyOrderId-or-empty|sorted
 
 每次 CAS 成功写终态或 `WAITING_HEDGE`、首次读取或 CAS 重读得到终态 `observed_state`，以及每次返回 `need_gtc`，还要用 `OperationalLog.info('hedge_reconciliation_conclusion', fields)` 记录进入状态、结论、失败码或角色，以及当时可得的两侧成交、补单前残差、当前残差和 `exposureKnown`。首次入口已经是终态时不得查所；此时未知的成交与残差字段省略，不能伪造零值。日志失败由 Task 3 包装吸收，不能改变返回结果。
 
-- [ ] **Step 6: 实现私有精确小数上下文和两种残差**
+- [x] **Step 6: 实现私有精确小数上下文和两种残差**
 
 在模块内创建私有基础构造器，不能导出：
 
@@ -4804,15 +4811,16 @@ currentResidual = totalSpot.minus(totalContract).abs();
 
 所有对外数量必须通过受限的 `canonicalDecimal()` 使用 `toFixed()` 规范化。GTC 请求量只比较 `preGtcResidual`；GTC remaining 只比较 `currentResidual`；GTC 成交后 `totalSpot - totalContract` 的符号不能穿越原始 `marketDelta`。
 
-- [ ] **Step 7: 实现无 GTC 与已有 GTC 的互斥决策表**
+- [x] **Step 7: 实现无 GTC 与已有 GTC 的互斥决策表**
 
 决策顺序固定如下，前一项命中后立即返回：
 
 1. 任一市价单 `open/unknown` -> `MARKET_ORDER_ACTIVE`。
 2. 任一尚未形成“有效快照或 definite-null”的订单 -> 对应证据 pending。
-3. 市价 rejected/definite 分支；并发一侧正成交、另一侧零拒单固定写 `HEDGE_INCOMPLETE / INCONSISTENT_ORDER_STATE`。
-4. 有 GTC 时先计算市场残差和角色方向，再校验请求、成交、剩余、穿越和状态；`unknown` 固定 pending。
-5. 无 GTC 时按顺序/并发表处理双零、等量、缺均价、正残差。
+3. 计算精确金额；已有 GTC 为 `unknown` 时固定返回 `GTC_STATUS_UNKNOWN`，即使精确金额超过资源限制，也优先于市价 rejected/definite 和后续 GTC 结构校验。
+4. 市价 rejected/definite 分支；并发一侧正成交、另一侧零拒单固定写 `HEDGE_INCOMPLETE / INCONSISTENT_ORDER_STATE`。
+5. 有 GTC 时按市场残差和角色方向校验请求、成交、剩余、穿越和状态；GTC rejected 零成交与 definite-null 保留其确定性结论，不降级为未知。
+6. 无 GTC 时按顺序/并发表处理双零、等量、缺均价、正残差。
 
 状态写统一经过一个方法：
 
@@ -4830,7 +4838,7 @@ private transition(
 
 只有 repository CAS 返回 `true` 才返回 `written`。false 或 throw 后重读：恰好已是目标状态且 failure code 相同才返回 `observed_state`；仍是进入状态或变成其他状态返回 `pending / STATE_WRITE_CONFLICT`。`WAITING_HEDGE + open GTC` 直接返回 `waiting_gtc`，不能调用仓储自转换。
 
-- [ ] **Step 8: 实现 need_gtc 前的精确可交易性验证**
+- [x] **Step 8: 实现 need_gtc 前的精确可交易性验证**
 
 目标 gateway 由角色决定；依次 `loadMarket`、验证 exchange/symbol/kind/active 与规则字段、用大侧均价 `quantizePrice`、验证正候选价且精确对齐 `priceStep`。市场身份、active 或规则失败返回 `MARKET_RULES_UNAVAILABLE`；价格调用失败、非正或不对齐返回 `PRICE_QUANTIZATION_FAILED`。
 
@@ -4854,7 +4862,7 @@ const withinNotionalRange = (
 
 `stepAligned`、`wholeContracts`、`priceAligned`、`withinBaseRange` 和 `withinNotionalRange` 都为 true 才返回 `need_gtc`。数量、合约张数或名义金额明确为 false 且有正暴露时 CAS 写 `HEDGE_INCOMPLETE / HEDGE_RESIDUAL_NOT_TRADABLE`；价格不对齐按上段归为 `PRICE_QUANTIZATION_FAILED`。解析、资源上限或市场数据不能可靠判定时返回 `EXACT_ARITHMETIC_UNAVAILABLE`，不能归类为不可交易。
 
-- [ ] **Step 9: 跑完整对账矩阵并提交**
+- [x] **Step 9: 跑完整对账矩阵并提交**
 
 Run:
 
@@ -4888,7 +4896,7 @@ git commit -m "feat: reconcile hedge orders before state changes"
 - Consumes: `ReconciliationRunner.run`、`ReconciliationResult`、`markDefinitelyNotSubmitted`、`NoOrderSubmittedError.reason`、现有 request builders、原子并发订单规划和 operation lock。
 - Produces: 新构造器 `HedgeCoordinator(registry, repository, reconciliation, tradeEvents?, operationalLog?)`；协调器不再 attach 查所快照或写四种受控状态。
 
-- [ ] **Step 1: 用 scripted runner 写授权与禁止副作用的红测试**
+- [x] **Step 1: 用 scripted runner 写授权与禁止副作用的红测试**
 
 在 `tests/strategy/hedge-coordinator.test.ts` 扩展 import：
 
@@ -5549,7 +5557,7 @@ test('waits for both submissions and retains the operation lock after one reject
 });
 ```
 
-- [ ] **Step 2: 写确定/不确定提交与守卫告警红测试**
+- [x] **Step 2: 写确定/不确定提交与守卫告警红测试**
 
 先在 `tests/exchanges/exchange-gateway.test.ts` 锁定闭集载体：
 
@@ -5995,7 +6003,7 @@ for (const testCase of [
 }
 ```
 
-- [ ] **Step 3: 运行协调器测试并确认构造器与行为变红**
+- [x] **Step 3: 运行协调器测试并确认构造器与行为变红**
 
 Run:
 
@@ -6005,7 +6013,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；首先出现新 `hedge-reconciliation.js` import、`NoOrderSubmittedError.reason` 或新构造器签名缺失的 TypeScript 错误。该红灯只证明公共接口尚未接入，不作为业务行为红灯。
 
-- [ ] **Step 4: 接入可编译、失败封闭的 run-first 骨架并确认行为变红**
+- [x] **Step 4: 接入可编译、失败封闭的 run-first 骨架并确认行为变红**
 
 在 `src/exchanges/exchange-gateway.ts` 先加入已由 Step 2 红测试锁定的闭集载体；不保留底层 cause 或 message：
 
@@ -6120,7 +6128,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；编译成功，`awaiting_market_submission` 没有规划订单、`need_gtc` 没有提交、market 后返回的 `need_gtc` 被丢弃，改写后的纯阻断守卫/无守卫恢复断言仍失败，且 CCXT 的明确不可交易用例仍得到 `UNCLASSIFIED`。至少一个新增授权用例和一个上表保留或改写的存量用例必须以行为断言失败；不能接受缺失 import、构造器或 fixture 错误作为这一轮红灯。
 
-- [ ] **Step 5: 重写持锁入口为完整 run-first 状态机**
+- [x] **Step 5: 重写持锁入口为完整 run-first 状态机**
 
 `confirmAndExecute` 保留现有 operation lock。锁内流程固定为：
 
@@ -6377,7 +6385,7 @@ private warnRejectedSubmissions(
 
 这是有界串联而不是循环：最多消费一次 `awaiting_market_submission`，其第二次 `run` 若返回当次 `need_gtc`，再消费一次 GTC 授权并做最终 `run`；最终结果不再触发提交。`pending/written/observed_state/waiting_gtc` 自然返回。每次 `need_gtc` 都只存在当前栈帧，不能保存到字段、缓存或数据库。
 
-- [ ] **Step 6: 收缩提交方法并删除直接判定路径**
+- [x] **Step 6: 收缩提交方法并删除直接判定路径**
 
 在 `src/exchanges/ccxt-exchange-gateway.ts` 增加不导出的分类错误，并只在四个“规则已经明确判定不满足”的位置抛它。解析失败、资源上限、market/账户/价格准备失败仍抛原固定错误，不能通过匹配 message 分类：
 
@@ -6549,7 +6557,7 @@ private warnSubmissionEvidenceConflict(
 
 账户 guard 改成纯阻断：读取失败记录 `hedge_submission_guard_pending`；设置漂移记录 `hedge_submission_guard_changed`，字段只有预检和当前的 margin/position/leverage 安全摘要。相同 `(strategyId, reason, strategy.updatedAt)` 只记录一次。它不能调用 transition，也不能在 `run` 前执行。
 
-- [ ] **Step 7: 跑协调器、网关与对账集成**
+- [x] **Step 7: 跑协调器、网关与对账集成**
 
 普通协调器测试 fixture 构造真实 reconciliation：
 
@@ -6597,7 +6605,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: PASS；退出码 `0`。同一 client order ID 在任何恢复场景下 `createdRequests` 最多为 1。
 
-- [ ] **Step 8: 提交协调器收口**
+- [x] **Step 8: 提交协调器收口**
 
 ```bash
 git add src/exchanges/exchange-gateway.ts src/exchanges/ccxt-exchange-gateway.ts src/strategy/hedge-coordinator.ts src/main.ts tests/exchanges/exchange-gateway.test.ts tests/exchanges/ccxt-gateway.test.ts tests/strategy/hedge-coordinator.test.ts tests/strategy/order-monitor.test.ts tests/http/server.test.ts
@@ -6620,7 +6628,7 @@ git commit -m "refactor: gate hedge submissions through reconciliation"
 - Consumes: Task 1 的 `claimSqliteProcessOwnership` 固定启动顺序、`ExecutionContinuation.confirmAndExecute(strategyId)`、仓储 `listRecoverable()`、Task 6 新协调器构造器。
 - Produces: `OrderMonitor(repository, executionContinuation, operationalLog?)`；恢复链路唯一为 monitor -> coordinator -> reconciliation。
 
-- [ ] **Step 1: 把监控测试改成转发、去重和恢复红测试**
+- [x] **Step 1: 把监控测试改成转发、去重和恢复红测试**
 
 删除 `tests/strategy/order-monitor.test.ts` 中从 `keeps waiting after a partial GTC fill` 到 `uses exact private Decimal arithmetic despite global configuration pollution` 的旧业务判定测试；这些规则由 Task 5 的真实对账器矩阵拥有。保留现有四个 timer/stop 测试，并把它们的 monitor 构造器改为新参数。
 
@@ -6778,7 +6786,7 @@ test('logging failures cannot change recovery forwarding', async () => {
 });
 ```
 
-- [ ] **Step 2: 写真实重启恢复验收红测试**
+- [x] **Step 2: 写真实重启恢复验收红测试**
 
 在 `tests/acceptance/hedge-opening.test.ts` 增加 import 和本地请求 helper：
 
@@ -7089,7 +7097,7 @@ for (const testCase of RESTART_GTC_CASES) {
 }
 ```
 
-- [ ] **Step 3: 运行监控与验收测试并确认旧实现失败**
+- [x] **Step 3: 运行监控与验收测试并确认旧实现失败**
 
 Run:
 
@@ -7099,7 +7107,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；首先出现新 constructor 参数不匹配。该轮只锁定公共边界，不把编译失败当成转发行为证据。
 
-- [ ] **Step 4: 建立可编译、无业务判定的 monitor 骨架并确认行为变红**
+- [x] **Step 4: 建立可编译、无业务判定的 monitor 骨架并确认行为变红**
 
 保留 `ExecutionContinuation` 接口、activeReconciliations、activeRecovery、start/stop 和逐策略 catch。构造器改为：
 
@@ -7127,7 +7135,7 @@ PATH=/usr/local/bin:$PATH npm run build && PATH=/usr/local/bin:$PATH node --test
 
 Expected: FAIL；编译成功，但 continuation 调用数组为空。不能接受构造器、import 或 fixture 错误作为这一轮红灯。
 
-- [ ] **Step 5: 让单策略入口只转发给协调器**
+- [x] **Step 5: 让单策略入口只转发给协调器**
 
 把骨架替换为唯一业务动作：
 
@@ -7139,7 +7147,7 @@ private async reconcileStrategyOwned(strategyId: string): Promise<void> {
 
 monitor 不自己持锁，因为 coordinator 必须在同一把锁内完成 `run -> 授权 -> submit -> run`。
 
-- [ ] **Step 6: 更新 main 装配且保持 HTTP 表面不变**
+- [x] **Step 6: 更新 main 装配且保持 HTTP 表面不变**
 
 保留 Task 1 已建立的 `database open -> claimSqliteProcessOwnership -> repository -> gateway` 顺序；不得因注入 reconciliation 把 gateway、monitor 或 server 移到 claim 之前。在 repository 和 registry 都已构造后按唯一顺序构造：
 
@@ -7201,7 +7209,7 @@ test('composition shares one safe trade sink with submission and evidence owners
 
 Task 1 的两个完整 `composeService` 竞争测试保持原断言，并在 Step 7 的目标命令中重跑；它们继续证明第二实例在 gateway 构造、恢复和监听之前失败。
 
-- [ ] **Step 7: 跑目标测试、静态所有权检查与全套回归**
+- [x] **Step 7: 跑目标测试、静态所有权检查与全套回归**
 
 Run:
 
@@ -7232,7 +7240,7 @@ PATH=/usr/local/bin:$PATH npm test
 
 Expected: PASS；退出码 `0`。输出不得包含真实网络请求、真实数据库路径或凭证。
 
-- [ ] **Step 8: 提交恢复链路收口**
+- [x] **Step 8: 提交恢复链路收口**
 
 ```bash
 git add src/strategy/order-monitor.ts src/main.ts tests/strategy/hedge-coordinator.test.ts tests/strategy/order-monitor.test.ts tests/main.test.ts tests/acceptance/hedge-opening.test.ts
@@ -7240,6 +7248,17 @@ git commit -m "refactor: route hedge recovery through reconciliation"
 ```
 
 ---
+
+## 审查后实施修订
+
+以下修订是任务内 TDD 与风险审查形成的最终实施约束；它们覆盖前文代码草图中更窄或不完整的历史表达：
+
+- Task 1：配置数据库路径去除首尾空白后再用于目录和连接；SQLite 竞争错误只接受 `SQLITE_BUSY`、`SQLITE_LOCKED` 或其下划线分隔的扩展码族，拒绝相似前缀。
+- Task 2：新建与迁移后的 `strategy_orders` 都校验完整规范 DDL；迁移还精确校验证据触发器、父外键和 SQL 字面量语义，任何伪装或不完整约束均失败关闭。
+- Task 4：每次查所后的决定都使用同步重读的本地订单；只有类型化校验或 CAS 失败映射到闭集 pending 原因，确定未提交与远端证据矛盾时携带安全标量诊断。
+- Task 5：GTC `unknown` 在市价失败、后续结构校验和精确资源限制之前保持 pending；GTC rejected 零成交和 definite-null 仍保留更强的确定性。结论日志记录实际持久化状态和失败码，精确计算成功前不写金额字段。
+- Task 6：协调器在同一把 operation lock 内执行 `run -> 当次授权 -> submit -> run`，只消费本轮授权；明确未提交与不确定提交分别持久化，且不直接写受控状态或附加交易所快照。
+- Task 7：监控器只负责调度、去重和失败隔离，所有可恢复策略统一转发给协调器；文件 SQLite 重启矩阵验证已有 GTC 的终态、拒单、部分撤单和查回 pending，且 fake gateway 零新提交。
 
 ## 规格覆盖索引
 
