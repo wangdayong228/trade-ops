@@ -74,14 +74,31 @@ Subject 字段：configuration/request 使用 `field`；exchange 使用 `exchang
 
 ```ts
 interface MarketLoadOptions { readonly reload?: boolean; }
-// ExchangeGateway 与 fake/CCXT 实现同步扩展；普通执行调用保留默认行为。
+type MarketIdentity = Pick<MarketRules,
+  'exchangeId' | 'symbol' | 'marketId' | 'kind' | 'base' | 'quote' | 'active'>;
+type MarketQuantityRules = Pick<MarketRules,
+  'amountStep' | 'contractSize' | 'minBaseAmount' | 'maxBaseAmount' | 'priceStep'>;
+type MarketNotionalRules = Pick<MarketRules, 'minQuoteNotional' | 'maxQuoteNotional'>;
+interface LoadedMarketSnapshot {
+  readonly identity: Readonly<MarketIdentity>;
+  quantityRules(): Readonly<MarketQuantityRules>;
+  notionalRules(): Readonly<MarketNotionalRules>;
+  fetchAccountSettings(): Promise<AccountSettings>;
+  fetchLastPrice(): Promise<string>;
+}
+// ExchangeGateway 与 fake/CCXT 实现同步扩展；快照读取绑定同轮 exchange symbol。
+loadMarketSnapshot(symbol: string, kind: MarketKind, options?: MarketLoadOptions): Promise<LoadedMarketSnapshot>;
+// 普通执行调用保留严格完整校验的 wrapper，不改变下单和恢复语义。
 loadMarket(symbol: string, kind: MarketKind, options?: MarketLoadOptions): Promise<MarketRules>;
 // CCXT 绑定接口：loadMarkets(reload?: boolean): Promise<Record<string, CcxtMarket>>。
 // 原有 run(input) 调用不破坏，复检通过可选参数使用 confirmation 阶段。
 run(input: PreflightInput, phase?: 'preflight' | 'confirmation'): Promise<PreflightResult>;
 ```
 
+分阶段快照在加载时捕获 identity、precision mode 及所需规则标量；解析方法不得读可变 CCXT 缓存或重新 I/O。第 9 步组合两腿 quantityRules 后归一数量；第 10、11 步各读取价格并解析本腿 notionalRules。账户/价格方法直接使用捕获的交易所 symbol。此补充替代仅增加 reload 参数的旧接口方案，因为完整 MarketRules 会过早校验后续规则。对外错误始终由 Task 1 工厂构造并由 run 统一阶段；第三方原始数据只投影字段类型或受控数值。
+
 - [ ] RED：按 spec 13 步记录调用轨迹，并对每个失败点断言后续读取为零；请求格式在所有网关读取前失败；现货失败不加载合约；模式失败不查价格/余额，保证金失败先于杠杆错误。
+- [ ] RED：真实 CCXT 适配器接 fake exchange，覆盖 one-way 与坏 contractSize 同时出现、非法数量与坏名义金额规则同时出现、两腿名义金额规则都坏的首错；账户/价格不能重入完整规则解析，快照捕获后修改原市场对象不影响该轮规则。
 - [ ] RED：fake CCXT 缓存旧规则后改变上游规则，`reload=true` 才可见；刷新拒绝时不得回退；OKX `hedged=false`/未知时不调用 `fetchPositions`，`hedged=true` 才解析空头设置。
 - [ ] RED：两腿价格分别计算名义金额；数量与名义金额上下限边界、零余额、无效价、非 1 合约乘数、十进制等价值；精确错误含对象/期望/实际且未知读取异常不透传。
 - [ ] GREEN：顺序 await，并在每次读取后立即完成对应检查；规则字段逐项诊断，保留共同数量归一算法及 Bitget 零最小量例外；确认复检每轮两腿各强制刷新一次。解析阶段必须保持失败优先级，不能用笼统包装掩盖已知失败。
