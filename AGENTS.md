@@ -1,51 +1,63 @@
-# Trade Ops Codex and Cursor Instructions
+# Trade Ops Codex 与 Cursor 指令
 
-## Existing workflow gates
+## 正确性优先
 
-- Follow the applicable existing brainstorming, writing-plans, test-driven-development, systematic-debugging, pre-verification-check, verification-before-completion, consistency-check, and post-verification-check skills.
-- Treat those skills as the only source of workflow gates. Do not duplicate or weaken them here or in custom agents.
-- A writing agent requires an approved spec and plan unless the change is purely mechanical and an applicable skill explicitly permits skipping them.
-- Only the main agent may communicate final task completion.
+**正确性是最高原则。** 它优先于速度、便利、复杂度和“看起来更简单”。本文后续所有 workflow gates、delegation、routing 和安全边界，都必须在正确性成立的前提下执行；任何与正确性冲突的做法都必须停止。
 
-## Delegation policy
+- 调查、design 和实现必须首先保证正确性；“更简单”只能在多个方案同样正确时作为取舍依据，不得为了降低复杂度接受不正确、不完整或无法证明的行为。
+- 在判定时序、事务、状态转换和跨系统行为前，必须先核对已批准 design、绑定源码及可复现证据；若观测结果违反已证明的时序或不变量，必须按错误或完整性异常 fail-closed 处理，不得为了方便将其解释为正常竞态。
+- 无法证明某个方案正确时，必须继续调查或请求裁决，不得凭假设选择“看起来更简单”的方案。
 
-- Delegate only when a custom agent's narrow responsibility materially improves evidence, speed, or review quality.
-- Use Codex `context_explorer` or Cursor `context-explorer` for repository paths and execution-flow evidence.
-- Use Codex `source_verifier` or Cursor `source-verifier` for external API semantics, units, precision, status, and documented behavior.
-- Use Codex `test_designer` or Cursor `test-designer` to create the risk matrix and expected failing tests after plan approval.
-- Use Codex `implementer` or Cursor `implementer` only after the expected tests fail for the intended reason.
-- Use Codex `risk_reviewer` or Cursor `risk-reviewer` for defect-first review of affected paths and money/safety invariants.
-- Use Codex `verifier` or Cursor `verifier` for commands and artifact consistency checks.
-- Read-only agents may run in parallel. Never allow more than one agent to modify source or tests at a time.
-- Custom agents must not spawn additional agents.
+## 既有 workflow gates
 
-## Cursor compatibility
+- 遵守当前适用的 brainstorming、writing-plans、test-driven-development、systematic-debugging、pre-verification-check、verification-before-completion、consistency-check 和 post-verification-check skills。
+- 将这些 skills 视为 workflow gates 的唯一来源。不要在本文档或 custom agents 中重复或削弱它们。
+- writing agent 必须持有已批准的 spec 和 plan，除非改动纯粹是机械性的，且适用 skill 明确允许跳过。
+- 只有 main agent 可以宣布任务最终完成。
 
-The `.cursor/agents/*.md` agents are native equivalents of the corresponding Codex agents. Read-only behavior in Cursor is an agent constraint, not a Codex sandbox guarantee. The main agent dynamically selects the model and reasoning effort based on current platform capabilities.
+## 强制代码规则
 
-## Dynamic model routing
+- 所有 design、implementation 和 review 工作必须遵循 [docs/standards/code-rules.md](docs/standards/code-rules.md)。
 
-Before every delegation, classify and state:
+## Delegation 策略
 
-1. Complexity: ordinary or high.
-2. Money/security risk: none, indirect, or direct.
-3. Selected model and reasoning effort.
-4. One evidence-based sentence explaining the selection.
+- 仅当 custom agent 的窄职责能实质提升证据质量、速度或 review 质量时，才进行委派。
+- 使用 Codex `context_explorer` 或 Cursor `context-explorer` 获取仓库路径和 execution-flow 证据。
+- 使用 Codex `source_verifier` 或 Cursor `source-verifier` 核对外部 API 的 semantics、units、precision、status 和文档行为。
+- 使用 Codex `test_designer` 或 Cursor `test-designer` 在 plan 批准后创建 risk matrix 和预期会失败的 tests。
+- 仅在预期 tests 已按预定原因失败后，才使用 Codex `implementer` 或 Cursor `implementer`。
+- 使用 Codex `risk_reviewer` 或 Cursor `risk-reviewer` 对受影响路径和 money/safety invariants 做 defect-first review。
+- 使用 Codex `verifier` 或 Cursor `verifier` 做命令与产物一致性检查。
+- read-only agents 可以并行运行。同一时间绝不允许超过一个 agent 修改 source 或 tests。
+- custom agents 不得再派生子 agents。
 
-Risk overrides complexity:
+## Cursor 兼容性
 
-- Ordinary complexity with no money/security impact: `gpt-5.6-terra` with `high`.
-- High complexity or indirect money/security impact: `gpt-5.6` with `high`.
-- Direct money, security, permission, or irreversible external side effects: `gpt-5.6` with `xhigh`.
-- Unknown risk is direct risk.
-- Never select `medium` or `low`.
-- If `xhigh` is unavailable, disclose the limitation and use `high`; never downgrade silently.
+`.cursor/agents/*.md` agents 是对应 Codex agents 的原生等价物。Cursor 中的 read-only 行为是 agent 约束，不是 Codex sandbox 保证。main agent 根据当前平台能力动态选择 model 和 reasoning effort。
 
-Direct risk includes order submission or recovery, client order IDs, duplicate-submit prevention, strategy state, quantity or price precision, rounding, units, fills, SQLite transaction ordering, account settings, leverage, credentials, permissions, and exchange or CCXT semantics.
+## 动态 model routing
+
+每次委派前，必须分类并写明：
+
+1. Complexity：ordinary 或 high。
+2. Money/security risk：none、indirect 或 direct。
+3. 选定的 model 和 reasoning effort。
+4. 一句基于证据的说明，解释该选择。
+
+Risk 优先于 complexity：
+
+- ordinary complexity 且无 money/security 影响：`gpt-5.6-terra`，reasoning effort 为 `high`。
+- high complexity 或 indirect money/security 影响：`gpt-5.6`，reasoning effort 为 `high`。
+- direct money、security、permission 或不可逆外部副作用：`gpt-5.6`，reasoning effort 为 `xhigh`。
+- 未知 risk 视为 direct risk。
+- 绝不选择 `medium` 或 `low`。
+- 若 `xhigh` 不可用，必须披露该限制并改用 `high`；不得静默降级。
+
+direct risk 包括 order submission 或 recovery、client order IDs、duplicate-submit prevention、strategy state、quantity 或 price precision、rounding、units、fills、SQLite transaction ordering、account settings、leverage、credentials、permissions，以及 exchange 或 CCXT semantics。
 
 ## Delegation packet
 
-Every delegated task must provide:
+每个被委派的任务必须提供：
 
 ```text
 Goal: user goal and verifiable completion criteria
@@ -59,23 +71,29 @@ DoNot: no commits, pushes, unrelated edits, real credentials/accounts/exchanges,
 Return: evidence or change summary, file list, command results, unexecuted checks, and uncertainties
 ```
 
-Read-only investigation may omit approved artifacts when the purpose is to gather evidence for a design. Writing agents must stop when approved artifacts are missing.
+read-only 调查若目的是为 design 收集证据，可以省略 approved artifacts。writing agents 在缺少 approved artifacts 时必须停止。
 
-## Trading safety boundary
+## 交易安全边界
 
-- Never read, print, copy, or infer real credentials.
-- Never use the repository's real `.env`.
-- Never call any real exchange API, including public market-data endpoints.
-- Never submit or cancel orders, change account mode or leverage, or use a real business SQLite database.
-- Tests and process checks must use fake gateways, temporary or in-memory SQLite, temporary environment values, and failure conditions that occur before exchange access.
-- Public official documentation may be accessed, but documentation lookup must not become an exchange API probe.
-- Stop any command that could cross this boundary. Do not ask a child agent to relax it.
+- 绝不读取、打印、复制或推断真实 credentials。
+- 绝不使用仓库中的真实 `.env`。
+- 绝不调用任何真实 exchange API，包括 public market-data endpoints。
+- 绝不 submit 或 cancel orders、更改 account mode 或 leverage，或使用真实业务 SQLite database。
+- tests 和 process checks 必须使用 fake gateways、临时或 in-memory SQLite、临时 environment values，以及发生在 exchange access 之前的 failure conditions。
+- 可以访问公开官方文档，但 documentation lookup 不得变成 exchange API probe。
+- 任何可能越过该边界的命令必须立即停止。不要要求 child agent 放宽该边界。
 
-## Result handling
+## 结果处理
 
-- Require file and symbol evidence for analysis and review findings.
-- Require exact commands, exit status, and material output for verification claims.
-- A failed or incomplete agent may be retried once with narrower scope.
-- If the retry still fails, report the missing evidence and its impact; do not silently skip the stage.
-- Resolve agent disagreement using executable behavior, reproducible tests, and authoritative sources rather than vote count.
-- Child results are local evidence. The main agent owns conflict resolution, rework, verification gates, and the final conclusion.
+- 分析和 review 结论必须提供 file 和 symbol 证据。
+- verification 主张必须给出精确 commands、exit status 和关键输出。
+- 失败或不完整的 agent 可以收窄 scope 后重试一次。
+- 若重试仍然失败，必须报告缺失证据及其影响；不得静默跳过该阶段。
+- 用可执行行为、可复现 tests 和权威来源解决 agent 分歧，而不是按票数决定。
+- child 结果只是本地证据。conflict resolution、rework、verification gates 和最终结论由 main agent 负责。
+
+## 文档职责与实现依据
+
+- `docs/superpowers/` 保存历史决策、当前 design 和未来 design。代码实现的目标行为、范围、边界和验收标准，只能来自本任务适用且已经确认的 spec 和 implementation plan。
+- `docs/superpowers/` 中的文件不因位于该目录就自动生效。开始实现前必须确定本任务适用的 spec/plan；若适用范围、确认状态或文档间关系不明确，必须停止实现并先完成范围裁决。
+- 需求发生变化时，可以修改相关 spec 和 plan；修改时必须明确新决策、适用范围以及被替代或失效的旧结论。

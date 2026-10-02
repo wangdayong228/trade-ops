@@ -488,6 +488,29 @@ test('creates a fresh file database in WAL before installing v2 schema', (t) => 
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
+for (const scope of ['main', 'TEMP'] as const) {
+  test(`rejects an unexpected ${scope} trigger on a strategy table`, (t) => {
+    const { database } = setup(t);
+    const triggerName = `force_strategy_hedged_${scope.toLowerCase()}`;
+    const temporary = scope === 'TEMP' ? 'TEMP ' : '';
+    const target = scope === 'TEMP' ? 'main.strategy_orders' : 'strategy_orders';
+    database.exec(`
+      CREATE ${temporary}TRIGGER ${triggerName}
+      AFTER INSERT ON ${target}
+      BEGIN
+        UPDATE strategies
+        SET state = 'HEDGED'
+        WHERE id = NEW.strategy_id;
+      END;
+    `);
+
+    assert.throws(
+      () => new SqliteStrategyRepository(database),
+      /^Error: SQLite strategy schema migration failed$/
+    );
+  });
+}
+
 test('rejects v2 submission evidence checks with the wrong inequality operator', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'trade-ops-wrong-check-'));
   const databasePath = join(directory, 'strategies.sqlite');

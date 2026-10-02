@@ -565,6 +565,50 @@ for (const [mode, roles] of [
   });
 }
 
+test('preserves topology insertion order when the wall clock moves backward', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  const timestamps = [
+    '2026-09-05T00:00:00.000Z',
+    '2026-09-05T00:00:01.000Z',
+    '2026-09-05T00:00:10.000Z',
+    '2026-09-05T00:00:05.000Z'
+  ];
+  let clockIndex = 0;
+  const repository = new SqliteStrategyRepository(database, () => {
+    const timestamp = timestamps[clockIndex];
+    if (timestamp === undefined) {
+      throw new Error('test clock exhausted');
+    }
+    clockIndex += 1;
+    return new Date(timestamp);
+  });
+  const preview = reconciliationPreflight('CONTRACT_FIRST', '1');
+  const strategyId = repository.createPending(preview).id;
+  assert.equal(repository.claimForExecution(strategyId), true);
+  const market = repository.planOrder(
+    strategyId,
+    'CONTRACT_MARKET',
+    requestForRole(strategyId, 'CONTRACT_MARKET')
+  );
+  const gtc = repository.planOrder(
+    strategyId,
+    'SPOT_HEDGE_GTC',
+    requestForRole(strategyId, 'SPOT_HEDGE_GTC')
+  );
+
+  assert.ok(gtc.createdAt < market.createdAt);
+  const orders = repository.listOrders(strategyId);
+  assert.deepEqual(
+    orders.map(({ id }) => id),
+    [market.id, gtc.id]
+  );
+  assert.equal(
+    inspectLocalTopology(repository.getStrategy(strategyId), orders).kind,
+    'valid'
+  );
+});
+
 test('classifies only an empty executing strategy as empty topology', (t) => {
   const f = fixture(t, 'CONTRACT_FIRST');
   assert.deepEqual(inspectLocalTopology(

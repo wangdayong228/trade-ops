@@ -1540,6 +1540,48 @@ function assertV2BusinessSchema(database: Database.Database): void {
   ) {
     throw schemaError();
   }
+
+  const expectedBusinessObjects = new Set([
+    'table:strategies:strategies',
+    'table:strategy_orders:strategy_orders',
+    'table:order_events:order_events',
+    'index:strategies_recoverable_idx:strategies',
+    'index:strategy_orders_strategy_idx:strategy_orders',
+    'index:order_events_order_idx:order_events',
+    'trigger:order_events_no_update:order_events',
+    'trigger:order_events_no_delete:order_events'
+  ]);
+  if (hasMigratedOrderTable) {
+    expectedBusinessObjects.add(
+      'trigger:strategy_orders_submission_evidence_insert:strategy_orders'
+    );
+    expectedBusinessObjects.add(
+      'trigger:strategy_orders_submission_evidence_update:strategy_orders'
+    );
+  }
+  const businessTables = new Set<string>(REQUIRED_BUSINESS_TABLES);
+  for (const row of rows) {
+    const table = row.tbl_name;
+    if (typeof table !== 'string' || !businessTables.has(table)) continue;
+    if (
+      typeof row.type !== 'string'
+      || typeof row.name !== 'string'
+      || !expectedBusinessObjects.has(`${row.type}:${row.name}:${table}`)
+    ) {
+      throw schemaError();
+    }
+  }
+
+  const placeholders = REQUIRED_BUSINESS_TABLES.map(() => '?').join(', ');
+  const temporaryBusinessObject = database.prepare(`
+    SELECT 1
+    FROM sqlite_temp_master
+    WHERE tbl_name IN (${placeholders})
+    LIMIT 1
+  `).get(...REQUIRED_BUSINESS_TABLES);
+  if (temporaryBusinessObject !== undefined) {
+    throw schemaError();
+  }
 }
 
 function assertForeignKeysClean(database: Database.Database): void {
@@ -1747,7 +1789,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       SELECT *
       FROM strategy_orders
       WHERE strategy_id = ?
-      ORDER BY created_at, rowid
+      ORDER BY rowid
     `);
     this.selectLatestEvent = this.database.prepare(`
       SELECT
