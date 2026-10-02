@@ -58,6 +58,8 @@ function safeFailureCategory(error: unknown): string;
 
 `ErrorCode` 为 spec 第 6 节所列闭合联合；`ErrorSubject` 为 configuration/request/exchange/market/account/strategy/database 闭合变体。标识、标量字符串、列表及项数有固定上限；工厂拒绝非有限数字、额外属性、访问器及任意对象。输入只允许已投影的安全值，凭证字段实际值仅为 spec 两种类别。中文消息由 code、subject、expected、actual 唯一生成；持久化读取重新校验并验证消息与字段一致。未知异常只按受控类别转换，不信任任意 `name`/`message`/`code`；原始 cause 不进入 detail。
 
+Subject 字段：configuration/request 使用 `field`；exchange 使用 `exchangeId, operation`；market 使用 `exchangeId, symbol, kind, field?`；account 使用 `exchangeId, symbol, field`；strategy 使用 `strategyId, field?`；database 使用 `path?, table?, recordId?, field?, operation?`。标识上限 128 字符、symbol 64、path 512；诊断字符串上限 2000，列表上限 16 项且每项上限 2000。字段只允许相应变体所列成员。
+
 - [ ] RED：安全字段与中文文案一致、不可变快照、阶段转换保留时间与证据、所有码均有工厂文案；恶意 getter/proxy/未知抛出值、额外字段、超界值、NaN、凭证、伪造持久化消息均有拒绝或安全类别测试。新模块未存在时先用动态 import 验证缺少能力，再以实际行为断言覆盖。
 - [ ] GREEN：实现上述契约；直接秘密替换只处理调用方显式提供的测试值/运行时注入值，不在模块导入时读取环境。
 - [ ] 验证与审查：`npm run build`；`node --test dist/tests/errors/trade-ops-error.test.js`；主代理审核并提交。
@@ -132,7 +134,7 @@ class ConfirmationService {
 
 ### Task 5：HTTP、安全错误投影与界面
 
-**文件：** 修改 `src/http/server.ts`、`src/http/public-error.ts`、`public/app.js`、`public/index.html`、按需 `public/styles.css`；更新 `tests/http/server.test.ts`、`tests/http/public-error.test.ts`，新增 `tests/http/operator-ui.test.ts`（通过 VM/fake DOM 验证真实 UI 代码）。
+**文件：** 修改 `src/http/server.ts`、`src/http/public-error.ts`、`public/app.js`、`public/index.html`、按需 `public/styles.css`；更新 `tests/http/server.test.ts`、`tests/http/public-error.test.ts`。复用 server.test.ts 已有 VM/fake DOM harness 验证真实 UI 代码，避免另建重复 harness。
 
 **输入：** Task 1 错误契约、Task 3 `preflightFailure`、Task 4 确认服务。
 
