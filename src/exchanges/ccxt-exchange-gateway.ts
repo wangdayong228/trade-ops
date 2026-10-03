@@ -20,6 +20,7 @@ import type {
 } from '../domain/types.js';
 import {
   createTradeOpsError,
+  type ErrorCode,
   type SafeDiagnosticValue
 } from '../errors/trade-ops-error.js';
 import {
@@ -155,6 +156,7 @@ interface CapturedMarket {
   readonly maximumAmount: Numeric | undefined;
   readonly minimumQuoteNotional: Numeric | undefined;
   readonly maximumQuoteNotional: Numeric | undefined;
+  readonly notionalRulesContainerActual: SafeDiagnosticValue | undefined;
   readonly contractSize: Numeric | undefined;
   readonly hasStructuredInfo: boolean;
   readonly rawMinimumAmount: unknown;
@@ -321,19 +323,67 @@ function marketRuleError(
   expected: SafeDiagnosticValue,
   actual: SafeDiagnosticValue
 ): Error {
+  return marketError(
+    'MARKET_RULE_INVALID',
+    exchangeId,
+    captured.requestedSymbol,
+    captured.requestedKind,
+    field,
+    expected,
+    actual
+  );
+}
+
+function marketError(
+  code: ErrorCode,
+  exchangeId: string,
+  symbol: string,
+  kind: MarketKind,
+  field: string | undefined,
+  expected: SafeDiagnosticValue,
+  actual: SafeDiagnosticValue
+): Error {
   return createTradeOpsError({
-    code: 'MARKET_RULE_INVALID',
+    code,
     phase: 'preflight',
     subject: {
       type: 'market',
       exchangeId,
-      symbol: captured.requestedSymbol,
-      kind: captured.requestedKind,
-      field
+      symbol,
+      kind,
+      ...(field === undefined ? {} : { field })
     },
     expected,
     actual
   });
+}
+
+function safeIdentityActual(value: unknown): SafeDiagnosticValue {
+  if (value === undefined) {
+    return 'missing';
+  }
+  if (value === null || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    return /^[A-Z0-9:/_-]{1,64}$/u.test(value)
+      ? value
+      : 'unrecognized string';
+  }
+  return `${typeof value} value`;
+}
+
+function nestedRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function missingContainerActual(value: unknown): SafeDiagnosticValue | undefined {
+  if (nestedRecord(value) !== undefined) {
+    return undefined;
+  }
+  return value === undefined ? 'missing' : `${typeof value} value`;
 }
 
 function optionalDecimalString(
@@ -750,7 +800,8 @@ export class CcxtExchangeGateway implements ExchangeGateway {
   private async captureMarket(
     symbol: string,
     kind: MarketKind,
-    options: MarketLoadOptions = {}
+    options: MarketLoadOptions = {},
+    selection: 'staged' | 'strict' = 'staged'
   ): Promise<CapturedMarket> {
     if (kind !== 'spot' && kind !== 'swap') {
       throw new Error(`unsupported market kind: ${String(kind)}`);
@@ -762,41 +813,101 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     if (kind === 'spot') {
       selected = markets[symbol];
       if (selected === undefined) {
-        throw new Error(
-          `missing supported active spot market for ${symbol}`
-        );
+        if (selection === 'staged') {
+          throw marketError(
+            'MARKET_UNAVAILABLE',
+            this.exchangeId,
+            symbol,
+            kind,
+            undefined,
+            'market present in refreshed market set',
+            'missing'
+          );
+        }
+        throw new Error(`missing supported active spot market for ${symbol}`);
       }
     } else {
       const candidates = Object.values(markets)
         .filter((candidate) => isSupportedSwap(candidate, base));
       const exactSymbol = `${symbol}:USDT`;
-      selected = Object.values(markets).find(
-        (candidate) => candidate.symbol === exactSymbol
-      );
+      selected = selection === 'strict'
+        ? candidates.find((candidate) => candidate.symbol === exactSymbol)
+        : Object.values(markets).find(
+          (candidate) => candidate.symbol === exactSymbol
+        );
       if (selected === undefined && candidates.length === 1) {
         selected = candidates[0];
       }
       if (selected === undefined) {
+        if (selection === 'staged') {
+          throw marketError(
+            'MARKET_UNAVAILABLE',
+            this.exchangeId,
+            symbol,
+            kind,
+            undefined,
+            'one unambiguous supported active linear USDT-settled swap',
+            candidates.length === 0
+              ? 'missing'
+              : `${candidates.length} supported candidates`
+          );
+        }
         throw new Error(
           `missing supported active linear USDT-settled swap for ${symbol}`
         );
       }
     }
 
-    if (kind === 'spot') {
-      if (
-        selected.symbol !== symbol
-        || selected.base !== base
-        || selected.quote !== 'USDT'
-        || selected.spot !== true
-        || selected.contract !== false
-      ) {
-        throw new Error(`missing supported active spot market for ${symbol}`);
+    if (selection === 'staged') {
+      const identityChecks: ReadonlyArray<readonly [
+        string,
+        SafeDiagnosticValue,
+        unknown
+      ]> = kind === 'spot'
+        ? [
+            ['symbol', symbol, selected.symbol],
+            ['base', base, selected.base],
+            ['quote', 'USDT', selected.quote],
+            ['kind', 'spot', selected.spot === true && selected.contract === false
+              ? 'spot'
+              : selected.type]
+          ]
+        : [
+            ['base', base, selected.base],
+            ['quote', 'USDT', selected.quote],
+            ['settle', 'USDT', selected.settle],
+            ['kind', 'swap', selected.swap === true
+              && selected.future === false
+              && selected.contract === true
+              ? 'swap'
+              : selected.type],
+            ['linear', true, selected.linear],
+            ['inverse', false, selected.inverse]
+          ];
+      for (const [field, expected, actual] of identityChecks) {
+        if (actual !== expected) {
+          throw marketError(
+            'MARKET_IDENTITY_MISMATCH',
+            this.exchangeId,
+            symbol,
+            kind,
+            field,
+            expected,
+            safeIdentityActual(actual)
+          );
+        }
       }
-    } else if (!hasSupportedSwapIdentity(selected, base)) {
-      throw new Error(
-        `missing supported active linear USDT-settled swap for ${symbol}`
-      );
+      if (selected.active !== true) {
+        throw marketError(
+          'MARKET_INACTIVE',
+          this.exchangeId,
+          symbol,
+          kind,
+          'active',
+          true,
+          safeIdentityActual(selected.active)
+        );
+      }
     }
 
     const structuredInfo = typeof selected.info === 'object'
@@ -805,11 +916,10 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     const rawMinimumAmount = structuredInfo
       ? (selected.info as Record<string, unknown>).minTradeAmount
       : undefined;
-    const actualKind = selected.spot === true && selected.contract === false
-      ? 'spot'
-      : selected.swap === true && selected.contract === true
-        ? 'swap'
-        : kind;
+    const precision = nestedRecord(selected.precision);
+    const limits = nestedRecord(selected.limits);
+    const amountLimits = nestedRecord(limits?.amount);
+    const costLimits = nestedRecord(limits?.cost);
     return Object.freeze({
       market: selected,
       exchangeSymbol: selected.symbol,
@@ -819,18 +929,19 @@ export class CcxtExchangeGateway implements ExchangeGateway {
         exchangeId: this.exchangeId,
         symbol,
         marketId: selected.id,
-        kind: actualKind,
+        kind,
         base: selected.base,
         quote: selected.quote as 'USDT',
         active: selected.active === true
       }),
       precisionMode: this.exchange.precisionMode,
-      amountPrecision: selected.precision.amount,
-      pricePrecision: selected.precision.price,
-      minimumAmount: selected.limits.amount.min,
-      maximumAmount: selected.limits.amount.max,
-      minimumQuoteNotional: selected.limits.cost.min,
-      maximumQuoteNotional: selected.limits.cost.max,
+      amountPrecision: precision?.amount as Numeric | undefined,
+      pricePrecision: precision?.price as Numeric | undefined,
+      minimumAmount: amountLimits?.min as Numeric | undefined,
+      maximumAmount: amountLimits?.max as Numeric | undefined,
+      minimumQuoteNotional: costLimits?.min as Numeric | undefined,
+      maximumQuoteNotional: costLimits?.max as Numeric | undefined,
+      notionalRulesContainerActual: missingContainerActual(limits?.cost),
       contractSize: selected.contractSize,
       hasStructuredInfo: structuredInfo,
       rawMinimumAmount,
@@ -1043,6 +1154,18 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     captured: Readonly<CapturedMarket>,
     preciseErrors: boolean
   ): Readonly<MarketNotionalRules> {
+    if (captured.notionalRulesContainerActual !== undefined) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          'notionalRules',
+          'limits.cost object',
+          captured.notionalRulesContainerActual
+        );
+      }
+      throw new Error('invalid quote notional rules: expected limits.cost object');
+    }
     const minQuoteNotional = captured.minimumQuoteNotional === undefined
       ? undefined
       : this.capturedDecimal(
@@ -1088,7 +1211,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     kind: MarketKind,
     options: MarketLoadOptions = {}
   ): Promise<ResolvedMarket> {
-    const captured = await this.captureMarket(symbol, kind, options);
+    const captured = await this.captureMarket(symbol, kind, options, 'strict');
     this.assertStrictMarket(captured);
     return {
       market: captured.market,
@@ -1124,13 +1247,31 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       ),
       fetchLastPrice: async () => {
         const ticker = await this.exchange.fetchTicker(captured.exchangeSymbol);
-        if (
-          (typeof ticker.last !== 'number' && typeof ticker.last !== 'string')
-          || String(ticker.last).trim() === ''
-        ) {
-          throw new Error('last price is unavailable');
+        const value = ticker.last;
+        if (value === undefined || value === null || String(value).trim() === '') {
+          throw marketError(
+            'PRICE_UNAVAILABLE',
+            this.exchangeId,
+            captured.requestedSymbol,
+            captured.requestedKind,
+            'price',
+            'finite decimal greater than zero',
+            safeRuleActual(value)
+          );
         }
-        return String(ticker.last);
+        try {
+          return decimalString(value, 'ticker reference price');
+        } catch {
+          throw marketError(
+            'PRICE_INVALID',
+            this.exchangeId,
+            captured.requestedSymbol,
+            captured.requestedKind,
+            'price',
+            'finite decimal greater than zero',
+            safeRuleActual(value)
+          );
+        }
       }
     });
   }
@@ -1165,7 +1306,21 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       ? currency as Record<string, unknown>
       : undefined;
     const value = freeByCurrency?.[asset] ?? currencyBalance?.free;
-    return decimalString(value, `free ${asset} balance`, 'non-negative');
+    try {
+      return decimalString(value, `free ${asset} balance`, 'non-negative');
+    } catch {
+      throw createTradeOpsError({
+        code: 'BALANCE_UNAVAILABLE',
+        phase: 'preflight',
+        subject: {
+          type: 'exchange',
+          exchangeId: this.exchangeId,
+          operation: `fetch ${kind} ${asset} balance`
+        },
+        expected: 'finite non-negative USDT balance',
+        actual: safeRuleActual(value)
+      });
+    }
   }
 
   async fetchAccountSettings(

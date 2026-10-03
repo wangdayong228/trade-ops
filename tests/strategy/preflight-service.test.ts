@@ -27,11 +27,13 @@ import {
 const SYMBOL = 'BTC/USDT';
 
 function isTradeOpsFailure(
-  code: ErrorCode,
+  code: ErrorCode | 'REQUEST_OPERATION_FAILED',
   options: {
     phase?: ErrorPhase;
     subjectType?: string;
     field?: string;
+    exchangeId?: string;
+    symbol?: string;
     expected?: unknown;
     actual?: unknown;
   } = {}
@@ -47,6 +49,16 @@ function isTradeOpsFailure(
       assert.equal('field' in error.detail.subject
         ? error.detail.subject.field
         : undefined, options.field);
+    }
+    if (options.exchangeId !== undefined) {
+      assert.equal('exchangeId' in error.detail.subject
+        ? error.detail.subject.exchangeId
+        : undefined, options.exchangeId);
+    }
+    if (options.symbol !== undefined) {
+      assert.equal('symbol' in error.detail.subject
+        ? error.detail.subject.symbol
+        : undefined, options.symbol);
     }
     if ('expected' in options) {
       assert.deepEqual(error.detail.expected, options.expected);
@@ -221,6 +233,7 @@ function setup(options: {
   spotFreeUsdt?: string;
   contractFreeUsdt?: string;
   accountSettings?: AccountSettings;
+  clock?: () => Date;
   spotGateway?: FakeExchangeGateway;
   contractGateway?: FakeExchangeGateway;
 } = {}): {
@@ -248,10 +261,13 @@ function setup(options: {
     leverage: '2'
   };
   return {
-    service: new PreflightService(new ExchangeRegistry(new Map([
-      ['bitget', spot],
-      ['okx', contract]
-    ]))),
+    service: new PreflightService(
+      new ExchangeRegistry(new Map([
+        ['bitget', spot],
+        ['okx', contract]
+      ])),
+      options.clock
+    ),
     spot,
     contract
   };
@@ -678,6 +694,32 @@ test('converts unknown account failures safely and applies the requested phase',
   assert.deepEqual(configured.contract.createdRequests, []);
 });
 
+test('repair: classifies a valid-request clock failure as an operation failure', async () => {
+  const secret = 'synthetic-clock-failure-must-not-leak';
+  const configured = orderedSetup({
+    clock: () => {
+      throw new Error(secret);
+    }
+  });
+
+  await assert.rejects(
+    configured.service.run(input()),
+    (error: unknown) => {
+      assert(isTradeOpsFailure('REQUEST_OPERATION_FAILED', {
+        subjectType: 'request',
+        field: 'preflight',
+        expected: 'successful preflight request processing',
+        actual: 'object-failure'
+      })(error));
+      assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+      return true;
+    }
+  );
+  assert.deepEqual(configured.trace, COMPLETE_PREFLIGHT_TRACE);
+  assert.deepEqual(configured.spot.createdRequests, []);
+  assert.deepEqual(configured.contract.createdRequests, []);
+});
+
 test('rejects same-exchange and unsupported exchange selections', async () => {
   const { service } = setup();
 
@@ -927,6 +969,28 @@ test('checks contract balance just below, exactly at, and just above leveraged r
   await setup({
     contractFreeUsdt: '60.000000000000000001'
   }).service.run(input());
+});
+
+test('repair: reports leveraged contract capacity on nonzero insufficiency', async () => {
+  await assert.rejects(
+    setup({
+      contractPrice: '100',
+      contractFreeUsdt: '49',
+      accountSettings: {
+        marginMode: 'isolated',
+        positionMode: 'hedged',
+        leverage: '2'
+      }
+    }).service.run(input()),
+    isTradeOpsFailure('BALANCE_INSUFFICIENT', {
+      subjectType: 'account',
+      field: 'balance',
+      exchangeId: 'okx',
+      symbol: SYMBOL,
+      expected: 'USDT capacity at least 100',
+      actual: '98'
+    })
+  );
 });
 
 test('fails closed for malformed spot and contract balances', async () => {

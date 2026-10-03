@@ -61,6 +61,7 @@ const ALL_ERROR_CODES = [
   'REQUEST_FORBIDDEN',
   'REQUEST_BODY_INVALID',
   'REQUEST_FIELD_INVALID',
+  'REQUEST_OPERATION_FAILED',
   'STRATEGY_NOT_FOUND',
   'STRATEGY_STATE_MISMATCH',
   'STRATEGY_OPERATION_BUSY',
@@ -110,6 +111,7 @@ const SUBJECT_BY_CODE: Readonly<Record<string, ErrorSubject>> = {
   REQUEST_FORBIDDEN: { type: 'request', field: 'origin' },
   REQUEST_BODY_INVALID: { type: 'request', field: 'body' },
   REQUEST_FIELD_INVALID: { type: 'request', field: 'requestedBaseQuantity' },
+  REQUEST_OPERATION_FAILED: { type: 'request', field: 'preflight' },
   STRATEGY_NOT_FOUND: { type: 'strategy', strategyId: 'strategy-test' },
   STRATEGY_STATE_MISMATCH: {
     type: 'strategy', strategyId: 'strategy-test', field: 'state'
@@ -301,6 +303,30 @@ async function loadContract(): Promise<ErrorContractModule> {
   }
   return candidate as ErrorContractModule;
 }
+
+test('repair: REQUEST_OPERATION_FAILED preserves safe request-operation evidence', async () => {
+  const contract = await loadContract();
+  const error = contract.createTradeOpsError({
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'preflight',
+    subject: { type: 'request', field: 'preflight' },
+    expected: 'successful preflight request processing',
+    actual: 'error'
+  });
+
+  assert.equal(error.detail.code, 'REQUEST_OPERATION_FAILED');
+  assert.equal(error.detail.phase, 'preflight');
+  assert.deepEqual(error.detail.subject, {
+    type: 'request',
+    field: 'preflight'
+  });
+  assert.equal(
+    error.detail.expected,
+    'successful preflight request processing'
+  );
+  assert.equal(error.detail.actual, 'error');
+  assert.match(error.detail.message, /期望 .*实际为/u);
+});
 
 test('可信精确错误契约', async (t) => {
   const contract = await loadContract();

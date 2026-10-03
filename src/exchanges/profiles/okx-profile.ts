@@ -3,6 +3,7 @@ import type {
   AccountSettings,
   OrderRequest
 } from '../../domain/types.js';
+import { createTradeOpsError } from '../../errors/trade-ops-error.js';
 import type {
   CcxtExchangeLike
 } from '../ccxt-exchange-gateway.js';
@@ -65,11 +66,24 @@ function isOpenPosition(
 
 function oneValue<T>(
   values: readonly T[],
-  field: string
+  field: 'marginMode' | 'leverage',
+  exchangeSymbol: string,
+  expected: string
 ): T | undefined {
   const distinct = [...new Set(values)];
   if (distinct.length > 1) {
-    throw new Error(`conflicting account settings for OKX ${field}`);
+    throw createTradeOpsError({
+      code: 'ACCOUNT_SETTINGS_CONFLICT',
+      phase: 'preflight',
+      subject: {
+        type: 'account',
+        exchangeId: 'okx',
+        symbol: exchangeSymbol,
+        field
+      },
+      expected,
+      actual: distinct.map(String)
+    });
   }
   return distinct[0];
 }
@@ -136,13 +150,29 @@ export class OkxProfile implements ExchangeProfile {
       (position) => position.side === 'short'
     );
     const marginModes = shortPositions
-      .map(positionMarginMode)
-      .filter((value) => value !== 'unknown');
+      .map(positionMarginMode);
+    if (marginModes.includes('unknown')) {
+      return {
+        marginMode: 'unknown',
+        positionMode,
+        leverage: null
+      };
+    }
+    const marginMode = oneValue(
+      marginModes,
+      'marginMode',
+      exchangeSymbol,
+      'one consistent margin mode'
+    ) ?? 'unknown';
     const leverages = shortPositions
       .map((position) => optionalPositive(position.leverage, 'leverage'))
       .filter((value): value is string => value !== null);
-    const marginMode = oneValue(marginModes, 'margin mode') ?? 'unknown';
-    const leverage = oneValue(leverages, 'leverage') ?? null;
+    const leverage = oneValue(
+      leverages,
+      'leverage',
+      exchangeSymbol,
+      'one consistent positive leverage'
+    ) ?? null;
 
     return { marginMode, positionMode, leverage };
   }

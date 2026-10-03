@@ -754,7 +754,6 @@ async function readBalance(
 }
 
 function assertSufficientBalance(
-  balance: Decimal,
   availableQuote: Decimal,
   requiredQuote: Decimal,
   exchangeId: string,
@@ -765,7 +764,7 @@ function assertSufficientBalance(
       'BALANCE_INSUFFICIENT',
       accountSubject(exchangeId, symbol, 'balance'),
       `USDT capacity at least ${requiredQuote.toFixed()}`,
-      balance.toFixed()
+      availableQuote.toFixed()
     );
   }
 }
@@ -796,10 +795,10 @@ export class PreflightService {
         throw known;
       }
       throw createTradeOpsError({
-        code: 'REQUEST_FIELD_INVALID',
+        code: 'REQUEST_OPERATION_FAILED',
         phase,
         subject: { type: 'request', field: 'preflight' },
-        expected: 'trusted preflight result or precise failure',
+        expected: 'successful preflight request processing',
         actual: safeFailureCategory(error)
       });
     }
@@ -924,7 +923,6 @@ export class PreflightService {
     );
     assertSufficientBalance(
       spotFreeUsdt,
-      spotFreeUsdt,
       spotQuoteNotional,
       request.spotExchangeId,
       request.symbol
@@ -951,7 +949,6 @@ export class PreflightService {
       );
     }
     assertSufficientBalance(
-      contractFreeUsdt,
       leveragedContractBalance,
       contractQuoteNotional,
       request.contractExchangeId,

@@ -233,6 +233,8 @@ class CcxtDouble implements CcxtExchangeLike {
     USDT: { free: 1234.5, used: 0, total: 1234.5 },
     info: {}
   };
+  balanceError: unknown;
+  tickerError: unknown;
   createResult: CcxtOrder = ccxtOrder();
   createError: Error | undefined;
   fetchOrderResult: CcxtOrder = ccxtOrder();
@@ -283,6 +285,9 @@ class CcxtDouble implements CcxtExchangeLike {
   ): Promise<Record<string, unknown>> {
     this.events.push('fetchBalance');
     this.balanceCalls.push(structuredClone(params));
+    if (this.balanceError !== undefined) {
+      throw this.balanceError;
+    }
     return this.balance;
   }
 
@@ -294,6 +299,9 @@ class CcxtDouble implements CcxtExchangeLike {
     last?: number | string;
   }> {
     this.events.push(`fetchTicker:${symbol}`);
+    if (this.tickerError !== undefined) {
+      throw this.tickerError;
+    }
     return this.ticker;
   }
 
@@ -466,6 +474,51 @@ function isTradeOpsFailure(
         : undefined, field);
     }
     assert.match(error.detail.message, /期望 .*实际为/);
+    return true;
+  };
+}
+
+function isPreciseTradeOpsFailure(
+  code: ErrorCode,
+  options: {
+    phase?: 'preflight' | 'confirmation';
+    subjectType: string;
+    exchangeId?: string;
+    symbol?: string;
+    kind?: string;
+    field?: string;
+    expected: unknown;
+    actual: unknown;
+    forbidden?: readonly string[];
+  }
+): (error: unknown) => boolean {
+  return (error: unknown): boolean => {
+    assert(error instanceof TradeOpsError);
+    assert.equal(error.detail.code, code);
+    assert.equal(error.detail.phase, options.phase ?? 'preflight');
+    assert.equal(error.detail.subject.type, options.subjectType);
+    const subject = error.detail.subject as unknown as Record<string, unknown>;
+    for (const [key, expected] of [
+      ['exchangeId', options.exchangeId],
+      ['symbol', options.symbol],
+      ['kind', options.kind],
+      ['field', options.field]
+    ] as const) {
+      if (expected !== undefined) {
+        assert.equal(
+          subject[key],
+          expected
+        );
+      }
+    }
+    assert.deepEqual(error.detail.expected, options.expected);
+    assert.deepEqual(error.detail.actual, options.actual);
+    const rendered = JSON.stringify(error);
+    for (const forbidden of options.forbidden ?? []) {
+      assert.doesNotMatch(rendered, new RegExp(forbidden));
+    }
+    assert.equal('cause' in error.detail, false);
+    assert.equal('stack' in error.detail, false);
     return true;
   };
 }
@@ -1251,6 +1304,383 @@ test('reports the spot notional rule before a malformed contract rule', async ()
   assert.deepEqual(configured.contractCcxt.createCalls, []);
 });
 
+test('repair: staged preflight reports an exact base mismatch instead of using fallback', async () => {
+  const configured = makeCcxtPreflight({
+    contractMarket: { base: 'ETH' }
+  });
+  const fallback = swapMarket({
+    id: 'BTC-USDT-SWAP-FALLBACK',
+    symbol: 'BTC/USDT:USDT-FALLBACK'
+  });
+  configured.contractCcxt.markets[fallback.symbol] = fallback;
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isPreciseTradeOpsFailure('MARKET_IDENTITY_MISMATCH', {
+      subjectType: 'market',
+      exchangeId: 'okx',
+      symbol: 'BTC/USDT',
+      kind: 'swap',
+      field: 'base',
+      expected: 'BTC',
+      actual: 'ETH'
+    })
+  );
+  assert.equal(
+    configured.contractCcxt.events.some(
+      (event) => event.startsWith('fetchPositionMode:')
+    ),
+    false
+  );
+});
+
+test('repair: staged preflight reports an inactive exact market before fallback', async () => {
+  const configured = makeCcxtPreflight({
+    contractMarket: { active: false }
+  });
+  const fallback = swapMarket({
+    id: 'BTC-USDT-SWAP-FALLBACK',
+    symbol: 'BTC/USDT:USDT-FALLBACK'
+  });
+  configured.contractCcxt.markets[fallback.symbol] = fallback;
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isPreciseTradeOpsFailure('MARKET_INACTIVE', {
+      subjectType: 'market',
+      exchangeId: 'okx',
+      symbol: 'BTC/USDT',
+      kind: 'swap',
+      field: 'active',
+      expected: true,
+      actual: false
+    })
+  );
+  assert.equal(
+    configured.contractCcxt.events.some(
+      (event) => event.startsWith('fetchPositionMode:')
+    ),
+    false
+  );
+});
+
+for (const { name, ticker, code, actual } of [
+  {
+    name: 'missing',
+    ticker: {},
+    code: 'PRICE_UNAVAILABLE',
+    actual: 'missing'
+  },
+  {
+    name: 'malformed',
+    ticker: { last: 'not-a-price' },
+    code: 'PRICE_INVALID',
+    actual: 'malformed decimal string'
+  }
+] satisfies Array<{
+  name: string;
+  ticker: CcxtDouble['ticker'];
+  code: ErrorCode;
+  actual: string;
+}>) {
+  test(`repair: real adapter preserves ${name} ticker evidence`, async () => {
+    const configured = makeCcxtPreflight();
+    configured.spotCcxt.ticker = ticker;
+
+    await assert.rejects(
+      configured.service.run(preflightInput),
+      isPreciseTradeOpsFailure(code, {
+        subjectType: 'market',
+        exchangeId: 'bitget',
+        symbol: 'BTC/USDT',
+        kind: 'spot',
+        field: 'price',
+        expected: 'finite decimal greater than zero',
+        actual
+      })
+    );
+    assert.equal(
+      configured.contractCcxt.events.some(
+        (event) => event.startsWith('fetchTicker:')
+      ),
+      false
+    );
+    assert.equal(
+      configured.spotCcxt.events.includes('fetchBalance'),
+      false
+    );
+  });
+}
+
+test('repair: unknown ticker rejection remains a safe failure category', async () => {
+  const configured = makeCcxtPreflight();
+  const secret = 'unknown-ticker-rejection-secret';
+  configured.spotCcxt.tickerError = new Error(secret);
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isPreciseTradeOpsFailure('PRICE_UNAVAILABLE', {
+      subjectType: 'market',
+      exchangeId: 'bitget',
+      symbol: 'BTC/USDT',
+      kind: 'spot',
+      field: 'price',
+      expected: 'successful reference price read',
+      actual: 'object-failure',
+      forbidden: [secret]
+    })
+  );
+});
+
+test('repair: OKX margin conflict wins before malformed leverage', async () => {
+  const secret = 'malformed-leverage-secret';
+  const configured = makeCcxtPreflight({
+    positions: [{
+      symbol: 'BTC/USDT:USDT',
+      side: 'short',
+      contracts: 1,
+      marginMode: 'cross',
+      leverage: 2,
+      info: {}
+    }, {
+      symbol: 'BTC/USDT:USDT',
+      side: 'short',
+      contracts: 2,
+      marginMode: 'isolated',
+      leverage: secret,
+      info: {}
+    }]
+  });
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isPreciseTradeOpsFailure('ACCOUNT_SETTINGS_CONFLICT', {
+      subjectType: 'account',
+      exchangeId: 'okx',
+      symbol: 'BTC/USDT:USDT',
+      field: 'marginMode',
+      expected: 'one consistent margin mode',
+      actual: ['cross', 'isolated'],
+      forbidden: [secret]
+    })
+  );
+  assert.equal(
+    configured.spotCcxt.events.some((event) => event.startsWith('fetchTicker:')),
+    false
+  );
+});
+
+test('repair: OKX unknown margin wins before malformed leverage', async () => {
+  const secret = 'malformed-leverage-before-margin-secret';
+  const configured = makeCcxtPreflight({
+    positions: [{
+      symbol: 'BTC/USDT:USDT',
+      side: 'short',
+      contracts: 1,
+      marginMode: 'portfolio',
+      leverage: secret,
+      info: {}
+    }]
+  });
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isPreciseTradeOpsFailure('ACCOUNT_MARGIN_MODE_MISMATCH', {
+      subjectType: 'account',
+      exchangeId: 'okx',
+      symbol: 'BTC/USDT',
+      field: 'marginMode',
+      expected: ['isolated', 'cross'],
+      actual: 'unknown',
+      forbidden: [secret]
+    })
+  );
+  assert.equal(
+    configured.spotCcxt.events.some((event) => event.startsWith('fetchTicker:')),
+    false
+  );
+});
+
+test('repair: OKX leverage conflict preserves both observed values', async () => {
+  const configured = makeCcxtPreflight({
+    positions: [{
+      symbol: 'BTC/USDT:USDT',
+      side: 'short',
+      contracts: 1,
+      marginMode: 'isolated',
+      leverage: 2,
+      info: {}
+    }, {
+      symbol: 'BTC/USDT:USDT',
+      side: 'short',
+      contracts: 2,
+      marginMode: 'isolated',
+      leverage: 3,
+      info: {}
+    }]
+  });
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isPreciseTradeOpsFailure('ACCOUNT_SETTINGS_CONFLICT', {
+      subjectType: 'account',
+      exchangeId: 'okx',
+      symbol: 'BTC/USDT:USDT',
+      field: 'leverage',
+      expected: 'one consistent positive leverage',
+      actual: ['2', '3']
+    })
+  );
+  assert.equal(
+    configured.spotCcxt.events.some((event) => event.startsWith('fetchTicker:')),
+    false
+  );
+});
+
+for (const { name, leg, value, actual } of [
+  {
+    name: 'missing spot balance',
+    leg: 'spot',
+    value: undefined,
+    actual: 'missing'
+  },
+  {
+    name: 'malformed contract balance',
+    leg: 'contract',
+    value: 'malformed-balance-secret',
+    actual: 'malformed decimal string'
+  }
+] as const) {
+  test(`repair: real adapter preserves ${name} evidence`, async () => {
+    const configured = makeCcxtPreflight();
+    const target = leg === 'spot'
+      ? configured.spotCcxt
+      : configured.contractCcxt;
+    target.balance = value === undefined
+      ? { free: {}, USDT: {}, info: {} }
+      : { free: { USDT: value }, USDT: { free: value }, info: {} };
+
+    await assert.rejects(
+      configured.service.run(preflightInput),
+      isPreciseTradeOpsFailure('BALANCE_UNAVAILABLE', {
+        subjectType: 'exchange',
+        exchangeId: leg === 'spot' ? 'bitget' : 'okx',
+        expected: 'finite non-negative USDT balance',
+        actual,
+        forbidden: value === undefined ? [] : [value]
+      })
+    );
+    assert.deepEqual(configured.spotCcxt.createCalls, []);
+    assert.deepEqual(configured.contractCcxt.createCalls, []);
+  });
+}
+
+for (const container of ['precision', 'limits'] as const) {
+  test(`repair: missing ${container} container does not precede one-way mode`, async () => {
+    const configured = makeCcxtPreflight({
+      positionMode: { info: { posMode: 'net_mode' }, hedged: false }
+    });
+    const contractMarket = configured.contractCcxt.markets['BTC/USDT:USDT'];
+    assert(contractMarket);
+    delete (contractMarket as Partial<CcxtMarket>)[container];
+
+    await assert.rejects(
+      configured.service.run(preflightInput),
+      isPreciseTradeOpsFailure('ACCOUNT_POSITION_MODE_MISMATCH', {
+        subjectType: 'account',
+        exchangeId: 'okx',
+        symbol: 'BTC/USDT',
+        field: 'positionMode',
+        expected: 'hedged',
+        actual: 'one-way'
+      })
+    );
+    assert.equal(
+      configured.contractCcxt.events.some(
+        (event) => event.startsWith('fetchPositionMode:')
+      ),
+      true
+    );
+    assert.equal(
+      configured.contractCcxt.events.some(
+        (event) => event.startsWith('fetchPositions:')
+      ),
+      false
+    );
+  });
+}
+
+for (const { container, field } of [
+  { container: 'precision', field: 'amountStep' },
+  { container: 'limits', field: 'minBaseAmount' }
+] as const) {
+  test(`repair: missing ${container} container fails in quantity stage`, async () => {
+    const configured = makeCcxtPreflight();
+    const contractMarket = configured.contractCcxt.markets['BTC/USDT:USDT'];
+    assert(contractMarket);
+    delete (contractMarket as Partial<CcxtMarket>)[container];
+
+    await assert.rejects(
+      configured.service.run(preflightInput),
+      isPreciseTradeOpsFailure('MARKET_RULE_INVALID', {
+        subjectType: 'market',
+        exchangeId: 'okx',
+        symbol: 'BTC/USDT',
+        kind: 'swap',
+        field,
+        expected: 'finite decimal greater than zero',
+        actual: 'missing'
+      })
+    );
+    assert.equal(
+      configured.contractCcxt.events.some(
+        (event) => event.startsWith('fetchPositions:')
+      ),
+      true
+    );
+    assert.equal(
+      configured.spotCcxt.events.some((event) => event.startsWith('fetchTicker:')),
+      false
+    );
+  });
+}
+
+for (const leg of ['spot', 'contract'] as const) {
+  test(`repair: missing ${leg} notional container fails in its notional stage`, async () => {
+    const configured = makeCcxtPreflight();
+    const target = leg === 'spot'
+      ? configured.spotCcxt.markets['BTC/USDT']
+      : configured.contractCcxt.markets['BTC/USDT:USDT'];
+    assert(target);
+    delete (target.limits as Partial<CcxtMarket['limits']>).cost;
+
+    await assert.rejects(
+      configured.service.run(preflightInput),
+      isPreciseTradeOpsFailure('MARKET_RULE_INVALID', {
+        subjectType: 'market',
+        exchangeId: leg === 'spot' ? 'bitget' : 'okx',
+        symbol: 'BTC/USDT',
+        kind: leg === 'spot' ? 'spot' : 'swap',
+        field: 'notionalRules',
+        expected: 'limits.cost object',
+        actual: 'missing'
+      })
+    );
+    assert.equal(
+      configured.spotCcxt.events.some((event) => event.startsWith('fetchTicker:')),
+      true
+    );
+    assert.equal(
+      configured.contractCcxt.events.some(
+        (event) => event.startsWith('fetchTicker:')
+      ),
+      leg === 'contract'
+    );
+    assert.equal(configured.spotCcxt.events.includes('fetchBalance'), false);
+    assert.equal(configured.contractCcxt.events.includes('fetchBalance'), false);
+  });
+}
+
 test('fails closed for unsupported precision mode', async () => {
   const { gateway, ccxt } = makeGateway('bitget');
   ccxt.precisionMode = functions.SIGNIFICANT_DIGITS;
@@ -1326,6 +1756,49 @@ for (const [label, rejectedMarket] of [
       gateway.loadMarket('BTC/USDT', 'swap'),
       /supported active linear USDT-settled swap/
     );
+  });
+}
+
+for (const { name, exactOverrides } of [
+  {
+    name: 'inactive exact candidate',
+    exactOverrides: { active: false }
+  },
+  {
+    name: 'identity-invalid exact candidate',
+    exactOverrides: { linear: false, inverse: true }
+  }
+] satisfies Array<{
+  name: string;
+  exactOverrides: Partial<CcxtMarket>;
+}>) {
+  test(`repair: strict wrapper ignores ${name} for one valid fallback`, async () => {
+    const exact = swapMarket(exactOverrides);
+    const fallback = swapMarket({
+      id: 'BTC-USDT-SWAP-FALLBACK',
+      symbol: 'BTC/USDT:USDT-FALLBACK'
+    });
+    const { gateway, ccxt } = makeGateway('okx', [exact, fallback]);
+    ccxt.fetchOrderResult = ccxtOrder({
+      symbol: fallback.symbol,
+      type: 'limit',
+      side: 'sell',
+      amount: 10,
+      filled: 1,
+      remaining: 9
+    });
+
+    const rules = await gateway.loadMarket('BTC/USDT', 'swap');
+    const order = await gateway.fetchOrder(
+      'exchange-order-1',
+      'BTC/USDT',
+      'swap'
+    );
+
+    assert.equal(rules.marketId, fallback.id);
+    assert.equal(order.requestedBaseQuantity, '0.01');
+    assert.equal(ccxt.fetchOrderCalls.length, 1);
+    assert.equal(ccxt.fetchOrderCalls[0]?.symbol, fallback.symbol);
   });
 }
 
