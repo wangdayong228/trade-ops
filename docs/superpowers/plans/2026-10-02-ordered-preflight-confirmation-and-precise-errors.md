@@ -166,12 +166,12 @@ class ConfirmationService {
 
 ### Task 6：启动边界、文档与总体验证
 
-**文件：** 修改 `src/main.ts`、`src/config/exchange-credentials.ts`、`src/config/funding-rate-config.ts`、`src/config/environment-loader.ts`、按需 `src/storage/sqlite-process-owner.ts`；更新 `tests/main.test.ts`、`tests/config/*.test.ts`、按需所有权测试；更新 `README.md`。
+**文件：** 修改 `src/main.ts`、`src/config/exchange-credentials.ts`、`src/config/funding-rate-config.ts`、`src/config/environment-loader.ts`、按需 `src/storage/sqlite-process-owner.ts`；更新 `tests/main.test.ts`、`tests/config/*.test.ts`、按需所有权测试；更新 `README.md` 和 `docs/usage/operator-guide.md`。
 
 - [ ] RED：配置固定检查顺序及具体字段证据，凭证只报告 missing/present-but-invalid；目录、开库、所有权、schema、组件和监听每个失败点均报告精确错误且没有后续动作；dotenv 读取失败安全转换。
 - [ ] RED：装配注入新确认服务；保持“恢复监控 → 监听 → 资金费率启动”；监听失败不启资金费率，幂等 cleanup 等待恢复后关闭数据库，cleanup 错误不覆盖原启动错误；运行检查只用临时环境、临时文件或 fake。
 - [ ] GREEN：为每个启动边界转换异常，保留已有可信 detail，不以 SERVICE_COMPONENT_FAILED 覆盖具体配置/schema/所有权错误；不更改资金费率业务逻辑；入口日志只保留安全详情，日志异常不影响退出状态或清理。
-- [ ] 文档：README 同步确认/失效状态、错误响应例子、schema v3 自动迁移、操作员重新预检步骤；保留单进程数据库及恢复说明。
+- [ ] 文档：README 与操作员指南同步确认/失效状态、错误响应例子、schema v3 自动迁移、操作员重新预检步骤；修正指南中 EXECUTING 可重复确认的旧说明，保留单进程数据库及监控恢复说明。
 - [ ] 集成验证：`npm test`；`git diff --check`；确认所有预检/确认路径与源码调用方类型一致，未引入真实网络测试。
 - [ ] 最终审查：按 affected-path review 要求对六任务 diff 及受影响调用链做资金/安全审查；修复所有重要发现并运行相关回归。若 skill 文件不可用，明确记录并用同范围只读风险审查完成工作。
 - [ ] 完成核对：`verification-before-completion` → `consistency-check` → `post-verification-check`；逐项勾选计划并记录实际命令、exit status、结果。主代理给出 worktree/branch、测试结果与剩余限制。
