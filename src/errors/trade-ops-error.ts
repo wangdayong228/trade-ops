@@ -706,6 +706,14 @@ function createMessage(
     + `期望 ${describeDiagnostic(expected)}，实际为 ${describeDiagnostic(actual)}`;
 }
 
+function rejectMessageContainingSecret(secrets: readonly string[]): never {
+  const rejectionMessage = '错误契约消息安全检查失败';
+  if (secrets.some((secret) => rejectionMessage.includes(secret))) {
+    throw new TypeError();
+  }
+  throw new TypeError(rejectionMessage);
+}
+
 function buildDetail(
   input: unknown,
   rawSecrets: readonly string[] | undefined
@@ -761,6 +769,9 @@ function buildDetail(
     ? canonicalTimestamp(propertyValue(properties, 'occurredAt'))
     : new Date().toISOString();
   const message = createMessage(code, subject, expected, actual);
+  if (secrets.some((secret) => message.includes(secret))) {
+    rejectMessageContainingSecret(secrets);
+  }
   return Object.freeze({
     code,
     phase,

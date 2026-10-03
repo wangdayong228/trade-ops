@@ -401,6 +401,26 @@ test('可信精确错误契约', async (t) => {
     assert.notEqual(subjectCollisionA, subjectCollisionB);
   });
 
+  await t.test('消息编码不得由真实换行合成显式秘密', () => {
+    const secret = String.raw`\n`;
+    const expected = 'line one\nline two';
+    assert.equal(expected.includes(secret), false);
+
+    assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
+      expected
+    }), [secret]), [secret]);
+  });
+
+  await t.test('消息编码不得由普通双引号合成显式秘密', () => {
+    const secret = String.raw`\"`;
+    const expected = 'quoted "value"';
+    assert.equal(expected.includes(secret), false);
+
+    assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
+      expected
+    }), [secret]), [secret]);
+  });
+
   await t.test('保留七种异构对象和全部安全诊断值而不改变数值精度', () => {
     const cases: readonly {
       code: string;
