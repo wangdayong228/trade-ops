@@ -66,7 +66,7 @@ Subject 字段：configuration/request 使用 `field`；exchange 使用 `exchang
 
 ### Task 2：有序预检与市场刷新
 
-**文件：** 修改 `src/strategy/preflight-service.ts`、`src/exchanges/exchange-gateway.ts`、`src/exchanges/ccxt-exchange-gateway.ts`、`src/exchanges/profiles/okx-profile.ts`、按需修改 `bitget-profile.ts` 与 `exchange-registry.ts`；对应 `tests/strategy/preflight-service.test.ts`、`tests/exchanges/ccxt-gateway.test.ts`、`tests/support/fake-exchange-gateway.ts`。精确数量错误需要时修改 `src/domain/quantity-normalizer.ts` 及其测试，但不改变数量计算规则。
+**文件：** 修改 `src/strategy/preflight-service.ts`、`src/exchanges/exchange-gateway.ts`、`src/exchanges/ccxt-exchange-gateway.ts`、`src/exchanges/profiles/okx-profile.ts`、按需修改 `bitget-profile.ts` 与 `exchange-registry.ts`；对应 `tests/strategy/preflight-service.test.ts`、`tests/exchanges/ccxt-gateway.test.ts`、`tests/support/fake-exchange-gateway.ts`。精确数量错误及已证明的固定精度截断问题需要修改 `src/domain/quantity-normalizer.ts` 及其测试；保持共同步长、向下取整和上限裁剪的业务公式，计算必须精确。
 
 **输入：** Task 1 的错误工厂。
 
@@ -100,6 +100,7 @@ run(input: PreflightInput, phase?: 'preflight' | 'confirmation'): Promise<Prefli
 - [ ] RED：按 spec 13 步记录调用轨迹，并对每个失败点断言后续读取为零；请求格式在所有网关读取前失败；现货失败不加载合约；模式失败不查价格/余额，保证金失败先于杠杆错误。
 - [ ] RED：真实 CCXT 适配器接 fake exchange，覆盖 one-way 与坏 contractSize 同时出现、非法数量与坏名义金额规则同时出现、两腿名义金额规则都坏的首错；账户/价格不能重入完整规则解析，快照捕获后修改原市场对象不影响该轮规则。
 - [ ] RED：fake CCXT 缓存旧规则后改变上游规则，`reload=true` 才可见；刷新拒绝时不得回退；OKX `hedged=false`/未知时不调用 `fetchPositions`，`hedged=true` 才解析空头设置。
+- [ ] RED：共同数量在超过 40 位有效数字时仍精确（已复现：请求 `12345678901234567890123456789012345678901.9`、两腿步长 `0.1`、乘数 `1`，期望原值，旧实现返回 `12345678901234567890123456789012345678900`）；使用手算十进制/整数关系作为独立依据。
 - [ ] RED：两腿价格分别计算名义金额；数量与名义金额上下限边界、零余额、无效价、非 1 合约乘数、十进制等价值；精确错误含对象/期望/实际且未知读取异常不透传。
 - [ ] GREEN：顺序 await，并在每次读取后立即完成对应检查；规则字段逐项诊断，保留共同数量归一算法及 Bitget 零最小量例外；确认复检每轮两腿各强制刷新一次。解析阶段必须保持失败优先级，不能用笼统包装掩盖已知失败。
 - [ ] 验证与审查：`npm run build`；`node --test dist/tests/strategy/preflight-service.test.js dist/tests/exchanges/ccxt-gateway.test.js dist/tests/exchanges/exchange-gateway.test.js dist/tests/domain/quantity-normalizer.test.js`；主代理审核并提交。
@@ -120,11 +121,11 @@ confirmPreflight(expected: Readonly<StrategyRecord>): void;
 invalidatePreflight(expected: Readonly<StrategyRecord>, failure: ErrorDetail): void;
 ```
 
-两方法成功只在事务提交后返回；失败抛出可信存储错误。事务验证保存的身份、preflight 快照、状态、两类 failure 和订单为空，再执行带条件的 CAS；零更新是完整性异常。保留原执行入口 `claimForExecution`，但不能借它绕过新 HTTP 确认服务。通用 `transition` 不得制造或复活失效状态。`preflight_failure_json` 仅失效状态非空，`failure_code` 保持原有终态约束；失效策略不得有订单，读取也验证。
+两方法成功只在事务提交后返回；拒绝在既有外部事务内调用，避免仅释放 savepoint 就报告已提交。失败抛出可信存储错误。事务验证保存的身份、preflight 快照、状态、两类 failure 和订单为空，再执行带条件的 CAS；零更新是完整性异常。保留原执行入口 `claimForExecution`，但不能借它绕过新 HTTP 确认服务。通用 `transition` 不得制造或复活失效状态；订单规划入口拒绝 `PENDING_CONFIRMATION` 和 `PREFLIGHT_INVALIDATED`，相应旧测试夹具先合法认领再规划。`preflight_failure_json` 仅失效状态非空，`failure_code` 保持原有终态约束；失效策略不得有订单，读取也验证。
 
 - [ ] RED：v2→v3 迁移保留所有状态、订单、提交结论、order_events、资金费率表；原有 v1→v2 路径继续升级到 v3；未知/损坏 schema 拒绝，迁移失败回滚，不修改原业务数据。
-- [ ] RED：成功认领、原子失效、重开数据库读回完整失败；错误结构损坏、异常状态/订单/失败/快照、CAS 零更新、SQL trigger 故障、回滚/回读不可用；无部分状态或失败落库，错误证据不包含原始行 JSON。
-- [ ] GREEN：迁移严格校验已知 schema，按需在事务内重建 strategies/metadata 并维护现有索引和外键；恢复外键设置且检查完整性。现有订单表、事件及资金费率结构不重建。新确认写入不改变对账写入权。
+- [ ] RED：成功认领、原子失效、重开数据库读回完整失败；错误结构损坏、异常状态/订单/失败/快照、CAS 零更新、SQL trigger 故障、回滚/回读不可用；无部分状态或失败落库，错误证据不包含原始行 JSON。事务结果无法确认后，该仓储实例对所有后续策略读写与恢复 fail-closed，防止未提交 EXECUTING 被监控续跑；单测在临时数据库上替换确认事务包装器模拟事务仍打开且回滚不可用，并断言无订单及恢复动作。
+- [ ] GREEN：迁移严格校验已知 schema，按需在事务内重建 strategies/metadata 并维护现有索引和外键；恢复外键设置且检查完整性。现有订单表、事件及资金费率结构不重建。v1→v2→v3 在同一外层事务内完成；保留独立且严格的 v2/v3 校验器，不让现有 v1 迁移误用新版 schema 常量。新确认写入不改变对账写入权。
 - [ ] 验证与审查：`npm run build`；`node --test dist/tests/storage/sqlite-repository.test.js dist/tests/storage/sqlite-funding-rate-repository.test.js dist/tests/strategy/hedge-reconciliation.test.js`；主代理审核并提交。
 
 ### Task 4：同步确认服务
