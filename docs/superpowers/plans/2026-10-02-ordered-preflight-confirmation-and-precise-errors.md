@@ -70,6 +70,8 @@ Subject 字段：configuration/request 使用 `field`；exchange 使用 `exchang
 
 **输入：** Task 1 的错误工厂。
 
+Task 2 审查修复提前在错误模块及其测试加入已批准的 `REQUEST_OPERATION_FAILED`，用于预检请求处理中的未知内部失败；不能把有效请求上的内部故障标成 `REQUEST_FIELD_INVALID`。Task 5 复用该码，只再补路由缺失码，不重复实现。
+
 **输出接口：**
 
 ```ts
@@ -152,7 +154,7 @@ class ConfirmationService {
 
 ### Task 5：HTTP、安全错误投影与界面
 
-**文件：** 修改 `src/http/server.ts`、`src/http/public-error.ts`、`public/app.js`、`public/index.html`、按需 `public/styles.css`；更新 `tests/http/server.test.ts`、`tests/http/public-error.test.ts`。为明确 HTTP 兜底边界，在 `src/errors/trade-ops-error.ts` 及其测试补充 `REQUEST_ROUTE_NOT_FOUND` 与 `REQUEST_OPERATION_FAILED`；其余 Task 1 合同不变。复用 server.test.ts 已有 VM/fake DOM harness 验证真实 UI 代码，避免另建重复 harness。
+**文件：** 修改 `src/http/server.ts`、`src/http/public-error.ts`、`public/app.js`、`public/index.html`、按需 `public/styles.css`；更新 `tests/http/server.test.ts`、`tests/http/public-error.test.ts`。为明确 HTTP 兜底边界，在 `src/errors/trade-ops-error.ts` 及其测试补充 `REQUEST_ROUTE_NOT_FOUND`，复用 Task 2 审查修复提前加入的 `REQUEST_OPERATION_FAILED`；其余 Task 1 合同不变。复用 server.test.ts 已有 VM/fake DOM harness 验证真实 UI 代码，避免另建重复 harness。
 
 **输入：** Task 1 错误契约、Task 3 `preflightFailure`、Task 4 确认服务。
 
