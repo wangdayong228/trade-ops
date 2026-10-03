@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
+import { safeFailureCategory } from '../../src/errors/trade-ops-error.js';
 import type {
   MarketKind,
   MarketRules,
@@ -25,6 +26,47 @@ import { HedgeReconciliation } from '../../src/strategy/hedge-reconciliation.js'
 import { OrderMonitor } from '../../src/strategy/order-monitor.js';
 import type { PreflightResult } from '../../src/strategy/preflight-service.js';
 import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
+
+const CONFIRMATION_MODULE_SPECIFIER =
+  '../../src/strategy/confirmation-service.js';
+
+interface ConfirmationServiceLike {
+  confirm(strategyId: string): Promise<void>;
+}
+
+interface ConfirmationModule {
+  readonly ConfirmationService: new (
+    repository: SqliteStrategyRepository,
+    preflight: {
+      run(
+        input: Pick<PreflightResult,
+          | 'spotExchangeId'
+          | 'contractExchangeId'
+          | 'symbol'
+          | 'requestedBaseQuantity'
+          | 'mode'>,
+        phase?: 'preflight' | 'confirmation'
+      ): Promise<PreflightResult>;
+    }
+  ) => ConfirmationServiceLike;
+}
+
+async function loadConfirmationModule(): Promise<ConfirmationModule> {
+  try {
+    const candidate = await import(CONFIRMATION_MODULE_SPECIFIER) as unknown;
+    assert.equal(
+      typeof (candidate as Partial<ConfirmationModule>).ConfirmationService,
+      'function',
+      'Task 4 requires an exported ConfirmationService constructor'
+    );
+    return candidate as ConfirmationModule;
+  } catch (error) {
+    assert.fail(
+      'Task 4 requires src/strategy/confirmation-service.ts before restart '
+      + `recovery can be verified: import failed with ${safeFailureCategory(error)}`
+    );
+  }
+}
 
 const SYMBOL = 'BTC/USDT';
 const LOCAL_HEADERS = {
@@ -748,5 +790,117 @@ test(
       ).size,
       2
     );
+  }
+);
+
+test(
+  'recovers a confirmed strategy after interruption before scheduling without duplicate orders',
+  async (t) => {
+    const { ConfirmationService } = await loadConfirmationModule();
+    const directory = await mkdtemp(join(tmpdir(), 'trade-ops-confirm-restart-'));
+    const databasePath = join(directory, 'confirmation.sqlite');
+    let initialDatabase: Database.Database | undefined = new Database(
+      databasePath,
+      { timeout: 0 }
+    );
+    let restartedDatabase: Database.Database | undefined;
+    t.after(async () => {
+      if (restartedDatabase?.open === true) restartedDatabase.close();
+      if (initialDatabase?.open === true) initialDatabase.close();
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    claimSqliteProcessOwnership(initialDatabase, databasePath);
+    const initialRepository = new SqliteStrategyRepository(initialDatabase);
+    const original = recoveryPreflight();
+    const created = initialRepository.createPending(original);
+    const confirmation = new ConfirmationService(initialRepository, {
+      async run(input, phase = 'preflight'): Promise<PreflightResult> {
+        assert.deepEqual(input, {
+          spotExchangeId: original.spotExchangeId,
+          contractExchangeId: original.contractExchangeId,
+          symbol: original.symbol,
+          requestedBaseQuantity: original.requestedBaseQuantity,
+          mode: original.mode
+        });
+        assert.equal(phase, 'confirmation');
+        return {
+          ...structuredClone(original),
+          spotReferencePrice: '60001',
+          contractReferencePrice: '60011',
+          spotFreeUsdt: '99999',
+          contractFreeUsdt: '49999',
+          createdAt: '2026-10-03T00:30:00.000Z'
+        };
+      }
+    });
+
+    await confirmation.confirm(created.id);
+
+    assert.equal(
+      initialRepository.getStrategy(created.id).state,
+      'EXECUTING'
+    );
+    assert.deepEqual(initialRepository.listOrders(created.id), []);
+    initialDatabase.close();
+    initialDatabase = undefined;
+
+    restartedDatabase = new Database(databasePath, { timeout: 0 });
+    claimSqliteProcessOwnership(restartedDatabase, databasePath);
+    const repository = new SqliteStrategyRepository(restartedDatabase);
+    assert.deepEqual(
+      repository.listRecoverable().map(({ id }) => id),
+      [created.id]
+    );
+
+    const spot = new FakeExchangeGateway('bitget');
+    const contract = new FakeExchangeGateway('okx');
+    spot.markets.set(`spot:${SYMBOL}`, market('bitget', 'spot'));
+    contract.markets.set(`swap:${SYMBOL}`, market('okx', 'swap'));
+    contract.accountSettings = { ...original.accountSettings };
+    spot.createResults.push(snapshot(created.id, 'SPOT_MARKET', {
+      exchangeOrderId: 'spot-confirm-restart',
+      requestedBaseQuantity: '1',
+      filledBaseQuantity: '1',
+      remainingBaseQuantity: '0',
+      averagePrice: '60001',
+      status: 'closed'
+    }));
+    contract.createResults.push(snapshot(created.id, 'CONTRACT_MARKET', {
+      exchangeOrderId: 'contract-confirm-restart',
+      requestedBaseQuantity: '1',
+      filledBaseQuantity: '1',
+      remainingBaseQuantity: '0',
+      averagePrice: '60011',
+      status: 'closed'
+    }));
+    const registry = new ExchangeRegistry(new Map([
+      ['bitget', spot],
+      ['okx', contract]
+    ]));
+    const reconciliation = new HedgeReconciliation(registry, repository);
+    const coordinator = new HedgeCoordinator(
+      registry,
+      repository,
+      reconciliation
+    );
+    const monitor = new OrderMonitor(repository, coordinator);
+
+    await Promise.all([
+      monitor.recover(),
+      coordinator.confirmAndExecute(created.id)
+    ]);
+    await waitForState(repository, created.id, 'HEDGED');
+    await monitor.recover();
+
+    assert.equal(spot.createdRequests.length, 1);
+    assert.equal(contract.createdRequests.length, 1);
+    const orders = repository.listOrders(created.id);
+    assert.deepEqual(
+      orders.map(({ role }) => role),
+      ['SPOT_MARKET', 'CONTRACT_MARKET']
+    );
+    assert.equal(new Set(orders.map(({ clientOrderId }) => clientOrderId)).size, 2);
+    assert.equal(repository.getStrategy(created.id).state, 'HEDGED');
   }
 );
