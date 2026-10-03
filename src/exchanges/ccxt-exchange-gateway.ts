@@ -868,19 +868,16 @@ export class CcxtExchangeGateway implements ExchangeGateway {
             ['symbol', symbol, selected.symbol],
             ['base', base, selected.base],
             ['quote', 'USDT', selected.quote],
-            ['kind', 'spot', selected.spot === true && selected.contract === false
-              ? 'spot'
-              : selected.type]
+            ['spot', true, selected.spot],
+            ['contract', false, selected.contract]
           ]
         : [
             ['base', base, selected.base],
             ['quote', 'USDT', selected.quote],
             ['settle', 'USDT', selected.settle],
-            ['kind', 'swap', selected.swap === true
-              && selected.future === false
-              && selected.contract === true
-              ? 'swap'
-              : selected.type],
+            ['swap', true, selected.swap],
+            ['future', false, selected.future],
+            ['contract', true, selected.contract],
             ['linear', true, selected.linear],
             ['inverse', false, selected.inverse]
           ];

@@ -3,7 +3,10 @@ import type {
   AccountSettings,
   OrderRequest
 } from '../../domain/types.js';
-import { createTradeOpsError } from '../../errors/trade-ops-error.js';
+import {
+  createTradeOpsError,
+  type SafeDiagnosticValue
+} from '../../errors/trade-ops-error.js';
 import type {
   CcxtExchangeLike
 } from '../ccxt-exchange-gateway.js';
@@ -12,22 +15,64 @@ import {
   type ExchangeProfile
 } from '../exchange-profile.js';
 
-function optionalPositive(value: unknown, field: string): string | null {
+function safeLeverageActual(value: unknown): SafeDiagnosticValue {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value) : 'non-finite number';
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (text === '') {
+      return 'empty string';
+    }
+    try {
+      const parsed = decimal(text);
+      return parsed.isFinite()
+        ? parsed.toFixed()
+        : 'non-finite decimal string';
+    } catch {
+      return 'malformed decimal string';
+    }
+  }
+  return `${typeof value} value`;
+}
+
+function invalidLeverage(
+  exchangeSymbol: string,
+  value: unknown
+): never {
+  throw createTradeOpsError({
+    code: 'ACCOUNT_LEVERAGE_MISMATCH',
+    phase: 'preflight',
+    subject: {
+      type: 'account',
+      exchangeId: 'okx',
+      symbol: exchangeSymbol,
+      field: 'leverage'
+    },
+    expected: 'finite decimal greater than zero',
+    actual: safeLeverageActual(value)
+  });
+}
+
+function optionalPositive(
+  value: unknown,
+  exchangeSymbol: string
+): string | null {
   if (value === undefined || value === null || value === '') {
     return null;
   }
   if (typeof value !== 'number' && typeof value !== 'string') {
-    throw new Error(`invalid OKX ${field}`);
+    return invalidLeverage(exchangeSymbol, value);
   }
+  let parsed: ReturnType<typeof decimal>;
   try {
-    const parsed = decimal(String(value));
-    if (!parsed.isFinite() || parsed.lte(0)) {
-      throw new Error(`invalid OKX ${field}`);
-    }
-    return parsed.toFixed();
+    parsed = decimal(String(value));
   } catch {
-    throw new Error(`invalid OKX ${field}`);
+    return invalidLeverage(exchangeSymbol, value);
   }
+  return !parsed.isFinite() || parsed.lte(0)
+    ? invalidLeverage(exchangeSymbol, value)
+    : parsed.toFixed();
 }
 
 function positionMarginMode(
@@ -165,7 +210,7 @@ export class OkxProfile implements ExchangeProfile {
       'one consistent margin mode'
     ) ?? 'unknown';
     const leverages = shortPositions
-      .map((position) => optionalPositive(position.leverage, 'leverage'))
+      .map((position) => optionalPositive(position.leverage, exchangeSymbol))
       .filter((value): value is string => value !== null);
     const leverage = oneValue(
       leverages,
