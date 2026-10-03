@@ -152,16 +152,16 @@ class ConfirmationService {
 
 ### Task 5：HTTP、安全错误投影与界面
 
-**文件：** 修改 `src/http/server.ts`、`src/http/public-error.ts`、`public/app.js`、`public/index.html`、按需 `public/styles.css`；更新 `tests/http/server.test.ts`、`tests/http/public-error.test.ts`。复用 server.test.ts 已有 VM/fake DOM harness 验证真实 UI 代码，避免另建重复 harness。
+**文件：** 修改 `src/http/server.ts`、`src/http/public-error.ts`、`public/app.js`、`public/index.html`、按需 `public/styles.css`；更新 `tests/http/server.test.ts`、`tests/http/public-error.test.ts`。为明确 HTTP 兜底边界，在 `src/errors/trade-ops-error.ts` 及其测试补充 `REQUEST_ROUTE_NOT_FOUND` 与 `REQUEST_OPERATION_FAILED`；其余 Task 1 合同不变。复用 server.test.ts 已有 VM/fake DOM harness 验证真实 UI 代码，避免另建重复 harness。
 
 **输入：** Task 1 错误契约、Task 3 `preflightFailure`、Task 4 确认服务。
 
 **输出接口：** `BuildServerDependencies` 必须接收 `confirmationService: Pick<ConfirmationService, 'confirm'>`；生产及所有测试装配同步更新，不保留绕过同步复检的 fallback。
 
-- [ ] RED：精确 `{ requestId, error }` 响应无旧顶层 code/message；400 请求/AJV字段、403 Host/Origin、404 不存在、409 锁忙/非 pending/已失效、422 首次业务预检、500 安全内部/存储错误。
+- [ ] RED：精确 `{ requestId, error }` 响应无旧顶层 code/message；400 请求/AJV字段、403 Host/Origin、404 策略/路由/静态资源不存在、409 锁忙/非 pending/已失效、422 首次业务预检、500 安全内部/存储错误。
 - [ ] RED：确认完成前 HTTP 不返回，失败不入队；成功事务和释放锁后才允许后台执行；EXECUTING 再确认 409；失效状态接口在重启后返回同一 detail；Host/Origin 拒绝后不缓存/解析 body，日志仍含安全 method/path/query/body。
 - [ ] RED：恶意第三方消息、cause/stack、任意属性、配置秘密及请求头均不出现在 HTTP/SQLite/UI；错误投影和日志抛异常不改变业务结果；UI 真实代码通过 textContent 展示中文标签，失效为终态并要求重新预检。
-- [ ] GREEN：统一 HTTP 边界映射，AJV 仅提取受控 schema 信息与安全实际类型；保留请求日志旁路及安全响应头。确认失效详情通过明确定义的 `strategy.preflightFailure` 字段投影；旧对账 failureCode 继续展示原含义。
+- [ ] GREEN：统一 HTTP 边界映射；路由/静态资源缺失用 REQUEST_ROUTE_NOT_FOUND，未知请求内部异常用 REQUEST_OPERATION_FAILED，不用启动错误或状态码猜测业务原因；已知 detail 保持具体性。AJV 仅提取受控 schema 信息与安全实际类型；保留请求日志旁路及安全响应头。确认失效详情通过明确定义的 `strategy.preflightFailure` 字段投影；旧对账 failureCode 继续展示原含义。
 - [ ] 验证与审查：`npm run build`；`node --test dist/tests/http/*.test.js dist/tests/logging/*.test.js`；以 fake 注入覆盖界面交互，不启动会访问交易所的服务；主代理审核并提交。
 
 ### Task 6：启动边界、文档与总体验证
