@@ -57,7 +57,21 @@ function derivedBaseStep(
   contractSize: Decimal,
   field: string
 ): Decimal {
-  return positiveDerivedDecimal(amountStep.mul(contractSize), field);
+  const requiredPrecision = amountStep.sd() + contractSize.sd() + 2;
+  if (
+    !Number.isSafeInteger(requiredPrecision)
+    || requiredPrecision > 1_000_000
+  ) {
+    throw new Error(`invalid ${field}: exact result exceeds supported precision`);
+  }
+  const ExactDecimal = Decimal.clone({
+    precision: Math.max(Decimal.precision, requiredPrecision),
+    rounding: Decimal.ROUND_DOWN
+  });
+  return positiveDerivedDecimal(
+    new ExactDecimal(amountStep.toString()).mul(contractSize.toString()),
+    field
+  );
 }
 
 function validatedRules(
@@ -95,11 +109,42 @@ function gcd(left: bigint, right: bigint): bigint {
 
 function commonStep(left: Decimal, right: Decimal): Decimal {
   const scale = Math.max(left.decimalPlaces(), right.decimalPlaces());
+  if (!Number.isSafeInteger(scale) || scale > 1_000_000) {
+    throw new Error('invalid commonStep: exact result exceeds supported precision');
+  }
   const factor = 10n ** BigInt(scale);
-  const a = BigInt(left.mul(factor.toString()).toFixed(0));
-  const b = BigInt(right.mul(factor.toString()).toFixed(0));
+  const ExactDecimal = Decimal.clone({
+    precision: Math.max(Decimal.precision, left.sd(), right.sd()),
+    rounding: Decimal.ROUND_DOWN
+  });
+  const a = BigInt(new ExactDecimal(left.toString()).mul(factor.toString()).toFixed(0));
+  const b = BigInt(new ExactDecimal(right.toString()).mul(factor.toString()).toFixed(0));
   const multiple = (a / gcd(a, b)) * b;
-  return decimal(multiple.toString()).div(factor.toString());
+  const ResultDecimal = Decimal.clone({
+    precision: Math.max(Decimal.precision, multiple.toString().length),
+    rounding: Decimal.ROUND_DOWN
+  });
+  return new ResultDecimal(multiple.toString()).div(factor.toString());
+}
+
+function alignedDown(value: Decimal, step: Decimal): Decimal {
+  const integerDigits = Math.max(1, value.e - step.e + 1);
+  const requiredPrecision = Math.max(
+    value.sd() + step.sd() + 2,
+    integerDigits + step.sd() + 2
+  );
+  if (
+    !Number.isSafeInteger(requiredPrecision)
+    || requiredPrecision > 1_000_000
+  ) {
+    throw new Error('invalid effective quantity: exact result exceeds supported precision');
+  }
+  const ExactDecimal = Decimal.clone({
+    precision: Math.max(Decimal.precision, requiredPrecision),
+    rounding: Decimal.ROUND_DOWN
+  });
+  const exactStep = new ExactDecimal(step.toString());
+  return new ExactDecimal(value.toString()).div(exactStep).floor().mul(exactStep);
 }
 
 export function normalizeCommonBaseQuantity(input: CommonQuantityInput): string {
@@ -120,11 +165,14 @@ export function normalizeCommonBaseQuantity(input: CommonQuantityInput): string 
     commonStep(spotBaseStep, swapBaseStep),
     'commonStep'
   );
-  let effective = requested.div(step).floor().mul(step);
+  let effective = alignedDown(requested, step);
 
   for (const maximum of [spot.maxBaseAmount, swap.maxBaseAmount]) {
     if (maximum !== undefined) {
-      effective = Decimal.min(effective, maximum.div(step).floor().mul(step));
+      const alignedMaximum = alignedDown(maximum, step);
+      if (alignedMaximum.lt(effective)) {
+        effective = alignedMaximum;
+      }
     }
   }
 

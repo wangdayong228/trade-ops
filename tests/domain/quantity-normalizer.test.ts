@@ -187,3 +187,50 @@ test('uses the lower market maximum and aligns it down to the common step', () =
     }
   }), '0.006');
 });
+
+test('preserves a requested quantity with more than forty significant digits', () => {
+  const requested = '12345678901234567890123456789012345678901.9';
+
+  // Integer cross-check: requested * 10 is an integer, so a 0.1 step needs no rounding.
+  assert.equal(
+    BigInt(requested.replace('.', '')),
+    123456789012345678901234567890123456789019n
+  );
+  assert.equal(normalizeCommonBaseQuantity({
+    requestedBaseQuantity: requested,
+    spot: { amountStep: '0.1', contractSize: '1', minBaseAmount: '0.1' },
+    swap: { amountStep: '0.1', contractSize: '1', minBaseAmount: '0.1' }
+  }), requested);
+});
+
+test('keeps exact common-step arithmetic with a non-one contract multiplier', () => {
+  const requested = '9007199254740993.9';
+
+  // The swap base step is 1 * 0.3. requested / 0.3 = 30023997515803313.
+  const scaled = BigInt(requested.replace('.', ''));
+  assert.equal(scaled % 3n, 0n);
+  assert.equal(scaled / 3n, 30023997515803313n);
+  assert.equal(normalizeCommonBaseQuantity({
+    requestedBaseQuantity: requested,
+    spot: { amountStep: '0.1', contractSize: '1', minBaseAmount: '0.1' },
+    swap: { amountStep: '1', contractSize: '0.3', minBaseAmount: '0.3' }
+  }), requested);
+});
+
+test('clips a high-precision quantity at the lower exact market maximum', () => {
+  assert.equal(normalizeCommonBaseQuantity({
+    requestedBaseQuantity: '12345678901234567890123456789012345678901.9',
+    spot: {
+      amountStep: '0.1',
+      contractSize: '1',
+      minBaseAmount: '0.1',
+      maxBaseAmount: '12345678901234567890123456789012345678901.8'
+    },
+    swap: {
+      amountStep: '1',
+      contractSize: '0.1',
+      minBaseAmount: '0.1',
+      maxBaseAmount: '12345678901234567890123456789012345678902.0'
+    }
+  }), '12345678901234567890123456789012345678901.8');
+});

@@ -8,9 +8,49 @@ import type {
   OrderSnapshot
 } from '../domain/types.js';
 
+export interface MarketLoadOptions {
+  readonly reload?: boolean;
+}
+
+export type MarketIdentity = Pick<MarketRules,
+  | 'exchangeId'
+  | 'symbol'
+  | 'marketId'
+  | 'kind'
+  | 'base'
+  | 'quote'
+  | 'active'>;
+
+export type MarketQuantityRules = Pick<MarketRules,
+  | 'amountStep'
+  | 'contractSize'
+  | 'minBaseAmount'
+  | 'maxBaseAmount'
+  | 'priceStep'>;
+
+export type MarketNotionalRules = Pick<MarketRules,
+  'minQuoteNotional' | 'maxQuoteNotional'>;
+
+export interface LoadedMarketSnapshot {
+  readonly identity: Readonly<MarketIdentity>;
+  quantityRules(): Readonly<MarketQuantityRules>;
+  notionalRules(): Readonly<MarketNotionalRules>;
+  fetchAccountSettings(): Promise<AccountSettings>;
+  fetchLastPrice(): Promise<string>;
+}
+
 export interface ExchangeGateway {
   readonly exchangeId: string;
-  loadMarket(symbol: string, kind: MarketKind): Promise<MarketRules>;
+  loadMarket(
+    symbol: string,
+    kind: MarketKind,
+    options?: MarketLoadOptions
+  ): Promise<MarketRules>;
+  loadMarketSnapshot(
+    symbol: string,
+    kind: MarketKind,
+    options?: MarketLoadOptions
+  ): Promise<LoadedMarketSnapshot>;
   quantizePrice(symbol: string, kind: MarketKind, price: string): Promise<string>;
   fetchFreeBalance(asset: 'USDT', kind: MarketKind): Promise<string>;
   fetchAccountSettings(symbol: string): Promise<AccountSettings>;

@@ -19,7 +19,16 @@ import type {
   OrderType
 } from '../domain/types.js';
 import {
+  createTradeOpsError,
+  type SafeDiagnosticValue
+} from '../errors/trade-ops-error.js';
+import {
   exchangeAmountToBase,
+  type LoadedMarketSnapshot,
+  type MarketIdentity,
+  type MarketLoadOptions,
+  type MarketNotionalRules,
+  type MarketQuantityRules,
   NoOrderSubmittedError,
   type ExchangeGateway
 } from './exchange-gateway.js';
@@ -97,7 +106,7 @@ export interface CcxtExchangeLike {
   precisionMode: number;
   readonly has: Record<string, boolean | string | undefined>;
   readonly enableRateLimit?: boolean;
-  loadMarkets(): Promise<Record<string, CcxtMarket>>;
+  loadMarkets(reload?: boolean): Promise<Record<string, CcxtMarket>>;
   amountToPrecision(symbol: string, amount: number): string;
   priceToPrecision(symbol: string, price: number): string;
   fetchBalance(
@@ -131,6 +140,31 @@ export interface CcxtExchangeLike {
 interface ResolvedMarket {
   market: CcxtMarket;
   rules: MarketRules;
+}
+
+interface CapturedMarket {
+  readonly market: CcxtMarket;
+  readonly exchangeSymbol: string;
+  readonly requestedSymbol: string;
+  readonly requestedKind: MarketKind;
+  readonly identity: Readonly<MarketIdentity>;
+  readonly precisionMode: number;
+  readonly amountPrecision: Numeric | undefined;
+  readonly pricePrecision: Numeric | undefined;
+  readonly minimumAmount: Numeric | undefined;
+  readonly maximumAmount: Numeric | undefined;
+  readonly minimumQuoteNotional: Numeric | undefined;
+  readonly maximumQuoteNotional: Numeric | undefined;
+  readonly contractSize: Numeric | undefined;
+  readonly hasStructuredInfo: boolean;
+  readonly rawMinimumAmount: unknown;
+  readonly spot: boolean;
+  readonly swap: boolean;
+  readonly future: boolean;
+  readonly contract: boolean;
+  readonly linear: boolean | undefined;
+  readonly inverse: boolean | undefined;
+  readonly settle: string | undefined;
 }
 
 interface NormalizationContext {
@@ -230,26 +264,76 @@ function exactFiniteDecimalZero(value: unknown): boolean {
 function classicBitgetSpotMinimumAmount(
   exchangeId: SupportedExchangeId,
   kind: MarketKind,
-  selected: Readonly<CcxtMarket>,
+  quote: string,
+  unifiedMinimumAmount: unknown,
+  hasStructuredInfo: boolean,
+  rawMinimumAmount: unknown,
   amountStep: string,
   minQuoteNotional: string | undefined
 ): string | undefined {
   if (
     exchangeId !== 'bitget'
     || kind !== 'spot'
-    || selected.quote !== 'USDT'
+    || quote !== 'USDT'
     || minQuoteNotional === undefined
-    || !exactFiniteDecimalZero(selected.limits.amount.min)
-    || typeof selected.info !== 'object'
-    || selected.info === null
-    || Array.isArray(selected.info)
+    || !exactFiniteDecimalZero(unifiedMinimumAmount)
+    || !hasStructuredInfo
   ) {
     return undefined;
   }
-  const info = selected.info as Record<string, unknown>;
-  return exactFiniteDecimalZero(info.minTradeAmount)
+  return exactFiniteDecimalZero(rawMinimumAmount)
     ? amountStep
     : undefined;
+}
+
+function safeRuleActual(value: unknown): SafeDiagnosticValue {
+  if (value === undefined) {
+    return 'missing';
+  }
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return 'non-finite number';
+    }
+    return String(value);
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (text === '') {
+      return 'empty string';
+    }
+    try {
+      const parsed = decimal(text);
+      return parsed.isFinite() ? parsed.toFixed() : 'non-finite decimal';
+    } catch {
+      return 'malformed decimal string';
+    }
+  }
+  return `${typeof value} value`;
+}
+
+function marketRuleError(
+  exchangeId: string,
+  captured: Readonly<CapturedMarket>,
+  field: string,
+  expected: SafeDiagnosticValue,
+  actual: SafeDiagnosticValue
+): Error {
+  return createTradeOpsError({
+    code: 'MARKET_RULE_INVALID',
+    phase: 'preflight',
+    subject: {
+      type: 'market',
+      exchangeId,
+      symbol: captured.requestedSymbol,
+      kind: captured.requestedKind,
+      field
+    },
+    expected,
+    actual
+  });
 }
 
 function optionalDecimalString(
@@ -285,6 +369,14 @@ function isSupportedSwap(
   candidate: CcxtMarket,
   base: string
 ): boolean {
+  return hasSupportedSwapIdentity(candidate, base)
+    && candidate.active === true;
+}
+
+function hasSupportedSwapIdentity(
+  candidate: CcxtMarket,
+  base: string
+): boolean {
   return candidate.base === base
     && candidate.quote === 'USDT'
     && candidate.settle === 'USDT'
@@ -292,8 +384,7 @@ function isSupportedSwap(
     && candidate.future === false
     && candidate.contract === true
     && candidate.linear === true
-    && candidate.inverse === false
-    && candidate.active === true;
+    && candidate.inverse === false;
 }
 
 function timestampToIso(order: CcxtOrder): string {
@@ -656,35 +747,20 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     this.profile = profileFor(this.exchangeId);
   }
 
-  private async resolveMarket(
+  private async captureMarket(
     symbol: string,
-    kind: MarketKind
-  ): Promise<ResolvedMarket> {
+    kind: MarketKind,
+    options: MarketLoadOptions = {}
+  ): Promise<CapturedMarket> {
     if (kind !== 'spot' && kind !== 'swap') {
       throw new Error(`unsupported market kind: ${String(kind)}`);
     }
     const { base } = parseUnifiedSymbol(symbol);
-    const markets = await this.exchange.loadMarkets();
-    if (this.exchange.precisionMode !== functions.TICK_SIZE) {
-      throw new Error(
-        `unsupported precision mode for ${this.exchangeId}`
-      );
-    }
+    const markets = await this.exchange.loadMarkets(options.reload === true);
 
     let selected: CcxtMarket | undefined;
     if (kind === 'spot') {
-      const direct = markets[symbol];
-      if (
-        direct !== undefined
-        && direct.symbol === symbol
-        && direct.base === base
-        && direct.quote === 'USDT'
-        && direct.spot === true
-        && direct.contract === false
-        && direct.active === true
-      ) {
-        selected = direct;
-      }
+      selected = markets[symbol];
       if (selected === undefined) {
         throw new Error(
           `missing supported active spot market for ${symbol}`
@@ -694,7 +770,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       const candidates = Object.values(markets)
         .filter((candidate) => isSupportedSwap(candidate, base));
       const exactSymbol = `${symbol}:USDT`;
-      selected = candidates.find(
+      selected = Object.values(markets).find(
         (candidate) => candidate.symbol === exactSymbol
       );
       if (selected === undefined && candidates.length === 1) {
@@ -707,97 +783,356 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       }
     }
 
-    const amountStep = decimalString(
-      selected.precision.amount,
-      'amount precision'
-    );
-    const priceStep = decimalString(
-      selected.precision.price,
-      'price precision'
-    );
-    const minQuoteNotional = selected.limits.cost.min === undefined
-      ? undefined
-      : decimalString(
-        selected.limits.cost.min,
-        'minimum quote notional'
+    if (kind === 'spot') {
+      if (
+        selected.symbol !== symbol
+        || selected.base !== base
+        || selected.quote !== 'USDT'
+        || selected.spot !== true
+        || selected.contract !== false
+      ) {
+        throw new Error(`missing supported active spot market for ${symbol}`);
+      }
+    } else if (!hasSupportedSwapIdentity(selected, base)) {
+      throw new Error(
+        `missing supported active linear USDT-settled swap for ${symbol}`
       );
-    const compatibleMinimumAmount = classicBitgetSpotMinimumAmount(
-      this.exchangeId,
-      kind,
-      selected,
-      amountStep,
-      minQuoteNotional
+    }
+
+    const structuredInfo = typeof selected.info === 'object'
+      && selected.info !== null
+      && !Array.isArray(selected.info);
+    const rawMinimumAmount = structuredInfo
+      ? (selected.info as Record<string, unknown>).minTradeAmount
+      : undefined;
+    const actualKind = selected.spot === true && selected.contract === false
+      ? 'spot'
+      : selected.swap === true && selected.contract === true
+        ? 'swap'
+        : kind;
+    return Object.freeze({
+      market: selected,
+      exchangeSymbol: selected.symbol,
+      requestedSymbol: symbol,
+      requestedKind: kind,
+      identity: Object.freeze({
+        exchangeId: this.exchangeId,
+        symbol,
+        marketId: selected.id,
+        kind: actualKind,
+        base: selected.base,
+        quote: selected.quote as 'USDT',
+        active: selected.active === true
+      }),
+      precisionMode: this.exchange.precisionMode,
+      amountPrecision: selected.precision.amount,
+      pricePrecision: selected.precision.price,
+      minimumAmount: selected.limits.amount.min,
+      maximumAmount: selected.limits.amount.max,
+      minimumQuoteNotional: selected.limits.cost.min,
+      maximumQuoteNotional: selected.limits.cost.max,
+      contractSize: selected.contractSize,
+      hasStructuredInfo: structuredInfo,
+      rawMinimumAmount,
+      spot: selected.spot,
+      swap: selected.swap,
+      future: selected.future,
+      contract: selected.contract,
+      linear: selected.linear,
+      inverse: selected.inverse,
+      settle: selected.settle
+    });
+  }
+
+  private assertStrictMarket(captured: Readonly<CapturedMarket>): void {
+    const { identity } = captured;
+    if (captured.requestedKind === 'spot') {
+      if (
+        identity.symbol !== captured.requestedSymbol
+        || identity.base !== parseUnifiedSymbol(captured.requestedSymbol).base
+        || identity.quote !== 'USDT'
+        || captured.spot !== true
+        || captured.contract !== false
+        || identity.active !== true
+      ) {
+        throw new Error(
+          `missing supported active spot market for ${captured.requestedSymbol}`
+        );
+      }
+      return;
+    }
+    if (
+      !hasSupportedSwapIdentity(
+        captured.market,
+        parseUnifiedSymbol(captured.requestedSymbol).base
+      )
+      || identity.active !== true
+    ) {
+      throw new Error(
+        `missing supported active linear USDT-settled swap for ${captured.requestedSymbol}`
+      );
+    }
+  }
+
+  private capturedDecimal(
+    captured: Readonly<CapturedMarket>,
+    value: unknown,
+    parseField: string,
+    publicField: string,
+    preciseErrors: boolean,
+    minimum: 'positive' | 'non-negative' = 'positive'
+  ): string {
+    try {
+      return decimalString(value, parseField, minimum);
+    } catch (error) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          publicField,
+          minimum === 'positive'
+            ? 'finite decimal greater than zero'
+            : 'finite non-negative decimal',
+          safeRuleActual(value)
+        );
+      }
+      throw error;
+    }
+  }
+
+  private quantityRules(
+    captured: Readonly<CapturedMarket>,
+    preciseErrors: boolean
+  ): Readonly<MarketQuantityRules> {
+    if (captured.precisionMode !== functions.TICK_SIZE) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          'precisionMode',
+          'TICK_SIZE',
+          Number.isFinite(captured.precisionMode)
+            ? captured.precisionMode
+            : 'non-finite number'
+        );
+      }
+      throw new Error(`unsupported precision mode for ${this.exchangeId}`);
+    }
+    const amountStep = this.capturedDecimal(
+      captured,
+      captured.amountPrecision,
+      'amount precision',
+      'amountStep',
+      preciseErrors
     );
-    const minimumAmount = compatibleMinimumAmount ?? decimalString(
-      selected.limits.amount.min,
-      'minimum amount limit'
+    const priceStep = this.capturedDecimal(
+      captured,
+      captured.pricePrecision,
+      'price precision',
+      'priceStep',
+      preciseErrors
     );
-    const contractSize = kind === 'swap'
-      ? decimalString(selected.contractSize, 'contract size')
+    let compatibleMinimumAmount: string | undefined;
+    if (
+      this.exchangeId === 'bitget'
+      && captured.requestedKind === 'spot'
+      && exactFiniteDecimalZero(captured.minimumAmount)
+    ) {
+      const minimumQuoteNotional = captured.minimumQuoteNotional === undefined
+        ? undefined
+        : this.capturedDecimal(
+          captured,
+          captured.minimumQuoteNotional,
+          'minimum quote notional',
+          'minQuoteNotional',
+          preciseErrors
+        );
+      compatibleMinimumAmount = classicBitgetSpotMinimumAmount(
+        this.exchangeId,
+        captured.requestedKind,
+        captured.identity.quote,
+        captured.minimumAmount,
+        captured.hasStructuredInfo,
+        captured.rawMinimumAmount,
+        amountStep,
+        minimumQuoteNotional
+      );
+    }
+    const minimumAmount = compatibleMinimumAmount ?? this.capturedDecimal(
+      captured,
+      captured.minimumAmount,
+      'minimum amount limit',
+      'minBaseAmount',
+      preciseErrors
+    );
+    const contractSize = captured.requestedKind === 'swap'
+      ? this.capturedDecimal(
+        captured,
+        captured.contractSize,
+        'contract size',
+        'contractSize',
+        preciseErrors
+      )
       : '1';
-    const minBaseAmount = exchangeAmountToBase(
-      minimumAmount,
-      contractSize
-    );
-    const maximumAmount = selected.limits.amount.max === undefined
+    let minBaseAmount: string;
+    try {
+      minBaseAmount = exchangeAmountToBase(minimumAmount, contractSize);
+    } catch (error) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          'minBaseAmount',
+          'finite non-negative base amount',
+          'unrepresentable derived value'
+        );
+      }
+      throw error;
+    }
+    const maximumAmount = captured.maximumAmount === undefined
       ? undefined
-      : decimalString(
-        selected.limits.amount.max,
-        'maximum amount limit'
+      : this.capturedDecimal(
+        captured,
+        captured.maximumAmount,
+        'maximum amount limit',
+        'maxBaseAmount',
+        preciseErrors
       );
-    const maxBaseAmount = maximumAmount === undefined
-      ? undefined
-      : exchangeAmountToBase(maximumAmount, contractSize);
+    let maxBaseAmount: string | undefined;
+    try {
+      maxBaseAmount = maximumAmount === undefined
+        ? undefined
+        : exchangeAmountToBase(maximumAmount, contractSize);
+    } catch (error) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          'maxBaseAmount',
+          'finite positive base amount',
+          'unrepresentable derived value'
+        );
+      }
+      throw error;
+    }
     if (
       maxBaseAmount !== undefined
       && decimal(minBaseAmount).gt(maxBaseAmount)
     ) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          'baseAmountRange',
+          'minimum less than or equal to maximum',
+          'minimum exceeds maximum'
+        );
+      }
       throw new Error('invalid base amount range');
     }
-    const maxQuoteNotional = selected.limits.cost.max === undefined
+    return Object.freeze({
+      amountStep,
+      contractSize,
+      minBaseAmount,
+      ...(maxBaseAmount === undefined ? {} : { maxBaseAmount }),
+      priceStep
+    });
+  }
+
+  private notionalRules(
+    captured: Readonly<CapturedMarket>,
+    preciseErrors: boolean
+  ): Readonly<MarketNotionalRules> {
+    const minQuoteNotional = captured.minimumQuoteNotional === undefined
       ? undefined
-      : decimalString(
-        selected.limits.cost.max,
-        'maximum quote notional'
+      : this.capturedDecimal(
+        captured,
+        captured.minimumQuoteNotional,
+        'minimum quote notional',
+        'minQuoteNotional',
+        preciseErrors
+      );
+    const maxQuoteNotional = captured.maximumQuoteNotional === undefined
+      ? undefined
+      : this.capturedDecimal(
+        captured,
+        captured.maximumQuoteNotional,
+        'maximum quote notional',
+        'maxQuoteNotional',
+        preciseErrors
       );
     if (
       minQuoteNotional !== undefined
       && maxQuoteNotional !== undefined
       && decimal(minQuoteNotional).gt(maxQuoteNotional)
     ) {
+      if (preciseErrors) {
+        throw marketRuleError(
+          this.exchangeId,
+          captured,
+          'quoteNotionalRange',
+          'minimum less than or equal to maximum',
+          'minimum exceeds maximum'
+        );
+      }
       throw new Error('invalid quote notional range');
     }
+    return Object.freeze({
+      ...(minQuoteNotional === undefined ? {} : { minQuoteNotional }),
+      ...(maxQuoteNotional === undefined ? {} : { maxQuoteNotional })
+    });
+  }
 
+  private async resolveMarket(
+    symbol: string,
+    kind: MarketKind,
+    options: MarketLoadOptions = {}
+  ): Promise<ResolvedMarket> {
+    const captured = await this.captureMarket(symbol, kind, options);
+    this.assertStrictMarket(captured);
     return {
-      market: selected,
+      market: captured.market,
       rules: {
-        exchangeId: this.exchangeId,
-        symbol,
-        marketId: selected.id,
-        kind,
-        base: selected.base,
-        quote: 'USDT',
-        active: true,
-        amountStep,
-        contractSize,
-        minBaseAmount,
-        priceStep,
-        ...(maxBaseAmount === undefined ? {} : { maxBaseAmount }),
-        ...(minQuoteNotional === undefined
-          ? {}
-          : { minQuoteNotional }),
-        ...(maxQuoteNotional === undefined
-          ? {}
-          : { maxQuoteNotional })
+        ...captured.identity,
+        ...this.quantityRules(captured, false),
+        ...this.notionalRules(captured, false)
       }
     };
   }
 
   async loadMarket(
     symbol: string,
-    kind: MarketKind
+    kind: MarketKind,
+    options: MarketLoadOptions = {}
   ): Promise<MarketRules> {
-    return (await this.resolveMarket(symbol, kind)).rules;
+    return (await this.resolveMarket(symbol, kind, options)).rules;
+  }
+
+  async loadMarketSnapshot(
+    symbol: string,
+    kind: MarketKind,
+    options: MarketLoadOptions = {}
+  ): Promise<LoadedMarketSnapshot> {
+    const captured = await this.captureMarket(symbol, kind, options);
+    return Object.freeze({
+      identity: captured.identity,
+      quantityRules: () => this.quantityRules(captured, true),
+      notionalRules: () => this.notionalRules(captured, true),
+      fetchAccountSettings: () => this.profile.fetchAccountSettings(
+        this.exchange,
+        captured.exchangeSymbol
+      ),
+      fetchLastPrice: async () => {
+        const ticker = await this.exchange.fetchTicker(captured.exchangeSymbol);
+        if (
+          (typeof ticker.last !== 'number' && typeof ticker.last !== 'string')
+          || String(ticker.last).trim() === ''
+        ) {
+          throw new Error('last price is unavailable');
+        }
+        return String(ticker.last);
+      }
+    });
   }
 
   async quantizePrice(

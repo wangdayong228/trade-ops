@@ -113,34 +113,36 @@ export class OkxProfile implements ExchangeProfile {
     exchange: CcxtExchangeLike,
     exchangeSymbol: string
   ): Promise<AccountSettings> {
-    const [mode, positions] = await Promise.all([
-      exchange.fetchPositionMode(exchangeSymbol),
-      exchange.fetchPositions([exchangeSymbol])
-    ]);
-    const openPositions = positions.filter((position) => (
-      isOpenPosition(position, exchangeSymbol)
-    ));
-    const shortPositions = openPositions.filter(
-      (position) => position.side === 'short'
-    );
-    const relevantPositions = mode.hedged === true
-      ? shortPositions
-      : openPositions;
-    const marginModes = relevantPositions
-      .map(positionMarginMode)
-      .filter((value) => value !== 'unknown');
-    const leverages = relevantPositions
-      .map((position) => optionalPositive(position.leverage, 'leverage'))
-      .filter((value): value is string => value !== null);
-    const marginMode = oneValue(marginModes, 'margin mode') ?? 'unknown';
-    const leverage = oneValue(leverages, 'leverage') ?? null;
-
+    const mode = await exchange.fetchPositionMode(exchangeSymbol);
     let positionMode: AccountSettings['positionMode'] = 'unknown';
     if (mode.hedged === true) {
       positionMode = 'hedged';
     } else if (mode.hedged === false) {
       positionMode = 'one-way';
     }
+    if (positionMode !== 'hedged') {
+      return {
+        marginMode: 'unknown',
+        positionMode,
+        leverage: null
+      };
+    }
+
+    const positions = await exchange.fetchPositions([exchangeSymbol]);
+    const openPositions = positions.filter((position) => (
+      isOpenPosition(position, exchangeSymbol)
+    ));
+    const shortPositions = openPositions.filter(
+      (position) => position.side === 'short'
+    );
+    const marginModes = shortPositions
+      .map(positionMarginMode)
+      .filter((value) => value !== 'unknown');
+    const leverages = shortPositions
+      .map((position) => optionalPositive(position.leverage, 'leverage'))
+      .filter((value): value is string => value !== null);
+    const marginMode = oneValue(marginModes, 'margin mode') ?? 'unknown';
+    const leverage = oneValue(leverages, 'leverage') ?? null;
 
     return { marginMode, positionMode, leverage };
   }

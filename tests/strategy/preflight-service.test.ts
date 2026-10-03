@@ -8,14 +8,56 @@ import type {
   MarketKind,
   MarketRules
 } from '../../src/domain/types.js';
+import {
+  TradeOpsError,
+  type ErrorCode,
+  type ErrorPhase
+} from '../../src/errors/trade-ops-error.js';
 import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
 import {
   PreflightService,
   type PreflightInput
 } from '../../src/strategy/preflight-service.js';
-import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
+import {
+  FakeExchangeGateway,
+  type FakeLoadedMarketSnapshot,
+  type FakeMarketLoadOptions
+} from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
+
+function isTradeOpsFailure(
+  code: ErrorCode,
+  options: {
+    phase?: ErrorPhase;
+    subjectType?: string;
+    field?: string;
+    expected?: unknown;
+    actual?: unknown;
+  } = {}
+): (error: unknown) => boolean {
+  return (error: unknown): boolean => {
+    assert(error instanceof TradeOpsError);
+    assert.equal(error.detail.code, code);
+    assert.equal(error.detail.phase, options.phase ?? 'preflight');
+    if (options.subjectType !== undefined) {
+      assert.equal(error.detail.subject.type, options.subjectType);
+    }
+    if (options.field !== undefined) {
+      assert.equal('field' in error.detail.subject
+        ? error.detail.subject.field
+        : undefined, options.field);
+    }
+    if ('expected' in options) {
+      assert.deepEqual(error.detail.expected, options.expected);
+    }
+    if ('actual' in options) {
+      assert.deepEqual(error.detail.actual, options.actual);
+    }
+    assert.match(error.detail.message, /期望 .*实际为/);
+    return true;
+  };
+}
 
 function deferred(): {
   promise: Promise<void>;
@@ -65,6 +107,74 @@ class ReadTrackingGateway extends FakeExchangeGateway {
     kind: MarketKind
   ): Promise<string> {
     this.readRequests.push(`price:${symbol}:${kind}`);
+    return super.fetchLastPrice(symbol, kind);
+  }
+}
+
+class OrderedReadGateway extends FakeExchangeGateway {
+  accountSettingsError: unknown;
+
+  constructor(
+    exchangeId: string,
+    private readonly trace: string[]
+  ) {
+    super(exchangeId);
+  }
+
+  override async loadMarket(
+    symbol: string,
+    kind: MarketKind,
+    options: FakeMarketLoadOptions = {}
+  ): Promise<MarketRules> {
+    this.trace.push(`${kind}:market:${String(options.reload === true)}`);
+    return super.loadMarket(symbol, kind, options);
+  }
+
+  override async loadMarketSnapshot(
+    symbol: string,
+    kind: MarketKind,
+    options: FakeMarketLoadOptions = {}
+  ): Promise<FakeLoadedMarketSnapshot> {
+    this.trace.push(`${kind}:market:${String(options.reload === true)}`);
+    const snapshot = await super.loadMarketSnapshot(symbol, kind, options);
+    return {
+      identity: snapshot.identity,
+      quantityRules: () => {
+        this.trace.push(`${kind}:quantity-rules`);
+        return snapshot.quantityRules();
+      },
+      notionalRules: () => {
+        this.trace.push(`${kind}:notional-rules`);
+        return snapshot.notionalRules();
+      },
+      fetchAccountSettings: () => snapshot.fetchAccountSettings(),
+      fetchLastPrice: () => snapshot.fetchLastPrice()
+    };
+  }
+
+  override async fetchFreeBalance(
+    asset: 'USDT',
+    kind: MarketKind
+  ): Promise<string> {
+    this.trace.push(`${kind}:balance`);
+    return super.fetchFreeBalance(asset, kind);
+  }
+
+  override async fetchAccountSettings(
+    symbol: string
+  ): Promise<AccountSettings> {
+    this.trace.push('swap:account-settings');
+    if (this.accountSettingsError !== undefined) {
+      throw this.accountSettingsError;
+    }
+    return super.fetchAccountSettings(symbol);
+  }
+
+  override async fetchLastPrice(
+    symbol: string,
+    kind: MarketKind
+  ): Promise<string> {
+    this.trace.push(`${kind}:price`);
     return super.fetchLastPrice(symbol, kind);
   }
 }
@@ -144,6 +254,23 @@ function setup(options: {
     ]))),
     spot,
     contract
+  };
+}
+
+function orderedSetup(options: Parameters<typeof setup>[0] = {}): {
+  service: PreflightService;
+  spot: OrderedReadGateway;
+  contract: OrderedReadGateway;
+  trace: string[];
+} {
+  const trace: string[] = [];
+  const spot = new OrderedReadGateway('bitget', trace);
+  const contract = new OrderedReadGateway('okx', trace);
+  return {
+    ...setup({ ...options, spotGateway: spot, contractGateway: contract }),
+    spot,
+    contract,
+    trace
   };
 }
 
@@ -234,16 +361,338 @@ test('keeps one input and market snapshot across async reads and after return', 
   assert.equal(result.contractMarket.symbol, SYMBOL);
 });
 
+const COMPLETE_PREFLIGHT_TRACE = [
+  'spot:market:true',
+  'swap:market:true',
+  'swap:account-settings',
+  'spot:quantity-rules',
+  'swap:quantity-rules',
+  'spot:price',
+  'spot:notional-rules',
+  'swap:price',
+  'swap:notional-rules',
+  'spot:balance',
+  'swap:balance'
+] as const;
+
+test('performs the thirteen preflight checks through the prescribed read order', async () => {
+  const configured = orderedSetup();
+
+  await configured.service.run(input());
+
+  assert.deepEqual(configured.trace, COMPLETE_PREFLIGHT_TRACE);
+  assert.deepEqual(configured.spot.marketLoadRequests, [{
+    symbol: SYMBOL,
+    kind: 'spot',
+    reload: true
+  }]);
+  assert.deepEqual(configured.contract.marketLoadRequests, [{
+    symbol: SYMBOL,
+    kind: 'swap',
+    reload: true
+  }]);
+  assert.deepEqual(configured.spot.createdRequests, []);
+  assert.deepEqual(configured.contract.createdRequests, []);
+});
+
+for (const invalidRequest of [
+  { name: 'symbol case', overrides: { symbol: 'btc/usdt' } },
+  { name: 'quantity exponent', overrides: { requestedBaseQuantity: '1e2' } },
+  { name: 'quantity leading zero', overrides: { requestedBaseQuantity: '01' } },
+  {
+    name: 'quantity length',
+    overrides: { requestedBaseQuantity: '1'.repeat(257) }
+  },
+  {
+    name: 'execution mode',
+    overrides: { mode: 'UNEXPECTED' as ExecutionMode }
+  }
+]) {
+  test(`rejects invalid ${invalidRequest.name} before every gateway read`, async () => {
+    const configured = orderedSetup();
+
+    await assert.rejects(
+      configured.service.run(input(invalidRequest.overrides)),
+      isTradeOpsFailure('REQUEST_FIELD_INVALID', {
+        subjectType: 'request'
+      })
+    );
+
+    assert.deepEqual(configured.trace, []);
+    assert.deepEqual(configured.spot.createdRequests, []);
+    assert.deepEqual(configured.contract.createdRequests, []);
+  });
+}
+
+test('checks both exchange configurations before loading the spot market', async () => {
+  const trace: string[] = [];
+  const spot = new OrderedReadGateway('bitget', trace);
+  spot.markets.set(`spot:${SYMBOL}`, market('bitget', 'spot'));
+  const service = new PreflightService(new ExchangeRegistry(new Map([
+    ['bitget', spot]
+  ])));
+
+  await assert.rejects(
+    service.run(input()),
+    isTradeOpsFailure('EXCHANGE_NOT_CONFIGURED', {
+      subjectType: 'exchange'
+    })
+  );
+  assert.deepEqual(trace, []);
+  assert.deepEqual(spot.createdRequests, []);
+});
+
+interface OrderedFailureCase {
+  readonly name: string;
+  readonly configure: (configured: ReturnType<typeof orderedSetup>) => void;
+  readonly expectedTrace: readonly string[];
+  readonly failure: (error: unknown) => boolean;
+}
+
+const orderedFailureCases: readonly OrderedFailureCase[] = [
+  {
+    name: 'spot market unavailable',
+    configure: ({ spot }) => spot.markets.clear(),
+    expectedTrace: ['spot:market:true'],
+    failure: isTradeOpsFailure('MARKET_UNAVAILABLE', {
+      subjectType: 'market'
+    })
+  },
+  {
+    name: 'contract market inactive',
+    configure: ({ contract }) => {
+      const configured = contract.markets.get(`swap:${SYMBOL}`);
+      assert(configured);
+      configured.active = false;
+    },
+    expectedTrace: ['spot:market:true', 'swap:market:true'],
+    failure: isTradeOpsFailure('MARKET_INACTIVE', {
+      subjectType: 'market',
+      field: 'active',
+      expected: true,
+      actual: false
+    })
+  },
+  {
+    name: 'one-way position mode',
+    configure: ({ contract }) => {
+      contract.accountSettings = {
+        marginMode: 'isolated',
+        positionMode: 'one-way',
+        leverage: '2'
+      };
+    },
+    expectedTrace: [
+      'spot:market:true',
+      'swap:market:true',
+      'swap:account-settings'
+    ],
+    failure: isTradeOpsFailure('ACCOUNT_POSITION_MODE_MISMATCH', {
+      subjectType: 'account',
+      field: 'positionMode',
+      expected: 'hedged',
+      actual: 'one-way'
+    })
+  },
+  {
+    name: 'unknown margin mode before leverage',
+    configure: ({ contract }) => {
+      contract.accountSettings = {
+        marginMode: 'unknown',
+        positionMode: 'hedged',
+        leverage: 'not-a-decimal'
+      };
+    },
+    expectedTrace: [
+      'spot:market:true',
+      'swap:market:true',
+      'swap:account-settings'
+    ],
+    failure: isTradeOpsFailure('ACCOUNT_MARGIN_MODE_MISMATCH', {
+      subjectType: 'account',
+      field: 'marginMode',
+      expected: ['isolated', 'cross'],
+      actual: 'unknown'
+    })
+  },
+  {
+    name: 'invalid leverage before quantity rules',
+    configure: ({ contract }) => {
+      contract.accountSettings = {
+        marginMode: 'isolated',
+        positionMode: 'hedged',
+        leverage: '0'
+      };
+    },
+    expectedTrace: [
+      'spot:market:true',
+      'swap:market:true',
+      'swap:account-settings'
+    ],
+    failure: isTradeOpsFailure('ACCOUNT_LEVERAGE_MISMATCH', {
+      subjectType: 'account',
+      field: 'leverage',
+      actual: '0'
+    })
+  },
+  {
+    name: 'invalid spot quantity rule before contract quantity rules',
+    configure: ({ spot }) => {
+      const configured = spot.markets.get(`spot:${SYMBOL}`);
+      assert(configured);
+      configured.amountStep = '0';
+    },
+    expectedTrace: [
+      'spot:market:true',
+      'swap:market:true',
+      'swap:account-settings',
+      'spot:quantity-rules'
+    ],
+    failure: isTradeOpsFailure('MARKET_RULE_INVALID', {
+      subjectType: 'market',
+      field: 'amountStep'
+    })
+  },
+  {
+    name: 'invalid spot price before spot notional rules',
+    configure: ({ spot }) => {
+      spot.lastPrices.set(`spot:${SYMBOL}`, 'NaN');
+    },
+    expectedTrace: [
+      ...COMPLETE_PREFLIGHT_TRACE.slice(0, 5),
+      'spot:price'
+    ],
+    failure: isTradeOpsFailure('PRICE_INVALID', {
+      subjectType: 'market',
+      field: 'price'
+    })
+  },
+  {
+    name: 'invalid spot notional rule before contract price',
+    configure: ({ spot }) => {
+      const configured = spot.markets.get(`spot:${SYMBOL}`);
+      assert(configured);
+      configured.minQuoteNotional = 'NaN';
+    },
+    expectedTrace: COMPLETE_PREFLIGHT_TRACE.slice(0, 7),
+    failure: isTradeOpsFailure('MARKET_RULE_INVALID', {
+      subjectType: 'market',
+      field: 'minQuoteNotional'
+    })
+  },
+  {
+    name: 'invalid contract price before contract notional rules',
+    configure: ({ contract }) => {
+      contract.lastPrices.set(`swap:${SYMBOL}`, 'Infinity');
+    },
+    expectedTrace: COMPLETE_PREFLIGHT_TRACE.slice(0, 8),
+    failure: isTradeOpsFailure('PRICE_INVALID', {
+      subjectType: 'market',
+      field: 'price'
+    })
+  },
+  {
+    name: 'invalid contract notional rule before balances',
+    configure: ({ contract }) => {
+      const configured = contract.markets.get(`swap:${SYMBOL}`);
+      assert(configured);
+      configured.maxQuoteNotional = '-1';
+    },
+    expectedTrace: COMPLETE_PREFLIGHT_TRACE.slice(0, 9),
+    failure: isTradeOpsFailure('MARKET_RULE_INVALID', {
+      subjectType: 'market',
+      field: 'maxQuoteNotional'
+    })
+  },
+  {
+    name: 'zero spot balance as insufficiency before contract balance',
+    configure: ({ spot }) => {
+      spot.freeUsdt = '0';
+    },
+    expectedTrace: COMPLETE_PREFLIGHT_TRACE.slice(0, 10),
+    failure: isTradeOpsFailure('BALANCE_INSUFFICIENT', {
+      subjectType: 'account',
+      field: 'balance',
+      actual: '0'
+    })
+  },
+  {
+    name: 'zero contract balance as insufficiency',
+    configure: ({ contract }) => {
+      contract.freeUsdt = '0';
+    },
+    expectedTrace: COMPLETE_PREFLIGHT_TRACE,
+    failure: isTradeOpsFailure('BALANCE_INSUFFICIENT', {
+      subjectType: 'account',
+      field: 'balance',
+      actual: '0'
+    })
+  }
+];
+
+for (const failureCase of orderedFailureCases) {
+  test(`stops after ${failureCase.name}`, async () => {
+    const configured = orderedSetup();
+    failureCase.configure(configured);
+
+    await assert.rejects(
+      configured.service.run(input()),
+      failureCase.failure
+    );
+
+    assert.deepEqual(configured.trace, failureCase.expectedTrace);
+    assert.deepEqual(configured.spot.createdRequests, []);
+    assert.deepEqual(configured.contract.createdRequests, []);
+  });
+}
+
+test('converts unknown account failures safely and applies the requested phase', async () => {
+  const configured = orderedSetup();
+  const secret = 'raw-third-party-account-failure';
+  configured.contract.accountSettingsError = new Error(secret);
+  const phasedService = configured.service as unknown as {
+    run(
+      value: PreflightInput,
+      phase?: 'preflight' | 'confirmation'
+    ): ReturnType<PreflightService['run']>;
+  };
+
+  await assert.rejects(
+    phasedService.run(input(), 'confirmation'),
+    (error: unknown) => {
+      assert(isTradeOpsFailure('ACCOUNT_SETTINGS_UNAVAILABLE', {
+        phase: 'confirmation',
+        subjectType: 'account',
+        field: 'settings'
+      })(error));
+      assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+      return true;
+    }
+  );
+  assert.deepEqual(configured.trace, [
+    'spot:market:true',
+    'swap:market:true',
+    'swap:account-settings'
+  ]);
+  assert.deepEqual(configured.spot.createdRequests, []);
+  assert.deepEqual(configured.contract.createdRequests, []);
+});
+
 test('rejects same-exchange and unsupported exchange selections', async () => {
   const { service } = setup();
 
   await assert.rejects(
     service.run(input({ contractExchangeId: 'bitget' })),
-    /different exchanges/
+    isTradeOpsFailure('REQUEST_FIELD_INVALID', {
+      subjectType: 'request',
+      field: 'contractExchangeId'
+    })
   );
   await assert.rejects(
     service.run(input({ spotExchangeId: 'coinbase' })),
-    /unsupported exchange/
+    isTradeOpsFailure('EXCHANGE_NOT_CONFIGURED', {
+      subjectType: 'exchange'
+    })
   );
 });
 
@@ -282,7 +731,9 @@ for (const identityCase of [
 
     await assert.rejects(
       configured.service.run(input()),
-      /market snapshot identity/
+      isTradeOpsFailure('MARKET_IDENTITY_MISMATCH', {
+        subjectType: 'market'
+      })
     );
 
     assert.deepEqual(spotGateway.readRequests, []);
@@ -296,7 +747,10 @@ test('rejects different base assets or non-USDT quote markets', async () => {
   });
   await assert.rejects(
     differentBase.service.run(input()),
-    /same base.*USDT/
+    isTradeOpsFailure('MARKET_IDENTITY_MISMATCH', {
+      subjectType: 'market',
+      field: 'base'
+    })
   );
 
   const nonUsdt = setup({
@@ -304,20 +758,43 @@ test('rejects different base assets or non-USDT quote markets', async () => {
   });
   await assert.rejects(
     nonUsdt.service.run(input()),
-    /same base.*USDT/
+    isTradeOpsFailure('MARKET_IDENTITY_MISMATCH', {
+      subjectType: 'market',
+      field: 'quote'
+    })
   );
 });
 
 test('rejects inactive or unexpected market kinds', async () => {
-  for (const configured of [
-    setup({ spotMarket: { active: false } }),
-    setup({ contractMarket: { active: false } }),
-    setup({ spotMarket: { kind: 'swap' } }),
-    setup({ contractMarket: { kind: 'spot' } })
-  ]) {
+  for (const { configured, code, field } of [
+    {
+      configured: setup({ spotMarket: { active: false } }),
+      code: 'MARKET_INACTIVE',
+      field: 'active'
+    },
+    {
+      configured: setup({ contractMarket: { active: false } }),
+      code: 'MARKET_INACTIVE',
+      field: 'active'
+    },
+    {
+      configured: setup({ spotMarket: { kind: 'swap' } }),
+      code: 'MARKET_IDENTITY_MISMATCH',
+      field: 'kind'
+    },
+    {
+      configured: setup({ contractMarket: { kind: 'spot' } }),
+      code: 'MARKET_IDENTITY_MISMATCH',
+      field: 'kind'
+    }
+  ] satisfies Array<{
+    configured: ReturnType<typeof setup>;
+    code: ErrorCode;
+    field: string;
+  }>) {
     await assert.rejects(
       configured.service.run(input()),
-      /active spot.*active linear USDT.*swap/
+      isTradeOpsFailure(code, { subjectType: 'market', field })
     );
   }
 });
@@ -335,26 +812,41 @@ test('accepts only the three execution modes', async () => {
     setup().service.run(input({
       mode: 'UNEXPECTED' as ExecutionMode
     })),
-    /execution mode/
+    isTradeOpsFailure('REQUEST_FIELD_INVALID', {
+      subjectType: 'request',
+      field: 'mode'
+    })
   );
 });
 
 test('fails closed when margin or position mode is unknown', async () => {
-  for (const accountSettings of [
+  for (const { accountSettings, code, field } of [
     {
-      marginMode: 'unknown',
-      positionMode: 'hedged',
-      leverage: '2'
+      accountSettings: {
+        marginMode: 'unknown',
+        positionMode: 'hedged',
+        leverage: '2'
+      },
+      code: 'ACCOUNT_MARGIN_MODE_MISMATCH',
+      field: 'marginMode'
     },
     {
-      marginMode: 'isolated',
-      positionMode: 'unknown',
-      leverage: '2'
+      accountSettings: {
+        marginMode: 'isolated',
+        positionMode: 'unknown',
+        leverage: '2'
+      },
+      code: 'ACCOUNT_POSITION_MODE_MISMATCH',
+      field: 'positionMode'
     }
-  ] satisfies AccountSettings[]) {
+  ] satisfies Array<{
+    accountSettings: AccountSettings;
+    code: ErrorCode;
+    field: string;
+  }>) {
     await assert.rejects(
       setup({ accountSettings }).service.run(input()),
-      /confirmed account settings/
+      isTradeOpsFailure(code, { subjectType: 'account', field })
     );
   }
 });
@@ -368,7 +860,10 @@ test('rejects flat OKX-style hedged settings when margin mode and leverage are n
         leverage: null
       }
     }).service.run(input()),
-    /confirmed account settings/
+    isTradeOpsFailure('ACCOUNT_MARGIN_MODE_MISMATCH', {
+      subjectType: 'account',
+      field: 'marginMode'
+    })
   );
 });
 
@@ -383,7 +878,10 @@ test('rejects one-way contract accounts before returning a persistable preview',
 
   await assert.rejects(
     service.run(input()),
-    /hedged position mode/
+    isTradeOpsFailure('ACCOUNT_POSITION_MODE_MISMATCH', {
+      subjectType: 'account',
+      field: 'positionMode'
+    })
   );
 });
 
@@ -397,7 +895,10 @@ test('fails closed when leverage is missing, non-finite, zero, or negative', asy
           leverage
         }
       }).service.run(input()),
-      /leverage/
+      isTradeOpsFailure('ACCOUNT_LEVERAGE_MISMATCH', {
+        subjectType: 'account',
+        field: 'leverage'
+      })
     );
   }
 });
@@ -405,7 +906,10 @@ test('fails closed when leverage is missing, non-finite, zero, or negative', asy
 test('checks spot balance just below, exactly at, and just above required quote', async () => {
   await assert.rejects(
     setup({ spotFreeUsdt: '99.999999999999999999' }).service.run(input()),
-    /spot USDT balance/
+    isTradeOpsFailure('BALANCE_INSUFFICIENT', {
+      subjectType: 'account',
+      field: 'balance'
+    })
   );
   await setup({ spotFreeUsdt: '100' }).service.run(input());
   await setup({ spotFreeUsdt: '100.000000000000000001' }).service.run(input());
@@ -414,7 +918,10 @@ test('checks spot balance just below, exactly at, and just above required quote'
 test('checks contract balance just below, exactly at, and just above leveraged requirement', async () => {
   await assert.rejects(
     setup({ contractFreeUsdt: '59.999999999999999999' }).service.run(input()),
-    /contract USDT balance/
+    isTradeOpsFailure('BALANCE_INSUFFICIENT', {
+      subjectType: 'account',
+      field: 'balance'
+    })
   );
   await setup({ contractFreeUsdt: '60' }).service.run(input());
   await setup({
@@ -423,14 +930,20 @@ test('checks contract balance just below, exactly at, and just above leveraged r
 });
 
 test('fails closed for malformed spot and contract balances', async () => {
-  for (const balance of ['NaN', 'Infinity', '-1', '0']) {
+  for (const balance of ['NaN', 'Infinity', '-1']) {
     await assert.rejects(
       setup({ spotFreeUsdt: balance }).service.run(input()),
-      /spot.*balance/
+      isTradeOpsFailure('BALANCE_UNAVAILABLE', {
+        subjectType: 'account',
+        field: 'balance'
+      })
     );
     await assert.rejects(
       setup({ contractFreeUsdt: balance }).service.run(input()),
-      /contract.*balance/
+      isTradeOpsFailure('BALANCE_UNAVAILABLE', {
+        subjectType: 'account',
+        field: 'balance'
+      })
     );
   }
 });
@@ -440,24 +953,36 @@ test('fails closed when either required reference price is missing or malformed'
   missingSpot.spot.lastPrices.clear();
   await assert.rejects(
     missingSpot.service.run(input()),
-    /missing last price/
+    isTradeOpsFailure('PRICE_UNAVAILABLE', {
+      subjectType: 'market',
+      field: 'price'
+    })
   );
 
   const missingContract = setup();
   missingContract.contract.lastPrices.clear();
   await assert.rejects(
     missingContract.service.run(input()),
-    /missing last price/
+    isTradeOpsFailure('PRICE_UNAVAILABLE', {
+      subjectType: 'market',
+      field: 'price'
+    })
   );
 
   for (const price of ['NaN', 'Infinity', '0', '-1']) {
     await assert.rejects(
       setup({ spotPrice: price }).service.run(input()),
-      /spot reference price/
+      isTradeOpsFailure('PRICE_INVALID', {
+        subjectType: 'market',
+        field: 'price'
+      })
     );
     await assert.rejects(
       setup({ contractPrice: price }).service.run(input()),
-      /contract reference price/
+      isTradeOpsFailure('PRICE_INVALID', {
+        subjectType: 'market',
+        field: 'price'
+      })
     );
   }
 });
@@ -478,7 +1003,10 @@ for (const leg of ['spot', 'contract'] as const) {
         spotFreeUsdt: '1000',
         contractFreeUsdt: '1000'
       }).service.run(input()),
-      new RegExp(`${leg} quote notional.*minimum`)
+      isTradeOpsFailure('NOTIONAL_OUT_OF_RANGE', {
+        subjectType: 'market',
+        field: 'notional'
+      })
     );
     await setup({
       [marketOption]: { minQuoteNotional: '100' },
@@ -521,7 +1049,10 @@ for (const leg of ['spot', 'contract'] as const) {
         spotFreeUsdt: '1000',
         contractFreeUsdt: '1000'
       }).service.run(input()),
-      new RegExp(`${leg} quote notional.*maximum`)
+      isTradeOpsFailure('NOTIONAL_OUT_OF_RANGE', {
+        subjectType: 'market',
+        field: 'notional'
+      })
     );
   });
 }
@@ -558,13 +1089,19 @@ test('rejects invalid quote-notional market limits', async () => {
       setup({
         spotMarket: { minQuoteNotional: limit }
       }).service.run(input()),
-      /spot minimum quote notional/
+      isTradeOpsFailure('MARKET_RULE_INVALID', {
+        subjectType: 'market',
+        field: 'minQuoteNotional'
+      })
     );
     await assert.rejects(
       setup({
         contractMarket: { maxQuoteNotional: limit }
       }).service.run(input()),
-      /contract maximum quote notional/
+      isTradeOpsFailure('MARKET_RULE_INVALID', {
+        subjectType: 'market',
+        field: 'maxQuoteNotional'
+      })
     );
   }
 
@@ -575,6 +1112,9 @@ test('rejects invalid quote-notional market limits', async () => {
         maxQuoteNotional: '100'
       }
     }).service.run(input()),
-    /spot quote notional limits/
+    isTradeOpsFailure('MARKET_RULE_INVALID', {
+      subjectType: 'market',
+      field: 'quoteNotionalRange'
+    })
   );
 });

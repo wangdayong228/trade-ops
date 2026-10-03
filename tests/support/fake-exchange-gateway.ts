@@ -11,6 +11,31 @@ import {
   type ExchangeGateway
 } from '../../src/exchanges/exchange-gateway.js';
 
+export interface FakeMarketLoadOptions {
+  readonly reload?: boolean;
+}
+
+export interface FakeLoadedMarketSnapshot {
+  readonly identity: Readonly<Pick<MarketRules,
+    | 'exchangeId'
+    | 'symbol'
+    | 'marketId'
+    | 'kind'
+    | 'base'
+    | 'quote'
+    | 'active'>>;
+  quantityRules(): Readonly<Pick<MarketRules,
+    | 'amountStep'
+    | 'contractSize'
+    | 'minBaseAmount'
+    | 'maxBaseAmount'
+    | 'priceStep'>>;
+  notionalRules(): Readonly<Pick<MarketRules,
+    'minQuoteNotional' | 'maxQuoteNotional'>>;
+  fetchAccountSettings(): Promise<AccountSettings>;
+  fetchLastPrice(): Promise<string>;
+}
+
 function marketKey(symbol: string, kind: MarketKind): string {
   return `${kind}:${symbol}`;
 }
@@ -108,6 +133,11 @@ export class FakeExchangeGateway implements ExchangeGateway {
     asset: 'USDT';
     kind: MarketKind;
   }> = [];
+  readonly marketLoadRequests: Array<{
+    symbol: string;
+    kind: MarketKind;
+    reload: boolean;
+  }> = [];
   readonly createdRequests: OrderRequest[] = [];
   readonly createResults: OrderSnapshot[] = [];
   readonly createErrors = new Map<string, Error>();
@@ -133,7 +163,16 @@ export class FakeExchangeGateway implements ExchangeGateway {
     this.#observedOrders.push(snapshot);
   }
 
-  async loadMarket(symbol: string, kind: MarketKind): Promise<MarketRules> {
+  async loadMarket(
+    symbol: string,
+    kind: MarketKind,
+    options: FakeMarketLoadOptions = {}
+  ): Promise<MarketRules> {
+    this.marketLoadRequests.push({
+      symbol,
+      kind,
+      reload: options.reload === true
+    });
     const configured = this.markets.get(marketKey(symbol, kind))
       ?? [...this.markets.values()].find(
         (market) => market.symbol === symbol && market.kind === kind
@@ -142,6 +181,56 @@ export class FakeExchangeGateway implements ExchangeGateway {
       throw new Error(`missing market configuration for ${symbol} ${kind}`);
     }
     return configured;
+  }
+
+  async loadMarketSnapshot(
+    symbol: string,
+    kind: MarketKind,
+    options: FakeMarketLoadOptions = {}
+  ): Promise<FakeLoadedMarketSnapshot> {
+    this.marketLoadRequests.push({
+      symbol,
+      kind,
+      reload: options.reload === true
+    });
+    const configured = this.markets.get(marketKey(symbol, kind))
+      ?? [...this.markets.values()].find(
+        (candidate) => candidate.symbol === symbol && candidate.kind === kind
+      );
+    if (configured === undefined) {
+      throw new Error(`missing market configuration for ${symbol} ${kind}`);
+    }
+    const captured = structuredClone(configured);
+    return {
+      identity: Object.freeze({
+        exchangeId: captured.exchangeId,
+        symbol: captured.symbol,
+        marketId: captured.marketId,
+        kind: captured.kind,
+        base: captured.base,
+        quote: captured.quote,
+        active: captured.active
+      }),
+      quantityRules: () => Object.freeze({
+        amountStep: captured.amountStep,
+        contractSize: captured.contractSize,
+        minBaseAmount: captured.minBaseAmount,
+        ...(captured.maxBaseAmount === undefined
+          ? {}
+          : { maxBaseAmount: captured.maxBaseAmount }),
+        priceStep: captured.priceStep
+      }),
+      notionalRules: () => Object.freeze({
+        ...(captured.minQuoteNotional === undefined
+          ? {}
+          : { minQuoteNotional: captured.minQuoteNotional }),
+        ...(captured.maxQuoteNotional === undefined
+          ? {}
+          : { maxQuoteNotional: captured.maxQuoteNotional })
+      }),
+      fetchAccountSettings: () => this.fetchAccountSettings(captured.symbol),
+      fetchLastPrice: () => this.fetchLastPrice(captured.symbol, captured.kind)
+    };
   }
 
   async quantizePrice(

@@ -19,6 +19,10 @@ import type {
   OrderSnapshot
 } from '../../src/domain/types.js';
 import {
+  TradeOpsError,
+  type ErrorCode
+} from '../../src/errors/trade-ops-error.js';
+import {
   CcxtExchangeGateway,
   type CcxtExchangeLike,
   type CcxtMarket,
@@ -31,6 +35,7 @@ import {
   buildCreateOrderParams
 } from '../../src/exchanges/exchange-profile.js';
 import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
+import { PreflightService } from '../../src/strategy/preflight-service.js';
 
 function market(overrides: Partial<CcxtMarket> = {}): CcxtMarket {
   return {
@@ -249,11 +254,15 @@ class CcxtDouble implements CcxtExchangeLike {
     info: { posMode: 'net_mode' },
     hedged: false
   };
+  loadMarketsErrorOnReload: unknown;
 
   constructor(readonly id: 'bitget' | 'okx') {}
 
-  async loadMarkets(): Promise<Record<string, CcxtMarket>> {
-    this.events.push('loadMarkets');
+  async loadMarkets(reload = false): Promise<Record<string, CcxtMarket>> {
+    this.events.push(reload ? 'loadMarkets:true' : 'loadMarkets');
+    if (reload && this.loadMarketsErrorOnReload !== undefined) {
+      throw this.loadMarketsErrorOnReload;
+    }
     return this.markets;
   }
 
@@ -367,6 +376,100 @@ class CcxtDouble implements CcxtExchangeLike {
   }
 }
 
+class CachedCcxtDouble extends CcxtDouble {
+  private cachedMarkets: Record<string, CcxtMarket> | undefined;
+
+  primeCache(): void {
+    this.cachedMarkets = structuredClone(this.markets);
+  }
+
+  override async loadMarkets(
+    reload = false
+  ): Promise<Record<string, CcxtMarket>> {
+    this.events.push(reload ? 'loadMarkets:true' : 'loadMarkets');
+    if (reload && this.loadMarketsErrorOnReload !== undefined) {
+      throw this.loadMarketsErrorOnReload;
+    }
+    if (reload || this.cachedMarkets === undefined) {
+      this.cachedMarkets = structuredClone(this.markets);
+    }
+    return structuredClone(this.cachedMarkets);
+  }
+}
+
+interface SnapshotLike {
+  readonly identity: Readonly<{
+    exchangeId: string;
+    symbol: string;
+    marketId: string;
+    kind: MarketKind;
+    base: string;
+    quote: 'USDT';
+    active: boolean;
+  }>;
+  quantityRules(): Readonly<{
+    amountStep: string;
+    contractSize: string;
+    minBaseAmount: string;
+    maxBaseAmount?: string;
+    priceStep: string;
+  }>;
+  notionalRules(): Readonly<{
+    minQuoteNotional?: string;
+    maxQuoteNotional?: string;
+  }>;
+  fetchAccountSettings(): Promise<{
+    marginMode: 'isolated' | 'cross' | 'unknown';
+    positionMode: 'one-way' | 'hedged' | 'unknown';
+    leverage: string | null;
+  }>;
+  fetchLastPrice(): Promise<string>;
+}
+
+interface SnapshotGatewayLike {
+  loadMarketSnapshot(
+    symbol: string,
+    kind: MarketKind,
+    options?: { readonly reload?: boolean }
+  ): Promise<SnapshotLike>;
+}
+
+function snapshotGateway(
+  gateway: CcxtExchangeGateway
+): SnapshotGatewayLike {
+  const candidate = gateway as unknown as Partial<SnapshotGatewayLike>;
+  assert.equal(
+    typeof candidate.loadMarketSnapshot,
+    'function',
+    'CcxtExchangeGateway must expose loadMarketSnapshot'
+  );
+  return candidate as SnapshotGatewayLike;
+}
+
+function isTradeOpsFailure(
+  code: ErrorCode,
+  exchangeId?: string,
+  field?: string
+): (error: unknown) => boolean {
+  return (error: unknown): boolean => {
+    assert(error instanceof TradeOpsError);
+    assert.equal(error.detail.code, code);
+    assert.equal(error.detail.phase, 'preflight');
+    if (exchangeId !== undefined) {
+      assert.equal('exchangeId' in error.detail.subject
+        ? error.detail.subject.exchangeId
+        : undefined, exchangeId);
+    }
+    if (field !== undefined) {
+      assert.equal('field' in error.detail.subject
+        ? error.detail.subject.field
+        : undefined, field);
+    }
+    assert.match(error.detail.message, /期望 .*实际为/);
+    return true;
+  };
+}
+
 function makeGateway(
   exchangeId: 'bitget' | 'okx',
   markets: CcxtMarket[] = exchangeId === 'bitget'
@@ -382,6 +485,56 @@ function makeGateway(
     ccxt
   };
 }
+
+function makeCcxtPreflight(options: {
+  spotMarket?: Partial<CcxtMarket>;
+  contractMarket?: Partial<CcxtMarket>;
+  positionMode?: Record<string, unknown>;
+  positions?: Array<Record<string, unknown>>;
+} = {}): {
+  service: PreflightService;
+  spotCcxt: CcxtDouble;
+  contractCcxt: CcxtDouble;
+} {
+  const spotCcxt = new CcxtDouble('bitget');
+  const contractCcxt = new CcxtDouble('okx');
+  const configuredSpot = market(options.spotMarket);
+  const configuredContract = swapMarket(options.contractMarket);
+  spotCcxt.markets[configuredSpot.symbol] = configuredSpot;
+  contractCcxt.markets[configuredContract.symbol] = configuredContract;
+  contractCcxt.positionMode = options.positionMode ?? {
+    info: { posMode: 'long_short_mode' },
+    hedged: true
+  };
+  contractCcxt.positions = options.positions ?? [{
+    symbol: 'BTC/USDT:USDT',
+    side: 'short',
+    contracts: 1,
+    contractSize: 0.001,
+    marginMode: 'isolated',
+    hedged: true,
+    leverage: 2,
+    info: {}
+  }];
+  const spot = new CcxtExchangeGateway('bitget', spotCcxt);
+  const contract = new CcxtExchangeGateway('okx', contractCcxt);
+  return {
+    service: new PreflightService(new ExchangeRegistry(new Map([
+      ['bitget', spot],
+      ['okx', contract]
+    ]))),
+    spotCcxt,
+    contractCcxt
+  };
+}
+
+const preflightInput = {
+  spotExchangeId: 'bitget',
+  contractExchangeId: 'okx',
+  symbol: 'BTC/USDT',
+  requestedBaseQuantity: '0.01',
+  mode: 'CONTRACT_FIRST' as const
+};
 
 function isNoOrderSubmitted(error: unknown): boolean {
   assert(error instanceof NoOrderSubmittedError);
@@ -894,6 +1047,209 @@ for (const exchangeId of ['bitget', 'okx'] as const) {
     });
   }
 }
+
+test('reloads a cached CCXT market only when the snapshot requests reload', async () => {
+  const ccxt = new CachedCcxtDouble('bitget');
+  const upstream = market({
+    precision: { amount: 0.1, price: 0.1 }
+  });
+  ccxt.markets[upstream.symbol] = upstream;
+  ccxt.primeCache();
+  upstream.precision.amount = 0.01;
+  const gateway = new CcxtExchangeGateway('bitget', ccxt);
+
+  assert.equal(
+    (await gateway.loadMarket('BTC/USDT', 'spot')).amountStep,
+    '0.1'
+  );
+  const snapshot = await snapshotGateway(gateway).loadMarketSnapshot(
+    'BTC/USDT',
+    'spot',
+    { reload: true }
+  );
+
+  assert.equal(snapshot.quantityRules().amountStep, '0.01');
+  assert.deepEqual(ccxt.events, ['loadMarkets', 'loadMarkets:true']);
+});
+
+test('does not fall back to a completed market cache when reload rejects', async () => {
+  const ccxt = new CachedCcxtDouble('bitget');
+  const configured = market();
+  ccxt.markets[configured.symbol] = configured;
+  ccxt.primeCache();
+  const reloadFailure = new Error('synthetic reload failure');
+  ccxt.loadMarketsErrorOnReload = reloadFailure;
+  const gateway = new CcxtExchangeGateway('bitget', ccxt);
+
+  await assert.rejects(
+    snapshotGateway(gateway).loadMarketSnapshot(
+      'BTC/USDT',
+      'spot',
+      { reload: true }
+    )
+  );
+  assert.deepEqual(ccxt.events, ['loadMarkets:true']);
+});
+
+test('captures staged market rules and bound readers from one reload', async () => {
+  const configured = swapMarket({
+    contractSize: '0.01',
+    precision: { amount: '2', price: '0.5' },
+    limits: {
+      amount: { min: '2', max: '20' },
+      price: { min: undefined, max: undefined },
+      cost: { min: '10', max: '1000' }
+    }
+  });
+  const { gateway, ccxt } = makeGateway('okx', [configured]);
+  ccxt.positionMode = {
+    info: { posMode: 'long_short_mode' },
+    hedged: true
+  };
+  ccxt.positions = [{
+    symbol: configured.symbol,
+    side: 'short',
+    contracts: 1,
+    marginMode: 'isolated',
+    leverage: 4,
+    info: {}
+  }];
+
+  const snapshot = await snapshotGateway(gateway).loadMarketSnapshot(
+    'BTC/USDT',
+    'swap',
+    { reload: true }
+  );
+  configured.id = 'MUTATED';
+  configured.contractSize = '9';
+  configured.precision.amount = '7';
+  configured.limits.amount.min = '8';
+  configured.limits.cost.min = '999';
+  ccxt.precisionMode = functions.SIGNIFICANT_DIGITS;
+
+  assert.equal(snapshot.identity.marketId, 'BTC-USDT-SWAP');
+  assert.deepEqual(snapshot.quantityRules(), {
+    amountStep: '2',
+    contractSize: '0.01',
+    minBaseAmount: '0.02',
+    maxBaseAmount: '0.2',
+    priceStep: '0.5'
+  });
+  assert.deepEqual(snapshot.notionalRules(), {
+    minQuoteNotional: '10',
+    maxQuoteNotional: '1000'
+  });
+  assert.equal(await snapshot.fetchLastPrice(), '60000');
+  assert.deepEqual(await snapshot.fetchAccountSettings(), {
+    marginMode: 'isolated',
+    positionMode: 'hedged',
+    leverage: '4'
+  });
+  assert.equal(
+    ccxt.events.filter((event) => event.startsWith('loadMarkets')).length,
+    1
+  );
+});
+
+test('bound snapshot readers do not parse malformed later-stage rules', async () => {
+  const configured = swapMarket({
+    contractSize: 0,
+    limits: {
+      amount: { min: 1, max: undefined },
+      price: { min: 0.1, max: 10000000 },
+      cost: { min: 'bad-notional', max: 100000000 }
+    }
+  });
+  const { gateway, ccxt } = makeGateway('okx', [configured]);
+  ccxt.positionMode = { info: { posMode: 'net_mode' }, hedged: false };
+  const snapshot = await snapshotGateway(gateway).loadMarketSnapshot(
+    'BTC/USDT',
+    'swap',
+    { reload: true }
+  );
+
+  assert.deepEqual(await snapshot.fetchAccountSettings(), {
+    marginMode: 'unknown',
+    positionMode: 'one-way',
+    leverage: null
+  });
+  assert.equal(await snapshot.fetchLastPrice(), '60000');
+  assert.throws(() => snapshot.quantityRules());
+  assert.throws(() => snapshot.notionalRules());
+  assert.equal(
+    ccxt.events.filter((event) => event.startsWith('loadMarkets')).length,
+    1
+  );
+});
+
+test('reports one-way mode before a malformed contract multiplier', async () => {
+  const configured = makeCcxtPreflight({
+    contractMarket: { contractSize: 0 },
+    positionMode: { info: { posMode: 'net_mode' }, hedged: false }
+  });
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isTradeOpsFailure(
+      'ACCOUNT_POSITION_MODE_MISMATCH',
+      'okx',
+      'positionMode'
+    )
+  );
+  assert.equal(
+    configured.contractCcxt.events.some(
+      (event) => event.startsWith('fetchPositions:')
+    ),
+    false
+  );
+  assert.deepEqual(configured.spotCcxt.createCalls, []);
+  assert.deepEqual(configured.contractCcxt.createCalls, []);
+});
+
+test('reports an out-of-range quantity before malformed notional metadata', async () => {
+  const configured = makeCcxtPreflight({
+    spotMarket: {
+      limits: {
+        amount: { min: 1, max: 1000 },
+        price: { min: 0.1, max: 10000000 },
+        cost: { min: 'bad-notional', max: 100000000 }
+      }
+    }
+  });
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isTradeOpsFailure('QUANTITY_OUT_OF_RANGE', 'bitget', 'amount')
+  );
+  assert.deepEqual(configured.spotCcxt.createCalls, []);
+  assert.deepEqual(configured.contractCcxt.createCalls, []);
+});
+
+test('reports the spot notional rule before a malformed contract rule', async () => {
+  const configured = makeCcxtPreflight({
+    spotMarket: {
+      limits: {
+        amount: { min: 0.000001, max: 1000 },
+        price: { min: 0.1, max: 10000000 },
+        cost: { min: 'bad-spot-notional', max: 100000000 }
+      }
+    },
+    contractMarket: {
+      limits: {
+        amount: { min: 1, max: undefined },
+        price: { min: 0.1, max: 10000000 },
+        cost: { min: 'bad-contract-notional', max: 100000000 }
+      }
+    }
+  });
+
+  await assert.rejects(
+    configured.service.run(preflightInput),
+    isTradeOpsFailure('MARKET_RULE_INVALID', 'bitget', 'minQuoteNotional')
+  );
+  assert.deepEqual(configured.spotCcxt.createCalls, []);
+  assert.deepEqual(configured.contractCcxt.createCalls, []);
+});
 
 test('fails closed for unsupported precision mode', async () => {
   const { gateway, ccxt } = makeGateway('bitget');
@@ -1806,7 +2162,47 @@ test('reads OKX position mode and an existing short position without changing th
     ccxt.events.some((event) => event.startsWith('set')),
     false
   );
+  assert.equal(
+    ccxt.events.filter((event) => event.startsWith('fetchPositions:')).length,
+    1
+  );
 });
+
+for (const { name, positionMode, expectedMode } of [
+  {
+    name: 'one-way',
+    positionMode: { info: { posMode: 'net_mode' }, hedged: false },
+    expectedMode: 'one-way'
+  },
+  {
+    name: 'unknown',
+    positionMode: { info: {} },
+    expectedMode: 'unknown'
+  }
+] as const) {
+  test(`does not fetch OKX positions when position mode is ${name}`, async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.positionMode = positionMode;
+    ccxt.positions = [{
+      symbol: 'BTC/USDT:USDT',
+      side: 'short',
+      contracts: 1,
+      marginMode: 'isolated',
+      leverage: 5,
+      info: {}
+    }];
+
+    assert.deepEqual(await gateway.fetchAccountSettings('BTC/USDT'), {
+      marginMode: 'unknown',
+      positionMode: expectedMode,
+      leverage: null
+    });
+    assert.equal(
+      ccxt.events.some((event) => event.startsWith('fetchPositions:')),
+      false
+    );
+  });
+}
 
 test('keeps a flat OKX hedged account fail-closed without inventing margin mode or leverage', async () => {
   const { gateway, ccxt } = makeGateway('okx');
