@@ -69,6 +69,8 @@ npm start
 
 数据库必须位于正确支持 SQLite/VFS 文件锁的本地文件系统，不支持 NFS、SMB 或其他网络挂载。同一个数据库文件同一时刻只能由一个 trade-ops 进程持有；服务运行时，其他 SQLite 工具也不能并行读取。检查、迁移和备份前必须先停止服务并等待数据库关闭。进程崩溃后，新实例通过 SQLite 原生锁接管并执行恢复；应用不创建或清理 PID 文件或独立 lock 文件。
 
+启动会把受支持的策略 schema v1/v2 自动迁移到 v3，保留既有订单、提交证据、事件和资金费率数据；未知或损坏的 schema 会阻止启动。升级前按上述步骤停机备份。v3 保存确认复检失效的状态和完整错误，重启后仍可查看。
+
 ## 资金费率历史同步
 
 服务在 HTTP 监听成功后启动一条只读、与订单执行隔离的资金费率链路。交易所固定为 Bitget 和 OKX；新市场只有同时满足 `active=true`、`swap=true`、`future=false`、`contract=true`、`linear=true`、`inverse=false`、`quote=USDT`、`settle=USDT` 才进入同步。Bitget 还要求 raw 产品为 `symbolType=perpetual` 且 `symbolStatus=normal`；OKX 要求 `instType=SWAP`、`ctType=linear`、`state=live`，且 quote 与 settle 的 raw 币种一致。状态缺失、未知或身份冲突时，本轮发现按不完整处理：不新增或停用市场，不猜测为 active，并保留已知市场供后续安全重试。
@@ -103,7 +105,9 @@ npm start
 
 每个完成的 HTTP 请求只记录一条 `request completed`：状态码低于 `400` 时为 `info`，且不带失败请求快照；`4xx` 为 `warn`，`5xx` 为 `error`。失败日志带 `httpError`，以及 `httpRequest` 快照（`method`、包含 query 的 `url`、`body`、`truncated`、`originalByteLength`）。Host/Origin 会在任何 body 观察或 parser 运行前检查；该边界早拒绝的 `403` 不读取或缓存攻击 payload，日志 body 为 `null`。
 
-全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察另有固定 `1 MiB` 安全预算；两者职责不同，路由显式配置更大的解析上限也不会扩大观察预算。若无效 body 超过观察预算且没有可用的 parsed body，日志 body 降级为 `[Unavailable]`，不会记录前缀。最终可记录的完整 body 会先替换当前已配置的敏感值，再按 UTF-8 最多 `8192` 字节截断；`1 MiB` 是原始观察安全预算，`8192` 是最终日志输出上限。任何请求 headers（包括 Authorization/Cookie）和响应 body 都不记录，也不记录原始 CCXT 请求/响应、完整环境变量、任意错误属性或 cause 链；`httpError.error` 只允许经过配置敏感值替换的类型、消息、字符串错误码和 stack。
+全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察另有固定 `1 MiB` 安全预算；两者职责不同，路由显式配置更大的解析上限也不会扩大观察预算。若无效 body 超过观察预算且没有可用的 parsed body，日志 body 降级为 `[Unavailable]`，不会记录前缀。最终可记录的完整 body 中，当前已配置的敏感值会先被完整替换，再按 UTF-8 最多 `8192` 字节截断；`1 MiB` 是原始观察安全预算，`8192` 是最终日志输出上限。任何请求 headers（包括 Authorization/Cookie）和响应 body 都不记录，也不记录原始 CCXT 请求/响应、完整环境变量或任意错误属性。启动与 HTTP 错误仅投影受控的安全详情，不透传第三方消息、cause 链或 stack。
+
+HTTP 错误体统一为 `{ "requestId", "error": { "code", "phase", "subject", "expected", "actual", "message", "occurredAt" } }`。中文说明与对象、期望和实际值对应；凭证错误只显示具体字段及 `missing` / `present-but-invalid`。完整响应示例与处理步骤见 [操作员使用说明](docs/usage/operator-guide.md#界面错误与日志)。
 
 失败的预检请求不会向 SQLite 写入对冲任务。同步请求失败不会再额外记录 `unhandled_http_request_failure`；确认接口返回 `202` 后的后台执行不属于该 HTTP 完成日志，异步失败仍单独记录 `background_confirmation_failed`。日志是旁路行为：stdout 写入失败不会改变 SQLite 状态、触发重试或重复下单。
 
@@ -114,6 +118,8 @@ npm start
 ## 执行模式与操作恢复（摘要）
 
 界面提供三种模式：`CONTRACT_FIRST`、`SPOT_FIRST`、`CONCURRENT`。模式语义、GTC 等待、对冲状态机、重启后用对冲任务 ID 加载，以及 `HEDGE_INCOMPLETE` 人工处理步骤，见 [操作员使用说明](docs/usage/operator-guide.md)。
+
+只有 `PENDING_CONFIRMATION` 可确认。首次预检与确认复检都会依次刷新两腿市场，再按账户设置、数量、两腿名义金额、两腿资金的顺序检查，首错即停。确认请求等待复检及执行认领事务提交成功后才返回 `202` 并调度后台执行。复检失败且失效事务提交成功时返回 `409`，任务进入无订单的终态 `PREFLIGHT_INVALIDATED`；修正错误后必须重新预检。`EXECUTING` / `WAITING_HEDGE` 由监控续跑，不接受再次确认。
 
 ## 本地 HTTP 安全边界
 

@@ -20,7 +20,9 @@ import type {
 } from '../../src/domain/types.js';
 import {
   TradeOpsError,
-  type ErrorCode
+  withErrorPhase,
+  type ErrorCode,
+  type ErrorDetail
 } from '../../src/errors/trade-ops-error.js';
 import {
   CcxtExchangeGateway,
@@ -721,9 +723,17 @@ test('credential errors never include credential values', () => {
       TRADING_OKX_API_KEY: secret
     }),
     (error: unknown) => {
-      assert(error instanceof Error);
-      assert.match(error.message, /missing credentials.*okx/);
-      assert.doesNotMatch(error.message, new RegExp(secret));
+      const detail: ErrorDetail = withErrorPhase(
+        error as TradeOpsError,
+        'startup'
+      ).detail;
+      assert.equal(detail.code, 'CONFIG_FIELD_MISSING');
+      assert.deepEqual(detail.subject, {
+        type: 'configuration',
+        field: 'TRADING_OKX_SECRET'
+      });
+      assert.equal(detail.actual, 'missing');
+      assert.doesNotMatch(JSON.stringify(detail), new RegExp(secret));
       return true;
     }
   );
@@ -748,10 +758,26 @@ for (const exchangeId of ['bitget', 'okx'] as const) {
             : { [`${prefix}_PASSWORD`]: password })
         }),
         (error: unknown) => {
-          assert(error instanceof Error);
-          assert.match(error.message, /missing credentials/);
-          assert.doesNotMatch(error.message, new RegExp(apiKey));
-          assert.doesNotMatch(error.message, new RegExp(secret));
+          const detail: ErrorDetail = withErrorPhase(
+            error as TradeOpsError,
+            'startup'
+          ).detail;
+          assert.equal(
+            detail.code,
+            password === undefined
+              ? 'CONFIG_FIELD_MISSING'
+              : 'CONFIG_FIELD_INVALID'
+          );
+          assert.deepEqual(detail.subject, {
+            type: 'configuration',
+            field: `${prefix}_PASSWORD`
+          });
+          assert.equal(
+            detail.actual,
+            password === undefined ? 'missing' : 'present-but-invalid'
+          );
+          assert.doesNotMatch(JSON.stringify(detail), new RegExp(apiKey));
+          assert.doesNotMatch(JSON.stringify(detail), new RegExp(secret));
           return true;
         }
       );

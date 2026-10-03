@@ -12,6 +12,36 @@ import type {
 import {
   loadEnvironmentFile
 } from '../../src/config/environment-loader.js';
+import {
+  withErrorPhase,
+  type ErrorDetail,
+  type TradeOpsError
+} from '../../src/errors/trade-ops-error.js';
+
+function startupDetail(error: unknown): ErrorDetail {
+  return withErrorPhase(error as TradeOpsError, 'startup').detail;
+}
+
+function assertEnvironmentFailure(
+  action: () => unknown,
+  actual: string,
+  forbidden: readonly string[] = []
+): void {
+  assert.throws(action, (error: unknown) => {
+    const detail = startupDetail(error);
+    assert.equal(detail.code, 'CONFIG_FIELD_INVALID');
+    assert.equal(detail.phase, 'startup');
+    assert.equal(detail.subject.type, 'configuration');
+    assert.equal(typeof detail.subject.field, 'string');
+    assert.notEqual(detail.subject.field.length, 0);
+    assert.equal(detail.actual, actual);
+    assert.equal(typeof detail.expected, 'string');
+    const serialized = JSON.stringify(detail);
+    for (const value of forbidden) assert.doesNotMatch(serialized, new RegExp(value));
+    assert.doesNotMatch(serialized, /stack|cause/);
+    return true;
+  });
+}
 
 test('loads .env without overriding an existing variable', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'trade-ops-env-'));
@@ -34,10 +64,102 @@ test('treats only ENOENT as an optional missing file', () => {
     loadEnvironmentFile({ load: () => output('ENOENT') }),
     'missing'
   );
-  assert.throws(
+  assertEnvironmentFailure(
     () => loadEnvironmentFile({ load: () => output('EACCES') }),
-    /^Error: EACCES$/
+    'object-failure',
+    ['EACCES']
   );
+});
+
+test('converts thrown dotenv failures without retaining raw values', () => {
+  assertEnvironmentFailure(
+    () => loadEnvironmentFile({
+      load: () => { throw 'dotenv-string-secret'; }
+    }),
+    'string-thrown',
+    ['dotenv-string-secret']
+  );
+  assertEnvironmentFailure(
+    () => loadEnvironmentFile({
+      load: () => {
+        throw {
+          message: 'dotenv-object-secret',
+          cause: new Error('dotenv-cause-secret'),
+          credential: 'dotenv-property-secret'
+        };
+      }
+    }),
+    'object-failure',
+    [
+      'dotenv-object-secret',
+      'dotenv-cause-secret',
+      'dotenv-property-secret'
+    ]
+  );
+});
+
+test('converts hostile returned dotenv failures without invoking traps or getters', () => {
+  let descriptorTrapReads = 0;
+  const proxiedError = new Proxy(new Error('dotenv-proxy-secret'), {
+    getOwnPropertyDescriptor(): never {
+      descriptorTrapReads += 1;
+      throw new Error('dotenv-descriptor-secret');
+    }
+  });
+  assertEnvironmentFailure(
+    () => loadEnvironmentFile({
+      load: () => ({ error: proxiedError }) as DotenvConfigOutput
+    }),
+    'object-failure',
+    ['dotenv-proxy-secret', 'dotenv-descriptor-secret']
+  );
+  assert.equal(descriptorTrapReads, 0);
+
+  const revoked = Proxy.revocable(new Error('dotenv-revoked-secret'), {});
+  revoked.revoke();
+  assertEnvironmentFailure(
+    () => loadEnvironmentFile({
+      load: () => ({ error: revoked.proxy }) as DotenvConfigOutput
+    }),
+    'object-failure',
+    ['dotenv-revoked-secret']
+  );
+
+  let codeGetterReads = 0;
+  const accessorError = new Error('dotenv-accessor-secret');
+  Object.defineProperty(accessorError, 'code', {
+    configurable: true,
+    enumerable: true,
+    get(): string {
+      codeGetterReads += 1;
+      return 'ENOENT';
+    }
+  });
+  assertEnvironmentFailure(
+    () => loadEnvironmentFile({
+      load: () => ({ error: accessorError }) as DotenvConfigOutput
+    }),
+    'object-failure',
+    ['dotenv-accessor-secret']
+  );
+  assert.equal(codeGetterReads, 0);
+
+  let resultErrorGetterReads = 0;
+  const accessorResult = {} as DotenvConfigOutput;
+  Object.defineProperty(accessorResult, 'error', {
+    configurable: true,
+    enumerable: true,
+    get(): Error {
+      resultErrorGetterReads += 1;
+      throw new Error('dotenv-result-getter-secret');
+    }
+  });
+  assertEnvironmentFailure(
+    () => loadEnvironmentFile({ load: () => accessorResult }),
+    'object-failure',
+    ['dotenv-result-getter-secret']
+  );
+  assert.equal(resultErrorGetterReads, 0);
 });
 
 test('loads dotenv quietly and preserves the target environment', () => {

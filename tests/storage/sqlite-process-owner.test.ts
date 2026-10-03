@@ -9,9 +9,30 @@ import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import Database from 'better-sqlite3';
 import {
-  claimSqliteProcessOwnership,
-  SqliteOwnershipError
+  claimSqliteProcessOwnership
 } from '../../src/storage/sqlite-process-owner.js';
+import {
+  withErrorPhase,
+  type ErrorDetail,
+  type TradeOpsError
+} from '../../src/errors/trade-ops-error.js';
+
+function ownershipDetail(error: unknown): ErrorDetail {
+  const detail = withErrorPhase(error as TradeOpsError, 'startup').detail;
+  assert.equal(detail.phase, 'startup');
+  assert.equal(detail.subject.type, 'database');
+  assert.equal(
+    'path' in detail.subject ? detail.subject.path : undefined,
+    '/safe/service.sqlite'
+  );
+  assert.equal(
+    typeof ('operation' in detail.subject
+      ? detail.subject.operation
+      : undefined),
+    'string'
+  );
+  return detail;
+}
 
 interface ChildResult {
   readonly kind: 'owned' | 'read' | 'rejected';
@@ -214,15 +235,9 @@ for (const sqliteCode of [
         '/safe/service.sqlite'
       ),
       (error: unknown) => {
-        assert.ok(error instanceof SqliteOwnershipError);
-        const ownershipError = error as {
-          readonly code: string;
-          readonly databasePath: string;
-          readonly message: string;
-        };
-        assert.equal(ownershipError.code, 'DATABASE_OWNERSHIP_BUSY');
-        assert.equal(ownershipError.databasePath, '/safe/service.sqlite');
-        assert.doesNotMatch(ownershipError.message, /secret sqlite detail/);
+        const detail = ownershipDetail(error);
+        assert.equal(detail.code, 'DATABASE_OWNERSHIP_BUSY');
+        assert.doesNotMatch(JSON.stringify(detail), /secret sqlite detail/);
         return true;
       }
     );
@@ -248,10 +263,12 @@ for (const sqliteCode of [
         '/safe/service.sqlite'
       ),
       (error: unknown) => {
-        assert.ok(error instanceof SqliteOwnershipError);
-        assert.equal(error.code, 'DATABASE_OWNERSHIP_UNAVAILABLE');
-        assert.doesNotMatch(error.message, /secret sqlite detail/);
-        assert.equal(Object.hasOwn(error, 'cause'), false);
+        const detail = ownershipDetail(error);
+        assert.equal(detail.code, 'DATABASE_OWNERSHIP_UNAVAILABLE');
+        assert.doesNotMatch(
+          JSON.stringify(detail),
+          /secret sqlite detail|secret nested cause/
+        );
         return true;
       }
     );
@@ -265,9 +282,13 @@ test('classifies non-contention ownership failures as unavailable', () => {
   } as unknown as Database.Database;
   assert.throws(
     () => claimSqliteProcessOwnership(unsupported, '/safe/service.sqlite'),
-    (error: unknown) => error instanceof SqliteOwnershipError
-      && (error as { readonly code: string }).code
-        === 'DATABASE_OWNERSHIP_UNAVAILABLE'
+    (error: unknown) => {
+      assert.equal(
+        ownershipDetail(error).code,
+        'DATABASE_OWNERSHIP_UNAVAILABLE'
+      );
+      return true;
+    }
   );
 
   const unavailable = {
@@ -279,11 +300,12 @@ test('classifies non-contention ownership failures as unavailable', () => {
       unavailable,
       '/safe/service.sqlite'
     ),
-    (error: unknown) => error instanceof SqliteOwnershipError
-      && (error as { readonly code: string }).code
-        === 'DATABASE_OWNERSHIP_UNAVAILABLE'
-      && !(error as { readonly message: string }).message
-        .includes('private filesystem detail')
+    (error: unknown) => {
+      const detail = ownershipDetail(error);
+      assert.equal(detail.code, 'DATABASE_OWNERSHIP_UNAVAILABLE');
+      assert.doesNotMatch(JSON.stringify(detail), /private filesystem detail/);
+      return true;
+    }
   );
 });
 

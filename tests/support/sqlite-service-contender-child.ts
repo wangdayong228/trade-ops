@@ -1,10 +1,11 @@
 /// <reference types="node" />
 
 import { EventEmitter } from 'node:events';
-import { run } from '../../src/main.js';
 import {
-  SqliteOwnershipError
-} from '../../src/storage/sqlite-process-owner.js';
+  withErrorPhase,
+  type TradeOpsError
+} from '../../src/errors/trade-ops-error.js';
+import { run } from '../../src/main.js';
 import { OrderMonitor } from '../../src/strategy/order-monitor.js';
 import { FakeExchangeGateway } from './fake-exchange-gateway.js';
 
@@ -84,11 +85,15 @@ try {
     listenCalls
   });
 } catch (error) {
+  let code = 'UNEXPECTED_SAFE_STARTUP_FAILURE';
+  try {
+    code = withErrorPhase(error as TradeOpsError, 'startup').detail.code;
+  } catch {
+    // IPC reports an untrusted error without inspecting arbitrary properties.
+  }
   send({
     kind: 'startup_rejected',
-    code: error instanceof SqliteOwnershipError
-      ? (error as { readonly code: string }).code
-      : 'UNEXPECTED_SAFE_STARTUP_FAILURE',
+    code,
     gatewayConstructions,
     recoveryStarts,
     monitorStarts,

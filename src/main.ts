@@ -13,6 +13,16 @@ import { loadEnvironmentFile } from './config/environment-loader.js';
 import type { ExchangeCredentials } from './config/exchange-credentials.js';
 import { loadExchangeCredentials } from './config/exchange-credentials.js';
 import { fundingRateSyncIntervalMs } from './config/funding-rate-config.js';
+import {
+  createTradeOpsError,
+  safeFailureCategory,
+  withErrorPhase,
+  type DatabaseErrorSubject,
+  type ErrorCode,
+  type ErrorSubject,
+  type SafeDiagnosticValue,
+  type TradeOpsError
+} from './errors/trade-ops-error.js';
 import { CcxtExchangeGateway } from './exchanges/ccxt-exchange-gateway.js';
 import type { ExchangeGateway } from './exchanges/exchange-gateway.js';
 import { ExchangeRegistry } from './exchanges/exchange-registry.js';
@@ -179,6 +189,79 @@ const DEFAULT_DATABASE_PATH = './data/trade-ops.sqlite';
 const DEFAULT_HOST: RuntimeConfig['host'] = '127.0.0.1';
 const DEFAULT_PORT = 3000;
 const MONITOR_INTERVAL_MS = 5000;
+const DIAGNOSTIC_STRING_LIMIT = 2_000;
+const DATABASE_PATH_LIMIT = 512;
+
+interface StartupFailureContext {
+  readonly code: ErrorCode;
+  readonly subject: ErrorSubject;
+  readonly expected: SafeDiagnosticValue;
+}
+
+function trustedStartupFailure(error: unknown): TradeOpsError | undefined {
+  try {
+    return withErrorPhase(error as TradeOpsError, 'startup');
+  } catch {
+    return undefined;
+  }
+}
+
+function startupFailure(
+  error: unknown,
+  context: StartupFailureContext
+): TradeOpsError {
+  return trustedStartupFailure(error) ?? createTradeOpsError({
+    code: context.code,
+    phase: 'startup',
+    subject: context.subject,
+    expected: context.expected,
+    actual: safeFailureCategory(error)
+  });
+}
+
+function runStartupBoundary<Value>(
+  action: () => Value,
+  context: StartupFailureContext
+): Value {
+  try {
+    return action();
+  } catch (error) {
+    throw startupFailure(error, context);
+  }
+}
+
+function componentContext(
+  component: string,
+  operation: 'constructed' | 'started' | 'stopped'
+): StartupFailureContext {
+  return {
+    code: 'SERVICE_COMPONENT_FAILED',
+    subject: {
+      type: 'configuration',
+      field: `service-component:${component}`
+    },
+    expected: `component ${operation} successfully`
+  };
+}
+
+function databasePathSubject(
+  path: string,
+  operation: string
+): DatabaseErrorSubject {
+  return {
+    type: 'database',
+    ...(path.length <= DATABASE_PATH_LIMIT
+      ? { path }
+      : { field: `path-length:${path.length}` }),
+    operation
+  };
+}
+
+function configurationActual(raw: string): string {
+  return raw.length <= DIAGNOSTIC_STRING_LIMIT
+    ? raw
+    : `string-length:${raw.length}`;
+}
 
 export interface ResolvedRuntimeEnvironment {
   readonly env: NodeJS.ProcessEnv;
@@ -196,15 +279,31 @@ export function resolveRuntimeEnvironment(
   return { env: process.env, fileStatus };
 }
 
-function invalidConfiguration(field: string): never {
-  throw new Error(`invalid ${field} configuration`);
+function invalidConfiguration(
+  field: string,
+  raw: string | undefined,
+  expected: string
+): never {
+  throw createTradeOpsError({
+    code: raw === undefined
+      ? 'CONFIG_FIELD_MISSING'
+      : 'CONFIG_FIELD_INVALID',
+    phase: 'startup',
+    subject: { type: 'configuration', field },
+    expected,
+    actual: raw === undefined ? 'missing' : configurationActual(raw)
+  });
 }
 
 function exchangeIds(
   raw: string | undefined
 ): readonly ConfiguredExchangeId[] {
   if (raw === undefined) {
-    return invalidConfiguration('TRADING_EXCHANGES');
+    return invalidConfiguration(
+      'TRADING_EXCHANGES',
+      raw,
+      'exact exchange set bitget,okx'
+    );
   }
   const tokens = raw.split(',').map((value) => value.trim());
   if (
@@ -213,7 +312,11 @@ function exchangeIds(
     || tokens.length !== REQUIRED_EXCHANGE_IDS.length
     || tokens.some((value) => !REQUIRED_EXCHANGE_SET.has(value))
   ) {
-    return invalidConfiguration('TRADING_EXCHANGES');
+    return invalidConfiguration(
+      'TRADING_EXCHANGES',
+      raw,
+      'exact exchange set bitget,okx'
+    );
   }
   return [...REQUIRED_EXCHANGE_IDS];
 }
@@ -227,7 +330,11 @@ function databasePath(raw: string | undefined): string {
     || trimmed === ':memory:'
     || /^file:/i.test(trimmed)
   ) {
-    return invalidConfiguration('TRADING_DATABASE_PATH');
+    return invalidConfiguration(
+      'TRADING_DATABASE_PATH',
+      raw,
+      'non-empty local SQLite file path'
+    );
   }
   return trimmed;
 }
@@ -239,7 +346,11 @@ function loopbackHost(
     return DEFAULT_HOST;
   }
   if (raw !== '127.0.0.1' && raw !== '::1') {
-    return invalidConfiguration('HOST');
+    return invalidConfiguration(
+      'HOST',
+      raw,
+      'loopback address 127.0.0.1 or ::1'
+    );
   }
   return raw;
 }
@@ -249,11 +360,19 @@ function canonicalPort(raw: string | undefined): number {
     return DEFAULT_PORT;
   }
   if (!/^[1-9][0-9]{0,4}$/.test(raw)) {
-    return invalidConfiguration('PORT');
+    return invalidConfiguration(
+      'PORT',
+      raw,
+      'canonical decimal port from 1 to 65535'
+    );
   }
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value > 65_535) {
-    return invalidConfiguration('PORT');
+    return invalidConfiguration(
+      'PORT',
+      raw,
+      'canonical decimal port from 1 to 65535'
+    );
   }
   return value;
 }
@@ -345,111 +464,196 @@ export function composeService(
 ): ServiceComposition {
   const env = options.env ?? process.env;
   const config = loadRuntimeConfig(env);
-  mkdirSync(dirname(resolve(config.databasePath)), {
+  runStartupBoundary(() => mkdirSync(dirname(resolve(config.databasePath)), {
     recursive: true,
     mode: 0o700
+  }), {
+    code: 'STORAGE_OPERATION_FAILED',
+    subject: databasePathSubject(
+      config.databasePath,
+      'create-parent-directory'
+    ),
+    expected: 'database parent directory created or already available'
   });
   const databaseFactory = options.databaseFactory ?? defaultDatabaseFactory;
-  const database = databaseFactory(config.databasePath);
+  const database = runStartupBoundary(
+    () => databaseFactory(config.databasePath),
+    {
+      code: 'DATABASE_OPEN_FAILED',
+      subject: databasePathSubject(config.databasePath, 'open-database'),
+      expected: 'SQLite database opened successfully'
+    }
+  );
   try {
-    claimSqliteProcessOwnership(database, config.databasePath);
+    runStartupBoundary(
+      () => claimSqliteProcessOwnership(database, config.databasePath),
+      {
+        code: 'DATABASE_OWNERSHIP_UNAVAILABLE',
+        subject: databasePathSubject(
+          config.databasePath,
+          'claim-exclusive-ownership'
+        ),
+        expected: 'exclusive SQLite process ownership'
+      }
+    );
     const clock = options.clock ?? (() => new Date());
-    const repository = new SqliteStrategyRepository(database, clock);
+    const repository = runStartupBoundary(
+      () => new SqliteStrategyRepository(database, clock),
+      {
+        code: 'STORAGE_OPERATION_FAILED',
+        subject: {
+          type: 'database',
+          table: 'strategies',
+          operation: 'initialize-strategy-repository'
+        },
+        expected: 'strategy repository initialized successfully'
+      }
+    );
+
+    const fundingRateRepositoryFactory = options.fundingRateRepositoryFactory
+      ?? defaultFundingRateRepositoryFactory;
+    const fundingRateRepository = runStartupBoundary(
+      () => fundingRateRepositoryFactory(database),
+      {
+        code: 'STORAGE_OPERATION_FAILED',
+        subject: {
+          type: 'database',
+          operation: 'initialize-funding-rate-repository'
+        },
+        expected: 'funding rate repository initialized successfully'
+      }
+    );
 
     const fundingRateSourceFactory = options.fundingRateSourceFactory
       ?? createCcxtFundingRateSources;
-    const [bitgetSource, okxSource] = fundingRateSourceFactory();
-    const fundingRateRepositoryFactory = options.fundingRateRepositoryFactory
-      ?? defaultFundingRateRepositoryFactory;
-    const fundingRateRepository = fundingRateRepositoryFactory(database);
-    const fundingRateEvents = options.fundingRateEvents
-      ?? (options.loggerInstance === undefined
-        ? NOOP_FUNDING_RATE_EVENT_SINK
-        : new PinoFundingRateEventSink(
-            options.loggerInstance,
-            () => configuredSecretValues(env)
-          ));
+    const [bitgetSource, okxSource] = runStartupBoundary(
+      () => fundingRateSourceFactory(),
+      componentContext('funding-rate-sources', 'constructed')
+    );
+    const fundingRateEvents = runStartupBoundary(
+      () => options.fundingRateEvents
+        ?? (options.loggerInstance === undefined
+          ? NOOP_FUNDING_RATE_EVENT_SINK
+          : new PinoFundingRateEventSink(
+              options.loggerInstance,
+              () => configuredSecretValues(env)
+            )),
+      componentContext('funding-rate-events', 'constructed')
+    );
     const fundingRateSyncFactory = options.fundingRateSyncFactory
       ?? defaultFundingRateSyncFactory;
-    const fundingRateSync = fundingRateSyncFactory({
-      bitgetSource,
-      okxSource,
-      repository: fundingRateRepository,
-      events: fundingRateEvents,
-      intervalMs: config.fundingRateSyncIntervalMs,
-      nowMs: options.fundingRateNowMs ?? Date.now,
-      sleep: options.fundingRateSleep ?? defaultFundingRateSleep
-    });
+    const fundingRateSync = runStartupBoundary(
+      () => fundingRateSyncFactory({
+        bitgetSource,
+        okxSource,
+        repository: fundingRateRepository,
+        events: fundingRateEvents,
+        intervalMs: config.fundingRateSyncIntervalMs,
+        nowMs: options.fundingRateNowMs ?? Date.now,
+        sleep: options.fundingRateSleep ?? defaultFundingRateSleep
+      }),
+      componentContext('funding-rate-sync', 'constructed')
+    );
 
     const gatewayFactory = options.gatewayFactory ?? defaultGatewayFactory;
     const gateways = new Map<string, ExchangeGateway>();
     for (const exchangeId of config.exchangeIds) {
       const credentials = config.credentials.get(exchangeId);
       if (credentials === undefined) {
-        throw new Error(
-          `missing credentials for configured exchange ${exchangeId}`
-        );
+        throw createTradeOpsError({
+          code: 'SERVICE_COMPONENT_FAILED',
+          phase: 'startup',
+          subject: {
+            type: 'configuration',
+            field: `service-component:${exchangeId}-gateway`
+          },
+          expected: 'configured credentials available for gateway construction',
+          actual: 'credentials-map-missing'
+        });
       }
       gateways.set(
         exchangeId,
-        gatewayFactory(exchangeId, credentials, env)
+        runStartupBoundary(
+          () => gatewayFactory(exchangeId, credentials, env),
+          componentContext(`${exchangeId}-gateway`, 'constructed')
+        )
       );
     }
-    const registry = new ExchangeRegistry(gateways);
-    const preflightService = new PreflightService(registry, clock);
-    const confirmationService = new ConfirmationService(
-      repository,
-      preflightService
+    const registry = runStartupBoundary(
+      () => new ExchangeRegistry(gateways),
+      componentContext('exchange-registry', 'constructed')
     );
-    const operationalLog = nonThrowingOperationalLog(
-      options.operationalLog
+    const preflightService = runStartupBoundary(
+      () => new PreflightService(registry, clock),
+      componentContext('preflight-service', 'constructed')
+    );
+    const confirmationService = runStartupBoundary(
+      () => new ConfirmationService(repository, preflightService),
+      componentContext('confirmation-service', 'constructed')
+    );
+    const operationalLog = runStartupBoundary(
+      () => nonThrowingOperationalLog(
+        options.operationalLog
+          ?? (options.loggerInstance === undefined
+            ? undefined
+            : createOperationalLog(
+                options.loggerInstance,
+                () => configuredSecretValues(env)
+              ))
+      ),
+      componentContext('operational-log', 'constructed')
+    );
+    const tradeEvents = runStartupBoundary(
+      () => options.tradeEvents
         ?? (options.loggerInstance === undefined
-          ? undefined
-          : createOperationalLog(
-              options.loggerInstance,
+          ? NOOP_TRADE_EVENT_SINK
+          : new PinoTradeEventSink(
+              options.loggerInstance.child({ component: 'trade' }),
               () => configuredSecretValues(env)
-            ))
+            )),
+      componentContext('trade-events', 'constructed')
     );
-    const tradeEvents = options.tradeEvents
-      ?? (options.loggerInstance === undefined
-        ? NOOP_TRADE_EVENT_SINK
-        : new PinoTradeEventSink(
-            options.loggerInstance.child({ component: 'trade' }),
-            () => configuredSecretValues(env)
-          ));
-    const reconciliation = new HedgeReconciliation(
-      registry,
-      repository,
-      tradeEvents,
-      operationalLog
+    const reconciliation = runStartupBoundary(
+      () => new HedgeReconciliation(
+        registry,
+        repository,
+        tradeEvents,
+        operationalLog
+      ),
+      componentContext('hedge-reconciliation', 'constructed')
     );
-    const coordinator = new HedgeCoordinator(
-      registry,
-      repository,
-      reconciliation,
-      tradeEvents,
-      operationalLog
+    const coordinator = runStartupBoundary(
+      () => new HedgeCoordinator(
+        registry,
+        repository,
+        reconciliation,
+        tradeEvents,
+        operationalLog
+      ),
+      componentContext('hedge-coordinator', 'constructed')
     );
-    const monitor = new OrderMonitor(
-      repository,
-      coordinator,
-      operationalLog
+    const monitor = runStartupBoundary(
+      () => new OrderMonitor(repository, coordinator, operationalLog),
+      componentContext('order-monitor', 'constructed')
     );
-    const server = buildServer({
-      registry,
-      preflightService,
-      confirmationService,
-      repository,
-      coordinator,
-      secretProvider: () => configuredSecretValues(env),
-      ...(options.loggerInstance === undefined
-        ? (options.logger === undefined ? {} : { logger: options.logger })
-        : { loggerInstance: options.loggerInstance as FastifyBaseLogger }),
-      ...(operationalLog === undefined ? {} : { operationalLog }),
-      ...(options.publicDirectory === undefined
-        ? {}
-        : { publicDirectory: options.publicDirectory })
-    });
+    const server = runStartupBoundary(
+      () => buildServer({
+        registry,
+        preflightService,
+        confirmationService,
+        repository,
+        coordinator,
+        secretProvider: () => configuredSecretValues(env),
+        ...(options.loggerInstance === undefined
+          ? (options.logger === undefined ? {} : { logger: options.logger })
+          : { loggerInstance: options.loggerInstance as FastifyBaseLogger }),
+        ...(operationalLog === undefined ? {} : { operationalLog }),
+        ...(options.publicDirectory === undefined
+          ? {}
+          : { publicDirectory: options.publicDirectory })
+      }),
+      componentContext('http-server', 'constructed')
+    );
     return {
       config,
       database,
@@ -462,7 +666,13 @@ export function composeService(
       server
     };
   } catch (error) {
-    return closeDatabaseAfterConstructionFailure(database, error);
+    return closeDatabaseAfterConstructionFailure(
+      database,
+      startupFailure(
+        error,
+        componentContext('service-composition', 'constructed')
+      )
+    );
   }
 }
 
@@ -507,33 +717,47 @@ export async function startService<T extends RunnableComposition>(
   };
 
   const closeResources = async (): Promise<void> => {
-    let firstError: unknown;
+    let hasFirstError = false;
+    let firstError!: TradeOpsError;
+    const rememberFailure = (
+      error: unknown,
+      context: StartupFailureContext
+    ): void => {
+      const failure = startupFailure(error, context);
+      if (!hasFirstError) {
+        hasFirstError = true;
+        firstError = failure;
+      }
+    };
     try {
       await composition.fundingRateSync.stop();
     } catch (error) {
-      firstError = error;
+      rememberFailure(
+        error,
+        componentContext('funding-rate-sync', 'stopped')
+      );
     }
     try {
       await composition.monitor.stop();
     } catch (error) {
-      firstError ??= error;
+      rememberFailure(error, componentContext('order-monitor', 'stopped'));
     }
     try {
       await composition.server.close();
     } catch (error) {
-      firstError ??= error;
+      rememberFailure(error, componentContext('http-server', 'stopped'));
     }
     try {
       composition.database.close();
     } catch (error) {
-      firstError ??= error;
+      rememberFailure(error, componentContext('database', 'stopped'));
     }
     try {
       removeSignalListeners();
     } catch (error) {
-      firstError ??= error;
+      rememberFailure(error, componentContext('signal-listeners', 'stopped'));
     }
-    if (firstError !== undefined) {
+    if (hasFirstError) {
       operationalLog?.error('service_stop_failed', firstError, runtimeFields);
       throw firstError;
     }
@@ -560,13 +784,35 @@ export async function startService<T extends RunnableComposition>(
   signalsInstalled = true;
   try {
     operationalLog?.info('service_starting', runtimeFields);
-    composition.monitor.start(MONITOR_INTERVAL_MS);
-    await listen(composition.server, {
-      host: composition.config.host,
-      port: composition.config.port
-    });
+    runStartupBoundary(
+      () => composition.monitor.start(MONITOR_INTERVAL_MS),
+      componentContext('order-monitor', 'started')
+    );
+    const listenContext: StartupFailureContext = {
+      code: 'SERVICE_LISTEN_FAILED',
+      subject: {
+        type: 'configuration',
+        field: 'service-listener'
+      },
+      expected: 'HTTP listener bound successfully'
+    };
+    const listening = runStartupBoundary(
+      () => listen(composition.server, {
+        host: composition.config.host,
+        port: composition.config.port
+      }),
+      listenContext
+    );
+    try {
+      await listening;
+    } catch (error) {
+      throw startupFailure(error, listenContext);
+    }
     if (shutdownPromise === null) {
-      composition.fundingRateSync.start();
+      runStartupBoundary(
+        () => composition.fundingRateSync.start(),
+        componentContext('funding-rate-sync', 'started')
+      );
       operationalLog?.info('service_started', runtimeFields);
     }
     return { composition, shutdown };

@@ -2,9 +2,12 @@
 
 import Database from 'better-sqlite3';
 import {
-  claimSqliteProcessOwnership,
-  SqliteOwnershipError
+  claimSqliteProcessOwnership
 } from '../../src/storage/sqlite-process-owner.js';
+import {
+  withErrorPhase,
+  type TradeOpsError
+} from '../../src/errors/trade-ops-error.js';
 
 type ChildAction = 'claim' | 'hold' | 'read';
 
@@ -53,11 +56,15 @@ try {
     }
   }
 } catch (error) {
+  let code = 'UNEXPECTED_SAFE_TEST_FAILURE';
+  try {
+    code = withErrorPhase(error as TradeOpsError, 'startup').detail.code;
+  } catch {
+    // IPC reports an untrusted error without inspecting arbitrary properties.
+  }
   send({
     kind: 'rejected',
-    code: error instanceof SqliteOwnershipError
-      ? (error as { readonly code: string }).code
-      : 'UNEXPECTED_SAFE_TEST_FAILURE'
+    code
   });
   database.close();
   process.disconnect?.();

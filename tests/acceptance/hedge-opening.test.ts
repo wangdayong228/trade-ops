@@ -7,7 +7,10 @@ import { join } from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
-import { safeFailureCategory } from '../../src/errors/trade-ops-error.js';
+import {
+  parseErrorDetail,
+  safeFailureCategory
+} from '../../src/errors/trade-ops-error.js';
 import type {
   MarketKind,
   MarketRules,
@@ -321,14 +324,34 @@ test(
         payload: { riskAcknowledged: true }
       })
     ]);
-    assert.deepEqual(
-      confirmResponses.map((response) => response.statusCode),
-      [202, 202]
+    const acceptedResponses = confirmResponses.filter(
+      ({ statusCode }) => statusCode === 202
     );
-    assert.deepEqual(
-      confirmResponses.map((response) => response.json()),
-      [{ accepted: true }, { accepted: true }]
+    const rejectedResponses = confirmResponses.filter(
+      ({ statusCode }) => statusCode === 409
     );
+    assert.equal(acceptedResponses.length, 1);
+    assert.equal(rejectedResponses.length, 1);
+    assert.deepEqual(acceptedResponses[0]?.json(), { accepted: true });
+    const rejectedBody = rejectedResponses[0]?.json() as {
+      readonly requestId: string;
+      readonly error: unknown;
+    };
+    assert.notEqual(rejectedBody.requestId.length, 0);
+    const rejection = parseErrorDetail(rejectedBody.error);
+    assert.equal(
+      rejection.code === 'STRATEGY_OPERATION_BUSY'
+        || rejection.code === 'STRATEGY_STATE_MISMATCH',
+      true
+    );
+    assert.equal(rejection.subject.type, 'strategy');
+    assert.equal(rejection.subject.strategyId, preflightBody.id);
+    if (rejection.code === 'STRATEGY_STATE_MISMATCH') {
+      assert.equal(rejection.subject.field, 'state');
+      assert.notEqual(rejection.actual, 'PENDING_CONFIRMATION');
+    } else {
+      assert.equal(rejection.subject.field, 'operationLock');
+    }
     await waitForState(
       initial.repository,
       preflightBody.id,

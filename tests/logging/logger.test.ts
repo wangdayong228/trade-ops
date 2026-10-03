@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import test from 'node:test';
 import type { Logger } from 'pino';
+import { createTradeOpsError } from '../../src/errors/trade-ops-error.js';
 import * as loggerModule from '../../src/logging/logger.js';
 import {
   configuredSecretValues,
@@ -107,6 +108,36 @@ test('writes JSON and replaces configured secrets in errors', () => {
   assert.equal(line.phase, 'configuration');
   assert.doesNotMatch(JSON.stringify(line), /api-key-value|secret-value/);
   assert.match(JSON.stringify(line), /\[Redacted\]/);
+});
+
+test('writes complete trusted startup details without Error branding or stack', () => {
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+  const operations = createOperationalLog(logger, () => ['startup-secret']);
+  const failure = createTradeOpsError({
+    code: 'CONFIG_FIELD_MISSING',
+    phase: 'startup',
+    subject: {
+      type: 'configuration',
+      field: 'TRADING_BITGET_API_KEY'
+    },
+    expected: 'non-empty credential',
+    actual: 'missing',
+    occurredAt: '2026-10-03T00:00:00.000Z'
+  }, ['startup-secret']);
+
+  operations.error('service_start_failed', failure);
+  operations.fatal('service_startup_failed', failure);
+
+  const entries = capturedEntries(output);
+  assert.equal(entries.length, 2);
+  for (const entry of entries) {
+    assert.deepEqual(entry.error, failure.detail);
+    assert.equal('stack' in (entry.error as object), false);
+    assert.equal('type' in (entry.error as object), false);
+    assert.equal('cause' in (entry.error as object), false);
+    assert.doesNotMatch(JSON.stringify(entry), /startup-secret/);
+  }
 });
 
 test('replaces configured secrets in non-error operational fields', () => {

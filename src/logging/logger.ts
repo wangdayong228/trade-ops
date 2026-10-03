@@ -1,4 +1,10 @@
 import pino, { type DestinationStream, type Logger } from 'pino';
+import {
+  createTradeOpsError,
+  withErrorPhase,
+  type ErrorDetail,
+  type TradeOpsError
+} from '../errors/trade-ops-error.js';
 
 export const LOGGER_REDACT_PATHS: readonly string[] = [
   'req.url',
@@ -246,6 +252,37 @@ export function safeError(
   };
 }
 
+function trustedStartupDetail(
+  error: unknown,
+  secrets: readonly string[]
+): ErrorDetail | undefined {
+  let detail: ErrorDetail;
+  try {
+    withErrorPhase(error as TradeOpsError, 'startup');
+    detail = (error as TradeOpsError).detail;
+  } catch {
+    return undefined;
+  }
+  if (detail.phase !== 'startup') {
+    return undefined;
+  }
+  return createTradeOpsError({
+    code: detail.code,
+    phase: detail.phase,
+    subject: detail.subject,
+    expected: detail.expected,
+    actual: detail.actual,
+    occurredAt: detail.occurredAt
+  }, secrets).detail;
+}
+
+function operationalError(
+  error: unknown,
+  secrets: readonly string[]
+): SafeError | ErrorDetail {
+  return trustedStartupDetail(error, secrets) ?? safeError(error, secrets);
+}
+
 export function createAppLogger(destination?: DestinationStream): Logger {
   const options = {
     level: 'info',
@@ -289,7 +326,7 @@ export function createOperationalLog(
         const safeEvent = redactText(event, secrets);
         logger.error({
           ...operationalFields(event, fields, secrets),
-          error: safeError(error, secrets)
+          error: operationalError(error, secrets)
         }, safeEvent);
       } catch {
         // Logging is never allowed to change service behavior.
@@ -301,7 +338,7 @@ export function createOperationalLog(
         const safeEvent = redactText(event, secrets);
         logger.fatal({
           ...operationalFields(event, fields, secrets),
-          error: safeError(error, secrets)
+          error: operationalError(error, secrets)
         }, safeEvent);
       } catch {
         // Logging is never allowed to change service behavior.

@@ -1,4 +1,11 @@
 import type Database from 'better-sqlite3';
+import {
+  createTradeOpsError,
+  safeFailureCategory,
+  withErrorPhase,
+  type DatabaseErrorSubject,
+  type TradeOpsError
+} from '../errors/trade-ops-error.js';
 
 export type SqliteOwnershipFailureCode =
   | 'DATABASE_OWNERSHIP_BUSY'
@@ -37,6 +44,44 @@ function isSqliteContentionCode(code: string | undefined): boolean {
     || code?.startsWith('SQLITE_LOCKED_') === true;
 }
 
+function ownershipSubject(
+  databasePath: string
+): DatabaseErrorSubject {
+  return {
+    type: 'database',
+    ...(databasePath.length <= 512
+      ? { path: databasePath }
+      : { field: `path-length:${databasePath.length}` }),
+    operation: 'claim-exclusive-ownership'
+  };
+}
+
+function ownershipError(
+  code: SqliteOwnershipFailureCode,
+  databasePath: string,
+  actual: string
+): TradeOpsError {
+  return createTradeOpsError({
+    code,
+    phase: 'startup',
+    subject: ownershipSubject(databasePath),
+    expected: 'exclusive SQLite process ownership',
+    actual
+  });
+}
+
+function trustedOwnershipError(error: unknown): TradeOpsError | undefined {
+  try {
+    const trusted = withErrorPhase(error as TradeOpsError, 'startup');
+    return trusted.detail.code === 'DATABASE_OWNERSHIP_BUSY'
+      || trusted.detail.code === 'DATABASE_OWNERSHIP_UNAVAILABLE'
+      ? trusted
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function claimSqliteProcessOwnership(
   database: Database.Database,
   databasePath: string
@@ -47,20 +92,28 @@ export function claimSqliteProcessOwnership(
       { simple: true }
     );
     if (mode !== 'exclusive') {
-      throw new SqliteOwnershipError(
+      throw ownershipError(
         'DATABASE_OWNERSHIP_UNAVAILABLE',
-        databasePath
+        databasePath,
+        'locking-mode-not-exclusive'
       );
     }
     database.exec('BEGIN EXCLUSIVE; COMMIT');
   } catch (error) {
-    if (error instanceof SqliteOwnershipError) throw error;
+    const trusted = trustedOwnershipError(error);
+    if (trusted !== undefined) throw trusted;
     const code = sqliteErrorCode(error);
-    throw new SqliteOwnershipError(
-      isSqliteContentionCode(code)
-        ? 'DATABASE_OWNERSHIP_BUSY'
-        : 'DATABASE_OWNERSHIP_UNAVAILABLE',
-      databasePath
+    if (isSqliteContentionCode(code)) {
+      throw ownershipError(
+        'DATABASE_OWNERSHIP_BUSY',
+        databasePath,
+        'sqlite-contention'
+      );
+    }
+    throw ownershipError(
+      'DATABASE_OWNERSHIP_UNAVAILABLE',
+      databasePath,
+      safeFailureCategory(error)
     );
   }
 }
