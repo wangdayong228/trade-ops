@@ -200,6 +200,11 @@ class ControlledRepository implements StrategyRepository {
   listError: unknown = NO_ERROR;
   confirmError: unknown = NO_ERROR;
   invalidateError: unknown = NO_ERROR;
+  writeHook: ((
+    operation: 'confirm' | 'invalidate',
+    expected: Readonly<StrategyRecord>,
+    failure?: ErrorDetail
+  ) => void) | undefined;
 
   constructor(public record: StrategyRecord) {}
 
@@ -218,6 +223,7 @@ class ControlledRepository implements StrategyRepository {
   confirmPreflight(expected: Readonly<StrategyRecord>): void {
     this.calls.push('confirmPreflight');
     this.confirmCalls.push(expected);
+    this.writeHook?.('confirm', expected);
     if (this.confirmError !== NO_ERROR) throw this.confirmError;
     this.record = { ...this.record, state: 'EXECUTING' };
   }
@@ -228,6 +234,7 @@ class ControlledRepository implements StrategyRepository {
   ): void {
     this.calls.push('invalidatePreflight');
     this.invalidateCalls.push({ expected, failure });
+    this.writeHook?.('invalidate', expected, failure);
     if (this.invalidateError !== NO_ERROR) throw this.invalidateError;
     this.record = {
       ...this.record,
@@ -344,19 +351,22 @@ function assertTradeOpsError(
   code: ErrorCode,
   phase: ErrorPhase
 ): asserts error is TradeOpsError {
-  let trusted = false;
+  let rebuilt: TradeOpsError;
   try {
-    trusted = error instanceof TradeOpsError;
+    rebuilt = withErrorPhase(error as TradeOpsError, phase);
   } catch {
-    assert.fail('error identity inspection escaped through a hostile throwable');
+    assert.fail(`expected WeakMap-branded ${code} TradeOpsError`);
   }
-  assert.equal(trusted, true, `expected trusted ${code} TradeOpsError`);
   const precise = error as TradeOpsError;
+  assert.deepEqual(precise.detail, rebuilt.detail);
   assert.equal(precise.detail.code, code);
   assert.equal(precise.detail.phase, phase);
+  assert.deepEqual(precise.detail.subject, rebuilt.detail.subject);
   assert.notEqual(precise.detail.expected, null);
   assert.notEqual(precise.detail.actual, null);
   assert.match(precise.detail.message, /检查失败/u);
+  assert.equal(precise.detail.message, rebuilt.detail.message);
+  assert.equal(precise.detail.occurredAt, rebuilt.detail.occurredAt);
 }
 
 function assertLockAvailable(strategyId: string): void {
@@ -992,6 +1002,92 @@ test('accepts decimal-equivalent rules, quantity, and leverage without Number ro
   assertLockAvailable(strategyId);
 });
 
+const LONG_PRECISION_DRIFT_CASES = [
+  {
+    name: 'effective base quantity',
+    field: 'effectiveBaseQuantity',
+    expected: '12345678901234567890123456789012345678901',
+    actual: '12345678901234567890123456789012345678902',
+    change(value: PreflightResult, decimalValue: string): void {
+      value.effectiveBaseQuantity = decimalValue;
+    }
+  },
+  {
+    name: 'spot amount step',
+    field: 'amountStep',
+    expected: '0.10000000000000000000000000000000000000001',
+    actual: '0.10000000000000000000000000000000000000002',
+    change(value: PreflightResult, decimalValue: string): void {
+      value.spotMarket.amountStep = decimalValue;
+    }
+  },
+  {
+    name: 'contract size',
+    field: 'contractSize',
+    expected: '1.00000000000000000000000000000000000000001',
+    actual: '1.00000000000000000000000000000000000000002',
+    change(value: PreflightResult, decimalValue: string): void {
+      value.contractMarket.contractSize = decimalValue;
+    }
+  },
+  {
+    name: 'contract maximum base amount',
+    field: 'maxBaseAmount',
+    expected: '12345678901234567890123456789012345678901',
+    actual: '12345678901234567890123456789012345678902',
+    change(value: PreflightResult, decimalValue: string): void {
+      value.contractMarket.maxBaseAmount = decimalValue;
+    }
+  }
+] as const;
+
+test(
+  'distinguishes more-than-40-digit changes in every protected decimal category',
+  async (t) => {
+    const { ConfirmationService } = await loadConfirmationModule();
+
+    for (const [index, testCase] of LONG_PRECISION_DRIFT_CASES.entries()) {
+      const original = preview();
+      testCase.change(original, testCase.expected);
+      const refreshed = structuredClone(original);
+      testCase.change(refreshed, testCase.actual);
+      const strategyId = `long-precision-drift-${index}`;
+      const repository = new ControlledRepository(strategy(strategyId, original));
+      const service = new ConfirmationService(
+        repository,
+        scriptedResult(refreshed)
+      );
+
+      const error = await captureRejection(service.confirm(strategyId));
+
+      assertTradeOpsError(error, 'PREFLIGHT_INVALIDATED', 'confirmation');
+      assert.equal(error.detail.expected, testCase.expected, testCase.name);
+      assert.equal(error.detail.actual, testCase.actual, testCase.name);
+      assert.equal(
+        'field' in error.detail.subject ? error.detail.subject.field : undefined,
+        testCase.field,
+        testCase.name
+      );
+      assert.equal(repository.invalidateCalls.length, 1, testCase.name);
+      assert.deepEqual(
+        repository.invalidateCalls[0]?.failure,
+        error.detail,
+        testCase.name
+      );
+      assert.equal(repository.confirmCalls.length, 0, testCase.name);
+      assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED', testCase.name);
+      assert.deepEqual(repository.orders, [], testCase.name);
+      assert.deepEqual(repository.forbiddenCalls, [], testCase.name);
+      assertLockAvailable(strategyId);
+    }
+    t.after(() => {
+      for (let index = 0; index < LONG_PRECISION_DRIFT_CASES.length; index += 1) {
+        releaseStrategyOperation(`long-precision-drift-${index}`);
+      }
+    });
+  }
+);
+
 test('preserves a precise confirmation failure after invalidation commits', async (t) => {
   const { ConfirmationService } = await loadConfirmationModule();
   const strategyId = 'precise-business-failure';
@@ -1083,6 +1179,194 @@ test('prioritizes storage errors and never converts confirmation writes into inv
     }
   });
 });
+
+interface ConditionalRejectionCase {
+  readonly name: string;
+  readonly actual: string;
+  readonly expectedEvidence: unknown;
+  readonly expectedOrderCount: number;
+  mutate(repository: ControlledRepository, strategyId: string): void;
+  evidence(repository: ControlledRepository): unknown;
+}
+
+const CONDITIONAL_REJECTION_CASES: readonly ConditionalRejectionCase[] = [
+  {
+    name: 'state changed',
+    actual: 'state-changed',
+    expectedEvidence: 'EXECUTING',
+    expectedOrderCount: 0,
+    mutate(repository): void {
+      repository.record = { ...repository.record, state: 'EXECUTING' };
+    },
+    evidence: (repository) => repository.record.state
+  },
+  {
+    name: 'strategy orders present',
+    actual: 'strategy-orders-present',
+    expectedEvidence: [{ id: 'order-1', role: 'SPOT_MARKET' }],
+    expectedOrderCount: 1,
+    mutate(repository, strategyId): void {
+      repository.orders = [plannedOrder(strategyId)];
+    },
+    evidence: (repository) => repository.orders.map(({ id, role }) => ({ id, role }))
+  },
+  {
+    name: 'execution failure present',
+    actual: 'execution-failure-present',
+    expectedEvidence: 'ORDER_SUBMISSION_FAILED',
+    expectedOrderCount: 0,
+    mutate(repository): void {
+      repository.record = {
+        ...repository.record,
+        failureCode: 'ORDER_SUBMISSION_FAILED'
+      };
+    },
+    evidence: (repository) => repository.record.failureCode
+  },
+  {
+    name: 'preflight failure present',
+    actual: 'preflight-failure-present',
+    expectedEvidence: 'BALANCE_INSUFFICIENT',
+    expectedOrderCount: 0,
+    mutate(repository): void {
+      repository.record = {
+        ...repository.record,
+        preflightFailure: createTradeOpsError({
+          code: 'BALANCE_INSUFFICIENT',
+          phase: 'confirmation',
+          subject: {
+            type: 'account', exchangeId: 'bitget', symbol: SYMBOL, field: 'balance'
+          },
+          expected: 'sufficient balance',
+          actual: 'insufficient balance',
+          occurredAt: '2026-10-03T00:19:00.000Z'
+        }).detail
+      };
+    },
+    evidence: (repository) => repository.record.preflightFailure?.code
+  },
+  {
+    name: 'spot exchange identity changed',
+    actual: 'spot-exchange-id-changed',
+    expectedEvidence: 'other',
+    expectedOrderCount: 0,
+    mutate(repository): void {
+      repository.record = { ...repository.record, spotExchangeId: 'other' };
+    },
+    evidence: (repository) => repository.record.spotExchangeId
+  },
+  {
+    name: 'preflight snapshot changed',
+    actual: 'preflight-snapshot-changed',
+    expectedEvidence: '0.0002',
+    expectedOrderCount: 0,
+    mutate(repository): void {
+      const changed = structuredClone(repository.record.preflight);
+      changed.spotMarket.amountStep = '0.0002';
+      repository.record = { ...repository.record, preflight: changed };
+    },
+    evidence: (repository) => repository.record.preflight.spotMarket.amountStep
+  },
+  {
+    name: 'conditional CAS updated zero rows',
+    actual: 'conditional-confirmation-cas-updated-zero-rows',
+    expectedEvidence: 'PENDING_CONFIRMATION',
+    expectedOrderCount: 0,
+    mutate(): void {},
+    evidence: (repository) => repository.record.state
+  }
+];
+
+test(
+  'rejects every confirmation storage precondition without secondary writes',
+  async (t) => {
+    const { ConfirmationService } = await loadConfirmationModule();
+    const businessFailure = createTradeOpsError({
+      code: 'BALANCE_INSUFFICIENT',
+      phase: 'confirmation',
+      subject: {
+        type: 'account', exchangeId: 'bitget', symbol: SYMBOL, field: 'balance'
+      },
+      expected: 'USDT capacity at least 100',
+      actual: '99',
+      occurredAt: '2026-10-03T00:18:00.000Z'
+    });
+    const strategyIds: string[] = [];
+
+    for (const [caseIndex, testCase] of CONDITIONAL_REJECTION_CASES.entries()) {
+      for (const operation of ['confirm', 'invalidate'] as const) {
+        const strategyId = `conditional-${caseIndex}-${operation}`;
+        strategyIds.push(strategyId);
+        const repository = new ControlledRepository(strategy(strategyId));
+        const rejection = createTradeOpsError({
+          code: 'STORAGE_TRANSITION_REJECTED',
+          phase: 'storage',
+          subject: { type: 'strategy', strategyId },
+          expected: 'unchanged pending confirmation snapshot without failures or orders',
+          actual: testCase.actual,
+          occurredAt: '2026-10-03T00:20:00.000Z'
+        });
+        repository.writeHook = (attempt, _expected, failure) => {
+          assert.equal(attempt, operation, testCase.name);
+          if (operation === 'invalidate') {
+            assert.deepEqual(failure, businessFailure.detail, testCase.name);
+          } else {
+            assert.equal(failure, undefined, testCase.name);
+          }
+          testCase.mutate(repository, strategyId);
+          throw rejection;
+        };
+        const preflight = operation === 'confirm'
+          ? scriptedResult(preview())
+          : new ScriptedPreflight(() => {
+              throw businessFailure;
+            });
+        const service = new ConfirmationService(repository, preflight);
+
+        const error = await captureRejection(service.confirm(strategyId));
+
+        assertTradeOpsError(error, 'STORAGE_TRANSITION_REJECTED', 'storage');
+        assert.deepEqual(error.detail, rejection.detail, testCase.name);
+        assert.deepEqual(
+          error.detail.subject,
+          { type: 'strategy', strategyId },
+          testCase.name
+        );
+        assert.equal(
+          error.detail.expected,
+          'unchanged pending confirmation snapshot without failures or orders',
+          testCase.name
+        );
+        assert.equal(error.detail.actual, testCase.actual, testCase.name);
+        assert.deepEqual(
+          testCase.evidence(repository),
+          testCase.expectedEvidence,
+          `${operation}: ${testCase.name}`
+        );
+        assert.equal(
+          repository.confirmCalls.length,
+          operation === 'confirm' ? 1 : 0,
+          `${operation}: ${testCase.name}`
+        );
+        assert.equal(
+          repository.invalidateCalls.length,
+          operation === 'invalidate' ? 1 : 0,
+          `${operation}: ${testCase.name}`
+        );
+        assert.equal(
+          repository.orders.length,
+          testCase.expectedOrderCount,
+          `${operation}: ${testCase.name}`
+        );
+        assert.deepEqual(repository.forbiddenCalls, [], testCase.name);
+        assertLockAvailable(strategyId);
+      }
+    }
+    t.after(() => {
+      for (const strategyId of strategyIds) releaseStrategyOperation(strategyId);
+    });
+  }
+);
 
 test('classifies unknown confirmation write failures without secondary writes', async (t) => {
   const { ConfirmationService } = await loadConfirmationModule();
@@ -1289,19 +1573,61 @@ test('serializes concurrent confirmations across success, business failure, and 
   });
 });
 
+class ObservedPreflightGateway extends FakeExchangeGateway {
+  failRefresh = false;
+  refreshAttempts = 0;
+  accountSettingsRequests = 0;
+  lastPriceRequests = 0;
+
+  override async loadMarketSnapshot(
+    symbol: string,
+    kind: MarketKind,
+    options: MarketLoadOptions = {}
+  ): Promise<LoadedMarketSnapshot> {
+    this.refreshAttempts += 1;
+    if (this.failRefresh && options.reload === true) {
+      this.marketLoadRequests.push({ symbol, kind, reload: true });
+      throw new Error('synthetic-raw-refresh-secret');
+    }
+    return await super.loadMarketSnapshot(symbol, kind, options);
+  }
+
+  override async fetchAccountSettings(symbol: string): Promise<AccountSettings> {
+    this.accountSettingsRequests += 1;
+    return await super.fetchAccountSettings(symbol);
+  }
+
+  override async fetchLastPrice(
+    symbol: string,
+    kind: MarketKind
+  ): Promise<string> {
+    this.lastPriceRequests += 1;
+    return await super.fetchLastPrice(symbol, kind);
+  }
+
+  resetObservations(): void {
+    this.refreshAttempts = 0;
+    this.accountSettingsRequests = 0;
+    this.lastPriceRequests = 0;
+    this.marketLoadRequests.length = 0;
+    this.balanceRequests.length = 0;
+    this.createdRequests.length = 0;
+  }
+}
+
 interface RealPreflightContext {
   readonly service: PreflightService;
-  readonly spot: FakeExchangeGateway;
-  readonly contract: FakeExchangeGateway;
+  readonly spot: ObservedPreflightGateway;
+  readonly contract: ObservedPreflightGateway;
   readonly input: PreflightInput;
 }
 
 function realPreflightContext(options: {
-  readonly spot?: FakeExchangeGateway;
-  readonly contract?: FakeExchangeGateway;
+  readonly spot?: ObservedPreflightGateway;
+  readonly contract?: ObservedPreflightGateway;
 } = {}): RealPreflightContext {
-  const spot = options.spot ?? new FakeExchangeGateway('bitget');
-  const contract = options.contract ?? new FakeExchangeGateway('okx');
+  const spot = options.spot ?? new ObservedPreflightGateway('bitget');
+  const contract = options.contract ?? new ObservedPreflightGateway('okx');
   spot.markets.set(`spot:${SYMBOL}`, market('bitget', 'spot'));
   contract.markets.set(`swap:${SYMBOL}`, market('okx', 'swap'));
   spot.lastPrices.set(`spot:${SYMBOL}`, '100');
@@ -1396,74 +1722,338 @@ test('enforces exact spot and leveraged contract balance boundaries on confirmat
   });
 });
 
-class FailingRefreshGateway extends FakeExchangeGateway {
-  failRefresh = false;
-  refreshAttempts = 0;
-
-  override async loadMarketSnapshot(
-    symbol: string,
-    kind: MarketKind,
-    options: MarketLoadOptions = {}
-  ): Promise<LoadedMarketSnapshot> {
-    this.refreshAttempts += 1;
-    if (this.failRefresh && options.reload === true) {
-      throw new Error('synthetic-raw-refresh-secret');
-    }
-    return await super.loadMarketSnapshot(symbol, kind, options);
-  }
+interface PreflightReadCounts {
+  readonly spotRefresh: number;
+  readonly contractRefresh: number;
+  readonly contractSettings: number;
+  readonly spotPrices: number;
+  readonly contractPrices: number;
+  readonly spotBalances: number;
+  readonly contractBalances: number;
 }
 
-test('invalidates changed refreshed rules and never falls back after refresh failure', async (t) => {
-  const { ConfirmationService } = await loadConfirmationModule();
+function changeObservedMarket(
+  gateway: ObservedPreflightGateway,
+  kind: MarketKind,
+  change: Partial<MarketRules>
+): void {
+  const key = `${kind}:${SYMBOL}`;
+  const configured = gateway.markets.get(key);
+  assert.ok(configured);
+  gateway.markets.set(key, { ...configured, ...change });
+}
 
+function assertPreflightReads(
+  context: RealPreflightContext,
+  expected: PreflightReadCounts,
+  message: string
+): void {
+  assert.deepEqual(context.spot.marketLoadRequests, expected.spotRefresh === 0
+    ? []
+    : [{ symbol: SYMBOL, kind: 'spot', reload: true }], message);
+  assert.deepEqual(context.contract.marketLoadRequests, expected.contractRefresh === 0
+    ? []
+    : [{ symbol: SYMBOL, kind: 'swap', reload: true }], message);
+  assert.equal(context.spot.refreshAttempts, expected.spotRefresh, message);
+  assert.equal(context.contract.refreshAttempts, expected.contractRefresh, message);
+  assert.equal(context.spot.accountSettingsRequests, 0, message);
+  assert.equal(
+    context.contract.accountSettingsRequests,
+    expected.contractSettings,
+    message
+  );
+  assert.equal(context.spot.lastPriceRequests, expected.spotPrices, message);
+  assert.equal(context.contract.lastPriceRequests, expected.contractPrices, message);
+  assert.equal(context.spot.balanceRequests.length, expected.spotBalances, message);
+  assert.equal(
+    context.contract.balanceRequests.length,
+    expected.contractBalances,
+    message
+  );
+}
+
+interface DirectPreflightFailureCase {
+  readonly name: string;
+  readonly code: ErrorCode;
+  readonly subject: ErrorDetail['subject'];
+  readonly expected: ErrorDetail['expected'];
+  readonly actual: ErrorDetail['actual'];
+  readonly reads: PreflightReadCounts;
+  mutate(context: RealPreflightContext): void;
+}
+
+const DIRECT_PREFLIGHT_FAILURE_CASES: readonly DirectPreflightFailureCase[] = [
   {
-    const context = realPreflightContext();
-    const original = await context.service.run(context.input);
-    context.spot.markets.set(`spot:${SYMBOL}`, market('bitget', 'spot', {
-      amountStep: '0.0002'
-    }));
-    const strategyId = 'real-rule-drift';
-    const repository = new ControlledRepository(strategy(strategyId, original));
-    const service = new ConfirmationService(repository, context.service);
-
-    const error = await captureRejection(service.confirm(strategyId));
-
-    assertTradeOpsError(error, 'PREFLIGHT_INVALIDATED', 'confirmation');
-    assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED');
-    assert.equal(context.spot.createdRequests.length, 0);
-    assert.equal(context.contract.createdRequests.length, 0);
-    assertLockAvailable(strategyId);
-  }
-
+    name: 'R21-01 spot exchange identity mismatch',
+    code: 'MARKET_IDENTITY_MISMATCH',
+    subject: {
+      type: 'market', exchangeId: 'bitget', symbol: SYMBOL,
+      kind: 'spot', field: 'exchangeId'
+    },
+    expected: 'bitget',
+    actual: 'other',
+    reads: {
+      spotRefresh: 1, contractRefresh: 0, contractSettings: 0,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate: (context) => changeObservedMarket(context.spot, 'spot', {
+      exchangeId: 'other'
+    })
+  },
   {
-    const spot = new FailingRefreshGateway('bitget');
-    const contract = new FakeExchangeGateway('okx');
-    const context = realPreflightContext({ spot, contract });
-    const original = await context.service.run(context.input);
-    const priorSnapshot = structuredClone(spot.markets.get(`spot:${SYMBOL}`));
-    assert.ok(priorSnapshot);
-    spot.markets.set(`spot:${SYMBOL}`, { ...priorSnapshot, amountStep: '0.5' });
-    spot.failRefresh = true;
-    const contractLoadsBefore = contract.marketLoadRequests.length;
-    const strategyId = 'real-refresh-failure';
-    const repository = new ControlledRepository(strategy(strategyId, original));
-    const service = new ConfirmationService(repository, context.service);
-
-    const error = await captureRejection(service.confirm(strategyId));
-
-    assertTradeOpsError(error, 'MARKET_UNAVAILABLE', 'confirmation');
-    assert.equal(JSON.stringify(error.detail).includes('raw-refresh-secret'), false);
-    assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED');
-    assert.equal(contract.marketLoadRequests.length, contractLoadsBefore);
-    assert.equal(spot.balanceRequests.length, 1, 'only initial preflight read balance');
-    assert.equal(contract.balanceRequests.length, 1, 'only initial preflight read balance');
-    assert.equal(spot.createdRequests.length, 0);
-    assert.equal(contract.createdRequests.length, 0);
-    assertLockAvailable(strategyId);
+    name: 'R21-02 contract kind identity mismatch',
+    code: 'MARKET_IDENTITY_MISMATCH',
+    subject: {
+      type: 'market', exchangeId: 'okx', symbol: SYMBOL,
+      kind: 'swap', field: 'kind'
+    },
+    expected: 'swap',
+    actual: 'spot',
+    reads: {
+      spotRefresh: 1, contractRefresh: 1, contractSettings: 0,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate: (context) => changeObservedMarket(context.contract, 'swap', {
+      kind: 'spot'
+    })
+  },
+  {
+    name: 'R21-03 spot inactive',
+    code: 'MARKET_INACTIVE',
+    subject: {
+      type: 'market', exchangeId: 'bitget', symbol: SYMBOL,
+      kind: 'spot', field: 'active'
+    },
+    expected: true,
+    actual: false,
+    reads: {
+      spotRefresh: 1, contractRefresh: 0, contractSettings: 0,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate: (context) => changeObservedMarket(context.spot, 'spot', {
+      active: false
+    })
+  },
+  {
+    name: 'R21-04 contract inactive',
+    code: 'MARKET_INACTIVE',
+    subject: {
+      type: 'market', exchangeId: 'okx', symbol: SYMBOL,
+      kind: 'swap', field: 'active'
+    },
+    expected: true,
+    actual: false,
+    reads: {
+      spotRefresh: 1, contractRefresh: 1, contractSettings: 0,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate: (context) => changeObservedMarket(context.contract, 'swap', {
+      active: false
+    })
+  },
+  {
+    name: 'R21-05 invalid spot amount step',
+    code: 'MARKET_RULE_INVALID',
+    subject: {
+      type: 'market', exchangeId: 'bitget', symbol: SYMBOL,
+      kind: 'spot', field: 'amountStep'
+    },
+    expected: 'finite decimal greater than zero',
+    actual: '0',
+    reads: {
+      spotRefresh: 1, contractRefresh: 1, contractSettings: 1,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate: (context) => changeObservedMarket(context.spot, 'spot', {
+      amountStep: '0'
+    })
+  },
+  {
+    name: 'R21-06 contract notional below changed minimum',
+    code: 'NOTIONAL_OUT_OF_RANGE',
+    subject: {
+      type: 'market', exchangeId: 'okx', symbol: SYMBOL,
+      kind: 'swap', field: 'notional'
+    },
+    expected: 'at least 200',
+    actual: '120',
+    reads: {
+      spotRefresh: 1, contractRefresh: 1, contractSettings: 1,
+      spotPrices: 1, contractPrices: 1, spotBalances: 0, contractBalances: 0
+    },
+    mutate: (context) => changeObservedMarket(context.contract, 'swap', {
+      minQuoteNotional: '200'
+    })
+  },
+  {
+    name: 'R21-07 spot forced refresh failure',
+    code: 'MARKET_UNAVAILABLE',
+    subject: {
+      type: 'market', exchangeId: 'bitget', symbol: SYMBOL, kind: 'spot'
+    },
+    expected: 'successful forced market refresh',
+    actual: 'object-failure',
+    reads: {
+      spotRefresh: 1, contractRefresh: 0, contractSettings: 0,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate(context): void { context.spot.failRefresh = true; }
+  },
+  {
+    name: 'R21-08 contract forced refresh failure',
+    code: 'MARKET_UNAVAILABLE',
+    subject: {
+      type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap'
+    },
+    expected: 'successful forced market refresh',
+    actual: 'object-failure',
+    reads: {
+      spotRefresh: 1, contractRefresh: 1, contractSettings: 0,
+      spotPrices: 0, contractPrices: 0, spotBalances: 0, contractBalances: 0
+    },
+    mutate(context): void { context.contract.failRefresh = true; }
   }
+];
 
-  t.after(() => {
-    releaseStrategyOperation('real-rule-drift');
-    releaseStrategyOperation('real-refresh-failure');
-  });
-});
+const LEGAL_PREFLIGHT_DRIFT_CASES = [
+  {
+    name: 'R21-09 spot amount step', side: 'spot', field: 'amountStep',
+    expected: '0.0001', actual: '0.0002'
+  },
+  {
+    name: 'R21-10 contract amount step', side: 'contract', field: 'amountStep',
+    expected: '1', actual: '2'
+  },
+  {
+    name: 'R21-11 spot price step', side: 'spot', field: 'priceStep',
+    expected: '0.1', actual: '0.2'
+  },
+  {
+    name: 'R21-12 contract price step', side: 'contract', field: 'priceStep',
+    expected: '0.1', actual: '0.2'
+  },
+  {
+    name: 'R21-13 spot contract size', side: 'spot', field: 'contractSize',
+    expected: '1', actual: '2'
+  },
+  {
+    name: 'R21-14 contract contract size', side: 'contract', field: 'contractSize',
+    expected: '0.001', actual: '0.002'
+  },
+  {
+    name: 'R21-15 spot minimum base amount', side: 'spot', field: 'minBaseAmount',
+    expected: '0.001', actual: '0.002'
+  },
+  {
+    name: 'R21-16 contract maximum base amount',
+    side: 'contract', field: 'maxBaseAmount', expected: '1000', actual: '999'
+  },
+  {
+    name: 'R21-17 spot minimum quote notional',
+    side: 'spot', field: 'minQuoteNotional', expected: '5', actual: '6'
+  },
+  {
+    name: 'R21-18 contract maximum quote notional',
+    side: 'contract', field: 'maxQuoteNotional',
+    expected: '1000000', actual: '999999'
+  }
+] as const;
+
+const FULL_PREFLIGHT_READS: PreflightReadCounts = {
+  spotRefresh: 1,
+  contractRefresh: 1,
+  contractSettings: 1,
+  spotPrices: 1,
+  contractPrices: 1,
+  spotBalances: 1,
+  contractBalances: 1
+};
+
+test(
+  'invalidates changed refreshed rules only after the real ordered preflight boundary',
+  async (t) => {
+    const { ConfirmationService } = await loadConfirmationModule();
+    const strategyIds: string[] = [];
+
+    for (const [caseIndex, testCase] of DIRECT_PREFLIGHT_FAILURE_CASES.entries()) {
+      const context = realPreflightContext();
+      const original = await context.service.run(context.input);
+      context.spot.resetObservations();
+      context.contract.resetObservations();
+      testCase.mutate(context);
+      const strategyId = `real-direct-failure-${caseIndex}`;
+      strategyIds.push(strategyId);
+      const repository = new ControlledRepository(strategy(strategyId, original));
+      const service = new ConfirmationService(repository, context.service);
+
+      const error = await captureRejection(service.confirm(strategyId));
+
+      assertTradeOpsError(error, testCase.code, 'confirmation');
+      assert.deepEqual(error.detail.subject, testCase.subject, testCase.name);
+      assert.equal(error.detail.expected, testCase.expected, testCase.name);
+      assert.equal(error.detail.actual, testCase.actual, testCase.name);
+      assert.equal(
+        JSON.stringify(error.detail).includes('synthetic-raw-refresh-secret'),
+        false,
+        testCase.name
+      );
+      assert.equal(repository.invalidateCalls.length, 1, testCase.name);
+      assert.deepEqual(
+        repository.invalidateCalls[0]?.failure,
+        error.detail,
+        testCase.name
+      );
+      assert.equal(repository.confirmCalls.length, 0, testCase.name);
+      assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED', testCase.name);
+      assertPreflightReads(context, testCase.reads, testCase.name);
+      assert.equal(context.spot.createdRequests.length, 0, testCase.name);
+      assert.equal(context.contract.createdRequests.length, 0, testCase.name);
+      assert.deepEqual(repository.forbiddenCalls, [], testCase.name);
+      assertLockAvailable(strategyId);
+    }
+
+    for (const [caseIndex, testCase] of LEGAL_PREFLIGHT_DRIFT_CASES.entries()) {
+      const context = realPreflightContext();
+      const original = await context.service.run(context.input);
+      context.spot.resetObservations();
+      context.contract.resetObservations();
+      const gateway = testCase.side === 'spot' ? context.spot : context.contract;
+      const kind = testCase.side === 'spot' ? 'spot' : 'swap';
+      changeObservedMarket(gateway, kind, { [testCase.field]: testCase.actual });
+      const strategyId = `real-legal-drift-${caseIndex}`;
+      strategyIds.push(strategyId);
+      const repository = new ControlledRepository(strategy(strategyId, original));
+      const service = new ConfirmationService(repository, context.service);
+
+      const error = await captureRejection(service.confirm(strategyId));
+
+      assertTradeOpsError(error, 'PREFLIGHT_INVALIDATED', 'confirmation');
+      assert.deepEqual(error.detail.subject, {
+        type: 'market',
+        exchangeId: testCase.side === 'spot' ? 'bitget' : 'okx',
+        symbol: SYMBOL,
+        kind,
+        field: testCase.field
+      }, testCase.name);
+      assert.equal(error.detail.expected, testCase.expected, testCase.name);
+      assert.equal(error.detail.actual, testCase.actual, testCase.name);
+      assert.equal(repository.invalidateCalls.length, 1, testCase.name);
+      assert.deepEqual(
+        repository.invalidateCalls[0]?.failure,
+        error.detail,
+        testCase.name
+      );
+      assert.equal(repository.confirmCalls.length, 0, testCase.name);
+      assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED', testCase.name);
+      assertPreflightReads(context, FULL_PREFLIGHT_READS, testCase.name);
+      assert.equal(context.spot.createdRequests.length, 0, testCase.name);
+      assert.equal(context.contract.createdRequests.length, 0, testCase.name);
+      assert.deepEqual(repository.forbiddenCalls, [], testCase.name);
+      assertLockAvailable(strategyId);
+    }
+
+    t.after(() => {
+      for (const strategyId of strategyIds) releaseStrategyOperation(strategyId);
+    });
+  }
+);

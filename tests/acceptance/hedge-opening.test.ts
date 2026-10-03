@@ -891,16 +891,39 @@ test(
       coordinator.confirmAndExecute(created.id)
     ]);
     await waitForState(repository, created.id, 'HEDGED');
+    const ordersBeforeSecondRecovery = repository.listOrders(created.id);
+    const identitiesBeforeSecondRecovery = ordersBeforeSecondRecovery.map((order) => ({
+      id: order.id,
+      role: order.role,
+      clientOrderId: order.clientOrderId
+    }));
+    const eventCountsBeforeSecondRecovery = ordersBeforeSecondRecovery.map((order) => ({
+      orderId: order.id,
+      count: repository.listOrderEvents(order.id).length
+    }));
+
     await monitor.recover();
 
     assert.equal(spot.createdRequests.length, 1);
     assert.equal(contract.createdRequests.length, 1);
     const orders = repository.listOrders(created.id);
+    assert.equal(orders.length, 2);
     assert.deepEqual(
       orders.map(({ role }) => role),
       ['SPOT_MARKET', 'CONTRACT_MARKET']
     );
     assert.equal(new Set(orders.map(({ clientOrderId }) => clientOrderId)).size, 2);
+    assert.deepEqual(
+      orders.map(({ id, role, clientOrderId }) => ({ id, role, clientOrderId })),
+      identitiesBeforeSecondRecovery
+    );
+    assert.deepEqual(
+      orders.map((order) => ({
+        orderId: order.id,
+        count: repository.listOrderEvents(order.id).length
+      })),
+      eventCountsBeforeSecondRecovery
+    );
     assert.equal(repository.getStrategy(created.id).state, 'HEDGED');
   }
 );
