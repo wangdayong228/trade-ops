@@ -21,6 +21,7 @@ import {
   parseErrorDetail,
   type ErrorDetail
 } from '../../src/errors/trade-ops-error.js';
+import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
 import {
   buildServer,
   LOGGER_REDACT_PATHS
@@ -31,15 +32,17 @@ import {
   type OperationalLog
 } from '../../src/logging/logger.js';
 import type { ConfirmationService } from '../../src/strategy/confirmation-service.js';
-import type {
-  PreflightInput,
-  PreflightResult
+import {
+  PreflightService,
+  type PreflightInput,
+  type PreflightResult
 } from '../../src/strategy/preflight-service.js';
 import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
 import {
   StrategyNotFoundError,
   type StrategyRepository
 } from '../../src/storage/strategy-repository.js';
+import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
 const LOCAL_HEADERS = {
@@ -301,6 +304,78 @@ function setup(
     confirmationInputs,
     getConfirmationCount: () => confirmationCount,
     getExecutionCount: () => executionCount
+  };
+}
+
+function repositoryCallCapture(t: TestContext): {
+  readonly repository: StrategyRepository;
+  readonly target: SqliteStrategyRepository;
+  readonly calls: string[];
+} {
+  const database = new Database(':memory:');
+  const target = new SqliteStrategyRepository(database);
+  const calls: string[] = [];
+  const repository = new Proxy<StrategyRepository>(target, {
+    get(instance, property) {
+      const value = Reflect.get(instance, property, instance);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        calls.push(String(property));
+        return Reflect.apply(value, instance, args);
+      };
+    }
+  });
+  t.after(() => database.close());
+  return { repository, target, calls };
+}
+
+function configuredRealPreflightService(clock?: () => Date): {
+  readonly service: PreflightService;
+  readonly spot: FakeExchangeGateway;
+  readonly contract: FakeExchangeGateway;
+  readonly registryCalls: () => Readonly<{ ids: number; get: number }>;
+} {
+  const preview = preflight();
+  const spot = new FakeExchangeGateway('bitget');
+  const contract = new FakeExchangeGateway('okx');
+  spot.markets.set(`spot:${SYMBOL}`, preview.spotMarket);
+  contract.markets.set(`swap:${SYMBOL}`, preview.contractMarket);
+  spot.lastPrices.set(`spot:${SYMBOL}`, preview.spotReferencePrice);
+  contract.lastPrices.set(`swap:${SYMBOL}`, preview.contractReferencePrice);
+  spot.freeUsdt = preview.spotFreeUsdt;
+  contract.freeUsdt = preview.contractFreeUsdt;
+  contract.accountSettings = preview.accountSettings;
+  const baseRegistry = new ExchangeRegistry(new Map([
+    ['bitget', spot],
+    ['okx', contract]
+  ]));
+  let idsCalls = 0;
+  let getCalls = 0;
+  const registry = new Proxy(baseRegistry, {
+    get(target, property) {
+      if (property === 'ids') {
+        return (): string[] => {
+          idsCalls += 1;
+          return target.ids();
+        };
+      }
+      if (property === 'get') {
+        return (exchangeId: string) => {
+          getCalls += 1;
+          return target.get(exchangeId);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  return {
+    service: clock === undefined
+      ? new PreflightService(registry)
+      : new PreflightService(registry, clock),
+    spot,
+    contract,
+    registryCalls: () => ({ ids: idsCalls, get: getCalls })
   };
 }
 
@@ -1640,6 +1715,38 @@ test('preflight distinguishes malformed or non-object bodies from field validati
       name: 'malformed JSON',
       headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' },
       payload: '{"symbol":'
+    },
+    {
+      name: 'empty JSON body',
+      headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' },
+      payload: '',
+      actualPattern: /empty/i,
+      forbidden: ['FST_ERR_CTP_EMPTY_JSON_BODY']
+    },
+    {
+      name: 'unsupported media type',
+      headers: {
+        ...LOCAL_HEADERS,
+        'content-type': 'application/x-unsupported-parser-sentinel'
+      },
+      payload: 'UNSUPPORTED-PARSER-BODY-SENTINEL',
+      actualPattern: /media|content.?type/i,
+      forbidden: [
+        'UNSUPPORTED-PARSER-BODY-SENTINEL',
+        'application/x-unsupported-parser-sentinel',
+        'FST_ERR_CTP_INVALID_MEDIA_TYPE'
+      ]
+    },
+    {
+      name: 'invalid content length',
+      headers: {
+        ...LOCAL_HEADERS,
+        'content-type': 'application/json',
+        'content-length': '20'
+      },
+      payload: '{}',
+      actualPattern: /content.?length/i,
+      forbidden: ['FST_ERR_CTP_INVALID_CONTENT_LENGTH']
     }
   ] as const;
 
@@ -1659,9 +1766,18 @@ test('preflight distinguishes malformed or non-object bodies from field validati
       });
       assert.deepEqual(detail.subject, { type: 'request', field: 'body' });
       assert.doesNotMatch(response.body, /body-string|symbol/);
+      if ('actualPattern' in item) {
+        assert.equal(typeof detail.actual, 'string');
+        assert.match(detail.actual as string, item.actualPattern);
+        assert.equal((detail.actual as string).length <= 100, true);
+        for (const forbidden of item.forbidden) {
+          assert.equal(response.body.includes(forbidden), false);
+        }
+      }
     });
   }
   assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(fixture.repository.listRecoverable().length, 0);
   assert.equal(fixture.getConfirmationCount(), 0);
   assert.equal(fixture.getExecutionCount(), 0);
 });
@@ -2005,6 +2121,103 @@ test('preflight preserves heterogeneous trusted business errors as 422', async (
       assert.equal(fixture.getExecutionCount(), 0);
     });
   }
+});
+
+test('real preflight operation failures remain internal HTTP failures without persistence', async (t) => {
+  const secret = 'REAL-PREFLIGHT-CLOCK-FAILURE-SENTINEL';
+  let clockCalls = 0;
+  const configured = configuredRealPreflightService(() => {
+    clockCalls += 1;
+    throw Object.assign(new Error(`${secret} message`), {
+      cause: new Error(`${secret} cause`),
+      stack: `${secret} stack`
+    });
+  });
+  const storage = repositoryCallCapture(t);
+  const fixture = setup(t, {
+    repository: storage.repository,
+    runPreflight: (input) => configured.service.run(input)
+  });
+
+  const response = await fixture.server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: LOCAL_HEADERS,
+    payload: {
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol: SYMBOL,
+      requestedBaseQuantity: '1',
+      mode: 'CONTRACT_FIRST'
+    }
+  });
+
+  assert.equal(response.statusCode, 500);
+  const detail = assertPublicHttpError(response, {
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'preflight'
+  });
+  assert.deepEqual(detail.subject, { type: 'request', field: 'preflight' });
+  assert.equal(detail.actual, 'object-failure');
+  assert.deepEqual(parseErrorDetail(detail), detail);
+  assert.doesNotMatch(response.body, new RegExp(secret));
+  assert.doesNotMatch(response.body, /cause|stack/);
+  assert.equal(clockCalls, 1);
+  assert.deepEqual(configured.registryCalls(), { ids: 1, get: 2 });
+  assert.equal(configured.spot.marketLoadRequests.length, 1);
+  assert.equal(configured.contract.marketLoadRequests.length, 1);
+  assert.deepEqual(configured.spot.balanceRequests, [{
+    asset: 'USDT', kind: 'spot'
+  }]);
+  assert.deepEqual(configured.contract.balanceRequests, [{
+    asset: 'USDT', kind: 'swap'
+  }]);
+  assert.deepEqual(storage.calls, []);
+  assert.deepEqual(storage.target.listRecoverable(), []);
+  assert.equal(fixture.preflightInputs.length, 1);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
+});
+
+test('real preflight request validation failures remain HTTP 400 before gateway reads', async (t) => {
+  const configured = configuredRealPreflightService();
+  const storage = repositoryCallCapture(t);
+  const fixture = setup(t, {
+    repository: storage.repository,
+    runPreflight: (input) => configured.service.run(input)
+  });
+  const symbol = 'BTC-PERP/USDT';
+
+  const response = await fixture.server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: LOCAL_HEADERS,
+    payload: {
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol,
+      requestedBaseQuantity: '1',
+      mode: 'CONTRACT_FIRST'
+    }
+  });
+
+  assert.equal(response.statusCode, 400);
+  const detail = assertPublicHttpError(response, {
+    code: 'REQUEST_FIELD_INVALID',
+    phase: 'preflight'
+  });
+  assert.deepEqual(detail.subject, { type: 'request', field: 'symbol' });
+  assert.equal(detail.actual, symbol);
+  assert.deepEqual(configured.registryCalls(), { ids: 0, get: 0 });
+  assert.deepEqual(configured.spot.marketLoadRequests, []);
+  assert.deepEqual(configured.contract.marketLoadRequests, []);
+  assert.deepEqual(configured.spot.balanceRequests, []);
+  assert.deepEqual(configured.contract.balanceRequests, []);
+  assert.deepEqual(storage.calls, []);
+  assert.deepEqual(storage.target.listRecoverable(), []);
+  assert.equal(fixture.preflightInputs.length, 1);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
 });
 
 test('preflight redacts configured secrets from a branded business detail', async (t) => {
@@ -5340,7 +5553,7 @@ test('one status-aware completion log is emitted for success redirect and failur
 
 test('completion captures valid body invalid JSON and stable known errors', async (t) => {
   const capture = completionCapture();
-  const { server } = setup(t, {
+  const fixture = setup(t, {
     loggerInstance: capture.logger,
     runPreflight: async () => {
       throw Object.assign(new Error('authentication failed'), {
@@ -5351,9 +5564,10 @@ test('completion captures valid body invalid JSON and stable known errors', asyn
       });
     }
   });
+  const { server } = fixture;
   const validBody = { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'SPOT_FIRST' };
   const valid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?dryRun=false', headers: LOCAL_HEADERS, payload: validBody });
-  const invalidText = '{"symbol":"RAW-INVALID"';
+  const invalidText = '{"apiKey":"RAW-CREDENTIAL-SENTINEL"';
   const invalid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?source=raw', headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' }, payload: invalidText });
   assert.equal(valid.statusCode, 500);
   assert.equal(invalid.statusCode, 400);
@@ -5374,10 +5588,20 @@ test('completion captures valid body invalid JSON and stable known errors', asyn
     code: 'REQUEST_BODY_INVALID',
     message: '请求正文结构检查失败'
   });
-  assert.equal((invalidLine.httpRequest as Record<string, unknown>).body, invalidText);
+  const invalidRequest = invalidLine.httpRequest as Record<string, unknown>;
+  assert.equal(invalidRequest.body, '[Unavailable]');
+  assert.equal(invalidRequest.truncated, false);
+  assert.equal(
+    invalidRequest.originalByteLength,
+    Buffer.byteLength('[Unavailable]', 'utf8')
+  );
+  assert.equal(fixture.preflightInputs.length, 1);
+  assert.deepEqual(fixture.repository.listRecoverable(), []);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
   assert.doesNotMatch(
     JSON.stringify(completions),
-    /AuthenticationError|authentication failed|40101|stack|ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL/
+    /AuthenticationError|authentication failed|40101|stack|ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL|RAW-CREDENTIAL-SENTINEL/
   );
 });
 
@@ -5398,6 +5622,118 @@ test('completion redacts configured exact overlapping secrets across URL body an
   assert.doesNotMatch(serialized, /abc123|(?<![A-Za-z])abc(?![A-Za-z])/);
   assert.match(serialized, /\[Redacted\]/);
   assert.match(serialized, /passwordHint/);
+});
+
+test('completion redacts credential-semantic body fields and decoded query keys', async (t) => {
+  const capture = completionCapture();
+  const { server } = setup(t, { loggerInstance: capture.logger });
+  server.post('/test/credential-semantics', async (_request, reply) => (
+    reply.status(418).send({ failed: true })
+  ));
+  const sensitiveValues = [
+    'DIRECT-APIKEY-SENTINEL',
+    'UNDERSCORE-APIKEY-SENTINEL',
+    'HYPHEN-APIKEY-SENTINEL',
+    'SECRET-VALUE-SENTINEL',
+    'PASSWORD-VALUE-SENTINEL',
+    'PASSPHRASE-VALUE-SENTINEL',
+    'SIGNATURE-VALUE-SENTINEL',
+    'AUTHORIZATION-VALUE-SENTINEL',
+    'COOKIE-VALUE-SENTINEL',
+    'CREDENTIALS-CONTAINER-SENTINEL',
+    'AUTH-CONTAINER-SENTINEL',
+    'NESTED-CREDENTIAL-SENTINEL',
+    'ARRAY-CREDENTIAL-SENTINEL',
+    'QUERY-APIKEY-SENTINEL',
+    'QUERY-SECRET-SENTINEL',
+    'QUERY-CREDENTIALS-SENTINEL'
+  ] as const;
+  const body = {
+    visible: 'ordinary-body-value',
+    passwordHint: 'ordinary-passwordHint-value',
+    apiKey: sensitiveValues[0],
+    api_key: sensitiveValues[1],
+    'api-key': sensitiveValues[2],
+    SeCrEt: sensitiveValues[3],
+    PASSWORD: sensitiveValues[4],
+    PassPhrase: sensitiveValues[5],
+    SiGnAtUrE: sensitiveValues[6],
+    AuThOrIzAtIoN: sensitiveValues[7],
+    CoOkIe: sensitiveValues[8],
+    credentials: { value: sensitiveValues[9], visible: 'hidden-with-container' },
+    auth: { value: sensitiveValues[10] },
+    nested: {
+      visible: 'ordinary-nested-value',
+      apiKey: sensitiveValues[11]
+    },
+    items: [
+      { ordinary: 'ordinary-array-value' },
+      { secret: sensitiveValues[12] }
+    ]
+  };
+  const url = '/test/credential-semantics'
+    + '?visible=ordinary-query-value'
+    + `&api%5Fkey=${sensitiveValues[13]}`
+    + `&SeCrEt=${sensitiveValues[14]}`
+    + `&credentials=${sensitiveValues[15]}`
+    + '&ordinary=passwordHint';
+
+  const response = await server.inject({
+    method: 'POST',
+    url,
+    headers: {
+      ...LOCAL_HEADERS,
+      authorization: 'HEADER-AUTHORIZATION-SENTINEL',
+      cookie: 'HEADER-COOKIE-SENTINEL=1'
+    },
+    payload: body
+  });
+
+  assert.equal(response.statusCode, 418);
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, 1);
+  const snapshot = completions[0]?.httpRequest as Record<string, unknown>;
+  assert.equal(snapshot.method, 'POST');
+  assert.equal(snapshot.truncated, false);
+  assert.equal(Object.hasOwn(snapshot, 'headers'), false);
+  const loggedBody = snapshot.body as Record<string, unknown>;
+  assert.equal(loggedBody.visible, 'ordinary-body-value');
+  assert.equal(loggedBody.passwordHint, 'ordinary-passwordHint-value');
+  for (const key of [
+    'apiKey', 'api_key', 'api-key', 'SeCrEt', 'PASSWORD', 'PassPhrase',
+    'SiGnAtUrE', 'AuThOrIzAtIoN', 'CoOkIe', 'credentials', 'auth'
+  ]) {
+    assert.equal(loggedBody[key], '[Redacted]', key);
+  }
+  const nested = loggedBody.nested as Record<string, unknown>;
+  assert.deepEqual(nested, {
+    visible: 'ordinary-nested-value',
+    apiKey: '[Redacted]'
+  });
+  assert.deepEqual(loggedBody.items, [
+    { ordinary: 'ordinary-array-value' },
+    { secret: '[Redacted]' }
+  ]);
+  assert.equal(
+    snapshot.originalByteLength,
+    Buffer.byteLength(JSON.stringify(loggedBody), 'utf8')
+  );
+  assert.equal(typeof snapshot.url, 'string');
+  const loggedUrl = new URL(snapshot.url as string, 'http://localhost');
+  assert.equal(loggedUrl.pathname, '/test/credential-semantics');
+  assert.equal(loggedUrl.searchParams.get('visible'), 'ordinary-query-value');
+  assert.equal(loggedUrl.searchParams.get('ordinary'), 'passwordHint');
+  assert.equal(loggedUrl.searchParams.get('api_key'), '[Redacted]');
+  assert.equal(loggedUrl.searchParams.get('SeCrEt'), '[Redacted]');
+  assert.equal(loggedUrl.searchParams.get('credentials'), '[Redacted]');
+  const serialized = JSON.stringify(completions);
+  for (const value of sensitiveValues) {
+    assert.equal(serialized.includes(value), false, value);
+  }
+  assert.doesNotMatch(
+    serialized,
+    /HEADER-AUTHORIZATION-SENTINEL|HEADER-COOKIE-SENTINEL/
+  );
 });
 
 test('completion body metadata observes 8192 8193 and UTF-8 boundaries after redaction', async (t) => {
@@ -5636,6 +5972,132 @@ test('HTTP safety boundary rejects invalid Host before Fastify body limit', asyn
     JSON.stringify(completion),
     /INVALID-HOST-LIMIT-SENTINEL|UNSAFE-ORIGIN-LIMIT-SENTINEL/
   );
+});
+
+test('bad URL handling emits a safe standard response and one completion before body observation', async (t) => {
+  const capture = completionCapture();
+  const storage = repositoryCallCapture(t);
+  const fixture = setup(t, {
+    repository: storage.repository,
+    loggerInstance: capture.logger
+  });
+  const pathSentinel = 'PATH-CONTENT-SENTINEL';
+  const bodySentinel = 'BAD-URL-BODY-SENTINEL';
+  const headerSentinel = 'BAD-URL-HEADER-SENTINEL';
+  const response = await fixture.server.inject({
+    method: 'POST',
+    url: `/api/hedges/${pathSentinel}%ZZ/confirm`,
+    headers: {
+      ...LOCAL_HEADERS,
+      authorization: headerSentinel,
+      'content-type': 'application/json'
+    },
+    payload: JSON.stringify({ credential: bodySentinel })
+  });
+
+  assert.equal(response.statusCode, 400);
+  const detail = assertPublicHttpError(response, {
+    code: 'REQUEST_FIELD_INVALID',
+    phase: 'request'
+  });
+  assert.deepEqual(detail.subject, { type: 'request', field: 'url' });
+  assert.equal(typeof detail.actual, 'string');
+  assert.match(detail.actual as string, /malformed.*url|url.*malformed/i);
+  assert.equal((detail.actual as string).length <= 100, true);
+  assert.equal(response.headers.pragma, 'no-cache');
+  assert.equal(response.headers['referrer-policy'], 'no-referrer');
+  assert.equal(response.headers['x-content-type-options'], 'nosniff');
+  assert.equal(response.headers['x-frame-options'], 'DENY');
+  assert.doesNotMatch(
+    response.body,
+    new RegExp(`${pathSentinel}|${bodySentinel}|${headerSentinel}|%ZZ`)
+  );
+  assert.deepEqual(storage.calls, []);
+  assert.deepEqual(storage.target.listRecoverable(), []);
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
+
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, 1);
+  const responseBody = response.json();
+  assert.equal(completions[0]?.reqId, responseBody.requestId);
+  const snapshot = completions[0]?.httpRequest as Record<string, unknown>;
+  assert.deepEqual(snapshot, {
+    method: 'POST',
+    url: '[Unavailable]',
+    body: null,
+    truncated: false,
+    originalByteLength: 0
+  });
+  assert.doesNotMatch(
+    JSON.stringify(capture.lines()),
+    new RegExp(`${pathSentinel}|${bodySentinel}|${headerSentinel}|%ZZ`)
+  );
+});
+
+test('concurrent bad URLs retain unique request completion correlation without leakage', async (t) => {
+  const capture = completionCapture();
+  const storage = repositoryCallCapture(t);
+  const fixture = setup(t, {
+    repository: storage.repository,
+    loggerInstance: capture.logger
+  });
+  const cases = [
+    {
+      path: 'BAD-URL-ONE-SENTINEL',
+      header: 'BAD-URL-HEADER-ONE-SENTINEL'
+    },
+    {
+      path: 'BAD-URL-TWO-SENTINEL',
+      header: 'BAD-URL-HEADER-TWO-SENTINEL'
+    }
+  ] as const;
+
+  const responses = await Promise.all(cases.map((item) => (
+    fixture.server.inject({
+      method: 'GET',
+      url: `/api/hedges/${item.path}%ZZ`,
+      headers: { host: 'localhost:80', authorization: item.header }
+    })
+  )));
+
+  const requestIds = responses.map((response) => {
+    assert.equal(response.statusCode, 400);
+    const detail = assertPublicHttpError(response, {
+      code: 'REQUEST_FIELD_INVALID',
+      phase: 'request'
+    });
+    assert.deepEqual(detail.subject, { type: 'request', field: 'url' });
+    return response.json().requestId as string;
+  });
+  assert.equal(new Set(requestIds).size, 2);
+  const completions = completionLines(capture.lines());
+  assert.equal(completions.length, 2);
+  for (const requestId of requestIds) {
+    const matches = completions.filter((line) => line.reqId === requestId);
+    assert.equal(matches.length, 1);
+    assert.deepEqual(matches[0]?.httpRequest, {
+      method: 'GET',
+      url: '[Unavailable]',
+      body: null,
+      truncated: false,
+      originalByteLength: 0
+    });
+  }
+  const serializedResponses = responses.map((response) => response.body).join('');
+  const serializedLogs = JSON.stringify(capture.lines());
+  for (const item of cases) {
+    assert.equal(serializedResponses.includes(item.path), false);
+    assert.equal(serializedResponses.includes(item.header), false);
+    assert.equal(serializedLogs.includes(item.path), false);
+    assert.equal(serializedLogs.includes(item.header), false);
+  }
+  assert.deepEqual(storage.calls, []);
+  assert.deepEqual(storage.target.listRecoverable(), []);
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
 });
 
 

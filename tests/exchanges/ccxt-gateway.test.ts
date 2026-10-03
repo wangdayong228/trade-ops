@@ -1275,6 +1275,54 @@ test('captures staged market rules and bound readers from one reload', async () 
   );
 });
 
+test('preflight rejects an invalid CCXT selected market id before later reads', async () => {
+  const spotCcxt = new CcxtDouble('bitget');
+  const contractCcxt = new CcxtDouble('okx');
+  const configuredSpot = market({ id: '' });
+  const configuredContract = swapMarket();
+  spotCcxt.markets[configuredSpot.symbol] = configuredSpot;
+  contractCcxt.markets[configuredContract.symbol] = configuredContract;
+  contractCcxt.positionMode = {
+    info: { posMode: 'long_short_mode' },
+    hedged: true
+  };
+  contractCcxt.positions = [{
+    symbol: configuredContract.symbol,
+    side: 'short',
+    contracts: 1,
+    contractSize: 0.001,
+    marginMode: 'isolated',
+    hedged: true,
+    leverage: 2,
+    info: {}
+  }];
+  const spotGateway = new CcxtExchangeGateway('bitget', spotCcxt);
+  const contractGateway = new CcxtExchangeGateway('okx', contractCcxt);
+  const snapshot = await snapshotGateway(spotGateway).loadMarketSnapshot(
+    'BTC/USDT',
+    'spot',
+    { reload: true }
+  );
+  assert.equal(snapshot.identity.marketId, '');
+  spotCcxt.events.length = 0;
+  const service = new PreflightService(new ExchangeRegistry(new Map([
+    ['bitget', spotGateway],
+    ['okx', contractGateway]
+  ])));
+
+  await assert.rejects(
+    service.run(preflightInput),
+    isTradeOpsFailure('MARKET_IDENTITY_MISMATCH', 'bitget', 'marketId')
+  );
+
+  assert.deepEqual(spotCcxt.events, ['loadMarkets:true']);
+  assert.deepEqual(contractCcxt.events, []);
+  assert.deepEqual(spotCcxt.balanceCalls, []);
+  assert.deepEqual(contractCcxt.balanceCalls, []);
+  assert.deepEqual(spotCcxt.createCalls, []);
+  assert.deepEqual(contractCcxt.createCalls, []);
+});
+
 test('bound snapshot readers do not parse malformed later-stage rules', async () => {
   const configured = swapMarket({
     contractSize: 0,

@@ -3129,6 +3129,114 @@ test('invalidates pending preflight atomically and reads the full failure after 
   assert.deepEqual(repository.listRecoverable(), []);
 });
 
+test('rejects confirmation clock rollback without changing or poisoning the pending strategy', async (t) => {
+  const rollbackCases = [
+    {
+      name: 'before creation time',
+      persistedUpdatedAt: '2026-10-03T00:00:00.000Z',
+      observedAt: '2026-10-02T23:59:59.999Z'
+    },
+    {
+      name: 'after creation but before the persisted update time',
+      persistedUpdatedAt: '2026-10-03T00:02:00.000Z',
+      observedAt: '2026-10-03T00:01:00.000Z'
+    }
+  ] as const;
+
+  for (const operation of ['confirm', 'invalidate'] as const) {
+    for (const rollbackCase of rollbackCases) {
+      await t.test(`${operation}: ${rollbackCase.name}`, (child) => {
+        const directory = mkdtempSync(join(tmpdir(), 'trade-ops-clock-rollback-'));
+        const databasePath = join(directory, 'strategies.sqlite');
+        const database = new Database(databasePath);
+        child.after(() => {
+          if (database.open) database.close();
+          rmSync(directory, { recursive: true, force: true });
+        });
+        let now = '2026-10-03T00:00:00.000Z';
+        const repository = new SqliteStrategyRepository(
+          database,
+          () => new Date(now)
+        );
+        const created = repository.createPending(preflight());
+        if (rollbackCase.persistedUpdatedAt !== created.updatedAt) {
+          database.prepare(`
+            UPDATE strategies SET updated_at = ? WHERE id = ?
+          `).run(rollbackCase.persistedUpdatedAt, created.id);
+        }
+        const expected = repository.getStrategy(created.id);
+        assert.equal(expected.updatedAt, rollbackCase.persistedUpdatedAt);
+        const confirmation = task3Repository(repository);
+        const before = confirmationStateFingerprint(database);
+        now = rollbackCase.observedAt;
+
+        const error = captureError(() => {
+          if (operation === 'confirm') {
+            confirmation.confirmPreflight(expected);
+          } else {
+            confirmation.invalidatePreflight(expected, confirmationFailure());
+          }
+        });
+
+        assertTrustedStorageError(
+          error,
+          'STORAGE_TRANSITION_REJECTED',
+          'strategy',
+          expected.id
+        );
+        assert.equal(error.detail.subject.type, 'strategy');
+        if (error.detail.subject.type === 'strategy') {
+          assert.equal(error.detail.subject.field, 'updatedAt');
+        }
+        assert.equal(
+          JSON.stringify(error.detail.expected).includes(expected.updatedAt),
+          true
+        );
+        assert.equal(
+          JSON.stringify(error.detail.actual).includes(rollbackCase.observedAt),
+          true
+        );
+        assert.equal(confirmationStateFingerprint(database), before);
+        assert.equal(database.inTransaction, false);
+        const pending = task3Record(repository.getStrategy(expected.id));
+        assert.equal(pending.state, 'PENDING_CONFIRMATION');
+        assert.equal(pending.failureCode, null);
+        assert.equal(pending.preflightFailure, null);
+        assert.deepEqual(repository.listOrders(expected.id), []);
+        assert.deepEqual(repository.listRecoverable(), []);
+        assert.equal(database.prepare(`
+          SELECT COUNT(*) FROM order_events
+        `).pluck().get(), 0);
+
+        const reopened = new Database(databasePath, { readonly: true });
+        try {
+          const restarted = new SqliteStrategyRepository(reopened);
+          const reloaded = task3Record(restarted.getStrategy(expected.id));
+          assert.equal(reloaded.state, 'PENDING_CONFIRMATION');
+          assert.equal(reloaded.updatedAt, expected.updatedAt);
+          assert.equal(reloaded.failureCode, null);
+          assert.equal(reloaded.preflightFailure, null);
+          assert.deepEqual(restarted.listOrders(expected.id), []);
+          assert.deepEqual(restarted.listRecoverable(), []);
+        } finally {
+          reopened.close();
+        }
+
+        now = '2026-10-03T00:03:00.000Z';
+        if (operation === 'confirm') {
+          confirmation.confirmPreflight(expected);
+          assert.equal(repository.getStrategy(expected.id).state, 'EXECUTING');
+        } else {
+          confirmation.invalidatePreflight(expected, confirmationFailure());
+          const invalidated = task3Record(repository.getStrategy(expected.id));
+          assert.equal(invalidated.state, 'PREFLIGHT_INVALIDATED');
+          assert.deepEqual(invalidated.preflightFailure, confirmationFailure());
+        }
+      });
+    }
+  }
+});
+
 test('persists the maximum valid confirmation failure without truncation', (t) => {
   const { database, repository } = setup(t);
   const expected = repository.createPending(preflight());

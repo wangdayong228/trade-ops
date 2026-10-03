@@ -129,6 +129,19 @@ function observedText(value: unknown): SafeDiagnosticValue {
   return `${typeof value} value`;
 }
 
+function invalidMarketIdActual(value: unknown): string {
+  if (typeof value !== 'string') {
+    return `${typeof value} value`;
+  }
+  if (value.length === 0) {
+    return 'empty string';
+  }
+  if (value.trim() !== value) {
+    return 'string with leading or trailing whitespace';
+  }
+  return `string length ${value.length}`;
+}
+
 function marketSubject(
   exchangeId: string,
   symbol: string,
@@ -308,6 +321,19 @@ function validateIdentity(
         observedText(actual)
       );
     }
+  }
+  if (
+    typeof identity.marketId !== 'string'
+    || identity.marketId.length === 0
+    || identity.marketId.trim() !== identity.marketId
+    || identity.marketId.length > 256
+  ) {
+    throw failure(
+      'MARKET_IDENTITY_MISMATCH',
+      marketSubject(exchangeId, symbol, kind, 'marketId'),
+      'string of 1 to 256 characters without surrounding whitespace',
+      invalidMarketIdActual(identity.marketId)
+    );
   }
   if (identity.active !== true) {
     throw failure(

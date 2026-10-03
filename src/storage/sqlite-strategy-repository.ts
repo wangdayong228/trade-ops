@@ -1999,6 +1999,20 @@ function storageTransitionError(
   });
 }
 
+function confirmationClockRollbackError(
+  strategyId: string,
+  expectedUpdatedAt: string,
+  actualUpdatedAt: string
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_TRANSITION_REJECTED',
+    phase: 'storage',
+    subject: { type: 'strategy', strategyId, field: 'updatedAt' },
+    expected: `timestamp at or after ${expectedUpdatedAt}`,
+    actual: `observed ${actualUpdatedAt}`
+  });
+}
+
 function storageOperationError(
   strategyId: string,
   actual: string
@@ -2654,11 +2668,23 @@ export class SqliteStrategyRepository implements StrategyRepository {
     if (mismatch !== null) {
       throw storageTransitionError(expected.id, mismatch);
     }
+    const nextUpdatedDate = this.clock();
+    const nextUpdatedAt = nextUpdatedDate.toISOString();
+    if (
+      nextUpdatedDate.getTime()
+      < new Date(expected.updatedAt).getTime()
+    ) {
+      throw confirmationClockRollbackError(
+        expected.id,
+        expected.updatedAt,
+        nextUpdatedAt
+      );
+    }
     const result = this.updateConfirmation.run({
       ...expected,
       targetState,
       preflightFailureJson,
-      nextUpdatedAt: this.clock().toISOString()
+      nextUpdatedAt
     });
     if (!sqliteIntegerEquals(result.changes, 1)) {
       throw storageTransitionError(

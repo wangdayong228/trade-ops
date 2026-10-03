@@ -170,15 +170,34 @@ class ConfirmationService {
 
 **文件：** 修改 `src/main.ts`、`src/config/exchange-credentials.ts`、`src/config/funding-rate-config.ts`、`src/config/environment-loader.ts`、按需 `src/storage/sqlite-process-owner.ts`；为启动日志保留完整可信详情且不输出 stack，最小扩展 `src/logging/logger.ts` 及 `tests/logging/logger.test.ts` 的可信错误投影；更新 `tests/main.test.ts`、`tests/config/*.test.ts`、按需所有权测试及 `tests/support/sqlite-owner-child.ts`、`tests/support/sqlite-service-contender-child.ts`；同步 `tests/exchanges/ccxt-gateway.test.ts` 中直接调用凭证 loader 的旧错误断言，其余交易网关行为不变；将 `tests/acceptance/hedge-opening.test.ts` 旧并发双 202 断言迁移为一次 202 与一次精确 409，保留后续订单唯一性及恢复验收；更新 `README.md` 和 `docs/usage/operator-guide.md`。
 
-- [ ] RED：配置固定检查顺序及具体字段证据，凭证只报告 missing/present-but-invalid；目录、开库、所有权、schema、组件和监听每个失败点均报告精确错误且没有后续动作；dotenv 读取失败安全转换。
-- [ ] RED：装配注入新确认服务；保持“恢复监控 → 监听 → 资金费率启动”；监听失败不启资金费率，幂等 cleanup 等待恢复后关闭数据库，cleanup 错误不覆盖原启动错误；运行检查只用临时环境、临时文件或 fake。
-- [ ] GREEN：为每个启动边界转换异常，保留已有可信 detail，不以 SERVICE_COMPONENT_FAILED 覆盖具体配置/schema/所有权错误；不更改资金费率业务逻辑；入口日志只保留安全详情，日志异常不影响退出状态或清理。
-- [ ] 文档：README 与操作员指南同步确认/失效状态、错误响应例子、schema v3 自动迁移、操作员重新预检步骤；修正指南中 EXECUTING 可重复确认的旧说明，保留单进程数据库及监控恢复说明。
-- [ ] 集成验证：`npm test`；`git diff --check`；确认所有预检/确认路径与源码调用方类型一致，未引入真实网络测试。
+- [x] RED：配置固定检查顺序及具体字段证据，凭证只报告 missing/present-but-invalid；目录、开库、所有权、schema、组件和监听每个失败点均报告精确错误且没有后续动作；dotenv 读取失败安全转换。
+- [x] RED：装配注入新确认服务；保持“恢复监控 → 监听 → 资金费率启动”；监听失败不启资金费率，幂等 cleanup 等待恢复后关闭数据库，cleanup 错误不覆盖原启动错误；运行检查只用临时环境、临时文件或 fake。
+- [x] GREEN：为每个启动边界转换异常，保留已有可信 detail，不以 SERVICE_COMPONENT_FAILED 覆盖具体配置/schema/所有权错误；不更改资金费率业务逻辑；入口日志只保留安全详情，日志异常不影响退出状态或清理。
+- [x] 文档：README 与操作员指南同步确认/失效状态、错误响应例子、schema v3 自动迁移、操作员重新预检步骤；修正指南中 EXECUTING 可重复确认的旧说明，保留单进程数据库及监控恢复说明。
+- [x] 集成验证：`npm test`；`git diff --check`；确认所有预检/确认路径与源码调用方类型一致，未引入真实网络测试。
 - [ ] 最终审查：按 affected-path review 要求对六任务 diff 及受影响调用链做资金/安全审查；修复所有重要发现并运行相关回归。若 skill 文件不可用，明确记录并用同范围只读风险审查完成工作。
 - [ ] 完成核对：`verification-before-completion` → `consistency-check` → `post-verification-check`；逐项勾选计划并记录实际命令、exit status、结果。主代理给出 worktree/branch、测试结果与剩余限制。
+
+## 最终审查修复范围（2026-10-04）
+
+最终只读审查覆盖基线 `4e8086c` 到 `6391b82` 的 45 个路径及受影响调用链，确认六项需修复的问题；它们仍属于以上 Task 2/3/5 的既定合同，按统一 RED → GREEN → 原审查者复审处理：
+
+- 真实预检错误按请求格式 400、业务拒绝 422、内部/存储失败 500 映射，保留具体详情。
+- 绑定 Fastify 的空 JSON、不支持的正文类型和 content-length 不符都返回安全 400；伪造异常仍为安全 500。
+- 确认和失效事务拒绝更新时间回拨，保留可读待确认记录及仓储可用性。
+- 两腿 marketId 在各自市场身份阶段验证既有持久化合同，首错后停止后续读取。
+- body/query 的凭证语义字段递归隐藏，无法安全结构化的原始正文使用 `[Unavailable]`；替代旧 raw-body 日志断言，同步 README/操作员指南。
+- 路由前 BAD_URL 通过同一安全错误/响应头/唯一完成日志边界，禁止正文观察和原始坏 URL 回显。
+
+完整修复合同、测试矩阵、RED/GREEN 与复审证据保存在 `.superpowers/sdd/final-repair-*`；不新增交易权限、外部依赖或执行/对账逻辑。
 
 ## 验证记录
 
 - 隔离基线：`npm test`，exit 0，1124 passed / 0 failed；完整日志 `.superpowers/sdd/baseline.log`。
 - 任务 RED/GREEN、审查及最终命令结果追加到 `.superpowers/sdd/progress.md`；每任务简报、报告与 diff 存同目录，不读取会话日志或真实业务数据。
+
+- 2026-10-04，Task 1–6 实现和任务审查已通过；源码提交 `6391b82`，功能基线 `4e8086c`。Task 6 审查修复了部分 signal 注册失败的资源清理和 SQLite 异常 `code` 的安全读取。
+- 主代理最终集成命令：`npm test`，exit 0，**1419 passed / 0 failed / 0 skipped**，包含 TypeScript build；完整输出 `.superpowers/sdd/final-test.log`。
+- `git diff --check`：exit 0；原工作区清单的 10 个文件 SHA256 全部保持。
+- 验证环境：Node.js v26.0.0；fake gateways、合成环境、临时或内存 SQLite、真实 UI 代码的 VM/fake DOM。未执行 Node 20/24 矩阵、真实交易所或真实浏览器布局验证。
+- 最终全功能风险审查与一致性/checkbox 核对正在进行，完成后补充结论。

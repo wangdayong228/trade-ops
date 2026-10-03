@@ -783,6 +783,91 @@ for (const identityCase of [
   });
 }
 
+for (const leg of ['spot', 'contract'] as const) {
+  for (const invalidMarketId of [
+    {
+      name: 'empty string',
+      value: '',
+      forbidden: []
+    },
+    {
+      name: 'non-string',
+      value: 17 as unknown as string,
+      forbidden: []
+    },
+    {
+      name: 'leading and trailing whitespace',
+      value: ' market-id-whitespace-sentinel ',
+      forbidden: ['market-id-whitespace-sentinel']
+    },
+    {
+      name: '257-character string',
+      value: `market-id-length-sentinel-${'x'.repeat(231)}`,
+      forbidden: ['market-id-length-sentinel']
+    }
+  ]) {
+    test(`rejects ${leg} ${invalidMarketId.name} marketId at the identity stage`, async () => {
+      assert.equal(
+        invalidMarketId.name === '257-character string'
+          ? invalidMarketId.value.length
+          : true,
+        invalidMarketId.name === '257-character string' ? 257 : true
+      );
+      const configured = orderedSetup(leg === 'spot'
+        ? { spotMarket: { marketId: invalidMarketId.value } }
+        : { contractMarket: { marketId: invalidMarketId.value } });
+
+      await assert.rejects(
+        configured.service.run(input()),
+        (error: unknown) => {
+          assert(isTradeOpsFailure('MARKET_IDENTITY_MISMATCH', {
+            subjectType: 'market',
+            field: 'marketId'
+          })(error));
+          assert(error instanceof TradeOpsError);
+          assert.equal(typeof error.detail.actual, 'string');
+          assert.notEqual(error.detail.actual, invalidMarketId.value);
+          assert.equal((error.detail.actual as string).length <= 64, true);
+          const rendered = JSON.stringify(error);
+          for (const forbidden of invalidMarketId.forbidden) {
+            assert.equal(rendered.includes(forbidden), false);
+          }
+          return true;
+        }
+      );
+
+      assert.deepEqual(configured.trace, leg === 'spot'
+        ? ['spot:market:true']
+        : ['spot:market:true', 'swap:market:true']);
+      assert.deepEqual(configured.spot.balanceRequests, []);
+      assert.deepEqual(configured.contract.balanceRequests, []);
+      assert.deepEqual(configured.spot.createdRequests, []);
+      assert.deepEqual(configured.contract.createdRequests, []);
+    });
+  }
+}
+
+for (const leg of ['spot', 'contract'] as const) {
+  test(`accepts and preserves a 256-character ${leg} marketId`, async () => {
+    const marketId = `${leg}-market-id-${'x'.repeat(
+      256 - `${leg}-market-id-`.length
+    )}`;
+    assert.equal(marketId.length, 256);
+    const configured = setup(leg === 'spot'
+      ? { spotMarket: { marketId } }
+      : { contractMarket: { marketId } });
+
+    const result = await configured.service.run(input());
+
+    assert.equal(
+      leg === 'spot'
+        ? result.spotMarket.marketId
+        : result.contractMarket.marketId,
+      marketId
+    );
+  });
+}
+
 test('rejects different base assets or non-USDT quote markets', async () => {
   const differentBase = setup({
     contractMarket: { base: 'ETH' }

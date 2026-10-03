@@ -182,9 +182,9 @@ GTC 一旦计划或提交，系统只观察该确定性 client order ID，绝不
 
 错误体只有 `requestId` 与 `error` 两个顶层字段。`400` 表示请求格式错误，`403` 表示 Host/Origin 被拒绝，`404` 表示策略或路由不存在，`409` 表示确认锁忙、状态不允许或复检已失效，`422` 表示首次业务预检未通过，`500` 表示安全转换后的内部或存储失败。应结合具体错误码和详情判断，不能只凭状态码认为任务已失效。
 
-stdout 中，每个完成的 HTTP 请求只记录一条 `request completed`。状态码低于 `400` 时级别为 `info`，且不带失败请求快照；`4xx` 为 `warn`，`5xx` 为 `error`。失败日志包含 `httpError` 和 `httpRequest`；后者只包含 `method`、含 query 的 `url`、`body`、`truncated`、`originalByteLength`。Host/Origin 在任何 body 观察或 parser 之前检查；该边界早拒绝的 `403` 不读取或缓存攻击 payload，日志 body 为 `null`。
+stdout 中，每个完成的 HTTP 请求只记录一条 `request completed`。状态码低于 `400` 时级别为 `info`，且不带失败请求快照；`4xx` 为 `warn`，`5xx` 为 `error`。失败日志包含 `httpError` 和 `httpRequest`；后者只包含 `method`、含 query 的 `url`、`body`、`truncated`、`originalByteLength`。Host/Origin 在任何 body 观察或 parser 之前检查；该边界早拒绝的 `403` 不读取或缓存攻击 payload，日志 body 为 `null`。路由解析前发现畸形 URL 时返回结构化 `400`，保留安全响应头与一条完成日志，不读取 body，日志 URL 使用 `[Unavailable]`。
 
-全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察使用另一项固定 `1 MiB` 安全预算。路由即使显式配置更大的解析上限，也不会扩大原始观察预算；无效 body 超过该预算且没有 parsed body 时，日志 body 为 `[Unavailable]`，不会输出原始前缀。可用 body 中，当前已配置的敏感值会先被完整替换，再按 UTF-8 最多 `8192` 字节截断。因此 `1 MiB` 限制原始旁路观察，`8192` 限制最终日志输出，二者不可互换。日志不记录任何请求 headers 或响应 body，也不记录完整环境变量或原始 CCXT 请求/响应。启动与 HTTP 错误只记录受控安全详情，不透传第三方消息、任意错误属性、cause 链或 stack；凭证错误的实际值仅为 `missing` 或 `present-but-invalid`。
+全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察另有固定 `1 MiB` 安全预算；路由显式配置更大的解析上限也不会扩大观察预算。无法安全结构化的原始正文（例如畸形 JSON）一律记录为 `[Unavailable]`，不输出原文或前缀。解析后的 body 会递归隐藏 API key、secret、password、passphrase、signature、authorization、cookie 等凭证字段，以及 credentials/auth 容器；query 中对应的字段也会在解码键名后隐藏，普通诊断字段保留。当前已配置的敏感值仍先被完整替换，再将最终 body 按 UTF-8 最多 `8192` 字节截断；`1 MiB` 是原始观察安全预算，`8192` 是最终日志输出上限。任何请求 headers 和响应 body 都不记录，也不记录原始 CCXT 请求/响应、完整环境变量或任意错误属性。启动与 HTTP 错误只保留受控安全详情，不透传第三方消息、cause 链或 stack；凭证错误实际值仅为 `missing` 或 `present-but-invalid`。
 
 预检失败不会向 SQLite 写入对冲任务。同步请求失败不会再另写 `unhandled_http_request_failure`。确认返回 `202` 后，该 HTTP 请求的完成日志已经结束；之后的后台执行属于独立边界，异步失败仍记录 `background_confirmation_failed`，应结合界面持久化状态、失败码与订单生命周期事件诊断。
 

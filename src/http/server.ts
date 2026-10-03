@@ -77,6 +77,18 @@ export interface BuildServerDependencies {
 
 const HTTP_REQUEST_BODY_LOG_LIMIT = 8192;
 const UNAVAILABLE = '[Unavailable]';
+const REDACTED = '[Redacted]';
+const CREDENTIAL_KEYS = new Set([
+  'apikey',
+  'secret',
+  'password',
+  'passphrase',
+  'signature',
+  'authorization',
+  'cookie',
+  'credentials',
+  'auth'
+]);
 
 interface HttpErrorForLog {
   readonly code: string;
@@ -123,7 +135,10 @@ function isLegacyStrategyNotFound(error: unknown): boolean {
 
 type FastifyParserFailure =
   | 'FST_ERR_CTP_INVALID_JSON_BODY'
-  | 'FST_ERR_CTP_BODY_TOO_LARGE';
+  | 'FST_ERR_CTP_BODY_TOO_LARGE'
+  | 'FST_ERR_CTP_EMPTY_JSON_BODY'
+  | 'FST_ERR_CTP_INVALID_MEDIA_TYPE'
+  | 'FST_ERR_CTP_INVALID_CONTENT_LENGTH';
 
 function fastifyParserFailure(error: unknown): FastifyParserFailure | undefined {
   try {
@@ -143,9 +158,54 @@ function fastifyParserFailure(error: unknown): FastifyParserFailure | undefined 
     ) {
       return 'FST_ERR_CTP_BODY_TOO_LARGE';
     }
+    if (
+      prototype
+      === Fastify.errorCodes.FST_ERR_CTP_EMPTY_JSON_BODY.prototype
+    ) {
+      return 'FST_ERR_CTP_EMPTY_JSON_BODY';
+    }
+    if (
+      prototype
+      === Fastify.errorCodes.FST_ERR_CTP_INVALID_MEDIA_TYPE.prototype
+    ) {
+      return 'FST_ERR_CTP_INVALID_MEDIA_TYPE';
+    }
+    if (
+      prototype
+      === Fastify.errorCodes.FST_ERR_CTP_INVALID_CONTENT_LENGTH.prototype
+    ) {
+      return 'FST_ERR_CTP_INVALID_CONTENT_LENGTH';
+    }
     return undefined;
   } catch {
     return undefined;
+  }
+}
+
+function isFastifyBadUrl(error: unknown): boolean {
+  try {
+    return typeof error === 'object'
+      && error !== null
+      && !isProxy(error)
+      && Object.getPrototypeOf(error)
+        === Fastify.errorCodes.FST_ERR_BAD_URL.prototype;
+  } catch {
+    return false;
+  }
+}
+
+function parserFailureActual(failure: FastifyParserFailure): string {
+  switch (failure) {
+    case 'FST_ERR_CTP_INVALID_JSON_BODY':
+      return 'malformed JSON';
+    case 'FST_ERR_CTP_BODY_TOO_LARGE':
+      return 'body too large';
+    case 'FST_ERR_CTP_EMPTY_JSON_BODY':
+      return 'empty JSON body';
+    case 'FST_ERR_CTP_INVALID_MEDIA_TYPE':
+      return 'unsupported media type';
+    case 'FST_ERR_CTP_INVALID_CONTENT_LENGTH':
+      return 'invalid content length';
   }
 }
 
@@ -194,10 +254,15 @@ function errorSummary(detail: Readonly<ErrorDetail>): string {
     : detail.message.slice(0, subjectStart);
 }
 
+function isCredentialKey(key: string): boolean {
+  return CREDENTIAL_KEYS.has(key.toLowerCase().replace(/[_-]/gu, ''));
+}
+
 function safeJsonValue(
   value: unknown,
   secrets: readonly string[],
-  seen = new Set<object>()
+  seen = new Set<object>(),
+  redactCredentialKeys = false
 ): unknown | undefined {
   if (value === null || typeof value === 'boolean' || typeof value === 'number') {
     return Number.isFinite(value as number) || typeof value !== 'number' ? value : null;
@@ -210,7 +275,12 @@ function safeJsonValue(
     if (Array.isArray(value)) {
       const result: unknown[] = [];
       for (const item of value) {
-        const safe = safeJsonValue(item, secrets, seen);
+        const safe = safeJsonValue(
+          item,
+          secrets,
+          seen,
+          redactCredentialKeys
+        );
         result.push(safe === undefined ? null : safe);
       }
       return result;
@@ -219,10 +289,20 @@ function safeJsonValue(
     if (prototype !== Object.prototype && prototype !== null) return undefined;
     const result: Record<string, unknown> = {};
     for (const key of Object.keys(value)) {
+      const safeKey = redactText(key, secrets);
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (descriptor === undefined || !('value' in descriptor)) return undefined;
-      const safe = safeJsonValue(descriptor.value, secrets, seen);
-      if (safe !== undefined) result[redactText(key, secrets)] = safe;
+      if (redactCredentialKeys && isCredentialKey(key)) {
+        result[safeKey] = REDACTED;
+        continue;
+      }
+      const safe = safeJsonValue(
+        descriptor.value,
+        secrets,
+        seen,
+        redactCredentialKeys
+      );
+      if (safe !== undefined) result[safeKey] = safe;
     }
     return result;
   } catch {
@@ -237,16 +317,19 @@ function bodyForLog(
   state: RequestLogState,
   secrets: readonly string[]
 ): { readonly body: unknown; readonly truncated: boolean; readonly originalByteLength: number } {
+  if (!state.bodyObservationAllowed) {
+    return { body: null, truncated: false, originalByteLength: 0 };
+  }
   let body: unknown;
   const parsedBodyAvailable = request.body !== undefined;
   if (parsedBodyAvailable) {
-    body = safeJsonValue(request.body, secrets);
+    body = safeJsonValue(request.body, secrets, new Set(), true);
     if (body === undefined) body = null;
   }
-  if (!parsedBodyAvailable && state.bodyObservationAllowed) {
+  if (!parsedBodyAvailable) {
     const captured = state.capture.result();
     if (captured.status === 'complete' && captured.byteLength > 0) {
-      body = redactText(captured.body.toString('utf8'), secrets);
+      body = UNAVAILABLE;
     } else if (captured.status !== 'complete') {
       body = UNAVAILABLE;
     }
@@ -266,6 +349,42 @@ function bodyForLog(
     truncated,
     originalByteLength
   };
+}
+
+function urlForLog(url: string, secrets: readonly string[]): string {
+  if (url === UNAVAILABLE) return UNAVAILABLE;
+  try {
+    const queryStart = url.indexOf('?');
+    const path = redactText(
+      queryStart < 0 ? url : url.slice(0, queryStart),
+      secrets
+    );
+    if (queryStart < 0) return path;
+    const projected = new URLSearchParams();
+    const query = new URLSearchParams(url.slice(queryStart + 1));
+    for (const [key, value] of query) {
+      projected.append(
+        redactText(key, secrets),
+        isCredentialKey(key) ? REDACTED : redactText(value, secrets)
+      );
+    }
+    return `${path}?${projected.toString()}`;
+  } catch {
+    return UNAVAILABLE;
+  }
+}
+
+function applySecurityHeaders(reply: FastifyReply, noStore: boolean): void {
+  reply.header('Content-Security-Policy', CONTENT_SECURITY_POLICY);
+  reply.header('Referrer-Policy', 'no-referrer');
+  reply.header('X-Content-Type-Options', 'nosniff');
+  reply.header('X-Frame-Options', 'DENY');
+  if (noStore) {
+    reply.header('Cache-Control', 'no-store');
+    reply.header('Pragma', 'no-cache');
+  } else {
+    reply.header('Cache-Control', 'no-cache');
+  }
 }
 
 const PREFLIGHT_SCHEMA = {
@@ -900,6 +1019,9 @@ export function buildServer(
     ...loggerOptions,
     logController: new LogController({ disableRequestLogging: true }),
     bodyLimit: RAW_REQUEST_BODY_CAPTURE_LIMIT,
+    frameworkErrors(error, request, reply) {
+      handleFrameworkError(error, request, reply);
+    },
     schemaErrorFormatter(validation, context) {
       const error = new Error('request schema validation failed');
       frameworkValidationFailures.set(error, { validation, context });
@@ -918,6 +1040,7 @@ export function buildServer(
   const queuedStrategyIds = new Set<string>();
   const backgroundTasks = new Set<Promise<void>>();
   const requestLogStates = new WeakMap<FastifyRequest, RequestLogState>();
+  const completedRequestLogs = new WeakSet<FastifyRequest>();
 
   function rememberHttpError(
     request: FastifyRequest,
@@ -990,6 +1113,106 @@ export function buildServer(
       requestId: request.id,
       error: projected.detail
     });
+  }
+
+  function logRequestCompletion(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    providedState?: RequestLogState
+  ): void {
+    if (completedRequestLogs.has(request)) return;
+    completedRequestLogs.add(request);
+    const state = providedState ?? requestLogStates.get(request);
+    requestLogStates.delete(request);
+    try {
+      const fields: Record<string, unknown> = {
+        res: reply,
+        responseTime: reply.elapsedTime
+      };
+      const statusCode = reply.statusCode;
+      if (statusCode >= 400) {
+        const stableError = state?.httpError ?? fallbackHttpError(statusCode);
+        try {
+          const secrets = nonEmptySecrets(dependencies.secretProvider?.() ?? []);
+          const requestBody = state === undefined
+            ? {
+                body: UNAVAILABLE,
+                truncated: false,
+                originalByteLength: Buffer.byteLength(UNAVAILABLE, 'utf8')
+              }
+            : bodyForLog(request, state, secrets);
+          fields.httpError = safeJsonValue(stableError, secrets) ?? {
+            code: stableError.code,
+            message: stableError.message
+          };
+          fields.httpRequest = {
+            method: state === undefined
+              ? UNAVAILABLE
+              : redactText(state.method, secrets),
+            url: state === undefined
+              ? UNAVAILABLE
+              : urlForLog(state.url, secrets),
+            ...requestBody
+          };
+        } catch {
+          fields.httpError = {
+            code: stableError.code,
+            message: stableError.message
+          };
+          fields.httpRequest = {
+            method: UNAVAILABLE,
+            url: UNAVAILABLE,
+            body: UNAVAILABLE,
+            truncated: false,
+            originalByteLength: Buffer.byteLength(UNAVAILABLE, 'utf8')
+          };
+        }
+      }
+      const method = statusCode >= 500
+        ? request.log.error.bind(request.log)
+        : statusCode >= 400
+          ? request.log.warn.bind(request.log)
+          : request.log.info.bind(request.log);
+      nonThrowingLogCall(() => method(fields, 'request completed'));
+    } catch {
+      // Completion logging is a side channel and cannot change the response.
+    } finally {
+      state?.capture.release();
+    }
+  }
+
+  function handleFrameworkError(
+    error: unknown,
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): void {
+    const state: RequestLogState = {
+      method: request.method,
+      url: UNAVAILABLE,
+      capture: createRequestBodyCapture(),
+      bodyObservationAllowed: false
+    };
+    requestLogStates.set(request, state);
+    applySecurityHeaders(reply, true);
+    reply.raw.once('finish', () => {
+      logRequestCompletion(request, reply, state);
+    });
+    if (isFastifyBadUrl(error)) {
+      void sendHttpError(request, reply, 400, requestFailure(
+        'REQUEST_FIELD_INVALID',
+        'url',
+        'valid URL encoding',
+        'malformed URL encoding'
+      ));
+      return;
+    }
+    void sendHttpError(
+      request,
+      reply,
+      500,
+      operationFailure('framework request', error),
+      { logDetail: true, fullLogMessage: true }
+    );
   }
 
   function queueConfirmation(strategyId: string): void {
@@ -1084,58 +1307,14 @@ export function buildServer(
   });
 
   app.addHook('onResponse', async (request, reply) => {
-    const state = requestLogStates.get(request);
-    requestLogStates.delete(request);
-    const fields: Record<string, unknown> = {
-      res: reply,
-      responseTime: reply.elapsedTime
-    };
-    const statusCode = reply.statusCode;
-    if (statusCode >= 400) {
-      const stableError = state?.httpError ?? fallbackHttpError(statusCode);
-      try {
-        const secrets = nonEmptySecrets(dependencies.secretProvider?.() ?? []);
-        const requestBody = state === undefined
-          ? { body: UNAVAILABLE, truncated: false, originalByteLength: Buffer.byteLength(UNAVAILABLE, 'utf8') }
-          : bodyForLog(request, state, secrets);
-        fields.httpError = safeJsonValue(stableError, secrets) ?? {
-          code: stableError.code,
-          message: stableError.message
-        };
-        fields.httpRequest = {
-          method: state === undefined ? UNAVAILABLE : redactText(state.method, secrets),
-          url: state === undefined ? UNAVAILABLE : redactText(state.url, secrets),
-          ...requestBody
-        };
-      } catch {
-        fields.httpError = { code: stableError.code, message: stableError.message };
-        fields.httpRequest = {
-          method: UNAVAILABLE,
-          url: UNAVAILABLE,
-          body: UNAVAILABLE,
-          truncated: false,
-          originalByteLength: Buffer.byteLength(UNAVAILABLE, 'utf8')
-        };
-      }
-    }
-    const method = statusCode >= 500 ? request.log.error.bind(request.log)
-      : statusCode >= 400 ? request.log.warn.bind(request.log)
-      : request.log.info.bind(request.log);
-    nonThrowingLogCall(() => method(fields, 'request completed'));
-    state?.capture.release();
+    logRequestCompletion(request, reply);
   });
 
   app.addHook('onSend', async (request, reply) => {
-    reply.header('Content-Security-Policy', CONTENT_SECURITY_POLICY);
-    reply.header('Referrer-Policy', 'no-referrer');
-    reply.header('X-Content-Type-Options', 'nosniff');
-    reply.header('X-Frame-Options', 'DENY');
-    if (reply.statusCode >= 400 || request.url.startsWith('/api/')) {
-      reply.header('Cache-Control', 'no-store');
-      reply.header('Pragma', 'no-cache');
-    } else {
-      reply.header('Cache-Control', 'no-cache');
-    }
+    applySecurityHeaders(
+      reply,
+      reply.statusCode >= 400 || request.url.startsWith('/api/')
+    );
   });
 
   app.addHook('onClose', async () => {
@@ -1182,11 +1361,9 @@ export function buildServer(
             'REQUEST_BODY_INVALID',
             'body',
             'JSON object body',
-            frameworkCode === 'FST_ERR_CTP_INVALID_JSON_BODY'
-              ? 'malformed JSON'
-              : frameworkCode === 'FST_ERR_CTP_BODY_TOO_LARGE'
-                ? 'body too large'
-                : valueCategory(request.body)
+            frameworkCode === undefined
+              ? valueCategory(request.body)
+              : parserFailureActual(frameworkCode)
           )
         : requestFailure(
             'REQUEST_FIELD_INVALID',
@@ -1243,9 +1420,13 @@ export function buildServer(
             { logDetail: true, fullLogMessage: true }
           );
         }
-        const statusCode = trusted.detail.code.startsWith('STORAGE_')
-          ? 500
-          : 422;
+        const statusCode = trusted.detail.code === 'REQUEST_BODY_INVALID'
+          || trusted.detail.code === 'REQUEST_FIELD_INVALID'
+          ? 400
+          : trusted.detail.code === 'REQUEST_OPERATION_FAILED'
+            || trusted.detail.code.startsWith('STORAGE_')
+            ? 500
+            : 422;
         return sendHttpError(request, reply, statusCode, trusted, {
           logDetail: true
         });
