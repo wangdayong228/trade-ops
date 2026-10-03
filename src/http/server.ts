@@ -602,8 +602,14 @@ function actualFills(
 
 function valueCategory(value: unknown): string {
   if (value === null) return 'null';
-  if (Array.isArray(value)) return 'array';
-  return typeof value;
+  const category = typeof value;
+  if (category !== 'object') return category;
+  try {
+    if (isProxy(value)) return 'object';
+    return Array.isArray(value) ? 'array' : 'object';
+  } catch {
+    return 'object';
+  }
 }
 
 const REQUEST_FIELDS = new Set([
@@ -616,60 +622,200 @@ const REQUEST_FIELDS = new Set([
   'id'
 ]);
 
-function validationField(validation: unknown): string {
-  if (!Array.isArray(validation) || validation.length === 0) {
-    return 'field';
+type DataProperty =
+  | { readonly kind: 'value'; readonly value: unknown }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'unavailable' };
+
+interface ValidationEntry {
+  readonly keyword: string;
+  readonly instancePath: string;
+  readonly params: unknown;
+}
+
+interface ValidationEvidence {
+  readonly field: string;
+  readonly expected: SafeDiagnosticValue;
+  readonly actual: SafeDiagnosticValue;
+}
+
+function ownDataProperty(value: unknown, key: string): DataProperty {
+  if (typeof value !== 'object' || value === null) {
+    return { kind: 'unavailable' };
   }
-  const first = validation[0];
-  if (typeof first !== 'object' || first === null) return 'field';
   try {
-    const keyword = Reflect.get(first, 'keyword');
-    const params = Reflect.get(first, 'params');
-    if (
-      keyword === 'required'
-      && typeof params === 'object'
-      && params !== null
-    ) {
-      const missing = Reflect.get(params, 'missingProperty');
-      return typeof missing === 'string' && REQUEST_FIELDS.has(missing)
-        ? missing
-        : 'field';
-    }
-    if (keyword === 'additionalProperties') return 'field';
-    const instancePath = Reflect.get(first, 'instancePath');
-    if (typeof instancePath !== 'string') return 'field';
-    const candidate = instancePath.split('/').filter(Boolean).at(-1);
-    return candidate !== undefined && REQUEST_FIELDS.has(candidate)
-      ? candidate
-      : 'field';
+    if (isProxy(value)) return { kind: 'unavailable' };
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined) return { kind: 'missing' };
+    return 'value' in descriptor
+      ? { kind: 'value', value: descriptor.value }
+      : { kind: 'unavailable' };
   } catch {
-    return 'field';
+    return { kind: 'unavailable' };
   }
 }
 
-function validationRule(validation: unknown): string {
-  if (!Array.isArray(validation) || validation.length === 0) {
-    return 'valid request field';
+function firstValidationEntry(validation: unknown): ValidationEntry | undefined {
+  if (typeof validation !== 'object' || validation === null) {
+    return undefined;
   }
   try {
-    const first = validation[0];
-    const keyword = typeof first === 'object' && first !== null
-      ? Reflect.get(first, 'keyword')
-      : undefined;
-    switch (keyword) {
-      case 'required': return 'required field';
-      case 'additionalProperties': return 'no additional fields';
-      case 'type': return 'schema type';
-      case 'enum': return 'allowed value';
-      case 'const': return 'required constant';
-      case 'pattern': return 'matching format';
-      case 'minLength':
-      case 'maxLength': return 'permitted length';
-      default: return 'valid request field';
+    if (isProxy(validation) || !Array.isArray(validation)) return undefined;
+    const firstDescriptor = Object.getOwnPropertyDescriptor(validation, '0');
+    if (firstDescriptor === undefined || !('value' in firstDescriptor)) {
+      return undefined;
     }
+    const keyword = ownDataProperty(firstDescriptor.value, 'keyword');
+    const instancePath = ownDataProperty(firstDescriptor.value, 'instancePath');
+    const params = ownDataProperty(firstDescriptor.value, 'params');
+    if (
+      keyword.kind !== 'value'
+      || typeof keyword.value !== 'string'
+      || instancePath.kind !== 'value'
+      || typeof instancePath.value !== 'string'
+      || params.kind !== 'value'
+    ) return undefined;
+    return {
+      keyword: keyword.value,
+      instancePath: instancePath.value,
+      params: params.value
+    };
   } catch {
-    return 'valid request field';
+    return undefined;
   }
+}
+
+function validationField(entry: Readonly<ValidationEntry>): string {
+  if (entry.keyword === 'additionalProperties') return 'field';
+  if (entry.keyword === 'required') {
+    const missing = ownDataProperty(entry.params, 'missingProperty');
+    return missing.kind === 'value'
+      && typeof missing.value === 'string'
+      && REQUEST_FIELDS.has(missing.value)
+      ? missing.value
+      : 'field';
+  }
+  const match = /^\/([^/]+)$/u.exec(entry.instancePath);
+  const candidate = match?.[1];
+  return candidate !== undefined && REQUEST_FIELDS.has(candidate)
+    ? candidate
+    : 'field';
+}
+
+function schemaStringList(value: unknown): readonly string[] | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  try {
+    if (isProxy(value) || !Array.isArray(value) || value.length > 16) {
+      return undefined;
+    }
+    const result: string[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (
+        descriptor === undefined
+        || !('value' in descriptor)
+        || typeof descriptor.value !== 'string'
+        || descriptor.value.length > 2_000
+      ) return undefined;
+      result.push(descriptor.value);
+    }
+    return result;
+  } catch {
+    return undefined;
+  }
+}
+
+function validationExpected(
+  entry: Readonly<ValidationEntry>
+): SafeDiagnosticValue {
+  switch (entry.keyword) {
+    case 'required': return 'required field';
+    case 'additionalProperties': return 'no additional fields';
+    case 'type': {
+      const type = ownDataProperty(entry.params, 'type');
+      return type.kind === 'value'
+        && typeof type.value === 'string'
+        && ['string', 'number', 'integer', 'boolean', 'null', 'array', 'object']
+          .includes(type.value)
+        ? type.value
+        : 'schema type';
+    }
+    case 'enum': {
+      const values = ownDataProperty(entry.params, 'allowedValues');
+      return values.kind === 'value'
+        ? schemaStringList(values.value) ?? 'allowed values'
+        : 'allowed values';
+    }
+    case 'pattern': {
+      const pattern = ownDataProperty(entry.params, 'pattern');
+      return pattern.kind === 'value'
+        && typeof pattern.value === 'string'
+        && pattern.value.length <= 1_980
+        ? `pattern ${pattern.value}`
+        : 'matching pattern';
+    }
+    case 'minLength':
+    case 'maxLength': {
+      const limit = ownDataProperty(entry.params, 'limit');
+      return limit.kind === 'value'
+        && typeof limit.value === 'number'
+        && Number.isSafeInteger(limit.value)
+        && limit.value >= 0
+        ? `${entry.keyword} ${limit.value}`
+        : `${entry.keyword} limit`;
+    }
+    case 'const': {
+      const allowed = ownDataProperty(entry.params, 'allowedValue');
+      return allowed.kind === 'value' && typeof allowed.value === 'boolean'
+        ? allowed.value
+        : 'required constant';
+    }
+    default: return 'valid request field';
+  }
+}
+
+function validationActual(
+  entry: Readonly<ValidationEntry>,
+  field: string,
+  context: string,
+  request: FastifyRequest
+): SafeDiagnosticValue {
+  if (entry.keyword === 'required') return 'missing';
+  if (entry.keyword === 'additionalProperties') return 'extra field present';
+  if (field === 'field') return 'invalid field value';
+  const source = context === 'body'
+    ? request.body
+    : context === 'params'
+      ? request.params
+      : undefined;
+  const actual = ownDataProperty(source, field);
+  if (actual.kind === 'missing') return 'missing';
+  if (actual.kind === 'unavailable') return 'unavailable';
+  if (entry.keyword === 'const' && typeof actual.value === 'boolean') {
+    return actual.value;
+  }
+  return valueCategory(actual.value);
+}
+
+function validationEvidence(
+  validation: unknown,
+  context: string,
+  request: FastifyRequest
+): ValidationEvidence {
+  const entry = firstValidationEntry(validation);
+  if (entry === undefined) {
+    return {
+      field: 'field',
+      expected: 'valid request field',
+      actual: 'unavailable'
+    };
+  }
+  const field = validationField(entry);
+  return {
+    field,
+    expected: validationExpected(entry),
+    actual: validationActual(entry, field, context, request)
+  };
 }
 
 interface LoopbackAuthority {
@@ -1024,6 +1170,13 @@ export function buildServer(
             || Array.isArray(request.body)
           )
         );
+      const evidence = frameworkValidation === undefined
+        ? undefined
+        : validationEvidence(
+            frameworkValidation.validation,
+            frameworkValidation.context,
+            request
+          );
       const failure = bodyInvalid
         ? requestFailure(
             'REQUEST_BODY_INVALID',
@@ -1037,9 +1190,9 @@ export function buildServer(
           )
         : requestFailure(
             'REQUEST_FIELD_INVALID',
-            validationField(frameworkValidation?.validation),
-            validationRule(frameworkValidation?.validation),
-            'invalid field value'
+            evidence?.field ?? 'field',
+            evidence?.expected ?? 'valid request field',
+            evidence?.actual ?? 'unavailable'
           );
       void sendHttpError(request, reply, 400, failure);
       return;

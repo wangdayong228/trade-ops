@@ -739,6 +739,31 @@ const DETAILED_BROWSER_ERROR = {
   error: DETAILED_BROWSER_DETAIL
 } as const;
 
+const LONG_BROWSER_EXPECTED_PREFIX = 'EXPECTED-LONG-DIAGNOSTIC-';
+const LONG_BROWSER_ACTUAL_PREFIX =
+  '<img src=x onerror=LONG-ACTUAL-SENTINEL>ACTUAL-LONG-DIAGNOSTIC-';
+const LONG_BROWSER_EXPECTED = LONG_BROWSER_EXPECTED_PREFIX
+  + 'e'.repeat(2_000 - LONG_BROWSER_EXPECTED_PREFIX.length);
+const LONG_BROWSER_ACTUAL = LONG_BROWSER_ACTUAL_PREFIX
+  + 'a'.repeat(2_000 - LONG_BROWSER_ACTUAL_PREFIX.length);
+const LONG_BROWSER_DETAIL = createTradeOpsError({
+  code: 'BALANCE_INSUFFICIENT',
+  phase: 'confirmation',
+  subject: {
+    type: 'account',
+    exchangeId: 'bitget',
+    symbol: SYMBOL,
+    field: 'balance'
+  },
+  expected: LONG_BROWSER_EXPECTED,
+  actual: LONG_BROWSER_ACTUAL,
+  occurredAt: '2026-10-03T00:00:00.000Z'
+}).detail;
+const LONG_BROWSER_UNBOUNDED_DIAGNOSTIC_LENGTH =
+  LONG_BROWSER_DETAIL.message.length
+  + LONG_BROWSER_EXPECTED.length
+  + LONG_BROWSER_ACTUAL.length;
+
 function assertDetailedBrowserMessage(
   message: string,
   operation: string,
@@ -1015,6 +1040,92 @@ test('operator UI bounds detailed server errors and labels invalid success respo
     assert.equal(browser.element('strategy-state').textContent, '—');
     assert.equal(browser.element('confirm-button').disabled, true);
   });
+});
+
+test('operator UI preserves long structured error fields within bounded text', async () => {
+  assert.deepEqual(
+    parseErrorDetail(LONG_BROWSER_DETAIL),
+    LONG_BROWSER_DETAIL
+  );
+  const browser = await browserHarness();
+  browser.setFetch(async (url) => {
+    assert.equal(url, '/api/hedges/preflight');
+    return browserResponse(422, {
+      requestId: 'request-long-detail',
+      error: LONG_BROWSER_DETAIL
+    });
+  });
+
+  await browser.element('preflight-form').emit('submit');
+
+  const element = browser.element('operator-message');
+  const message = element.textContent;
+  assert.match(message, /代码[：:].*BALANCE_INSUFFICIENT/);
+  assert.match(message, /消息[：:]/);
+  assert.match(message, /阶段[：:].*confirmation/);
+  assert.match(message, /对象[：:].*account/);
+  assert.match(message, new RegExp(`期望[：:].*${LONG_BROWSER_EXPECTED_PREFIX}`));
+  assert.match(message, new RegExp(`实际[：:].*${LONG_BROWSER_ACTUAL_PREFIX}`));
+  assert.match(message, /请求 ID[：:].*request-long-detail/);
+  assert.match(message, /…\[truncated\]/);
+  assert.ok(message.length < LONG_BROWSER_UNBOUNDED_DIAGNOSTIC_LENGTH);
+  assert.match(message, /<img src=x onerror=LONG-ACTUAL-SENTINEL>/);
+  assert.deepEqual(element.children, []);
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI bounds long persisted invalidation without enabling confirmation', async () => {
+  assert.deepEqual(
+    parseErrorDetail(LONG_BROWSER_DETAIL),
+    LONG_BROWSER_DETAIL
+  );
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174020';
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    state: 'PREFLIGHT_INVALIDATED',
+    failureCode: null,
+    preflightFailure: LONG_BROWSER_DETAIL
+  });
+  status.orders = [];
+  setBrowserActualFills(status, '0', '0', '0');
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url) => {
+    assert.equal(url, `/api/hedges/${strategyId}`);
+    return browserResponse(200, status);
+  });
+
+  await browser.element('resume-form').emit('submit');
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  await browser.element('confirm-button').emit('click');
+
+  assert.equal(
+    browser.element('strategy-state').textContent,
+    'PREFLIGHT_INVALIDATED'
+  );
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, false);
+  assert.equal(
+    browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
+    0
+  );
+  const element = browser.element('operator-message');
+  const message = element.textContent;
+  assert.match(message, /重新预检/);
+  assert.match(message, /代码[：:].*BALANCE_INSUFFICIENT/);
+  assert.match(message, /消息[：:]/);
+  assert.match(message, /阶段[：:].*confirmation/);
+  assert.match(message, /对象[：:].*account/);
+  assert.match(message, new RegExp(`期望[：:].*${LONG_BROWSER_EXPECTED_PREFIX}`));
+  assert.match(message, new RegExp(`实际[：:].*${LONG_BROWSER_ACTUAL_PREFIX}`));
+  assert.match(message, /…\[truncated\]/);
+  assert.ok(message.length < LONG_BROWSER_UNBOUNDED_DIAGNOSTIC_LENGTH);
+  assert.match(message, /<img src=x onerror=LONG-ACTUAL-SENTINEL>/);
+  assert.deepEqual(element.children, []);
 });
 
 test('lists only configured exchange ids', async (t) => {
@@ -1602,6 +1713,229 @@ test('preflight never coerces runtime types for any string field', async (t) => 
     }
   }
   assert.equal(preflightInputs.length, 0);
+});
+
+test('AJV field failures expose trusted schema evidence without echoing request values', async (t) => {
+  interface DiagnosticCase {
+    readonly name: string;
+    readonly request: {
+      readonly method: 'GET' | 'POST';
+      readonly url: string;
+      readonly payload?: Readonly<Record<string, unknown>>;
+    };
+    readonly field: string;
+    readonly forbidden: readonly string[];
+    readonly assertExpected: (value: ErrorDetail['expected']) => void;
+    readonly assertActual: (value: ErrorDetail['actual']) => void;
+  }
+
+  const fixture = setup(t);
+  const valid = {
+    spotExchangeId: 'bitget',
+    contractExchangeId: 'okx',
+    symbol: SYMBOL,
+    requestedBaseQuantity: '1',
+    mode: 'CONCURRENT'
+  };
+  const typeCases = [
+    { name: 'number', value: 7, category: 'number', forbidden: [] },
+    { name: 'boolean', value: true, category: 'boolean', forbidden: [] },
+    { name: 'null', value: null, category: 'null', forbidden: [] },
+    { name: 'array', value: ['1'], category: 'array', forbidden: [] },
+    {
+      name: 'object',
+      value: { value: 'AJV-TYPE-SECRET-SENTINEL' },
+      category: 'object',
+      forbidden: ['AJV-TYPE-SECRET-SENTINEL']
+    }
+  ] as const;
+  const cases: DiagnosticCase[] = [
+    {
+      name: 'required body field',
+      request: {
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        payload: {
+          spotExchangeId: 'bitget',
+          contractExchangeId: 'okx',
+          symbol: SYMBOL,
+          requestedBaseQuantity: '1'
+        }
+      },
+      field: 'mode',
+      forbidden: [],
+      assertExpected(value) {
+        assert.ok(typeof value === 'string');
+        assert.match(value, /required/i);
+      },
+      assertActual(value) {
+        assert.equal(value, 'missing');
+      }
+    },
+    {
+      name: 'additional body field',
+      request: {
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        payload: {
+          ...valid,
+          apiKey: 'AJV-EXTRA-SECRET-SENTINEL'
+        }
+      },
+      field: 'field',
+      forbidden: ['apiKey', 'AJV-EXTRA-SECRET-SENTINEL'],
+      assertExpected(value) {
+        assert.ok(typeof value === 'string');
+        assert.match(value, /additional/i);
+      },
+      assertActual(value) {
+        assert.ok(typeof value === 'string');
+        assert.match(value, /present/i);
+      }
+    },
+    ...typeCases.map(({ name, value, category, forbidden }) => ({
+      name: `body type ${name}`,
+      request: {
+        method: 'POST' as const,
+        url: '/api/hedges/preflight',
+        payload: { ...valid, requestedBaseQuantity: value }
+      },
+      field: 'requestedBaseQuantity',
+      forbidden,
+      assertExpected(expected: ErrorDetail['expected']): void {
+        assert.equal(expected, 'string');
+      },
+      assertActual(actual: ErrorDetail['actual']): void {
+        assert.equal(actual, category);
+      }
+    })),
+    {
+      name: 'enum body field',
+      request: {
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        payload: { ...valid, mode: 'AUTO' }
+      },
+      field: 'mode',
+      forbidden: ['AUTO'],
+      assertExpected(value) {
+        assert.deepEqual(value, [
+          'CONCURRENT',
+          'CONTRACT_FIRST',
+          'SPOT_FIRST'
+        ]);
+      },
+      assertActual(value) {
+        assert.equal(value, 'string');
+      }
+    },
+    {
+      name: 'pattern body field',
+      request: {
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        payload: {
+          ...valid,
+          requestedBaseQuantity: 'AJV-PATTERN-SECRET-SENTINEL'
+        }
+      },
+      field: 'requestedBaseQuantity',
+      forbidden: ['AJV-PATTERN-SECRET-SENTINEL'],
+      assertExpected(value) {
+        assert.ok(typeof value === 'string');
+        assert.match(value, /pattern/i);
+        assert.match(value, /\[1-9\]/);
+      },
+      assertActual(value) {
+        assert.equal(value, 'string');
+      }
+    },
+    {
+      name: 'maximum length body field',
+      request: {
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        payload: { ...valid, requestedBaseQuantity: '1'.repeat(257) }
+      },
+      field: 'requestedBaseQuantity',
+      forbidden: ['1'.repeat(257)],
+      assertExpected(value) {
+        assert.ok(typeof value === 'string');
+        assert.match(value, /maxLength/i);
+        assert.match(value, /256/);
+      },
+      assertActual(value) {
+        assert.equal(value, 'string');
+      }
+    },
+    {
+      name: 'pattern params field',
+      request: {
+        method: 'GET',
+        url: '/api/hedges/invalid.id'
+      },
+      field: 'id',
+      forbidden: ['invalid.id'],
+      assertExpected(value) {
+        assert.ok(typeof value === 'string');
+        assert.match(value, /pattern/i);
+        assert.match(value, /A-Za-z0-9/);
+      },
+      assertActual(value) {
+        assert.equal(value, 'string');
+      }
+    },
+    {
+      name: 'constant confirmation field',
+      request: {
+        method: 'POST',
+        url: '/api/hedges/123e4567-e89b-42d3-a456-426614174000/confirm',
+        payload: { riskAcknowledged: false }
+      },
+      field: 'riskAcknowledged',
+      forbidden: [],
+      assertExpected(value) {
+        assert.equal(value, true);
+      },
+      assertActual(value) {
+        assert.equal(value, false);
+      }
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const response = await fixture.server.inject({
+        method: item.request.method,
+        url: item.request.url,
+        headers: LOCAL_HEADERS,
+        ...(item.request.payload === undefined
+          ? {}
+          : { payload: item.request.payload })
+      });
+
+      assert.equal(response.statusCode, 400);
+      const detail = assertPublicHttpError(response, {
+        code: 'REQUEST_FIELD_INVALID',
+        phase: 'request'
+      });
+      assert.deepEqual(detail.subject, {
+        type: 'request',
+        field: item.field
+      });
+      assert.deepEqual(parseErrorDetail(detail), detail);
+      for (const forbidden of item.forbidden) {
+        assert.equal(response.body.includes(forbidden), false);
+      }
+      item.assertExpected(detail.expected);
+      item.assertActual(detail.actual);
+    });
+  }
+
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(fixture.repository.listRecoverable().length, 0);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
 });
 
 test('preflight preserves heterogeneous trusted business errors as 422', async (t) => {

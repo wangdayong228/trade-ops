@@ -1429,7 +1429,7 @@ async function responseJson(response) {
   }
 }
 
-const operatorErrorTextLimit = 2000;
+const operatorErrorLineLimit = 256;
 const operatorTruncationSuffix = '…[truncated]';
 
 class OperatorRequestError extends Error {
@@ -1439,15 +1439,13 @@ class OperatorRequestError extends Error {
   }
 }
 
-function boundedOperatorText(value) {
-  if (typeof value !== 'string' || value.length === 0) {
-    return null;
-  }
-  return value.length <= operatorErrorTextLimit
-    ? value
-    : `${value.slice(
+function boundedOperatorLine(label, value) {
+  const line = `${label}：${value}`;
+  return line.length <= operatorErrorLineLimit
+    ? line
+    : `${line.slice(
         0,
-        operatorErrorTextLimit - operatorTruncationSuffix.length
+        operatorErrorLineLimit - operatorTruncationSuffix.length
       )}${operatorTruncationSuffix}`;
 }
 
@@ -1488,12 +1486,12 @@ function formattedDiagnostic(value) {
 
 function detailLines(detail) {
   return [
-    `代码：${detail.code}`,
-    `消息：${detail.message}`,
-    `阶段：${detail.phase}`,
-    `对象：${formattedSubject(detail.subject)}`,
-    `期望：${formattedDiagnostic(detail.expected)}`,
-    `实际：${formattedDiagnostic(detail.actual)}`
+    boundedOperatorLine('代码', detail.code),
+    boundedOperatorLine('消息', detail.message),
+    boundedOperatorLine('阶段', detail.phase),
+    boundedOperatorLine('对象', formattedSubject(detail.subject)),
+    boundedOperatorLine('期望', formattedDiagnostic(detail.expected)),
+    boundedOperatorLine('实际', formattedDiagnostic(detail.actual))
   ];
 }
 
@@ -1514,13 +1512,12 @@ function serverFailureMessage(operation, response, body) {
     const envelope = exactObject(body, ['requestId', 'error']);
     const requestId = requiredString(envelope.requestId, 2000);
     const detail = validatedErrorDetail(envelope.error);
-    const message = [
+    return [
       `${operation}失败`,
       `HTTP ${response.status}`,
       ...detailLines(detail),
-      `请求 ID：${requestId}`
+      boundedOperatorLine('请求 ID', requestId)
     ].join('\n');
-    return boundedOperatorText(message) ?? invalid;
   } catch {
     return invalid;
   }
