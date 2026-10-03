@@ -2,7 +2,7 @@
 
 > 执行代理：使用 `subagent-driven-development` 逐项实施。用户已授权完成本计划并实施，过程自动确认；按 TDD 和任务审查连续推进。
 
-**状态：已批准（2026-10-02，用户授权自动确认计划及实施）**
+**状态：已完成（2026-10-04；六项任务、最终审查修复与全部验证完成。用户于 2026-10-02 授权自动确认计划及实施。）**
 
 **目标：** 落实同日已批准 spec 的有序预检、同步确认复检及安全精确错误，在现有对账与 schema v2 基础上交付完整 HTTP/UI 行为。
 
@@ -175,8 +175,8 @@ class ConfirmationService {
 - [x] GREEN：为每个启动边界转换异常，保留已有可信 detail，不以 SERVICE_COMPONENT_FAILED 覆盖具体配置/schema/所有权错误；不更改资金费率业务逻辑；入口日志只保留安全详情，日志异常不影响退出状态或清理。
 - [x] 文档：README 与操作员指南同步确认/失效状态、错误响应例子、schema v3 自动迁移、操作员重新预检步骤；修正指南中 EXECUTING 可重复确认的旧说明，保留单进程数据库及监控恢复说明。
 - [x] 集成验证：`npm test`；`git diff --check`；确认所有预检/确认路径与源码调用方类型一致，未引入真实网络测试。
-- [ ] 最终审查：按 affected-path review 要求对六任务 diff 及受影响调用链做资金/安全审查；修复所有重要发现并运行相关回归。若 skill 文件不可用，明确记录并用同范围只读风险审查完成工作。
-- [ ] 完成核对：`verification-before-completion` → `consistency-check` → `post-verification-check`；逐项勾选计划并记录实际命令、exit status、结果。主代理给出 worktree/branch、测试结果与剩余限制。
+- [x] 最终审查：按 affected-path review 要求对六任务 diff 及受影响调用链做资金/安全审查；修复所有重要发现并运行相关回归。若 skill 文件不可用，明确记录并用同范围只读风险审查完成工作。
+- [x] 完成核对：`verification-before-completion` → `consistency-check` → `post-verification-check`；逐项勾选计划并记录实际命令、exit status、结果。主代理给出 worktree/branch、测试结果与剩余限制。
 
 ## 最终审查修复范围（2026-10-04）
 
@@ -197,7 +197,12 @@ class ConfirmationService {
 - 任务 RED/GREEN、审查及最终命令结果追加到 `.superpowers/sdd/progress.md`；每任务简报、报告与 diff 存同目录，不读取会话日志或真实业务数据。
 
 - 2026-10-04，Task 1–6 实现和任务审查已通过；源码提交 `6391b82`，功能基线 `4e8086c`。Task 6 审查修复了部分 signal 注册失败的资源清理和 SQLite 异常 `code` 的安全读取。
-- 主代理最终集成命令：`npm test`，exit 0，**1419 passed / 0 failed / 0 skipped**，包含 TypeScript build；完整输出 `.superpowers/sdd/final-test.log`。
+- 最终审查前的主代理集成命令：`npm test`，exit 0，1419 passed / 0 failed / 0 skipped；完整输出 `.superpowers/sdd/final-test.log`。
 - `git diff --check`：exit 0；原工作区清单的 10 个文件 SHA256 全部保持。
 - 验证环境：Node.js v26.0.0；fake gateways、合成环境、临时或内存 SQLite、真实 UI 代码的 VM/fake DOM。未执行 Node 20/24 矩阵、真实交易所或真实浏览器布局验证。
-- 最终全功能风险审查与一致性/checkbox 核对正在进行，完成后补充结论。
+- 最终全功能风险审查完成：原审查者分别确认 F3/F4 与 F1/F2/F5/F6 全部关闭，spec compliance 与 quality 均通过，无遗留发现。`affected-path-review` skill 不可用时，按计划采用同范围只读风险审查；完整报告在 `.superpowers/sdd/final-repair-execution-review.md` 与 `.superpowers/sdd/final-repair-boundaries-review.md`。
+
+- 最终审查 F1–F6 修复提交 `cf5aea8`（base `6391b82`）：七组定向回归全部通过，相关模块 725/725；主代理独立 `npm test` exit 0，**1443 passed / 0 failed / 0 skipped**，含 TypeScript build，完整输出 `.superpowers/sdd/final-repair-full-test.log`；`git diff --check` exit 0。原审查者已完成复核；boundary 定向命令另通过 17/17，并通过重复敏感 query、畸形 URL 日志故障旁路探针。
+
+- 完成核对：`consistency-check` 五维检查全部通过；`post-verification-check` 重读本计划，总计 **30** 项，原已勾选 **28** 项，本次补勾 **2** 项，未完成 **0** 项。代码与测试在最终验证后未再修改。
+- 交付保留本地分支 `feature/ordered-preflight-confirmation-v2` 与工作树 `.worktrees/ordered-preflight-confirmation`；原工作区文件保持，不合并或推送。
