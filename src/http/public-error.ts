@@ -1,49 +1,35 @@
-import { safeError } from '../logging/logger.js';
+import {
+  createTradeOpsError,
+  withErrorPhase,
+  type ErrorDetail,
+  type TradeOpsError
+} from '../errors/trade-ops-error.js';
 
-export const PUBLIC_ERROR_TEXT_LIMIT = 2_000;
-const TRUNCATION_SUFFIX = '…[truncated]';
-
-export interface PublicErrorDetail {
-  readonly type: string;
-  readonly message: string;
-  readonly code?: string | number;
-}
-
-function bounded(value: string): string {
-  if (value.length <= PUBLIC_ERROR_TEXT_LIMIT) {
-    return value;
-  }
-  return `${value.slice(
-    0,
-    PUBLIC_ERROR_TEXT_LIMIT - TRUNCATION_SUFFIX.length
-  )}${TRUNCATION_SUFFIX}`;
-}
-
-function numericCode(error: unknown): number | undefined {
-  if (typeof error !== 'object' || error === null) {
-    return undefined;
-  }
-  try {
-    const value: unknown = Reflect.get(error, 'code');
-    return typeof value === 'number' && Number.isFinite(value)
-      ? value
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
+export type PublicErrorDetail = ErrorDetail;
 
 export function publicErrorDetail(
   error: unknown,
   secrets: readonly string[]
-): PublicErrorDetail {
-  const safe = safeError(error, secrets);
-  const code = safe.code === undefined
-    ? numericCode(error)
-    : bounded(safe.code);
-  return {
-    type: bounded(safe.type),
-    message: bounded(safe.message),
-    ...(code === undefined ? {} : { code })
-  };
+): PublicErrorDetail | undefined {
+  let trusted: TradeOpsError;
+  try {
+    trusted = error as TradeOpsError;
+    withErrorPhase(trusted, 'request');
+  } catch {
+    return undefined;
+  }
+
+  try {
+    const detail = trusted.detail;
+    return createTradeOpsError({
+      code: detail.code,
+      phase: detail.phase,
+      subject: detail.subject,
+      expected: detail.expected,
+      actual: detail.actual,
+      occurredAt: detail.occurredAt
+    }, secrets).detail;
+  } catch {
+    return undefined;
+  }
 }

@@ -62,6 +62,7 @@ const ALL_ERROR_CODES = [
   'REQUEST_BODY_INVALID',
   'REQUEST_FIELD_INVALID',
   'REQUEST_OPERATION_FAILED',
+  'REQUEST_ROUTE_NOT_FOUND',
   'STRATEGY_NOT_FOUND',
   'STRATEGY_STATE_MISMATCH',
   'STRATEGY_OPERATION_BUSY',
@@ -112,6 +113,7 @@ const SUBJECT_BY_CODE: Readonly<Record<string, ErrorSubject>> = {
   REQUEST_BODY_INVALID: { type: 'request', field: 'body' },
   REQUEST_FIELD_INVALID: { type: 'request', field: 'requestedBaseQuantity' },
   REQUEST_OPERATION_FAILED: { type: 'request', field: 'preflight' },
+  REQUEST_ROUTE_NOT_FOUND: { type: 'request', field: 'route' },
   STRATEGY_NOT_FOUND: { type: 'strategy', strategyId: 'strategy-test' },
   STRATEGY_STATE_MISMATCH: {
     type: 'strategy', strategyId: 'strategy-test', field: 'state'

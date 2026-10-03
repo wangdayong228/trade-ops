@@ -1,10 +1,12 @@
 import { resolve } from 'node:path';
+import { isNativeError, isProxy } from 'node:util/types';
 import staticPlugin from '@fastify/static';
 import { Decimal } from 'decimal.js';
 import Fastify, {
   LogController,
   type FastifyBaseLogger,
   type FastifyInstance,
+  type FastifyReply,
   type FastifyRequest,
   type FastifyServerOptions
 } from 'fastify';
@@ -21,6 +23,7 @@ import type {
 } from '../storage/strategy-repository.js';
 import { StrategyNotFoundError } from '../storage/strategy-repository.js';
 import type { HedgeCoordinator } from '../strategy/hedge-coordinator.js';
+import type { ConfirmationService } from '../strategy/confirmation-service.js';
 import type {
   PreflightInput,
   PreflightResult,
@@ -32,11 +35,18 @@ import {
   nonThrowingLogCall,
   nonThrowingOperationalLog,
   redactText,
-  safeError,
   utf8Prefix,
-  type OperationalLog,
-  type SafeError
+  type OperationalLog
 } from '../logging/logger.js';
+import {
+  createTradeOpsError,
+  safeFailureCategory,
+  withErrorPhase,
+  type ErrorCode,
+  type ErrorDetail,
+  type SafeDiagnosticValue,
+  type TradeOpsError
+} from '../errors/trade-ops-error.js';
 import {
   createRequestBodyCapture,
   createRequestBodyCaptureTransform,
@@ -53,6 +63,7 @@ export { LOGGER_REDACT_PATHS } from '../logging/logger.js';
 export interface BuildServerDependencies {
   readonly registry: Pick<ExchangeRegistry, 'ids'>;
   readonly preflightService: Pick<PreflightService, 'run'>;
+  readonly confirmationService: Pick<ConfirmationService, 'confirm'>;
   readonly repository: StrategyRepository;
   readonly coordinator: Pick<HedgeCoordinator, 'confirmAndExecute'>;
   readonly logger?: FastifyServerOptions['logger'];
@@ -70,7 +81,7 @@ const UNAVAILABLE = '[Unavailable]';
 interface HttpErrorForLog {
   readonly code: string;
   readonly message: string;
-  readonly error?: SafeError;
+  readonly error?: PublicErrorDetail;
 }
 
 interface RequestLogState {
@@ -86,6 +97,101 @@ function fallbackHttpError(statusCode: number): HttpErrorForLog {
     code: 'HTTP_ERROR',
     message: `HTTP request failed with status ${statusCode}`
   };
+}
+
+function trustedFailure(error: unknown): TradeOpsError | undefined {
+  try {
+    const trusted = error as TradeOpsError;
+    withErrorPhase(trusted, 'request');
+    return trusted;
+  } catch {
+    return undefined;
+  }
+}
+
+function isLegacyStrategyNotFound(error: unknown): boolean {
+  try {
+    return typeof error === 'object'
+      && error !== null
+      && !isProxy(error)
+      && isNativeError(error)
+      && Object.getPrototypeOf(error) === StrategyNotFoundError.prototype;
+  } catch {
+    return false;
+  }
+}
+
+type FastifyParserFailure =
+  | 'FST_ERR_CTP_INVALID_JSON_BODY'
+  | 'FST_ERR_CTP_BODY_TOO_LARGE';
+
+function fastifyParserFailure(error: unknown): FastifyParserFailure | undefined {
+  try {
+    if (typeof error !== 'object' || error === null || isProxy(error)) {
+      return undefined;
+    }
+    const prototype = Object.getPrototypeOf(error);
+    if (
+      prototype
+      === Fastify.errorCodes.FST_ERR_CTP_INVALID_JSON_BODY.prototype
+    ) {
+      return 'FST_ERR_CTP_INVALID_JSON_BODY';
+    }
+    if (
+      prototype
+      === Fastify.errorCodes.FST_ERR_CTP_BODY_TOO_LARGE.prototype
+    ) {
+      return 'FST_ERR_CTP_BODY_TOO_LARGE';
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function requestFailure(
+  code: Extract<ErrorCode,
+    | 'REQUEST_FORBIDDEN'
+    | 'REQUEST_BODY_INVALID'
+    | 'REQUEST_FIELD_INVALID'
+    | 'REQUEST_OPERATION_FAILED'
+    | 'REQUEST_ROUTE_NOT_FOUND'>,
+  field: string,
+  expected: SafeDiagnosticValue,
+  actual: SafeDiagnosticValue
+): TradeOpsError {
+  return createTradeOpsError({
+    code,
+    phase: 'request',
+    subject: { type: 'request', field },
+    expected,
+    actual
+  });
+}
+
+function operationFailure(operation: string, error: unknown): TradeOpsError {
+  return requestFailure(
+    'REQUEST_OPERATION_FAILED',
+    operation,
+    `successful ${operation}`,
+    safeFailureCategory(error)
+  );
+}
+
+function projectionFallback(): TradeOpsError {
+  return requestFailure(
+    'REQUEST_OPERATION_FAILED',
+    'errorProjection',
+    'safe public error detail',
+    'projection unavailable'
+  );
+}
+
+function errorSummary(detail: Readonly<ErrorDetail>): string {
+  const subjectStart = detail.message.indexOf('（');
+  return subjectStart < 0
+    ? '请求处理失败'
+    : detail.message.slice(0, subjectStart);
 }
 
 function safeJsonValue(
@@ -301,7 +407,8 @@ function publicPreflight(
 }
 
 function publicStrategy(
-  strategy: Readonly<StrategyRecord>
+  strategy: Readonly<StrategyRecord>,
+  preflightFailure: PublicErrorDetail | null
 ): Record<string, unknown> {
   return {
     id: strategy.id,
@@ -313,6 +420,7 @@ function publicStrategy(
     requestedBaseQuantity: strategy.requestedBaseQuantity,
     effectiveBaseQuantity: strategy.effectiveBaseQuantity,
     failureCode: strategy.failureCode,
+    preflightFailure,
     createdAt: strategy.createdAt,
     updatedAt: strategy.updatedAt
   };
@@ -492,48 +600,76 @@ function actualFills(
   };
 }
 
-function errorProperty(
-  error: unknown,
-  property: 'code' | 'validation'
-): unknown {
-  if (typeof error !== 'object' || error === null) {
-    return undefined;
+function valueCategory(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+const REQUEST_FIELDS = new Set([
+  'spotExchangeId',
+  'contractExchangeId',
+  'symbol',
+  'requestedBaseQuantity',
+  'mode',
+  'riskAcknowledged',
+  'id'
+]);
+
+function validationField(validation: unknown): string {
+  if (!Array.isArray(validation) || validation.length === 0) {
+    return 'field';
+  }
+  const first = validation[0];
+  if (typeof first !== 'object' || first === null) return 'field';
+  try {
+    const keyword = Reflect.get(first, 'keyword');
+    const params = Reflect.get(first, 'params');
+    if (
+      keyword === 'required'
+      && typeof params === 'object'
+      && params !== null
+    ) {
+      const missing = Reflect.get(params, 'missingProperty');
+      return typeof missing === 'string' && REQUEST_FIELDS.has(missing)
+        ? missing
+        : 'field';
+    }
+    if (keyword === 'additionalProperties') return 'field';
+    const instancePath = Reflect.get(first, 'instancePath');
+    if (typeof instancePath !== 'string') return 'field';
+    const candidate = instancePath.split('/').filter(Boolean).at(-1);
+    return candidate !== undefined && REQUEST_FIELDS.has(candidate)
+      ? candidate
+      : 'field';
+  } catch {
+    return 'field';
+  }
+}
+
+function validationRule(validation: unknown): string {
+  if (!Array.isArray(validation) || validation.length === 0) {
+    return 'valid request field';
   }
   try {
-    return Reflect.get(error, property);
-  } catch {
-    return undefined;
-  }
-}
-
-interface PublicHttpError {
-  readonly code: string;
-  readonly message: string;
-  readonly requestId: string;
-  readonly error?: PublicErrorDetail;
-}
-
-function publicHttpError(
-  requestId: string,
-  code: string,
-  message: string,
-  error: unknown | undefined,
-  secretProvider: (() => readonly string[]) | undefined
-): PublicHttpError {
-  let detail: PublicErrorDetail | undefined;
-  if (error !== undefined && secretProvider !== undefined) {
-    try {
-      detail = publicErrorDetail(error, secretProvider());
-    } catch {
-      detail = undefined;
+    const first = validation[0];
+    const keyword = typeof first === 'object' && first !== null
+      ? Reflect.get(first, 'keyword')
+      : undefined;
+    switch (keyword) {
+      case 'required': return 'required field';
+      case 'additionalProperties': return 'no additional fields';
+      case 'type': return 'schema type';
+      case 'enum': return 'allowed value';
+      case 'const': return 'required constant';
+      case 'pattern': return 'matching format';
+      case 'minLength':
+      case 'maxLength': return 'permitted length';
+      default: return 'valid request field';
     }
+  } catch {
+    return 'valid request field';
   }
-  return {
-    code,
-    message,
-    requestId,
-    ...(detail === undefined ? {} : { error: detail })
-  };
 }
 
 interface LoopbackAuthority {
@@ -602,6 +738,11 @@ function matchingLoopbackOrigin(
 export function buildServer(
   dependencies: BuildServerDependencies
 ): FastifyInstance {
+  const frameworkValidationFailures = new WeakMap<object, {
+    readonly validation: readonly unknown[];
+    readonly context: string;
+  }>();
+  const requestsEnteringHandlers = new WeakSet<FastifyRequest>();
   const loggerOptions = dependencies.loggerInstance === undefined
     ? {
         logger: dependencies.logger ?? {
@@ -613,6 +754,11 @@ export function buildServer(
     ...loggerOptions,
     logController: new LogController({ disableRequestLogging: true }),
     bodyLimit: RAW_REQUEST_BODY_CAPTURE_LIMIT,
+    schemaErrorFormatter(validation, context) {
+      const error = new Error('request schema validation failed');
+      frameworkValidationFailures.set(error, { validation, context });
+      return error;
+    },
     ajv: {
       customOptions: {
         coerceTypes: false,
@@ -629,21 +775,75 @@ export function buildServer(
 
   function rememberHttpError(
     request: FastifyRequest,
-    code: string,
-    message: string,
-    error?: unknown
+    error: HttpErrorForLog
   ): void {
     const state = requestLogStates.get(request);
     if (state === undefined) return;
-    let detail: SafeError | undefined;
-    if (error !== undefined) {
-      try {
-        detail = safeError(error, nonEmptySecrets(dependencies.secretProvider?.() ?? []));
-      } catch {
-        detail = undefined;
+    state.httpError = error;
+  }
+
+  function projectFailure(error: unknown): {
+    readonly detail: PublicErrorDetail;
+    readonly specific: boolean;
+  } {
+    try {
+      const secrets = nonEmptySecrets(dependencies.secretProvider?.() ?? []);
+      const detail = publicErrorDetail(error, secrets);
+      if (detail !== undefined) {
+        return { detail, specific: true };
       }
+      const fallback = publicErrorDetail(projectionFallback(), secrets);
+      if (fallback !== undefined) {
+        return { detail: fallback, specific: false };
+      }
+    } catch {
+      // Public diagnostics are allowed to degrade without changing behavior.
     }
-    state.httpError = { code, message, ...(detail === undefined ? {} : { error: detail }) };
+    return { detail: projectionFallback().detail, specific: false };
+  }
+
+  function projectPersistedFailure(
+    detail: Readonly<ErrorDetail> | null
+  ): PublicErrorDetail | null {
+    if (detail === null) return null;
+    try {
+      const error = createTradeOpsError({
+        code: detail.code,
+        phase: detail.phase,
+        subject: detail.subject,
+        expected: detail.expected,
+        actual: detail.actual,
+        occurredAt: detail.occurredAt
+      });
+      return projectFailure(error).detail;
+    } catch {
+      return projectFailure(projectionFallback()).detail;
+    }
+  }
+
+  function sendHttpError(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    statusCode: number,
+    failure: TradeOpsError,
+    options: {
+      readonly logDetail?: boolean;
+      readonly fullLogMessage?: boolean;
+    } = {}
+  ): FastifyReply {
+    const projected = projectFailure(failure);
+    const logDetail = options.logDetail === true && projected.specific;
+    rememberHttpError(request, {
+      code: projected.detail.code,
+      message: options.fullLogMessage === true && projected.specific
+        ? projected.detail.message
+        : errorSummary(projected.detail),
+      ...(logDetail ? { error: projected.detail } : {})
+    });
+    return reply.status(statusCode).send({
+      requestId: request.id,
+      error: projected.detail
+    });
   }
 
   function queueConfirmation(strategyId: string): void {
@@ -683,34 +883,37 @@ export function buildServer(
       request.headers.host,
       LOCAL_HTTP_PROTOCOL
     );
-    const isStateChangingPost = request.method === 'POST';
-    const origin = request.headers.origin;
+    if (requestAuthority === null) {
+      return sendHttpError(request, reply, 403, requestFailure(
+        'REQUEST_FORBIDDEN',
+        'host',
+        'valid loopback authority',
+        'invalid or missing'
+      ));
+    }
+    if (request.method === 'POST' && !matchingLoopbackOrigin(
+      request.headers.origin,
+      requestAuthority,
+      LOCAL_HTTP_PROTOCOL
+    )) {
+      return sendHttpError(request, reply, 403, requestFailure(
+        'REQUEST_FORBIDDEN',
+        'origin',
+        'matching loopback origin',
+        'invalid or missing'
+      ));
+    }
     const fetchSite = request.headers['sec-fetch-site'];
-    const forbidden = (
-      requestAuthority === null
-      || (
-        isStateChangingPost
-        && (
-          !matchingLoopbackOrigin(
-            origin,
-            requestAuthority,
-            LOCAL_HTTP_PROTOCOL
-          )
-          || (
-            typeof fetchSite === 'string'
-            && fetchSite.toLowerCase() === 'cross-site'
-          )
-        )
-      )
-    );
-    if (forbidden) {
-      rememberHttpError(request, 'FORBIDDEN', 'Request forbidden');
-      return reply.status(403).send(publicHttpError(
-        request.id,
-        'FORBIDDEN',
-        'Request forbidden',
-        undefined,
-        dependencies.secretProvider
+    if (
+      request.method === 'POST'
+      && typeof fetchSite === 'string'
+      && fetchSite.toLowerCase() === 'cross-site'
+    ) {
+      return sendHttpError(request, reply, 403, requestFailure(
+        'REQUEST_FORBIDDEN',
+        'fetchSite',
+        'same-origin request',
+        'cross-site'
       ));
     }
     const state = requestLogStates.get(request);
@@ -728,6 +931,10 @@ export function buildServer(
     if (state !== undefined && request.body !== undefined) {
       state.capture.release();
     }
+  });
+
+  app.addHook('preHandler', async (request) => {
+    requestsEnteringHandlers.add(request);
   });
 
   app.addHook('onResponse', async (request, reply) => {
@@ -777,7 +984,7 @@ export function buildServer(
     reply.header('Referrer-Policy', 'no-referrer');
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('X-Frame-Options', 'DENY');
-    if (request.url.startsWith('/api/')) {
+    if (reply.statusCode >= 400 || request.url.startsWith('/api/')) {
       reply.header('Cache-Control', 'no-store');
       reply.header('Pragma', 'no-cache');
     } else {
@@ -790,39 +997,75 @@ export function buildServer(
   });
 
   app.setErrorHandler((error, request, reply) => {
-    if (error instanceof StrategyNotFoundError) {
-      rememberHttpError(request, 'STRATEGY_NOT_FOUND', 'Strategy not found', error);
-      void reply.status(404).send(publicHttpError(
-        request.id,
-        'STRATEGY_NOT_FOUND',
-        'Strategy not found',
-        error,
-        dependencies.secretProvider
-      ));
+    if (isLegacyStrategyNotFound(error)) {
+      void sendHttpError(request, reply, 404, createTradeOpsError({
+        code: 'STRATEGY_NOT_FOUND',
+        phase: 'request',
+        subject: { type: 'strategy', strategyId: 'unknown' },
+        expected: 'existing strategy',
+        actual: 'missing'
+      }), { logDetail: true });
       return;
     }
-    if (
-      errorProperty(error, 'validation') !== undefined
-      || errorProperty(error, 'code') === 'FST_ERR_CTP_INVALID_JSON_BODY'
-    ) {
-      rememberHttpError(request, 'INVALID_REQUEST', 'Request validation failed');
-      void reply.status(400).send(publicHttpError(
-        request.id,
-        'INVALID_REQUEST',
-        'Request validation failed',
-        error,
-        dependencies.secretProvider
-      ));
+    const frameworkValidation = typeof error === 'object' && error !== null
+      ? frameworkValidationFailures.get(error)
+      : undefined;
+    const frameworkCode = requestsEnteringHandlers.has(request)
+      ? undefined
+      : fastifyParserFailure(error);
+    if (frameworkValidation !== undefined || frameworkCode !== undefined) {
+      const bodyInvalid = frameworkCode !== undefined
+        || (
+          frameworkValidation?.context === 'body'
+          && (
+            request.body === undefined
+            || request.body === null
+            || typeof request.body !== 'object'
+            || Array.isArray(request.body)
+          )
+        );
+      const failure = bodyInvalid
+        ? requestFailure(
+            'REQUEST_BODY_INVALID',
+            'body',
+            'JSON object body',
+            frameworkCode === 'FST_ERR_CTP_INVALID_JSON_BODY'
+              ? 'malformed JSON'
+              : frameworkCode === 'FST_ERR_CTP_BODY_TOO_LARGE'
+                ? 'body too large'
+                : valueCategory(request.body)
+          )
+        : requestFailure(
+            'REQUEST_FIELD_INVALID',
+            validationField(frameworkValidation?.validation),
+            validationRule(frameworkValidation?.validation),
+            'invalid field value'
+          );
+      void sendHttpError(request, reply, 400, failure);
       return;
     }
-    rememberHttpError(request, 'INTERNAL_ERROR', 'Internal server error', error);
-    void reply.status(500).send(publicHttpError(
-      request.id,
-      'INTERNAL_ERROR',
-      'Internal server error',
-      error,
-      dependencies.secretProvider
-    ));
+    const trusted = trustedFailure(error);
+    if (trusted !== undefined) {
+      const statusCode = trusted.detail.code === 'STRATEGY_NOT_FOUND'
+        ? 404
+        : trusted.detail.code === 'REQUEST_FORBIDDEN'
+          ? 403
+          : trusted.detail.code === 'REQUEST_BODY_INVALID'
+            || trusted.detail.code === 'REQUEST_FIELD_INVALID'
+            ? 400
+            : 500;
+      void sendHttpError(request, reply, statusCode, trusted, {
+        logDetail: true
+      });
+      return;
+    }
+    void sendHttpError(
+      request,
+      reply,
+      500,
+      operationFailure('request', error),
+      { logDetail: true, fullLogMessage: true }
+    );
   });
 
   app.get('/api/exchanges', async () => ({
@@ -837,14 +1080,22 @@ export function buildServer(
       try {
         preview = await dependencies.preflightService.run(request.body);
       } catch (error) {
-        rememberHttpError(request, 'PREFLIGHT_REJECTED', 'Preflight checks did not pass', error);
-        return reply.status(422).send(publicHttpError(
-          request.id,
-          'PREFLIGHT_REJECTED',
-          'Preflight checks did not pass',
-          error,
-          dependencies.secretProvider
-        ));
+        const trusted = trustedFailure(error);
+        if (trusted === undefined) {
+          return sendHttpError(
+            request,
+            reply,
+            500,
+            operationFailure('preflight', error),
+            { logDetail: true, fullLogMessage: true }
+          );
+        }
+        const statusCode = trusted.detail.code.startsWith('STORAGE_')
+          ? 500
+          : 422;
+        return sendHttpError(request, reply, statusCode, trusted, {
+          logDetail: true
+        });
       }
       const strategy = dependencies.repository.createPending(preview);
       return reply.status(201).send({
@@ -867,13 +1118,29 @@ export function buildServer(
       }
     },
     async (request, reply) => {
-      const strategy = dependencies.repository.getStrategy(request.params.id);
-      if (
-        strategy.state === 'PENDING_CONFIRMATION'
-        || strategy.state === 'EXECUTING'
-      ) {
-        queueConfirmation(strategy.id);
+      try {
+        await dependencies.confirmationService.confirm(request.params.id);
+      } catch (error) {
+        const trusted = trustedFailure(error);
+        if (trusted === undefined) {
+          return sendHttpError(
+            request,
+            reply,
+            500,
+            operationFailure('confirmation', error),
+            { logDetail: true, fullLogMessage: true }
+          );
+        }
+        const statusCode = trusted.detail.code === 'STRATEGY_NOT_FOUND'
+          ? 404
+          : trusted.detail.code.startsWith('STORAGE_')
+            ? 500
+            : 409;
+        return sendHttpError(request, reply, statusCode, trusted, {
+          logDetail: true
+        });
       }
+      queueConfirmation(request.params.id);
       return reply.status(202).send({ accepted: true });
     }
   );
@@ -881,15 +1148,46 @@ export function buildServer(
   app.get<{ Params: { id: string } }>(
     '/api/hedges/:id',
     { schema: { params: STRATEGY_ID_PARAMS_SCHEMA } },
-    async (request) => {
-      const strategy = dependencies.repository.getStrategy(request.params.id);
-      const orders = dependencies.repository.listOrders(strategy.id);
-      return {
-        strategy: publicStrategy(strategy),
-        preflight: publicPreflight(strategy.preflight),
-        orders: orders.map(publicOrder),
-        actualFills: actualFills(orders)
-      };
+    async (request, reply) => {
+      try {
+        const strategy = dependencies.repository.getStrategy(request.params.id);
+        const orders = dependencies.repository.listOrders(strategy.id);
+        return {
+          strategy: publicStrategy(
+            strategy,
+            projectPersistedFailure(strategy.preflightFailure)
+          ),
+          preflight: publicPreflight(strategy.preflight),
+          orders: orders.map(publicOrder),
+          actualFills: actualFills(orders)
+        };
+      } catch (error) {
+        if (isLegacyStrategyNotFound(error)) {
+          return sendHttpError(request, reply, 404, createTradeOpsError({
+            code: 'STRATEGY_NOT_FOUND',
+            phase: 'request',
+            subject: {
+              type: 'strategy',
+              strategyId: request.params.id
+            },
+            expected: 'existing strategy',
+            actual: 'missing'
+          }), { logDetail: true });
+        }
+        const trusted = trustedFailure(error);
+        if (trusted !== undefined) {
+          return sendHttpError(request, reply, 500, trusted, {
+            logDetail: true
+          });
+        }
+        return sendHttpError(
+          request,
+          reply,
+          500,
+          operationFailure('status', error),
+          { logDetail: true, fullLogMessage: true }
+        );
+      }
     }
   );
 
@@ -897,6 +1195,18 @@ export function buildServer(
     root: dependencies.publicDirectory ?? resolve(process.cwd(), 'public'),
     index: 'index.html'
   });
+
+  app.setNotFoundHandler((request, reply) => sendHttpError(
+    request,
+    reply,
+    404,
+    requestFailure(
+      'REQUEST_ROUTE_NOT_FOUND',
+      'route',
+      'matched route or static resource',
+      'not found'
+    )
+  ));
 
   return app;
 }

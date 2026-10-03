@@ -2,9 +2,10 @@
 
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { Writable } from 'node:stream';
+import { tmpdir } from 'node:os';
 import test, { type TestContext } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import Database from 'better-sqlite3';
@@ -15,7 +16,11 @@ import type {
   OrderRole,
   OrderSnapshot
 } from '../../src/domain/types.js';
-import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
+import {
+  createTradeOpsError,
+  parseErrorDetail,
+  type ErrorDetail
+} from '../../src/errors/trade-ops-error.js';
 import {
   buildServer,
   LOGGER_REDACT_PATHS
@@ -25,8 +30,7 @@ import {
   type OperationalFields,
   type OperationalLog
 } from '../../src/logging/logger.js';
-import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
-import { HedgeReconciliation } from '../../src/strategy/hedge-reconciliation.js';
+import type { ConfirmationService } from '../../src/strategy/confirmation-service.js';
 import type {
   PreflightInput,
   PreflightResult
@@ -36,7 +40,6 @@ import {
   StrategyNotFoundError,
   type StrategyRepository
 } from '../../src/storage/strategy-repository.js';
-import { FakeExchangeGateway } from '../support/fake-exchange-gateway.js';
 
 const SYMBOL = 'BTC/USDT';
 const LOCAL_HEADERS = {
@@ -124,16 +127,50 @@ function faultingCompletionLogger(
   return wrap(createAppLogger(destination));
 }
 
+interface PublicErrorExpectation {
+  readonly code: string;
+  readonly phase?: ErrorDetail['phase'];
+  readonly detail?: ErrorDetail;
+}
+
 function assertPublicHttpError(
-  response: { json(): Record<string, unknown> },
-  expected: Readonly<Record<string, unknown>>
-): void {
+  response: {
+    readonly headers: Record<string, string | string[] | number | undefined>;
+    json(): Record<string, unknown>;
+  },
+  expected: Readonly<PublicErrorExpectation>
+): ErrorDetail {
   const body = response.json();
   assert.equal(typeof body.requestId, 'string');
-  assert.deepEqual(body, {
-    ...expected,
-    requestId: body.requestId
-  });
+  assert.deepEqual(
+    Object.keys(body).sort(),
+    ['error', 'requestId'],
+    'public HTTP errors must contain only requestId and error'
+  );
+  const detail = parseErrorDetail(body.error);
+  assert.equal(detail.code, expected.code);
+  if (expected.phase !== undefined) {
+    assert.equal(detail.phase, expected.phase);
+  }
+  if (expected.detail !== undefined) {
+    assert.deepEqual(detail, expected.detail);
+  }
+  assert.match(String(response.headers['cache-control'] ?? ''), /no-store/);
+  assert.match(
+    String(response.headers['content-security-policy'] ?? ''),
+    /default-src 'self'/
+  );
+  return detail;
+}
+
+type TestServerDependencies = Parameters<typeof buildServer>[0] & {
+  readonly confirmationService: Pick<ConfirmationService, 'confirm'>;
+};
+
+function buildTestServer(
+  dependencies: TestServerDependencies
+): FastifyInstance {
+  return buildServer(dependencies);
 }
 
 function preflight(
@@ -193,6 +230,8 @@ interface Fixture {
   readonly server: FastifyInstance;
   readonly repository: SqliteStrategyRepository;
   readonly preflightInputs: PreflightInput[];
+  readonly confirmationInputs: string[];
+  readonly getConfirmationCount: () => number;
   readonly getExecutionCount: () => number;
 }
 
@@ -203,6 +242,7 @@ function setup(
     readonly runPreflight?: (
       input: PreflightInput
     ) => Promise<PreflightResult>;
+    readonly confirmStrategy?: (strategyId: string) => Promise<void>;
     readonly confirmAndExecute?: (strategyId: string) => Promise<void>;
     readonly operationalLog?: OperationalLog;
     readonly secretProvider?: () => readonly string[];
@@ -213,8 +253,10 @@ function setup(
   const baseRepository = new SqliteStrategyRepository(database);
   const repository = options.repository ?? baseRepository;
   const preflightInputs: PreflightInput[] = [];
+  const confirmationInputs: string[] = [];
+  let confirmationCount = 0;
   let executionCount = 0;
-  const server = buildServer({
+  const server = buildTestServer({
     registry: {
       ids: () => ['bitget', 'okx']
     },
@@ -225,6 +267,13 @@ function setup(
       }
     },
     repository,
+    confirmationService: {
+      confirm: async (strategyId) => {
+        confirmationCount += 1;
+        confirmationInputs.push(strategyId);
+        await options.confirmStrategy?.(strategyId);
+      }
+    },
     coordinator: {
       confirmAndExecute: async (strategyId) => {
         executionCount += 1;
@@ -249,6 +298,8 @@ function setup(
     server,
     repository: baseRepository,
     preflightInputs,
+    confirmationInputs,
+    getConfirmationCount: () => confirmationCount,
     getExecutionCount: () => executionCount
   };
 }
@@ -521,6 +572,7 @@ function browserStatusResponse(
       effectiveBaseQuantity: '1',
       mode: 'CONCURRENT',
       failureCode: null,
+      preflightFailure: null,
       createdAt: '2026-07-31T00:00:00.000Z',
       updatedAt: '2026-07-31T00:00:00.000Z'
     },
@@ -668,24 +720,44 @@ async function browserWithValidPreflight(): Promise<BrowserHarness> {
   return browser;
 }
 
+const DETAILED_BROWSER_DETAIL = createTradeOpsError({
+  code: 'BALANCE_INSUFFICIENT',
+  phase: 'preflight',
+  subject: {
+    type: 'account',
+    exchangeId: 'bitget',
+    symbol: SYMBOL,
+    field: 'balance'
+  },
+  expected: '60000.00000000000000000001 USDT',
+  actual: '<b>59999.99999999999999999999 USDT</b>',
+  occurredAt: '2026-10-03T00:00:00.000Z'
+}).detail;
+
 const DETAILED_BROWSER_ERROR = {
-  code: 'PREFLIGHT_REJECTED',
-  message: 'Preflight checks did not pass',
   requestId: 'req-3',
-  error: {
-    type: 'AuthenticationError',
-    code: '40101',
-    message: '<b>bitget authentication failed</b>'
-  }
+  error: DETAILED_BROWSER_DETAIL
 } as const;
 
-function detailedBrowserMessage(operation: string, status: number): string {
-  return [
-    `${operation}失败`,
-    `HTTP ${status} · PREFLIGHT_REJECTED`,
-    'AuthenticationError [40101]: <b>bitget authentication failed</b>',
-    '请求 ID：req-3'
-  ].join('\n');
+function assertDetailedBrowserMessage(
+  message: string,
+  operation: string,
+  status: number
+): void {
+  assert.match(message, new RegExp(`^${operation}失败`));
+  assert.match(message, new RegExp(`HTTP ${status}`));
+  assert.match(message, /BALANCE_INSUFFICIENT/);
+  assert.match(message, new RegExp(DETAILED_BROWSER_DETAIL.message));
+  assert.match(message, /阶段[：:]/);
+  assert.match(message, /preflight/);
+  assert.match(message, /对象[：:]/);
+  assert.match(message, /account/);
+  assert.match(message, /bitget/);
+  assert.match(message, /期望[：:]/);
+  assert.match(message, /60000\.00000000000000000001 USDT/);
+  assert.match(message, /实际[：:]/);
+  assert.match(message, /<b>59999\.99999999999999999999 USDT<\/b>/);
+  assert.match(message, /请求 ID[：:]req-3/);
 }
 
 test('operator UI shows detailed structured preflight failures as plain text', async () => {
@@ -697,9 +769,10 @@ test('operator UI shows detailed structured preflight failures as plain text', a
 
   await browser.element('preflight-form').emit('submit');
 
-  assert.equal(
+  assertDetailedBrowserMessage(
     browser.element('operator-message').textContent,
-    detailedBrowserMessage('预检', 422)
+    '预检',
+    422
   );
   assert.match(browser.element('operator-message').textContent, /<b>.*<\/b>/);
   assert.equal(browser.element('strategy-state').textContent, '—');
@@ -714,9 +787,10 @@ test('operator UI shows detailed structured strategy-load failures', async () =>
 
   await browser.element('resume-form').emit('submit');
 
-  assert.equal(
+  assertDetailedBrowserMessage(
     browser.element('operator-message').textContent,
-    detailedBrowserMessage('任务加载', 404)
+    '任务加载',
+    404
   );
   assert.equal(browser.element('risk-ack').checked, false);
   assert.equal(browser.element('confirm-button').disabled, true);
@@ -728,9 +802,10 @@ test('operator UI shows detailed structured status-refresh failures', async () =
 
   await browser.element('refresh-button').emit('click');
 
-  assert.equal(
+  assertDetailedBrowserMessage(
     browser.element('operator-message').textContent,
-    detailedBrowserMessage('状态刷新', 503)
+    '状态刷新',
+    503
   );
   assert.equal(browser.element('strategy-state').textContent, '—');
   assert.equal(browser.element('confirm-button').disabled, true);
@@ -744,11 +819,12 @@ test('operator UI shows detailed structured confirmation failures', async () => 
 
   await browser.element('confirm-button').emit('click');
 
-  assert.equal(
+  assertDetailedBrowserMessage(
     browser.element('operator-message').textContent,
-    detailedBrowserMessage('确认', 409)
+    '确认',
+    409
   );
-  assert.equal(browser.element('confirm-button').disabled, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
 });
 
 test('operator UI shows detailed structured exchange-list failures', async () => {
@@ -757,13 +833,82 @@ test('operator UI shows detailed structured exchange-list failures', async () =>
     return browserResponse(500, DETAILED_BROWSER_ERROR);
   });
 
-  assert.equal(
+  assertDetailedBrowserMessage(
     browser.element('operator-message').textContent,
-    detailedBrowserMessage('交易所列表加载', 500)
+    '交易所列表加载',
+    500
   );
 });
 
-test('operator UI keeps legacy JSON errors readable', async () => {
+test('operator UI renders every trusted subject and safe diagnostic value kind', async (t) => {
+  const cases = [
+    createTradeOpsError({
+      code: 'CONFIG_FIELD_INVALID', phase: 'request',
+      subject: { type: 'configuration', field: 'HOST' },
+      expected: ['127.0.0.1', '::1'], actual: null
+    }),
+    createTradeOpsError({
+      code: 'REQUEST_FIELD_INVALID', phase: 'request',
+      subject: { type: 'request', field: 'requestedBaseQuantity' },
+      expected: 'positive decimal string', actual: 'string'
+    }),
+    createTradeOpsError({
+      code: 'EXCHANGE_NOT_CONFIGURED', phase: 'preflight',
+      subject: { type: 'exchange', exchangeId: 'synthetic-exchange', operation: 'preflight' },
+      expected: 'configured exchange', actual: false
+    }),
+    createTradeOpsError({
+      code: 'MARKET_INACTIVE', phase: 'confirmation',
+      subject: {
+        type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap',
+        field: 'active'
+      },
+      expected: true, actual: false
+    }),
+    createTradeOpsError({
+      code: 'BALANCE_INSUFFICIENT', phase: 'preflight',
+      subject: { type: 'account', exchangeId: 'bitget', symbol: SYMBOL, field: 'balance' },
+      expected: '1.00000000000000000001 BTC',
+      actual: '0.99999999999999999999 BTC'
+    }),
+    createTradeOpsError({
+      code: 'STRATEGY_STATE_MISMATCH', phase: 'confirmation',
+      subject: { type: 'strategy', strategyId: 'strategy-synthetic', field: 'state' },
+      expected: 'PENDING_CONFIRMATION', actual: 'EXECUTING'
+    }),
+    createTradeOpsError({
+      code: 'STORAGE_OPERATION_FAILED', phase: 'storage',
+      subject: {
+        type: 'database', table: 'strategies', recordId: 'strategy-synthetic',
+        operation: 'read strategy'
+      },
+      expected: 'successful read', actual: 'failure'
+    })
+  ] as const;
+
+  for (const failure of cases) {
+    await t.test(failure.detail.subject.type, async () => {
+      const browser = await browserHarness();
+      browser.setFetch(async () => browserResponse(500, {
+        requestId: `request-${failure.detail.subject.type}`,
+        error: failure.detail
+      }));
+
+      await browser.element('preflight-form').emit('submit');
+
+      const message = browser.element('operator-message').textContent;
+      assert.match(message, /阶段[：:]/);
+      assert.match(message, /对象[：:]/);
+      assert.match(message, /期望[：:]/);
+      assert.match(message, /实际[：:]/);
+      assert.match(message, new RegExp(failure.detail.subject.type));
+      assert.match(message, new RegExp(failure.detail.code));
+      assert.match(message, new RegExp(`request-${failure.detail.subject.type}`));
+    });
+  }
+});
+
+test('operator UI rejects legacy JSON errors without displaying untrusted fields', async () => {
   const browser = await browserHarness();
   browser.setFetch(async () => browserResponse(422, {
     code: 'LEGACY_REJECTED',
@@ -772,11 +917,10 @@ test('operator UI keeps legacy JSON errors readable', async () => {
 
   await browser.element('preflight-form').emit('submit');
 
-  assert.equal(browser.element('operator-message').textContent, [
-    '预检失败',
-    'HTTP 422 · LEGACY_REJECTED',
-    'legacy detailed failure'
-  ].join('\n'));
+  const message = browser.element('operator-message').textContent;
+  assert.match(message, /^预检失败\nHTTP 422/);
+  assert.match(message, /结构化.*错误|错误结构/);
+  assert.doesNotMatch(message, /LEGACY_REJECTED|legacy detailed failure/);
 });
 
 test('operator UI distinguishes non-JSON and network failures', async (t) => {
@@ -807,10 +951,39 @@ test('operator UI distinguishes non-JSON and network failures', async (t) => {
 
     await browser.element('preflight-form').emit('submit');
 
-    assert.equal(browser.element('operator-message').textContent, [
-      '预检失败',
-      '网络错误：connection refused'
-    ].join('\n'));
+    const message = browser.element('operator-message').textContent;
+    assert.match(message, /^预检失败\n网络.*失败/);
+    assert.doesNotMatch(message, /connection refused/);
+  });
+
+  await t.test('hostile thrown value', async () => {
+    const browser = await browserHarness();
+    let messageGetterCalls = 0;
+    let toStringCalls = 0;
+    const hostile = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(hostile, 'message', {
+      get() {
+        messageGetterCalls += 1;
+        return 'HOSTILE-MESSAGE-SENTINEL';
+      }
+    });
+    Object.defineProperty(hostile, 'toString', {
+      value() {
+        toStringCalls += 1;
+        return 'HOSTILE-TOSTRING-SENTINEL';
+      }
+    });
+    browser.setFetch(async () => {
+      throw hostile;
+    });
+
+    await browser.element('preflight-form').emit('submit');
+
+    const message = browser.element('operator-message').textContent;
+    assert.match(message, /^预检失败\n网络.*失败/);
+    assert.equal(messageGetterCalls, 0);
+    assert.equal(toStringCalls, 0);
+    assert.doesNotMatch(message, /HOSTILE-/);
   });
 });
 
@@ -819,10 +992,7 @@ test('operator UI bounds detailed server errors and labels invalid success respo
     const browser = await browserHarness();
     browser.setFetch(async () => browserResponse(422, {
       ...DETAILED_BROWSER_ERROR,
-      error: {
-        ...DETAILED_BROWSER_ERROR.error,
-        message: 'x'.repeat(2_100)
-      }
+      error: { ...DETAILED_BROWSER_ERROR.error, message: 'x'.repeat(2_100) }
     }));
 
     await browser.element('preflight-form').emit('submit');
@@ -868,6 +1038,7 @@ test('rejects non-loopback and malformed Host before every route boundary', asyn
   let registryCalls = 0;
   let preflightCalls = 0;
   let repositoryCalls = 0;
+  let confirmationCalls = 0;
   let coordinatorCalls = 0;
   const repository = new Proxy<StrategyRepository>(targetRepository, {
     get(target, property) {
@@ -881,7 +1052,7 @@ test('rejects non-loopback and malformed Host before every route boundary', asyn
       };
     }
   });
-  const server = buildServer({
+  const server = buildTestServer({
     registry: {
       ids: () => {
         registryCalls += 1;
@@ -895,6 +1066,11 @@ test('rejects non-loopback and malformed Host before every route boundary', asyn
       }
     },
     repository,
+    confirmationService: {
+      confirm: async () => {
+        confirmationCalls += 1;
+      }
+    },
     coordinator: {
       confirmAndExecute: async () => {
         coordinatorCalls += 1;
@@ -968,8 +1144,8 @@ test('rejects non-loopback and malformed Host before every route boundary', asyn
     for (const response of await Promise.all(requests)) {
       assert.equal(response.statusCode, 403, `host=${JSON.stringify(host)}`);
       assertPublicHttpError(response, {
-        code: 'FORBIDDEN',
-        message: 'Request forbidden'
+        code: 'REQUEST_FORBIDDEN',
+        phase: 'request'
       });
       assert.doesNotMatch(response.body, new RegExp(
         host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') || 'evil.example'
@@ -980,6 +1156,7 @@ test('rejects non-loopback and malformed Host before every route boundary', asyn
   assert.equal(registryCalls, 0);
   assert.equal(preflightCalls, 0);
   assert.equal(repositoryCalls, 0);
+  assert.equal(confirmationCalls, 0);
   assert.equal(coordinatorCalls, 0);
 });
 
@@ -989,6 +1166,7 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
   const strategy = targetRepository.createPending(preflight());
   let repositoryCalls = 0;
   let preflightCalls = 0;
+  let confirmationCalls = 0;
   let coordinatorCalls = 0;
   const repository = new Proxy<StrategyRepository>(targetRepository, {
     get(target, property) {
@@ -1002,7 +1180,7 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
       };
     }
   });
-  const server = buildServer({
+  const server = buildTestServer({
     registry: { ids: () => ['bitget', 'okx'] },
     preflightService: {
       run: async () => {
@@ -1011,6 +1189,11 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
       }
     },
     repository,
+    confirmationService: {
+      confirm: async () => {
+        confirmationCalls += 1;
+      }
+    },
     coordinator: {
       confirmAndExecute: async () => {
         coordinatorCalls += 1;
@@ -1064,8 +1247,8 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
     for (const response of responses) {
       assert.equal(response.statusCode, 403);
       assertPublicHttpError(response, {
-        code: 'FORBIDDEN',
-        message: 'Request forbidden'
+        code: 'REQUEST_FORBIDDEN',
+        phase: 'request'
       });
       assert.doesNotMatch(response.body, /evil|user@|not-an-origin/);
     }
@@ -1090,6 +1273,7 @@ test('rejects unsafe browser origins before preflight, repository, or coordinato
   await flushImmediate();
   assert.equal(preflightCalls, 0);
   assert.equal(repositoryCalls, 0);
+  assert.equal(confirmationCalls, 0);
   assert.equal(coordinatorCalls, 0);
 });
 
@@ -1099,6 +1283,7 @@ test('requires Origin on every POST before any write-path dependency', async (t)
   const strategy = targetRepository.createPending(preflight());
   let repositoryCalls = 0;
   let preflightCalls = 0;
+  let confirmationCalls = 0;
   let coordinatorCalls = 0;
   const repository = new Proxy<StrategyRepository>(targetRepository, {
     get(target, property) {
@@ -1112,7 +1297,7 @@ test('requires Origin on every POST before any write-path dependency', async (t)
       };
     }
   });
-  const server = buildServer({
+  const server = buildTestServer({
     registry: { ids: () => ['bitget', 'okx'] },
     preflightService: {
       run: async () => {
@@ -1121,6 +1306,11 @@ test('requires Origin on every POST before any write-path dependency', async (t)
       }
     },
     repository,
+    confirmationService: {
+      confirm: async () => {
+        confirmationCalls += 1;
+      }
+    },
     coordinator: {
       confirmAndExecute: async () => {
         coordinatorCalls += 1;
@@ -1157,13 +1347,14 @@ test('requires Origin on every POST before any write-path dependency', async (t)
   for (const response of [preflightResponse, confirmationResponse]) {
     assert.equal(response.statusCode, 403);
     assertPublicHttpError(response, {
-      code: 'FORBIDDEN',
-      message: 'Request forbidden'
+      code: 'REQUEST_FORBIDDEN',
+      phase: 'request'
     });
   }
   await flushImmediate();
   assert.equal(preflightCalls, 0);
   assert.equal(repositoryCalls, 0);
+  assert.equal(confirmationCalls, 0);
   assert.equal(coordinatorCalls, 0);
 });
 
@@ -1228,8 +1419,8 @@ test('requires the local HTTP origin scheme and ignores forwarded protocol', asy
   });
   assert.equal(wrongScheme.statusCode, 403);
   assertPublicHttpError(wrongScheme, {
-    code: 'FORBIDDEN',
-    message: 'Request forbidden'
+    code: 'REQUEST_FORBIDDEN',
+    phase: 'request'
   });
   assert.equal(preflightInputs.length, 0);
 
@@ -1311,12 +1502,57 @@ test('preflight rejects missing, extra, secret, malformed, and oversized fields 
     });
     assert.equal(response.statusCode, 400);
     assertPublicHttpError(response, {
-      code: 'INVALID_REQUEST',
-      message: 'Request validation failed'
+      code: 'REQUEST_FIELD_INVALID',
+      phase: 'request'
     });
     assert.doesNotMatch(response.body, /LEAK-ME-NOT/);
   }
   assert.equal(preflightInputs.length, 0);
+});
+
+test('preflight distinguishes malformed or non-object bodies from field validation', async (t) => {
+  const fixture = setup(t);
+  const cases = [
+    { name: 'missing body' },
+    {
+      name: 'null body',
+      headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' },
+      payload: 'null'
+    },
+    { name: 'array body', payload: [] },
+    {
+      name: 'string body',
+      headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' },
+      payload: '"body-string"'
+    },
+    {
+      name: 'malformed JSON',
+      headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' },
+      payload: '{"symbol":'
+    }
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const response = await fixture.server.inject({
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        headers: 'headers' in item ? item.headers : LOCAL_HEADERS,
+        ...('payload' in item ? { payload: item.payload } : {})
+      });
+
+      assert.equal(response.statusCode, 400);
+      const detail = assertPublicHttpError(response, {
+        code: 'REQUEST_BODY_INVALID',
+        phase: 'request'
+      });
+      assert.deepEqual(detail.subject, { type: 'request', field: 'body' });
+      assert.doesNotMatch(response.body, /body-string|symbol/);
+    });
+  }
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
 });
 
 test('preflight never coerces runtime types for any string field', async (t) => {
@@ -1359,8 +1595,8 @@ test('preflight never coerces runtime types for any string field', async (t) => 
         `${field} accepted ${JSON.stringify(invalidValue)}`
       );
       assertPublicHttpError(response, {
-        code: 'INVALID_REQUEST',
-        message: 'Request validation failed'
+        code: 'REQUEST_FIELD_INVALID',
+        phase: 'request'
       });
       assert.doesNotMatch(response.body, /TYPE-SENTINEL/);
     }
@@ -1368,23 +1604,100 @@ test('preflight never coerces runtime types for any string field', async (t) => 
   assert.equal(preflightInputs.length, 0);
 });
 
-test('preflight failure returns detailed sanitized diagnostics', async (t) => {
-  const failure = Object.assign(
-    new Error('bitget credential-value authentication failed'),
-    {
-      name: 'AuthenticationError',
-      code: 401,
-      rawResponse: 'LEAK-ME-NOT'
-    }
-  );
-  const { server } = setup(t, {
+test('preflight preserves heterogeneous trusted business errors as 422', async (t) => {
+  const failures = [
+    createTradeOpsError({
+      code: 'MARKET_INACTIVE',
+      phase: 'preflight',
+      subject: {
+        type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap',
+        field: 'active'
+      },
+      expected: true,
+      actual: false,
+      occurredAt: '2026-10-03T00:00:00.000Z'
+    }),
+    createTradeOpsError({
+      code: 'ACCOUNT_MARGIN_MODE_MISMATCH',
+      phase: 'preflight',
+      subject: {
+        type: 'account', exchangeId: 'okx', symbol: SYMBOL, field: 'marginMode'
+      },
+      expected: 'isolated',
+      actual: 'cross',
+      occurredAt: '2026-10-03T00:00:00.000Z'
+    }),
+    createTradeOpsError({
+      code: 'QUANTITY_NOT_REPRESENTABLE',
+      phase: 'preflight',
+      subject: {
+        type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap',
+        field: 'amountPrecision'
+      },
+      expected: '0.00000000000000000001 BTC',
+      actual: '0.000000000000000000001 BTC',
+      occurredAt: '2026-10-03T00:00:00.000Z'
+    })
+  ] as const;
+
+  for (const failure of failures) {
+    await t.test(failure.detail.code, async (subtest) => {
+      const fixture = setup(subtest, {
+        runPreflight: async () => {
+          throw failure;
+        }
+      });
+      const response = await fixture.server.inject({
+        method: 'POST',
+        url: '/api/hedges/preflight',
+        headers: LOCAL_HEADERS,
+        payload: {
+          spotExchangeId: 'bitget',
+          contractExchangeId: 'okx',
+          symbol: SYMBOL,
+          requestedBaseQuantity: '1',
+          mode: 'SPOT_FIRST'
+        }
+      });
+
+      assert.equal(response.statusCode, 422);
+      assertPublicHttpError(response, {
+        code: failure.detail.code,
+        phase: 'preflight',
+        detail: failure.detail
+      });
+      assert.equal(fixture.repository.listRecoverable().length, 0);
+      assert.equal(fixture.getConfirmationCount(), 0);
+      assert.equal(fixture.getExecutionCount(), 0);
+    });
+  }
+});
+
+test('preflight redacts configured secrets from a branded business detail', async (t) => {
+  const configuredSecret = 'CONFIGURED-PREFLIGHT-SECRET';
+  const input = {
+    code: 'BALANCE_INSUFFICIENT',
+    phase: 'preflight',
+    subject: {
+      type: 'account',
+      exchangeId: 'bitget',
+      symbol: SYMBOL,
+      field: 'balance'
+    },
+    expected: 'available balance',
+    actual: `insufficient-${configuredSecret}`,
+    occurredAt: '2026-10-03T00:00:00.000Z'
+  } as const;
+  const failure = createTradeOpsError(input);
+  const expected = createTradeOpsError(input, [configuredSecret]).detail;
+  const fixture = setup(t, {
     runPreflight: async () => {
       throw failure;
     },
-    secretProvider: () => ['credential-value']
+    secretProvider: () => [configuredSecret]
   });
 
-  const response = await server.inject({
+  const response = await fixture.server.inject({
     method: 'POST',
     url: '/api/hedges/preflight',
     headers: LOCAL_HEADERS,
@@ -1398,28 +1711,69 @@ test('preflight failure returns detailed sanitized diagnostics', async (t) => {
   });
 
   assert.equal(response.statusCode, 422);
-  const body = response.json();
-  assert.deepEqual(body, {
-    code: 'PREFLIGHT_REJECTED',
-    message: 'Preflight checks did not pass',
-    requestId: body.requestId,
-    error: {
-      type: 'AuthenticationError',
-      code: 401,
-      message: 'bitget [Redacted] authentication failed'
-    }
+  assertPublicHttpError(response, {
+    code: expected.code,
+    phase: expected.phase,
+    detail: expected
   });
-  assert.equal(typeof body.requestId, 'string');
-  assert.doesNotMatch(
-    response.body,
-    /credential-value|LEAK-ME-NOT|rawResponse|stack/
-  );
+  assert.doesNotMatch(response.body, new RegExp(configuredSecret));
+  assert.equal(fixture.repository.listRecoverable().length, 0);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
 });
 
-test('a failing secret provider omits detail without changing the preflight response', async (t) => {
+test('an unknown preflight failure becomes a safe 500 without persistence', async (t) => {
+  const sentinel = 'UNKNOWN-PREFLIGHT-SECRET';
+  const fixture = setup(t, {
+    runPreflight: async () => {
+      throw Object.assign(new Error(`${sentinel} raw message`), {
+        code: sentinel,
+        cause: new Error(`${sentinel} cause`),
+        response: { body: sentinel }
+      });
+    },
+    secretProvider: () => [sentinel]
+  });
+
+  const response = await fixture.server.inject({
+    method: 'POST',
+    url: '/api/hedges/preflight',
+    headers: LOCAL_HEADERS,
+    payload: {
+      spotExchangeId: 'bitget',
+      contractExchangeId: 'okx',
+      symbol: SYMBOL,
+      requestedBaseQuantity: '1',
+      mode: 'SPOT_FIRST'
+    }
+  });
+
+  assert.equal(response.statusCode, 500);
+  assertPublicHttpError(response, {
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
+  });
+  assert.equal(fixture.repository.listRecoverable().length, 0);
+  assert.doesNotMatch(response.body, new RegExp(sentinel));
+  assert.doesNotMatch(response.body, /cause|stack|response/);
+});
+
+test('a failing secret provider keeps the business status with safe detail', async (t) => {
+  const failure = createTradeOpsError({
+    code: 'BALANCE_INSUFFICIENT',
+    phase: 'preflight',
+    subject: {
+      type: 'account',
+      exchangeId: 'bitget',
+      symbol: SYMBOL,
+      field: 'balance'
+    },
+    expected: 'available balance',
+    actual: 'insufficient balance'
+  });
   const { server } = setup(t, {
     runPreflight: async () => {
-      throw new Error('sensitive failure');
+      throw failure;
     },
     secretProvider: () => {
       throw new Error('secret provider unavailable');
@@ -1441,41 +1795,56 @@ test('a failing secret provider omits detail without changing the preflight resp
 
   assert.equal(response.statusCode, 422);
   const body = response.json();
-  assert.deepEqual(body, {
-    code: 'PREFLIGHT_REJECTED',
-    message: 'Preflight checks did not pass',
-    requestId: body.requestId
-  });
+  assert.deepEqual(Object.keys(body).sort(), ['error', 'requestId']);
   assert.equal(typeof body.requestId, 'string');
-  assert.doesNotMatch(response.body, /sensitive failure|secret provider/);
+  assert.doesNotThrow(() => parseErrorDetail(body.error));
+  assert.doesNotMatch(response.body, /secret provider/);
 });
 
 test('confirmation requires the exact true risk acknowledgement before queueing', async (t) => {
-  const { server, repository, getExecutionCount } = setup(t);
+  const {
+    server,
+    repository,
+    getConfirmationCount,
+    getExecutionCount
+  } = setup(t);
   const strategy = repository.createPending(preflight());
   const invalidPayloads = [
-    undefined,
-    {},
-    { riskAcknowledged: false },
-    { riskAcknowledged: true, extra: true }
+    { payload: undefined, code: 'REQUEST_BODY_INVALID' },
+    { payload: {}, code: 'REQUEST_FIELD_INVALID' },
+    { payload: { riskAcknowledged: false }, code: 'REQUEST_FIELD_INVALID' },
+    {
+      payload: { riskAcknowledged: true, extra: true },
+      code: 'REQUEST_FIELD_INVALID'
+    }
   ];
 
-  for (const payload of invalidPayloads) {
+  for (const item of invalidPayloads) {
     const response = await server.inject({
       method: 'POST',
       url: `/api/hedges/${strategy.id}/confirm`,
       headers: LOCAL_HEADERS,
-      ...(payload === undefined ? {} : { payload })
+      ...(item.payload === undefined ? {} : { payload: item.payload })
     });
     assert.equal(response.statusCode, 400);
+    assertPublicHttpError(response, {
+      code: item.code,
+      phase: 'request'
+    });
   }
   await flushImmediate();
+  assert.equal(getConfirmationCount(), 0);
   assert.equal(getExecutionCount(), 0);
   assert.equal(repository.getStrategy(strategy.id).state, 'PENDING_CONFIRMATION');
 });
 
 test('confirmation never coerces acknowledgement runtime types', async (t) => {
-  const { server, repository, getExecutionCount } = setup(t);
+  const {
+    server,
+    repository,
+    getConfirmationCount,
+    getExecutionCount
+  } = setup(t);
   const strategy = repository.createPending(preflight());
 
   for (const riskAcknowledged of [
@@ -1496,273 +1865,327 @@ test('confirmation never coerces acknowledgement runtime types', async (t) => {
       `accepted ${JSON.stringify(riskAcknowledged)}`
     );
     assertPublicHttpError(response, {
-      code: 'INVALID_REQUEST',
-      message: 'Request validation failed'
+      code: 'REQUEST_FIELD_INVALID',
+      phase: 'request'
     });
     assert.doesNotMatch(response.body, /TYPE-SENTINEL/);
   }
   await flushImmediate();
+  assert.equal(getConfirmationCount(), 0);
   assert.equal(getExecutionCount(), 0);
   assert.equal(repository.getStrategy(strategy.id).state, 'PENDING_CONFIRMATION');
 });
 
-test('confirmation returns detailed 404 for an unknown strategy without queueing', async (t) => {
-  const { server, getExecutionCount } = setup(t, {
-    secretProvider: () => []
-  });
-
-  const response = await server.inject({
-    method: 'POST',
-    url: '/api/hedges/missing-strategy/confirm',
-    headers: LOCAL_HEADERS,
-    payload: { riskAcknowledged: true }
-  });
-
-  assert.equal(response.statusCode, 404);
-  assertPublicHttpError(response, {
-    code: 'STRATEGY_NOT_FOUND',
-    message: 'Strategy not found',
-    error: {
-      type: 'StrategyNotFoundError',
-      message: 'unknown strategy'
+test('confirmation route delegates without reading the repository directly', async (t) => {
+  const database = new Database(':memory:');
+  const target = new SqliteStrategyRepository(database);
+  const pending = target.createPending(preflight());
+  const repository = new Proxy<StrategyRepository>(target, {
+    get(targetRepository, property, receiver) {
+      if (property === 'getStrategy') {
+        return (): never => {
+          throw new Error('ROUTE-DIRECT-READ-SENTINEL');
+        };
+      }
+      const value = Reflect.get(targetRepository, property, receiver);
+      return typeof value === 'function' ? value.bind(targetRepository) : value;
     }
   });
-  await flushImmediate();
-  assert.equal(getExecutionCount(), 0);
-});
+  t.after(() => database.close());
+  const fixture = setup(t, { repository });
 
-test('two concurrent confirmations queue only one coordinator execution', async (t) => {
-  let releaseExecution: (() => void) | undefined;
-  const executionGate = new Promise<void>((resolve) => {
-    releaseExecution = resolve;
-  });
-  const fixture = setup(t, {
-    confirmAndExecute: async () => executionGate
-  });
-  const strategy = fixture.repository.createPending(preflight());
-
-  const responses = await Promise.all([
-    fixture.server.inject({
-      method: 'POST',
-      url: `/api/hedges/${strategy.id}/confirm`,
-      headers: LOCAL_HEADERS,
-      payload: { riskAcknowledged: true }
-    }),
-    fixture.server.inject({
-      method: 'POST',
-      url: `/api/hedges/${strategy.id}/confirm`,
-      headers: LOCAL_HEADERS,
-      payload: { riskAcknowledged: true }
-    })
-  ]);
-
-  assert.deepEqual(
-    responses.map((response) => response.statusCode).sort(),
-    [202, 202]
-  );
-  assert.ok(responses.every((response) => (
-    response.json().accepted === true
-  )));
-  await flushImmediate();
-  assert.equal(fixture.getExecutionCount(), 1);
-  releaseExecution?.();
-});
-
-test('two concurrent confirmations create each fake exchange order only once', async (t) => {
-  const database = new Database(':memory:');
-  const repository = new SqliteStrategyRepository(database);
-  const spot = new FakeExchangeGateway('bitget');
-  const contract = new FakeExchangeGateway('okx');
-  const registry = new ExchangeRegistry(new Map([
-    ['bitget', spot],
-    ['okx', contract]
-  ]));
-  const strategy = repository.createPending(preflight());
-  spot.markets.set(`spot:${strategy.symbol}`, strategy.preflight.spotMarket);
-  const contractRequest = requestFor(
-    strategy.id,
-    'CONTRACT_MARKET',
-    strategy.effectiveBaseQuantity
-  );
-  const spotRequest = requestFor(
-    strategy.id,
-    'SPOT_HEDGE_GTC',
-    strategy.effectiveBaseQuantity
-  );
-  contract.createResults.push(snapshotFor(contractRequest, 'okx', {
-    filledBaseQuantity: '1',
-    remainingBaseQuantity: '0',
-    averagePrice: '60010',
-    status: 'closed'
-  }));
-  spot.createResults.push(snapshotFor(spotRequest, 'bitget', {
-    filledBaseQuantity: '1',
-    remainingBaseQuantity: '0',
-    averagePrice: '60010',
-    status: 'closed'
-  }));
-  const reconciliation = new HedgeReconciliation(registry, repository);
-  const server = buildServer({
-    registry,
-    preflightService: {
-      run: async () => {
-        throw new Error('not used');
-      }
-    },
-    repository,
-    coordinator: new HedgeCoordinator(registry, repository, reconciliation),
-    logger: false
-  });
-  t.after(async () => {
-    await server.close();
-    database.close();
-  });
-
-  const responses = await Promise.all([
-    server.inject({
-      method: 'POST',
-      url: `/api/hedges/${strategy.id}/confirm`,
-      headers: LOCAL_HEADERS,
-      payload: { riskAcknowledged: true }
-    }),
-    server.inject({
-      method: 'POST',
-      url: `/api/hedges/${strategy.id}/confirm`,
-      headers: LOCAL_HEADERS,
-      payload: { riskAcknowledged: true }
-    })
-  ]);
-  await server.close();
-
-  assert.deepEqual(
-    responses.map((response) => response.statusCode).sort(),
-    [202, 202]
-  );
-  assert.equal(contract.createdRequests.length, 1);
-  assert.equal(spot.createdRequests.length, 1);
-  assert.equal(repository.getStrategy(strategy.id).state, 'HEDGED');
-});
-
-test('an EXECUTING strategy can be confirmed again after background failure', async (t) => {
-  const fixture = setup(t, {
-    confirmAndExecute: async () => {
-      throw new Error('fixed background failure');
-    }
-  });
-  const strategy = fixture.repository.createPending(preflight());
-  assert.equal(fixture.repository.claimForExecution(strategy.id), true);
-
-  const first = await fixture.server.inject({
+  const response = await fixture.server.inject({
     method: 'POST',
-    url: `/api/hedges/${strategy.id}/confirm`,
+    url: `/api/hedges/${pending.id}/confirm`,
     headers: LOCAL_HEADERS,
     payload: { riskAcknowledged: true }
   });
-  assert.equal(first.statusCode, 202);
   await flushImmediate();
-  assert.equal(fixture.getExecutionCount(), 1);
-  assert.equal(
-    fixture.repository.getStrategy(strategy.id).state,
-    'EXECUTING'
-  );
-
-  const second = await fixture.server.inject({
-    method: 'POST',
-    url: `/api/hedges/${strategy.id}/confirm`,
-    headers: LOCAL_HEADERS,
-    payload: { riskAcknowledged: true }
-  });
-  assert.equal(second.statusCode, 202);
-  await flushImmediate();
-  assert.equal(fixture.getExecutionCount(), 2);
-});
-
-test('EXECUTING confirmation recovers an existing intent without duplicate create', async (t) => {
-  const database = new Database(':memory:');
-  const repository = new SqliteStrategyRepository(database);
-  const spot = new FakeExchangeGateway('bitget');
-  const contract = new FakeExchangeGateway('okx');
-  const registry = new ExchangeRegistry(new Map([
-    ['bitget', spot],
-    ['okx', contract]
-  ]));
-  const strategy = repository.createPending(preflight());
-  spot.markets.set(`spot:${strategy.symbol}`, strategy.preflight.spotMarket);
-  assert.equal(repository.claimForExecution(strategy.id), true);
-  const contractRequest = requestFor(
-    strategy.id,
-    'CONTRACT_MARKET',
-    strategy.effectiveBaseQuantity
-  );
-  repository.planOrder(strategy.id, 'CONTRACT_MARKET', contractRequest);
-  contract.seedObservedOrder(snapshotFor(contractRequest, 'okx', {
-    filledBaseQuantity: '1',
-    remainingBaseQuantity: '0',
-    averagePrice: '60010',
-    status: 'closed'
-  }));
-  const spotRequest = requestFor(
-    strategy.id,
-    'SPOT_HEDGE_GTC',
-    strategy.effectiveBaseQuantity
-  );
-  spot.createResults.push(snapshotFor(spotRequest, 'bitget', {
-    filledBaseQuantity: '1',
-    remainingBaseQuantity: '0',
-    averagePrice: '60010',
-    status: 'closed'
-  }));
-  const reconciliation = new HedgeReconciliation(registry, repository);
-  const server = buildServer({
-    registry,
-    preflightService: {
-      run: async () => {
-        throw new Error('not used');
-      }
-    },
-    repository,
-    coordinator: new HedgeCoordinator(registry, repository, reconciliation),
-    logger: false
-  });
-  t.after(async () => {
-    await server.close();
-    database.close();
-  });
-
-  const response = await server.inject({
-    method: 'POST',
-    url: `/api/hedges/${strategy.id}/confirm`,
-    headers: LOCAL_HEADERS,
-    payload: { riskAcknowledged: true }
-  });
-  await server.close();
-
-  assert.equal(response.statusCode, 202);
-  assert.equal(contract.createdRequests.length, 0);
-  assert.equal(spot.createdRequests.length, 1);
-  assert.equal(repository.getStrategy(strategy.id).state, 'HEDGED');
-});
-
-test('confirmation is an idempotent 202 for terminal strategies without new execution', async (t) => {
-  const { server, repository, getExecutionCount } = setup(t);
-  const strategy = repository.createPending(preflight());
-  assert.equal(repository.claimForExecution(strategy.id), true);
-  assert.equal(
-    repository.transition(strategy.id, ['EXECUTING'], 'HEDGED'),
-    true
-  );
-
-  const response = await server.inject({
-    method: 'POST',
-    url: `/api/hedges/${strategy.id}/confirm`,
-    headers: LOCAL_HEADERS,
-    payload: { riskAcknowledged: true }
-  });
 
   assert.equal(response.statusCode, 202);
   assert.deepEqual(response.json(), { accepted: true });
+  assert.deepEqual(fixture.confirmationInputs, [pending.id]);
+  assert.equal(fixture.getExecutionCount(), 1);
+  assert.doesNotMatch(response.body, /ROUTE-DIRECT-READ-SENTINEL/);
+});
+
+test('confirmation waits for commit and lock release before responding and queueing', async (t) => {
+  const events: string[] = [];
+  let releaseConfirmation: (() => void) | undefined;
+  const confirmationGate = new Promise<void>((resolve) => {
+    releaseConfirmation = resolve;
+  });
+  const fixture = setup(t, {
+    confirmStrategy: async () => {
+      events.push('confirm-start');
+      await confirmationGate;
+      events.push('confirm-resolve');
+    },
+    confirmAndExecute: async () => {
+      events.push('coordinator-start');
+    }
+  });
+  const pending = fixture.repository.createPending(preflight());
+  let httpResolved = false;
+  const responsePromise = fixture.server.inject({
+    method: 'POST',
+    url: `/api/hedges/${pending.id}/confirm`,
+    headers: LOCAL_HEADERS,
+    payload: { riskAcknowledged: true }
+  }).then((response) => {
+    httpResolved = true;
+    events.push('http-resolve');
+    return response;
+  });
+
+  for (let attempt = 0; attempt < 20 && events.length === 0; attempt += 1) {
+    await flushImmediate();
+  }
+  const observedBeforeRelease = {
+    events: [...events],
+    httpResolved,
+    executionCount: fixture.getExecutionCount()
+  };
+  releaseConfirmation?.();
+  const response = await responsePromise;
   await flushImmediate();
-  assert.equal(getExecutionCount(), 0);
+
+  assert.deepEqual(observedBeforeRelease, {
+    events: ['confirm-start'],
+    httpResolved: false,
+    executionCount: 0
+  });
+  assert.equal(response.statusCode, 202);
+  assert.deepEqual(events, [
+    'confirm-start',
+    'confirm-resolve',
+    'http-resolve',
+    'coordinator-start'
+  ]);
+});
+
+test('competing confirmation is busy for every first-request outcome', async (t) => {
+  const cases = [
+    {
+      name: 'first confirmation succeeds',
+      firstStatus: 202,
+      firstError: undefined,
+      firstCode: undefined,
+      executionCount: 1
+    },
+    {
+      name: 'business recheck failure commits invalidation',
+      firstStatus: 409,
+      firstError: createTradeOpsError({
+        code: 'MARKET_INACTIVE', phase: 'confirmation',
+        subject: {
+          type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap',
+          field: 'active'
+        },
+        expected: true, actual: false
+      }),
+      firstCode: 'MARKET_INACTIVE',
+      executionCount: 0
+    },
+    {
+      name: 'external recheck read failure commits invalidation',
+      firstStatus: 409,
+      firstError: createTradeOpsError({
+        code: 'PRICE_UNAVAILABLE', phase: 'confirmation',
+        subject: {
+          type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap',
+          field: 'price'
+        },
+        expected: 'available reference price', actual: 'read-failed'
+      }),
+      firstCode: 'PRICE_UNAVAILABLE',
+      executionCount: 0
+    },
+    {
+      name: 'initial storage read fails before invalidation',
+      firstStatus: 500,
+      firstError: createTradeOpsError({
+        code: 'STORAGE_OPERATION_FAILED', phase: 'storage',
+        subject: {
+          type: 'database', table: 'strategies', operation: 'read strategy'
+        },
+        expected: 'successful read strategy', actual: 'read-failed'
+      }),
+      firstCode: 'STORAGE_OPERATION_FAILED',
+      executionCount: 0
+    }
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, async (subtest) => {
+      let invocationCount = 0;
+      let releaseFirst: (() => void) | undefined;
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const fixture = setup(subtest, {
+        confirmStrategy: async (strategyId) => {
+          invocationCount += 1;
+          if (invocationCount > 1) {
+            throw createTradeOpsError({
+              code: 'STRATEGY_OPERATION_BUSY',
+              phase: 'confirmation',
+              subject: { type: 'strategy', strategyId, field: 'operationLock' },
+              expected: 'available',
+              actual: 'busy'
+            });
+          }
+          await firstGate;
+          if (item.firstError !== undefined) {
+            throw item.firstError;
+          }
+        }
+      });
+      const pending = fixture.repository.createPending(preflight());
+      const request = {
+        method: 'POST' as const,
+        url: `/api/hedges/${pending.id}/confirm`,
+        headers: LOCAL_HEADERS,
+        payload: { riskAcknowledged: true }
+      };
+      const firstPromise = fixture.server.inject(request);
+      for (
+        let attempt = 0;
+        attempt < 20 && invocationCount === 0;
+        attempt += 1
+      ) {
+        await flushImmediate();
+      }
+      const firstStartedBeforeCompetition = invocationCount === 1;
+      const secondPromise = fixture.server.inject(request);
+      for (
+        let attempt = 0;
+        attempt < 20 && invocationCount < 2;
+        attempt += 1
+      ) {
+        await flushImmediate();
+      }
+      releaseFirst?.();
+      const [first, second] = await Promise.all([firstPromise, secondPromise]);
+      await flushImmediate();
+
+      assert.equal(firstStartedBeforeCompetition, true);
+      assert.equal(first.statusCode, item.firstStatus);
+      if (item.firstCode === undefined) {
+        assert.deepEqual(first.json(), { accepted: true });
+      } else {
+        assertPublicHttpError(first, {
+          code: item.firstCode,
+          phase: item.firstError.detail.phase,
+          detail: item.firstError.detail
+        });
+      }
+      assert.equal(second.statusCode, 409);
+      assertPublicHttpError(second, {
+        code: 'STRATEGY_OPERATION_BUSY',
+        phase: 'confirmation'
+      });
+      assert.equal(fixture.getConfirmationCount(), 2);
+      assert.equal(fixture.getExecutionCount(), item.executionCount);
+    });
+  }
+});
+
+test('confirmation maps precise failures by context without queueing', async (t) => {
+  const strategyId = 'strategy-confirmation-errors';
+  const cases: ReadonlyArray<{
+    readonly name: string;
+    readonly status: number;
+    readonly error: unknown;
+    readonly code: string;
+    readonly phase: ErrorDetail['phase'];
+  }> = [
+    {
+      name: 'missing strategy',
+      status: 404,
+      error: createTradeOpsError({
+        code: 'STRATEGY_NOT_FOUND', phase: 'confirmation',
+        subject: { type: 'strategy', strategyId },
+        expected: 'existing strategy', actual: 'missing'
+      }),
+      code: 'STRATEGY_NOT_FOUND', phase: 'confirmation'
+    },
+    ...(['EXECUTING', 'WAITING_HEDGE', 'HEDGED', 'HEDGE_INCOMPLETE', 'FAILED',
+      'PREFLIGHT_INVALIDATED'] as const).map((state) => ({
+      name: `state ${state}`,
+      status: 409,
+      error: createTradeOpsError({
+        code: 'STRATEGY_STATE_MISMATCH', phase: 'confirmation',
+        subject: { type: 'strategy', strategyId, field: 'state' },
+        expected: 'PENDING_CONFIRMATION', actual: state
+      }),
+      code: 'STRATEGY_STATE_MISMATCH',
+      phase: 'confirmation' as const
+    })),
+    {
+      name: 'external preflight read invalidated after commit',
+      status: 409,
+      error: createTradeOpsError({
+        code: 'PRICE_UNAVAILABLE', phase: 'confirmation',
+        subject: {
+          type: 'market', exchangeId: 'okx', symbol: SYMBOL, kind: 'swap',
+          field: 'price'
+        },
+        expected: 'available reference price', actual: 'object-failure'
+      }),
+      code: 'PRICE_UNAVAILABLE', phase: 'confirmation'
+    },
+    {
+      name: 'initial storage read failure',
+      status: 500,
+      error: createTradeOpsError({
+        code: 'STORAGE_OPERATION_FAILED', phase: 'storage',
+        subject: {
+          type: 'database', table: 'strategies', recordId: strategyId,
+          operation: 'read strategy'
+        },
+        expected: 'successful read strategy', actual: 'object-failure'
+      }),
+      code: 'STORAGE_OPERATION_FAILED', phase: 'storage'
+    },
+    {
+      name: 'unknown confirmation failure',
+      status: 500,
+      error: Object.assign(new Error('CONFIRM-SECRET-SENTINEL'), {
+        cause: new Error('CONFIRM-CAUSE-SENTINEL')
+      }),
+      code: 'REQUEST_OPERATION_FAILED', phase: 'request'
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async (subtest) => {
+      const fixture = setup(subtest, {
+        confirmStrategy: async () => {
+          throw item.error;
+        }
+      });
+      const response = await fixture.server.inject({
+        method: 'POST',
+        url: `/api/hedges/${strategyId}/confirm`,
+        headers: LOCAL_HEADERS,
+        payload: { riskAcknowledged: true }
+      });
+      await flushImmediate();
+
+      assert.equal(response.statusCode, item.status);
+      assertPublicHttpError(response, {
+        code: item.code,
+        phase: item.phase
+      });
+      assert.equal(fixture.getConfirmationCount(), 1);
+      assert.equal(fixture.getExecutionCount(), 0);
+      assert.doesNotMatch(
+        response.body,
+        /CONFIRM-SECRET-SENTINEL|CONFIRM-CAUSE-SENTINEL|cause|stack/
+      );
+    });
+  }
 });
 
 test('background coordinator rejection is caught and server close drains queued work', async (t) => {
@@ -1935,6 +2358,195 @@ test('status reports zero actual fills for orders without snapshots', async (t) 
   });
 });
 
+test('status returns the same invalidation detail after reopening SQLite', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'trade-ops-task-5-status-'));
+  const databasePath = join(directory, 'strategies.sqlite');
+  let database = new Database(databasePath);
+  let repository = new SqliteStrategyRepository(database);
+  const pending = repository.createPending(preflight());
+  const invalidation = createTradeOpsError({
+    code: 'MARKET_INACTIVE',
+    phase: 'confirmation',
+    subject: {
+      type: 'market',
+      exchangeId: 'okx',
+      symbol: SYMBOL,
+      kind: 'swap',
+      field: 'active'
+    },
+    expected: true,
+    actual: false,
+    occurredAt: '2026-10-03T00:00:00.000Z'
+  }).detail;
+  repository.invalidatePreflight(pending, invalidation);
+  database.close();
+
+  database = new Database(databasePath);
+  repository = new SqliteStrategyRepository(database);
+  let confirmationCalls = 0;
+  let executionCalls = 0;
+  const server = buildTestServer({
+    registry: { ids: () => ['bitget', 'okx'] },
+    preflightService: {
+      run: async () => {
+        throw new Error('status route must not run preflight');
+      }
+    },
+    repository,
+    confirmationService: {
+      confirm: async () => {
+        confirmationCalls += 1;
+      }
+    },
+    coordinator: {
+      confirmAndExecute: async () => {
+        executionCalls += 1;
+      }
+    },
+    logger: false
+  });
+  t.after(async () => {
+    await server.close();
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const response = await server.inject({
+    method: 'GET',
+    url: `/api/hedges/${pending.id}`,
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(response.statusCode, 200);
+  const body = response.json();
+  assert.equal(body.strategy.state, 'PREFLIGHT_INVALIDATED');
+  assert.equal(body.strategy.failureCode, null);
+  assert.deepEqual(body.strategy.preflightFailure, invalidation);
+  assert.deepEqual(body.orders, []);
+  assert.deepEqual(body.actualFills, {
+    spotBuyBaseQuantity: '0',
+    contractShortBaseQuantity: '0',
+    unmatchedBaseQuantity: '0'
+  });
+  assert.equal(confirmationCalls, 0);
+  assert.equal(executionCalls, 0);
+});
+
+test('trusted persisted projection and projection failures are side-effect free', async (t) => {
+  await t.test('GET redacts configured secrets without rewriting SQLite', async (subtest) => {
+    const configuredSecret = 'CONFIGURED-PERSISTED-SECRET';
+    const input = {
+      code: 'MARKET_INACTIVE',
+      phase: 'confirmation',
+      subject: {
+        type: 'market',
+        exchangeId: `exchange-${configuredSecret}`,
+        symbol: SYMBOL,
+        kind: 'swap',
+        field: 'active'
+      },
+      expected: true,
+      actual: false,
+      occurredAt: '2026-10-03T00:00:00.000Z'
+    } as const;
+    const unsafePersistedDetail = createTradeOpsError(input).detail;
+    const expectedPublicDetail = createTradeOpsError(
+      input,
+      [configuredSecret]
+    ).detail;
+    const fixture = setup(subtest, {
+      secretProvider: () => [configuredSecret]
+    });
+    const pending = fixture.repository.createPending(preflight());
+    fixture.repository.invalidatePreflight(pending, unsafePersistedDetail);
+    const storedBefore = fixture.repository.getStrategy(pending.id);
+
+    const response = await fixture.server.inject({
+      method: 'GET',
+      url: `/api/hedges/${pending.id}`,
+      headers: LOCAL_HEADERS
+    });
+
+    assert.equal(response.statusCode, 200);
+    const body = response.json();
+    assert.equal(body.strategy.state, 'PREFLIGHT_INVALIDATED');
+    assert.deepEqual(
+      parseErrorDetail(body.strategy.preflightFailure),
+      expectedPublicDetail
+    );
+    assert.doesNotMatch(response.body, new RegExp(configuredSecret));
+    assert.deepEqual(fixture.repository.getStrategy(pending.id), storedBefore);
+    assert.deepEqual(storedBefore.preflightFailure, unsafePersistedDetail);
+    assert.match(
+      JSON.stringify(storedBefore.preflightFailure),
+      new RegExp(configuredSecret)
+    );
+    assert.equal(fixture.getConfirmationCount(), 0);
+    assert.equal(fixture.getExecutionCount(), 0);
+  });
+
+  await t.test('confirmation keeps committed invalidation when projection fails', async (subtest) => {
+    const providerSentinel = 'PROVIDER-FAILURE-SENTINEL';
+    const failure = createTradeOpsError({
+      code: 'MARKET_INACTIVE',
+      phase: 'confirmation',
+      subject: {
+        type: 'market',
+        exchangeId: 'okx',
+        symbol: SYMBOL,
+        kind: 'swap',
+        field: 'active'
+      },
+      expected: true,
+      actual: false,
+      occurredAt: '2026-10-03T00:00:00.000Z'
+    });
+    let confirmBehavior: (strategyId: string) => Promise<void> = async () => {
+      throw new Error('confirmation behavior not initialized');
+    };
+    const fixture = setup(subtest, {
+      confirmStrategy: async (strategyId) => confirmBehavior(strategyId),
+      secretProvider: () => {
+        throw new Error(providerSentinel);
+      }
+    });
+    const pending = fixture.repository.createPending(preflight());
+    confirmBehavior = async (strategyId) => {
+      const current = fixture.repository.getStrategy(strategyId);
+      fixture.repository.invalidatePreflight(current, failure.detail);
+      throw failure;
+    };
+
+    const response = await fixture.server.inject({
+      method: 'POST',
+      url: `/api/hedges/${pending.id}/confirm`,
+      headers: LOCAL_HEADERS,
+      payload: { riskAcknowledged: true }
+    });
+    await flushImmediate();
+
+    assert.equal(response.statusCode, 409);
+    const body = response.json();
+    assert.equal(typeof body.requestId, 'string');
+    assert.deepEqual(Object.keys(body).sort(), ['error', 'requestId']);
+    assert.doesNotThrow(() => parseErrorDetail(body.error));
+    assert.match(String(response.headers['cache-control'] ?? ''), /no-store/);
+    assert.match(
+      String(response.headers['content-security-policy'] ?? ''),
+      /default-src 'self'/
+    );
+    assert.doesNotMatch(response.body, new RegExp(providerSentinel));
+
+    const stored = fixture.repository.getStrategy(pending.id);
+    assert.equal(stored.state, 'PREFLIGHT_INVALIDATED');
+    assert.deepEqual(stored.preflightFailure, failure.detail);
+    assert.equal(stored.failureCode, null);
+    assert.deepEqual(fixture.repository.listOrders(pending.id), []);
+    assert.equal(fixture.getConfirmationCount(), 1);
+    assert.equal(fixture.getExecutionCount(), 0);
+  });
+});
+
 test('status returns typed 404 and tampered repository failures return safe 500', async (t) => {
   const loggedErrors: CapturedOperationalError[] = [];
   const first = setup(t);
@@ -1944,6 +2556,10 @@ test('status returns typed 404 and tampered repository failures return safe 500'
     headers: LOCAL_HEADERS
   });
   assert.equal(missing.statusCode, 404);
+  assertPublicHttpError(missing, {
+    code: 'STRATEGY_NOT_FOUND',
+    phase: 'request'
+  });
 
   const existing = first.repository.createPending(preflight());
   const tamperedRepository = new Proxy<StrategyRepository>(first.repository, {
@@ -1970,18 +2586,148 @@ test('status returns typed 404 and tampered repository failures return safe 500'
 
   assert.equal(tampered.statusCode, 500);
   assertPublicHttpError(tampered, {
-    code: 'INTERNAL_ERROR',
-    message: 'Internal server error',
-    error: {
-      type: 'Error',
-      message: 'sqlite row secret [Redacted]'
-    }
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
   });
   assert.doesNotMatch(tampered.body, /LEAK-ME-NOT|unconfigured-token|apiKey/);
   assert.deepEqual(
     loggedErrors.filter((entry) => entry.event === 'unhandled_http_request_failure'),
     []
   );
+});
+
+test('unknown thrown values cannot impersonate repository or framework errors', async (t) => {
+  const first = setup(t);
+  const fakeMissing = Object.create(
+    StrategyNotFoundError.prototype
+  ) as StrategyNotFoundError;
+  const spoofedRepository = new Proxy<StrategyRepository>(first.repository, {
+    get(target, property, receiver) {
+      if (property === 'getStrategy') {
+        return (): never => {
+          throw fakeMissing;
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  const spoofedFixture = setup(t, { repository: spoofedRepository });
+  const spoofedMissing = await spoofedFixture.server.inject({
+    method: 'GET',
+    url: '/api/hedges/spoofed-missing',
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(spoofedMissing.statusCode, 500);
+  assertPublicHttpError(spoofedMissing, {
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
+  });
+
+  let codeReads = 0;
+  let validationReads = 0;
+  const hostileFrameworkShape = new Error('untrusted route failure');
+  Object.defineProperties(hostileFrameworkShape, {
+    code: {
+      get(): string {
+        codeReads += 1;
+        return 'FST_ERR_CTP_INVALID_JSON_BODY';
+      }
+    },
+    validation: {
+      get(): readonly unknown[] {
+        validationReads += 1;
+        return [{ keyword: 'required' }];
+      }
+    }
+  });
+  const frameworkFixture = setup(t);
+  frameworkFixture.server.get('/test/hostile-framework-shape', async () => {
+    throw hostileFrameworkShape;
+  });
+  const hostileFramework = await frameworkFixture.server.inject({
+    method: 'GET',
+    url: '/test/hostile-framework-shape',
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(hostileFramework.statusCode, 500);
+  assertPublicHttpError(hostileFramework, {
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
+  });
+  assert.equal(codeReads, 0);
+  assert.equal(validationReads, 0);
+
+  const { proxy: revoked, revoke } = Proxy.revocable({}, {});
+  revoke();
+  const revokedRepository = new Proxy<StrategyRepository>(first.repository, {
+    get(target, property, receiver) {
+      if (property === 'getStrategy') {
+        return (): never => {
+          throw revoked;
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  const revokedFixture = setup(t, { repository: revokedRepository });
+  const revokedResponse = await revokedFixture.server.inject({
+    method: 'GET',
+    url: '/api/hedges/revoked-throwable',
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(revokedResponse.statusCode, 500);
+  assertPublicHttpError(revokedResponse, {
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
+  });
+});
+
+test('parameter validation remains a field error when the request has no body', async (t) => {
+  const fixture = setup(t);
+  const response = await fixture.server.inject({
+    method: 'GET',
+    url: '/api/hedges/invalid.id',
+    headers: LOCAL_HEADERS
+  });
+
+  assert.equal(response.statusCode, 400);
+  const detail = assertPublicHttpError(response, {
+    code: 'REQUEST_FIELD_INVALID',
+    phase: 'request'
+  });
+  assert.deepEqual(detail.subject, { type: 'request', field: 'id' });
+});
+
+test('unmatched API routes and static resources use the typed route 404', async (t) => {
+  const fixture = setup(t);
+  const responses = await Promise.all([
+    fixture.server.inject({
+      method: 'GET',
+      url: '/api/route-that-does-not-exist?kind=synthetic',
+      headers: LOCAL_HEADERS
+    }),
+    fixture.server.inject({
+      method: 'GET',
+      url: '/missing-static-resource.js',
+      headers: LOCAL_HEADERS
+    })
+  ]);
+
+  for (const response of responses) {
+    assert.equal(response.statusCode, 404);
+    const detail = assertPublicHttpError(response, {
+      code: 'REQUEST_ROUTE_NOT_FOUND',
+      phase: 'request'
+    });
+    assert.deepEqual(detail.subject, { type: 'request', field: 'route' });
+    assert.doesNotMatch(response.body, /synthetic|missing-static-resource/);
+  }
+  assert.equal(fixture.preflightInputs.length, 0);
+  assert.equal(fixture.getConfirmationCount(), 0);
+  assert.equal(fixture.getExecutionCount(), 0);
 });
 
 test('a throwing operational log cannot replace an HTTP 500 response', async (t) => {
@@ -2017,8 +2763,8 @@ test('a throwing operational log cannot replace an HTTP 500 response', async (t)
 
   assert.equal(response.statusCode, 500);
   assertPublicHttpError(response, {
-    code: 'INTERNAL_ERROR',
-    message: 'Internal server error'
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
   });
 });
 
@@ -2278,8 +3024,8 @@ test('operator UI accepts a matching status id and canonical high-precision fill
     browser.element('contract-order-ids').children[0]?.textContent ?? '',
     /okx-/
   );
-  assert.equal(browser.element('risk-ack').checked, true);
-  assert.equal(browser.element('confirm-button').disabled, false);
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
 });
 
 test('operator UI rejects status strategy identity mismatches before rendering', async (t) => {
@@ -2485,7 +3231,7 @@ test('operator UI admits only one confirmation request across a double click', a
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
-test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgement to resume', async () => {
+test('operator UI loads an EXECUTING strategy for observation without confirmation', async () => {
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174000';
   const status = browserStatusResponse();
@@ -2508,14 +3254,6 @@ test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgeme
       assert.equal(options, undefined);
       return browserResponse(200, status);
     }
-    if (url === `/api/hedges/${strategyId}/confirm`) {
-      assert.equal(options?.method, 'POST');
-      assert.equal(
-        options?.body,
-        JSON.stringify({ riskAcknowledged: true })
-      );
-      return browserResponse(202, { accepted: true });
-    }
     throw new Error(`unexpected resume URL: ${url}`);
   });
 
@@ -2534,17 +3272,16 @@ test('operator UI loads an EXECUTING strategy and requires a fresh acknowledgeme
 
   browser.element('risk-ack').checked = true;
   await browser.element('risk-ack').emit('change');
-  assert.equal(browser.element('confirm-button').disabled, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
   await browser.element('confirm-button').emit('click');
   assert.equal(
     browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
-    1
+    0
   );
-  assert.equal(browser.element('risk-ack').checked, false);
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
-test('operator UI loads and actually confirms a concurrent single-market recovery intent', async () => {
+test('operator UI leaves an EXECUTING recovery intent to the monitor', async () => {
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174009';
   const status = browserStatusResponse();
@@ -2564,14 +3301,6 @@ test('operator UI loads and actually confirms a concurrent single-market recover
       assert.equal(options, undefined);
       return browserResponse(200, status);
     }
-    if (url === `/api/hedges/${strategyId}/confirm`) {
-      assert.equal(options?.method, 'POST');
-      assert.equal(
-        options?.body,
-        JSON.stringify({ riskAcknowledged: true })
-      );
-      return browserResponse(202, { accepted: true });
-    }
     throw new Error(`unexpected single-intent URL: ${url}`);
   });
 
@@ -2582,14 +3311,13 @@ test('operator UI loads and actually confirms a concurrent single-market recover
 
   browser.element('risk-ack').checked = true;
   await browser.element('risk-ack').emit('change');
-  assert.equal(browser.element('confirm-button').disabled, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
   await browser.element('confirm-button').emit('click');
 
   assert.equal(
     browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
-    1
+    0
   );
-  assert.equal(browser.element('risk-ack').checked, false);
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
@@ -2787,6 +3515,63 @@ test('operator UI loads WAITING_HEDGE for observation without enabling confirmat
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
+test('operator UI renders invalidation detail as terminal plain text', async () => {
+  const browser = await browserHarness();
+  const strategyId = '123e4567-e89b-42d3-a456-426614174019';
+  const failure = createTradeOpsError({
+    code: 'MARKET_INACTIVE',
+    phase: 'confirmation',
+    subject: {
+      type: 'market',
+      exchangeId: 'okx',
+      symbol: SYMBOL,
+      kind: 'swap',
+      field: 'active'
+    },
+    expected: true,
+    actual: '<img src=x onerror=INVALIDATION-SENTINEL>',
+    occurredAt: '2026-10-03T00:00:00.000Z'
+  }).detail;
+  const status = browserStatusResponse();
+  Object.assign(status.strategy as Record<string, unknown>, {
+    id: strategyId,
+    state: 'PREFLIGHT_INVALIDATED',
+    failureCode: null,
+    preflightFailure: failure
+  });
+  status.orders = [];
+  setBrowserActualFills(status, '0', '0', '0');
+  browser.element('resume-strategy-id').value = strategyId;
+  browser.setFetch(async (url) => {
+    assert.equal(url, `/api/hedges/${strategyId}`);
+    return browserResponse(200, status);
+  });
+
+  await browser.element('resume-form').emit('submit');
+  browser.element('risk-ack').checked = true;
+  await browser.element('risk-ack').emit('change');
+  await browser.element('confirm-button').emit('click');
+
+  assert.equal(
+    browser.element('strategy-state').textContent,
+    'PREFLIGHT_INVALIDATED'
+  );
+  const message = browser.element('operator-message').textContent;
+  assert.match(message, /重新预检/);
+  assert.match(message, new RegExp(failure.message));
+  assert.match(message, /阶段[：:].*confirmation/);
+  assert.match(message, /对象[：:].*market/);
+  assert.match(message, /期望[：:].*true/);
+  assert.match(message, /实际[：:].*INVALIDATION-SENTINEL/);
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+  assert.equal(browser.element('refresh-button').disabled, false);
+  assert.equal(
+    browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
+    0
+  );
+});
+
 test('operator UI disables recovery confirmation when refresh reaches WAITING_HEDGE', async () => {
   const browser = await browserHarness();
   const strategyId = '123e4567-e89b-42d3-a456-426614174008';
@@ -2805,7 +3590,7 @@ test('operator UI disables recovery confirmation when refresh reaches WAITING_HE
   await browser.element('resume-form').emit('submit');
   browser.element('risk-ack').checked = true;
   await browser.element('risk-ack').emit('change');
-  assert.equal(browser.element('confirm-button').disabled, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
 
   const waiting = browserContractFirstWaitingStatus(strategyId);
   status = waiting;
@@ -2913,6 +3698,54 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     (body.preflight as Record<string, unknown>).mode = mode;
   };
   const cases: StatusMutation[] = [
+    {
+      name: 'strategy omits preflight failure field',
+      mutate(body) {
+        delete (body.strategy as Record<string, unknown>).preflightFailure;
+      }
+    },
+    {
+      name: 'pending strategy carries a preflight failure',
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).preflightFailure =
+          DETAILED_BROWSER_DETAIL;
+      }
+    },
+    {
+      name: 'invalidated strategy omits its preflight failure',
+      mutate(body) {
+        Object.assign(body.strategy as Record<string, unknown>, {
+          state: 'PREFLIGHT_INVALIDATED',
+          preflightFailure: null
+        });
+        body.orders = [];
+        setBrowserActualFills(body, '0', '0', '0');
+      }
+    },
+    {
+      name: 'invalidated strategy contains an order',
+      mutate(body) {
+        Object.assign(body.strategy as Record<string, unknown>, {
+          state: 'PREFLIGHT_INVALIDATED',
+          preflightFailure: DETAILED_BROWSER_DETAIL
+        });
+        oneOrder(body);
+      }
+    },
+    {
+      name: 'invalidated strategy carries malformed failure detail',
+      mutate(body) {
+        Object.assign(body.strategy as Record<string, unknown>, {
+          state: 'PREFLIGHT_INVALIDATED',
+          preflightFailure: {
+            ...DETAILED_BROWSER_DETAIL,
+            rawError: 'RAW-FAILURE-SENTINEL'
+          }
+        });
+        body.orders = [];
+        setBrowserActualFills(body, '0', '0', '0');
+      }
+    },
     {
       name: 'contract-first contains the spot-first market role',
       mutate(body) {
@@ -3559,7 +4392,8 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       | 'WAITING_HEDGE'
       | 'HEDGED'
       | 'HEDGE_INCOMPLETE'
-      | 'FAILED';
+      | 'FAILED'
+      | 'PREFLIGHT_INVALIDATED';
     readonly roles: readonly OrderRole[];
     readonly quantities?: Partial<Record<OrderRole, string>>;
     readonly snapshots?: Partial<
@@ -3593,7 +4427,7 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       mode,
       state: 'EXECUTING' as const,
       roles,
-      actionable: true
+      actionable: false
     })),
     {
       name: 'executing contract-first with a derived spot second leg',
@@ -3610,7 +4444,7 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
         }
       },
       actualFills: { spot: '0', contract: '0.6', unmatched: '0.6' },
-      actionable: true
+      actionable: false
     },
     {
       name: 'executing spot-first with a derived contract second leg',
@@ -3627,7 +4461,7 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
         }
       },
       actualFills: { spot: '0.7', contract: '0', unmatched: '0.7' },
-      actionable: true
+      actionable: false
     },
     {
       name: 'executing concurrent with equal positive market fills',
@@ -3649,7 +4483,7 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
         }
       },
       actualFills: { spot: '0.8', contract: '0.8', unmatched: '0' },
-      actionable: true
+      actionable: false
     },
     {
       name: 'executing concurrent preserves an exact tiny contract hedge',
@@ -3681,7 +4515,7 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
         contract: '0.5',
         unmatched: '0.0000000000000000000000000000000000000001'
       },
-      actionable: true
+      actionable: false
     },
     {
       name: 'executing concurrent hedges the smaller spot fill',
@@ -3704,7 +4538,7 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
         }
       },
       actualFills: { spot: '0.4', contract: '1', unmatched: '0.6' },
-      actionable: true
+      actionable: false
     },
     {
       name: 'waiting contract-first with both sequential roles',
@@ -3847,6 +4681,13 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
       state: 'FAILED',
       roles: ['SPOT_MARKET', 'CONTRACT_HEDGE_GTC'],
       actionable: false
+    },
+    {
+      name: 'invalidated preflight is terminal without orders',
+      mode: 'CONCURRENT',
+      state: 'PREFLIGHT_INVALIDATED',
+      roles: [],
+      actionable: false
     }
   ];
 
@@ -3860,6 +4701,22 @@ test('operator UI preserves every reachable or diagnostic mode-state topology', 
         state: item.state,
         failureCode: ['HEDGE_INCOMPLETE', 'FAILED'].includes(item.state)
           ? 'INCONSISTENT_ORDER_STATE'
+          : null,
+        preflightFailure: item.state === 'PREFLIGHT_INVALIDATED'
+          ? createTradeOpsError({
+              code: 'MARKET_INACTIVE',
+              phase: 'confirmation',
+              subject: {
+                type: 'market',
+                exchangeId: 'okx',
+                symbol: SYMBOL,
+                kind: 'swap',
+                field: 'active'
+              },
+              expected: true,
+              actual: false,
+              occurredAt: '2026-10-03T00:00:00.000Z'
+            }).detail
           : null
       });
       (body.preflight as Record<string, unknown>).mode = item.mode;
@@ -3937,7 +4794,7 @@ test('operator UI invalidates a loaded strategy when the resume id is edited', a
   await browser.element('resume-form').emit('submit');
   browser.element('risk-ack').checked = true;
   await browser.element('risk-ack').emit('change');
-  assert.equal(browser.element('confirm-button').disabled, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
 
   browser.element('resume-strategy-id').value =
     '123e4567-e89b-42d3-a456-426614174004';
@@ -4164,31 +5021,29 @@ test('completion captures valid body invalid JSON and stable known errors', asyn
   const valid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?dryRun=false', headers: LOCAL_HEADERS, payload: validBody });
   const invalidText = '{"symbol":"RAW-INVALID"';
   const invalid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?source=raw', headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' }, payload: invalidText });
-  assert.equal(valid.statusCode, 422);
+  assert.equal(valid.statusCode, 500);
   assert.equal(invalid.statusCode, 400);
   const completions = completionLines(capture.lines());
-  const preflightLine = completionForStatus(completions, 422);
+  const preflightLine = completionForStatus(completions, 500);
   assert.notEqual(preflightLine.httpError, undefined);
-  const loggedError = preflightLine.httpError as { error: { stack: string } };
-  assert.deepEqual(preflightLine.httpError, {
-    code: 'PREFLIGHT_REJECTED', message: 'Preflight checks did not pass',
-    error: { type: 'AuthenticationError', message: 'authentication failed', code: '40101', stack: loggedError.error.stack }
-  });
+  const loggedError = preflightLine.httpError as Record<string, unknown>;
+  assert.deepEqual(Object.keys(loggedError).sort(), ['code', 'error', 'message']);
+  assert.equal(loggedError.code, 'REQUEST_OPERATION_FAILED');
+  const loggedDetail = parseErrorDetail(loggedError.error);
+  assert.equal(loggedError.message, loggedDetail.message);
+  assert.equal(loggedDetail.code, 'REQUEST_OPERATION_FAILED');
+  assert.equal(loggedDetail.phase, 'request');
   assert.deepEqual((preflightLine.httpRequest as Record<string, unknown>).body, validBody);
   assert.equal((preflightLine.httpRequest as Record<string, unknown>).url, '/api/hedges/preflight?dryRun=false');
   const invalidLine = completionForStatus(completions, 400);
-  assert.deepEqual(invalidLine.httpError, { code: 'INVALID_REQUEST', message: 'Request validation failed' });
+  assert.deepEqual(invalidLine.httpError, {
+    code: 'REQUEST_BODY_INVALID',
+    message: '请求正文结构检查失败'
+  });
   assert.equal((invalidLine.httpRequest as Record<string, unknown>).body, invalidText);
-  assert.deepEqual(Object.keys(loggedError.error).sort(), [
-    'code',
-    'message',
-    'stack',
-    'type'
-  ]);
-  assert.equal(Object.hasOwn(loggedError.error, 'validation'), false);
   assert.doesNotMatch(
     JSON.stringify(completions),
-    /ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL/
+    /AuthenticationError|authentication failed|40101|stack|ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL/
   );
 });
 
@@ -4264,11 +5119,14 @@ test('completion safely degrades when secret provider fails and failed preflight
     method: 'POST', url: '/api/hedges/preflight?token=url-secret', headers: LOCAL_HEADERS,
     payload: { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'SPOT_FIRST' }
   });
-  assert.equal(response.statusCode, 422);
+  assert.equal(response.statusCode, 500);
   assert.equal(preflightRuns, 1);
   assert.equal(repository.listRecoverable().length, before);
-  const line = completionForStatus(capture.lines(), 422);
-  assert.deepEqual(line.httpError, { code: 'PREFLIGHT_REJECTED', message: 'Preflight checks did not pass' });
+  const line = completionForStatus(capture.lines(), 500);
+  assert.deepEqual(line.httpError, {
+    code: 'REQUEST_OPERATION_FAILED',
+    message: '请求处理操作检查失败'
+  });
   assert.deepEqual(line.httpRequest, { method: '[Unavailable]', url: '[Unavailable]', body: '[Unavailable]', truncated: false, originalByteLength: Buffer.byteLength('[Unavailable]', 'utf8') });
   assert.doesNotMatch(JSON.stringify(line), /provider-secret|payload-secret|url-secret/);
 });
@@ -4290,7 +5148,10 @@ test('forbidden completion excludes hostile headers and records stable request d
   assert.equal(response.statusCode, 403);
   const line = completionForStatus(capture.lines(), 403);
   assert.equal(line.level, 40);
-  assert.deepEqual(line.httpError, { code: 'FORBIDDEN', message: 'Request forbidden' });
+  assert.deepEqual(line.httpError, {
+    code: 'REQUEST_FORBIDDEN',
+    message: '请求来源安全检查失败'
+  });
   const snapshot = line.httpRequest as Record<string, unknown>;
   assert.equal(snapshot.method, 'POST');
   assert.equal(snapshot.url, '/api/hedges/preflight?visible=query-value');
@@ -4356,8 +5217,8 @@ test('HTTP safety boundary rejects invalid Host and unsafe Origin before invalid
     });
     assert.equal(response.statusCode, 403, request.label);
     assertPublicHttpError(response, {
-      code: 'FORBIDDEN',
-      message: 'Request forbidden'
+      code: 'REQUEST_FORBIDDEN',
+      phase: 'request'
     });
   }
 
@@ -4369,8 +5230,8 @@ test('HTTP safety boundary rejects invalid Host and unsafe Origin before invalid
   for (const completion of completions) {
     assert.equal(completion.level, 40);
     assert.deepEqual(completion.httpError, {
-      code: 'FORBIDDEN',
-      message: 'Request forbidden'
+      code: 'REQUEST_FORBIDDEN',
+      message: '请求来源安全检查失败'
     });
     const snapshot = completion.httpRequest as Record<string, unknown>;
     assert.equal(snapshot.method, 'POST');
@@ -4419,8 +5280,8 @@ test('HTTP safety boundary rejects invalid Host before Fastify body limit', asyn
 
   assert.equal(response.statusCode, 403);
   assertPublicHttpError(response, {
-    code: 'FORBIDDEN',
-    message: 'Request forbidden'
+    code: 'REQUEST_FORBIDDEN',
+    phase: 'request'
   });
   assert.equal(fixture.preflightInputs.length, 0);
   assert.equal(repositoryCalls, 0);
@@ -4428,8 +5289,8 @@ test('HTTP safety boundary rejects invalid Host before Fastify body limit', asyn
   const completion = completionForStatus(capture.lines(), 403);
   assert.equal(completion.level, 40);
   assert.deepEqual(completion.httpError, {
-    code: 'FORBIDDEN',
-    message: 'Request forbidden'
+    code: 'REQUEST_FORBIDDEN',
+    message: '请求来源安全检查失败'
   });
   const snapshot = completion.httpRequest as Record<string, unknown>;
   assert.equal(snapshot.method, 'POST');
@@ -4474,8 +5335,8 @@ test('raw request capture has an independent 1 MiB limit below a route body limi
 
   assert.equal(response.statusCode, 400);
   assertPublicHttpError(response, {
-    code: 'INVALID_REQUEST',
-    message: 'Request validation failed'
+    code: 'REQUEST_BODY_INVALID',
+    phase: 'request'
   });
   assert.equal(handlerCalls, 0);
   const completions = completionLines(capture.lines());
@@ -4483,8 +5344,8 @@ test('raw request capture has an independent 1 MiB limit below a route body limi
   const completion = completionForStatus(completions, 400);
   assert.equal(completion.level, 40);
   assert.deepEqual(completion.httpError, {
-    code: 'INVALID_REQUEST',
-    message: 'Request validation failed'
+    code: 'REQUEST_BODY_INVALID',
+    message: '请求正文结构检查失败'
   });
   const snapshot = completion.httpRequest as Record<string, unknown>;
   assert.equal(snapshot.method, 'POST');
@@ -4584,17 +5445,25 @@ test('known and fallback HTTP failures emit stable completion summaries', async 
   };
   const schemaLine = byUrl('/api/hedges/preflight?kind=schema');
   assert.deepEqual((schemaLine.httpRequest as Record<string, unknown>).body, schemaBody);
-  assert.deepEqual(schemaLine.httpError, { code: 'INVALID_REQUEST', message: 'Request validation failed' });
-  assert.deepEqual(byUrl('/api/hedges/missing-business').httpError, {
-    code: 'STRATEGY_NOT_FOUND', message: 'Strategy not found',
-    error: (byUrl('/api/hedges/missing-business').httpError as { error: unknown }).error
+  assert.deepEqual(schemaLine.httpError, {
+    code: 'REQUEST_FIELD_INVALID',
+    message: '请求字段有效性检查失败'
   });
+  const businessError = byUrl('/api/hedges/missing-business')
+    .httpError as Record<string, unknown>;
+  assert.equal(businessError.code, 'STRATEGY_NOT_FOUND');
+  assert.equal(businessError.message, '策略存在性检查失败');
+  assert.equal(parseErrorDetail(businessError.error).code, 'STRATEGY_NOT_FOUND');
   assert.deepEqual(byUrl('/missing-framework?kind=404').httpError, {
-    code: 'HTTP_ERROR', message: 'HTTP request failed with status 404'
+    code: 'REQUEST_ROUTE_NOT_FOUND',
+    message: '请求路由存在性检查失败'
   });
   const internalLine = byUrl('/test/internal-completion?kind=500');
   assert.equal(internalLine.level, 50);
-  assert.equal((internalLine.httpError as { code: string }).code, 'INTERNAL_ERROR');
+  assert.equal(
+    (internalLine.httpError as { code: string }).code,
+    'REQUEST_OPERATION_FAILED'
+  );
   assert.equal(Object.hasOwn(schemaLine.httpError as object, 'validation'), false);
   assert.equal(
     Object.hasOwn((schemaLine.httpError as { error?: object }).error ?? {}, 'validation'),
@@ -4662,7 +5531,13 @@ test('concurrent preflight completions correlate response requestId with isolate
     const line = matches[0] as Record<string, unknown>;
     assert.equal((line.httpRequest as { url: string }).url, `/api/hedges/preflight?case=${label}`);
     assert.equal(((line.httpRequest as { body: { requestedBaseQuantity: string } }).body).requestedBaseQuantity, quantity);
-    assert.match(JSON.stringify(line.httpError), new RegExp(ownError));
+    assert.equal(
+      parseErrorDetail(
+        (line.httpError as { error: unknown }).error
+      ).code,
+      'REQUEST_OPERATION_FAILED'
+    );
+    assert.doesNotMatch(JSON.stringify(line.httpError), new RegExp(ownError));
     assert.doesNotMatch(JSON.stringify(line), new RegExp(otherError));
   }
 });
@@ -4706,7 +5581,7 @@ test('HTTP completion logger faults do not change persistence preflight count or
       assert.equal(createPendingCalls, 1, mode);
       assert.equal(targetRepository.getStrategy(created.json().id).state, 'PENDING_CONFIRMATION', mode);
       const rejected = await fixture.server.inject({ method: 'POST', url: '/api/hedges/preflight', headers: LOCAL_HEADERS, payload: { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '2', mode: 'SPOT_FIRST' } });
-      assert.equal(rejected.statusCode, 422, mode);
+      assert.equal(rejected.statusCode, 500, mode);
       assert.equal(preflightRuns, 2, mode);
       assert.equal(createPendingCalls, 1, mode);
       const confirmed = await fixture.server.inject({ method: 'POST', url: `/api/hedges/${created.json().id}/confirm`, headers: LOCAL_HEADERS, payload: { riskAcknowledged: true } });

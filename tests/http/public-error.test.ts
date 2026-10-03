@@ -3,94 +3,170 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  PUBLIC_ERROR_TEXT_LIMIT,
-  publicErrorDetail
-} from '../../src/http/public-error.js';
+  createTradeOpsError,
+  parseErrorDetail
+} from '../../src/errors/trade-ops-error.js';
+import { publicErrorDetail } from '../../src/http/public-error.js';
 
-const TRUNCATION_SUFFIX = '…[truncated]';
+const projectPublicError = publicErrorDetail as unknown as (
+  error: unknown,
+  secrets?: readonly string[]
+) => unknown;
 
-test('returns only bounded redacted type code and message', () => {
-  const error = Object.assign(
-    new Error(`credential-value failed ${'x'.repeat(2_100)}`),
+test('projects only a trusted TradeOpsError detail', () => {
+  const error = createTradeOpsError({
+    code: 'BALANCE_INSUFFICIENT',
+    phase: 'preflight',
+    subject: {
+      type: 'account',
+      exchangeId: 'bitget',
+      symbol: 'BTC/USDT',
+      field: 'balance'
+    },
+    expected: '60000.00000000000000000001 USDT',
+    actual: '59999.99999999999999999999 USDT',
+    occurredAt: '2026-10-03T00:00:00.000Z'
+  });
+
+  const projected = projectPublicError(error, []);
+
+  assert.deepEqual(projected, error.detail);
+  assert.deepEqual(parseErrorDetail(projected), error.detail);
+  assert.deepEqual(
+    Object.keys(projected as unknown as Record<string, unknown>).sort(),
+    ['actual', 'code', 'expected', 'message', 'occurredAt', 'phase', 'subject']
+  );
+});
+
+test('redacts configured secrets from branded details before public projection', async (t) => {
+  const configuredSecret = 'CONFIGURED-PROJECTION-SECRET';
+  const occurredAt = '2026-10-03T00:00:00.000Z';
+  const cases = [
     {
-      name: 'AuthenticationError',
-      code: 401,
-      apiKey: 'credential-value',
-      request: { apiKey: 'credential-value' },
-      response: { body: 'credential-value' },
-      cause: new Error('credential-value nested')
+      name: 'subject',
+      input: {
+        code: 'EXCHANGE_NOT_CONFIGURED',
+        phase: 'preflight',
+        subject: {
+          type: 'exchange',
+          exchangeId: `exchange-${configuredSecret}`,
+          operation: 'preflight'
+        },
+        expected: 'configured exchange',
+        actual: 'missing',
+        occurredAt
+      }
+    },
+    {
+      name: 'expected',
+      input: {
+        code: 'BALANCE_INSUFFICIENT',
+        phase: 'preflight',
+        subject: {
+          type: 'account',
+          exchangeId: 'bitget',
+          symbol: 'BTC/USDT',
+          field: 'balance'
+        },
+        expected: `required-${configuredSecret}`,
+        actual: 'insufficient balance',
+        occurredAt
+      }
+    },
+    {
+      name: 'actual list item',
+      input: {
+        code: 'ACCOUNT_SETTINGS_CONFLICT',
+        phase: 'confirmation',
+        subject: {
+          type: 'account',
+          exchangeId: 'okx',
+          symbol: 'BTC/USDT',
+          field: 'marginMode'
+        },
+        expected: 'one consistent setting',
+        actual: [`observed-${configuredSecret}`],
+        occurredAt
+      }
     }
+  ] as const;
+
+  for (const item of cases) {
+    await t.test(item.name, () => {
+      const branded = createTradeOpsError(item.input);
+      const expected = createTradeOpsError(
+        item.input,
+        [configuredSecret]
+      ).detail;
+
+      const projected = projectPublicError(branded, [configuredSecret]);
+
+      assert.deepEqual(projected, expected);
+      assert.deepEqual(parseErrorDetail(projected), expected);
+      assert.doesNotMatch(
+        JSON.stringify(projected),
+        new RegExp(configuredSecret)
+      );
+      assert.equal(expected.code, branded.detail.code);
+      assert.equal(expected.phase, branded.detail.phase);
+      assert.equal(expected.occurredAt, branded.detail.occurredAt);
+    });
+  }
+});
+
+test('does not project arbitrary third-party error properties', () => {
+  const sentinel = 'THIRD-PARTY-SECRET-SENTINEL';
+  const error = Object.assign(new Error(`${sentinel} raw response`), {
+    name: 'AuthenticationError',
+    code: '40101',
+    apiKey: sentinel,
+    request: { authorization: sentinel },
+    response: { body: sentinel },
+    cause: new Error(`${sentinel} nested`)
+  });
+  error.stack = `${sentinel} stack`;
+
+  let projected: unknown;
+  let thrown: unknown;
+  try {
+    projected = projectPublicError(error, [sentinel]);
+  } catch (failure) {
+    thrown = failure;
+  }
+
+  assert.equal(
+    projected,
+    undefined,
+    'unknown errors require conversion at a boundary that knows the operation'
   );
-
-  const detail = publicErrorDetail(error, ['credential-value']);
-
-  assert.equal(detail.type, 'AuthenticationError');
-  assert.equal(detail.code, 401);
-  assert.match(detail.message, /\[Redacted\]/);
-  assert.match(detail.message, /…\[truncated\]$/);
-  assert.ok(detail.message.length <= PUBLIC_ERROR_TEXT_LIMIT);
-  assert.deepEqual(Object.keys(detail).sort(), ['code', 'message', 'type']);
   assert.doesNotMatch(
-    JSON.stringify(detail),
-    /credential-value|apiKey|request|response|cause|stack/
+    JSON.stringify(projected) + String(thrown ?? ''),
+    new RegExp(sentinel)
   );
 });
 
-test('preserves a redacted string code and handles primitive throws', () => {
-  const coded = Object.assign(new Error('request failed'), {
-    code: 'AUTH-secret-value'
-  });
-
-  assert.deepEqual(publicErrorDetail(coded, ['secret-value']), {
-    type: 'Error',
-    message: 'request failed',
-    code: 'AUTH-[Redacted]'
-  });
-  assert.deepEqual(publicErrorDetail('plain failure', []), {
-    type: 'UnknownError',
-    message: 'plain failure'
-  });
-});
-
-test('fails safely when error property getters throw', () => {
+test('rejects hostile unknown values without invoking property getters', () => {
+  let getterCalls = 0;
   const hostile = {};
-  for (const property of ['name', 'message', 'code', 'stack']) {
+  for (const property of ['name', 'message', 'code', 'stack', 'cause']) {
     Object.defineProperty(hostile, property, {
+      enumerable: true,
       get(): never {
-        throw new Error(`blocked ${property}`);
+        getterCalls += 1;
+        throw new Error(`HOSTILE-${property}`);
       }
     });
   }
 
-  assert.doesNotThrow(() => publicErrorDetail(hostile, []));
-  assert.deepEqual(publicErrorDetail(hostile, []), {
-    type: 'UnknownError',
-    message: 'Unknown error'
-  });
-});
+  let projected: unknown;
+  let thrown: unknown;
+  try {
+    projected = projectPublicError(hostile, []);
+  } catch (failure) {
+    thrown = failure;
+  }
 
-test('omits non-finite numeric codes and ignores empty secrets', () => {
-  const error = Object.assign(new Error('visible message'), {
-    code: Number.POSITIVE_INFINITY
-  });
-
-  assert.deepEqual(publicErrorDetail(error, ['', '']), {
-    type: 'Error',
-    message: 'visible message'
-  });
-});
-
-test('bounds oversized type and string code fields', () => {
-  const error = Object.assign(new Error('short message'), {
-    name: `Type-${'t'.repeat(2_100)}`,
-    code: `CODE-${'c'.repeat(2_100)}`
-  });
-
-  const detail = publicErrorDetail(error, []);
-
-  assert.equal(detail.type.length, PUBLIC_ERROR_TEXT_LIMIT);
-  assert.equal(String(detail.code).length, PUBLIC_ERROR_TEXT_LIMIT);
-  assert.equal(detail.type.endsWith(TRUNCATION_SUFFIX), true);
-  assert.equal(String(detail.code).endsWith(TRUNCATION_SUFFIX), true);
-  assert.equal(detail.message, 'short message');
+  assert.equal(getterCalls, 0);
+  assert.equal(projected, undefined);
+  assert.doesNotMatch(String(thrown ?? ''), /HOSTILE-/);
 });

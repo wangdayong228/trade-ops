@@ -25,6 +25,7 @@ let preflightReady = false;
 let requestPending = false;
 let inputRevision = 0;
 let submittedStrategyInput = null;
+let displayedStrategyState = null;
 
 const executionModes = new Set([
   'CONCURRENT',
@@ -34,6 +35,7 @@ const executionModes = new Set([
 const configuredExchangeIds = new Set(['bitget', 'okx']);
 const strategyStates = new Set([
   'PENDING_CONFIRMATION',
+  'PREFLIGHT_INVALIDATED',
   'EXECUTING',
   'WAITING_HEDGE',
   'HEDGED',
@@ -74,8 +76,54 @@ const snapshotStatuses = new Set([
   'unknown'
 ]);
 const resumableStates = new Set([
-  'PENDING_CONFIRMATION',
-  'EXECUTING'
+  'PENDING_CONFIRMATION'
+]);
+const errorCodes = new Set([
+  'CONFIG_FIELD_MISSING',
+  'CONFIG_FIELD_INVALID',
+  'DATABASE_OPEN_FAILED',
+  'DATABASE_SCHEMA_VERSION_MISMATCH',
+  'DATABASE_OWNERSHIP_BUSY',
+  'DATABASE_OWNERSHIP_UNAVAILABLE',
+  'SERVICE_COMPONENT_FAILED',
+  'SERVICE_LISTEN_FAILED',
+  'REQUEST_FORBIDDEN',
+  'REQUEST_BODY_INVALID',
+  'REQUEST_FIELD_INVALID',
+  'REQUEST_OPERATION_FAILED',
+  'REQUEST_ROUTE_NOT_FOUND',
+  'STRATEGY_NOT_FOUND',
+  'STRATEGY_STATE_MISMATCH',
+  'STRATEGY_OPERATION_BUSY',
+  'EXCHANGE_NOT_CONFIGURED',
+  'MARKET_UNAVAILABLE',
+  'MARKET_IDENTITY_MISMATCH',
+  'MARKET_INACTIVE',
+  'MARKET_RULE_INVALID',
+  'ACCOUNT_SETTINGS_UNAVAILABLE',
+  'ACCOUNT_SETTINGS_CONFLICT',
+  'ACCOUNT_POSITION_MODE_MISMATCH',
+  'ACCOUNT_MARGIN_MODE_MISMATCH',
+  'ACCOUNT_LEVERAGE_MISMATCH',
+  'QUANTITY_INVALID',
+  'QUANTITY_NOT_REPRESENTABLE',
+  'QUANTITY_OUT_OF_RANGE',
+  'PRICE_UNAVAILABLE',
+  'PRICE_INVALID',
+  'NOTIONAL_OUT_OF_RANGE',
+  'BALANCE_UNAVAILABLE',
+  'BALANCE_INSUFFICIENT',
+  'PREFLIGHT_INVALIDATED',
+  'STORAGE_OPERATION_FAILED',
+  'STORAGE_RECORD_INVALID',
+  'STORAGE_TRANSITION_REJECTED'
+]);
+const errorPhases = new Set([
+  'startup',
+  'request',
+  'preflight',
+  'confirmation',
+  'storage'
 ]);
 
 function setText(id, value) {
@@ -95,6 +143,9 @@ function resetOrderList(id) {
 }
 
 function updateConfirmButton() {
+  if (displayedStrategyState === 'PREFLIGHT_INVALIDATED') {
+    riskAck.checked = false;
+  }
   confirmButton.disabled = (
     requestPending
     || strategyId === null
@@ -131,6 +182,7 @@ function resetActionablePreview(message, kind = '') {
   preflightReady = false;
   requestPending = false;
   submittedStrategyInput = null;
+  displayedStrategyState = null;
   riskAck.checked = false;
   preflightButton.disabled = false;
   loadStrategyButton.disabled = false;
@@ -219,6 +271,144 @@ function canonicalTimestamp(value) {
     throw new Error('invalid response timestamp');
   }
   return timestamp;
+}
+
+function optionalSubjectString(value, maximumLength = 128) {
+  return value === undefined ? undefined : requiredString(value, maximumLength);
+}
+
+function validatedErrorSubject(value) {
+  if (!isRecord(value)) {
+    throw new Error('invalid error subject');
+  }
+  switch (value.type) {
+    case 'configuration':
+    case 'request': {
+      const subject = exactObject(value, ['type', 'field']);
+      return {
+        type: subject.type,
+        field: requiredString(subject.field, 128)
+      };
+    }
+    case 'exchange': {
+      const subject = exactObject(value, [
+        'type', 'exchangeId', 'operation'
+      ]);
+      return {
+        type: subject.type,
+        exchangeId: requiredString(subject.exchangeId, 128),
+        operation: requiredString(subject.operation, 128)
+      };
+    }
+    case 'market': {
+      const subject = exactObject(
+        value,
+        ['type', 'exchangeId', 'symbol', 'kind'],
+        ['field']
+      );
+      return {
+        type: subject.type,
+        exchangeId: requiredString(subject.exchangeId, 128),
+        symbol: requiredString(subject.symbol, 64),
+        kind: requiredString(subject.kind, 128),
+        ...(subject.field === undefined
+          ? {}
+          : { field: requiredString(subject.field, 128) })
+      };
+    }
+    case 'account': {
+      const subject = exactObject(value, [
+        'type', 'exchangeId', 'symbol', 'field'
+      ]);
+      return {
+        type: subject.type,
+        exchangeId: requiredString(subject.exchangeId, 128),
+        symbol: requiredString(subject.symbol, 64),
+        field: requiredString(subject.field, 128)
+      };
+    }
+    case 'strategy': {
+      const subject = exactObject(
+        value,
+        ['type', 'strategyId'],
+        ['field']
+      );
+      return {
+        type: subject.type,
+        strategyId: requiredString(subject.strategyId, 128),
+        ...(subject.field === undefined
+          ? {}
+          : { field: requiredString(subject.field, 128) })
+      };
+    }
+    case 'database': {
+      const subject = exactObject(value, ['type'], [
+        'path', 'table', 'recordId', 'field', 'operation'
+      ]);
+      const result = { type: subject.type };
+      for (const [key, maximumLength] of [
+        ['path', 512],
+        ['table', 128],
+        ['recordId', 128],
+        ['field', 128],
+        ['operation', 128]
+      ]) {
+        const field = optionalSubjectString(subject[key], maximumLength);
+        if (field !== undefined) result[key] = field;
+      }
+      return result;
+    }
+    default:
+      throw new Error('invalid error subject type');
+  }
+}
+
+function validatedDiagnosticValue(value) {
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('invalid diagnostic number');
+    return value;
+  }
+  if (typeof value === 'string') {
+    if (value.length > 2000) throw new Error('invalid diagnostic string');
+    return value;
+  }
+  if (
+    !Array.isArray(value)
+    || value.length > 16
+    || value.some((item) => (
+      typeof item !== 'string' || item.length > 2000
+    ))
+  ) {
+    throw new Error('invalid diagnostic value');
+  }
+  return [...value];
+}
+
+function validatedErrorDetail(value) {
+  const detail = exactObject(value, [
+    'code',
+    'phase',
+    'subject',
+    'expected',
+    'actual',
+    'message',
+    'occurredAt'
+  ]);
+  const code = requiredString(detail.code, 128);
+  const phase = requiredString(detail.phase, 32);
+  if (!errorCodes.has(code) || !errorPhases.has(phase)) {
+    throw new Error('invalid error code or phase');
+  }
+  return {
+    code,
+    phase,
+    subject: validatedErrorSubject(detail.subject),
+    expected: validatedDiagnosticValue(detail.expected),
+    actual: validatedDiagnosticValue(detail.actual),
+    message: requiredString(detail.message, 10_000),
+    occurredAt: canonicalTimestamp(detail.occurredAt)
+  };
 }
 
 function decimalParts(value, positive = false) {
@@ -483,6 +673,7 @@ function validatedStrategy(value, expectedInput, expectedStrategyId, preview) {
     'requestedBaseQuantity',
     'effectiveBaseQuantity',
     'failureCode',
+    'preflightFailure',
     'createdAt',
     'updatedAt'
   ]);
@@ -506,6 +697,12 @@ function validatedStrategy(value, expectedInput, expectedStrategyId, preview) {
   ) {
     throw new Error('invalid strategy failure state');
   }
+  let preflightFailure = null;
+  if (state === 'PREFLIGHT_INVALIDATED') {
+    preflightFailure = validatedErrorDetail(strategy.preflightFailure);
+  } else if (strategy.preflightFailure !== null) {
+    throw new Error('unexpected preflight failure');
+  }
   const createdAt = canonicalTimestamp(strategy.createdAt);
   const updatedAt = canonicalTimestamp(strategy.updatedAt);
   if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
@@ -517,6 +714,7 @@ function validatedStrategy(value, expectedInput, expectedStrategyId, preview) {
     ...identity,
     effectiveBaseQuantity,
     failureCode,
+    preflightFailure,
     createdAt,
     updatedAt
   };
@@ -810,7 +1008,10 @@ async function validatedOrder(value, strategy, preview) {
 
 function orderTopologyMatchesStrategy(strategy, orders) {
   const roles = new Set(orders.map((order) => order.role));
-  if (strategy.state === 'PENDING_CONFIRMATION') {
+  if (
+    strategy.state === 'PENDING_CONFIRMATION'
+    || strategy.state === 'PREFLIGHT_INVALIDATED'
+  ) {
     return roles.size === 0;
   }
 
@@ -960,6 +1161,7 @@ function isFullClosedHedge(order) {
 function orderExecutionMatchesStrategy(strategy, orders, actualFills) {
   if (
     strategy.state === 'PENDING_CONFIRMATION'
+    || strategy.state === 'PREFLIGHT_INVALIDATED'
     || failureStates.has(strategy.state)
   ) {
     return true;
@@ -1249,53 +1451,88 @@ function boundedOperatorText(value) {
       )}${operatorTruncationSuffix}`;
 }
 
-function caughtOperatorText(error, fallback) {
-  const message = boundedOperatorText(error?.message);
-  if (message !== null) {
-    return message;
-  }
-  try {
-    return boundedOperatorText(String(error)) ?? fallback;
-  } catch {
-    return fallback;
+function formattedSubject(subject) {
+  switch (subject.type) {
+    case 'configuration':
+    case 'request':
+      return `${subject.type} · field=${subject.field}`;
+    case 'exchange':
+      return `${subject.type} · exchangeId=${subject.exchangeId}`
+        + ` · operation=${subject.operation}`;
+    case 'market':
+      return `${subject.type} · exchangeId=${subject.exchangeId}`
+        + ` · symbol=${subject.symbol} · kind=${subject.kind}`
+        + (subject.field === undefined ? '' : ` · field=${subject.field}`);
+    case 'account':
+      return `${subject.type} · exchangeId=${subject.exchangeId}`
+        + ` · symbol=${subject.symbol} · field=${subject.field}`;
+    case 'strategy':
+      return `${subject.type} · strategyId=${subject.strategyId}`
+        + (subject.field === undefined ? '' : ` · field=${subject.field}`);
+    case 'database': {
+      const parts = ['path', 'table', 'recordId', 'field', 'operation']
+        .filter((key) => subject[key] !== undefined)
+        .map((key) => `${key}=${subject[key]}`);
+      return [subject.type, ...parts].join(' · ');
+    }
+    default:
+      throw new Error('invalid formatted subject');
   }
 }
 
+function formattedDiagnostic(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `[${value.join(', ')}]`;
+  return String(value);
+}
+
+function detailLines(detail) {
+  return [
+    `代码：${detail.code}`,
+    `消息：${detail.message}`,
+    `阶段：${detail.phase}`,
+    `对象：${formattedSubject(detail.subject)}`,
+    `期望：${formattedDiagnostic(detail.expected)}`,
+    `实际：${formattedDiagnostic(detail.actual)}`
+  ];
+}
+
+function invalidationMessage(detail) {
+  return [
+    '预检已失效，请重新预检。',
+    ...detailLines(detail)
+  ].join('\n');
+}
+
 function serverFailureMessage(operation, response, body) {
-  const lines = [`${operation}失败`];
-  const code = isRecord(body) ? boundedOperatorText(body.code) : null;
-  lines.push(`HTTP ${response.status}${code === null ? '' : ` · ${code}`}`);
-  const detail = isRecord(body?.error) ? body.error : null;
-  const detailType = boundedOperatorText(detail?.type);
-  const detailMessage = boundedOperatorText(detail?.message);
-  const detailCode = typeof detail?.code === 'number'
-    && Number.isFinite(detail.code)
-    ? String(detail.code)
-    : boundedOperatorText(detail?.code);
-  if (detailType !== null && detailMessage !== null) {
-    lines.push(
-      `${detailType}${detailCode === null ? '' : ` [${detailCode}]`}: ${detailMessage}`
-    );
-  } else {
-    const message = isRecord(body) ? boundedOperatorText(body.message) : null;
-    lines.push(message ?? '响应不是有效的结构化 JSON 错误');
+  const invalid = [
+    `${operation}失败`,
+    `HTTP ${response.status}`,
+    '响应不是有效的结构化 JSON 错误'
+  ].join('\n');
+  try {
+    const envelope = exactObject(body, ['requestId', 'error']);
+    const requestId = requiredString(envelope.requestId, 2000);
+    const detail = validatedErrorDetail(envelope.error);
+    const message = [
+      `${operation}失败`,
+      `HTTP ${response.status}`,
+      ...detailLines(detail),
+      `请求 ID：${requestId}`
+    ].join('\n');
+    return boundedOperatorText(message) ?? invalid;
+  } catch {
+    return invalid;
   }
-  const requestId = isRecord(body)
-    ? boundedOperatorText(body.requestId)
-    : null;
-  if (requestId !== null) {
-    lines.push(`请求 ID：${requestId}`);
-  }
-  return lines.join('\n');
 }
 
 async function requestJson(operation, url, options, expectedStatus) {
   let response;
   try {
     response = await fetch(url, options);
-  } catch (error) {
+  } catch {
     throw new OperatorRequestError(
-      `${operation}失败\n网络错误：${caughtOperatorText(error, '未知网络错误')}`
+      `${operation}失败\n网络请求失败`
     );
   }
   const body = await responseJson(response);
@@ -1316,10 +1553,7 @@ function operatorFailureMessage(operation, error) {
   if (error instanceof OperatorRequestError) {
     return error.operatorMessage;
   }
-  return `${operation}失败\n响应校验失败：${caughtOperatorText(
-    error,
-    '未知响应错误'
-  )}`;
+  return `${operation}失败\n响应校验失败：响应结构无效`;
 }
 
 async function refreshStatus() {
@@ -1356,11 +1590,19 @@ async function refreshStatus() {
       return;
     }
     preflightReady = resumableStates.has(status.strategy.state);
+    displayedStrategyState = status.strategy.state;
     if (!preflightReady) {
       riskAck.checked = false;
     }
     renderStatus(status);
-    setMessage('状态已刷新。', 'success');
+    if (status.strategy.state === 'PREFLIGHT_INVALIDATED') {
+      setMessage(
+        invalidationMessage(status.strategy.preflightFailure),
+        'error'
+      );
+    } else {
+      setMessage('状态已刷新。', 'success');
+    }
   } catch (error) {
     if (
       statusRevision === inputRevision
@@ -1432,15 +1674,23 @@ resumeForm.addEventListener('submit', async (event) => {
     submittedStrategyInput = submittedInput;
     strategyId = requestedStrategyId;
     preflightReady = resumableStates.has(loaded.status.strategy.state);
+    displayedStrategyState = loaded.status.strategy.state;
     riskAck.checked = false;
     renderStatus(loaded.status);
     refreshButton.disabled = false;
-    setMessage(
-      preflightReady
-        ? '对冲任务已加载。请核对状态并重新确认风险。'
-        : '对冲任务已加载，仅供查看。',
-      'success'
-    );
+    if (loaded.status.strategy.state === 'PREFLIGHT_INVALIDATED') {
+      setMessage(
+        invalidationMessage(loaded.status.strategy.preflightFailure),
+        'error'
+      );
+    } else {
+      setMessage(
+        preflightReady
+          ? '对冲任务已加载。请核对状态并重新确认风险。'
+          : '对冲任务已加载，仅供查看。',
+        'success'
+      );
+    }
   } catch (error) {
     if (loadRevision === inputRevision) {
       resetActionablePreview(
@@ -1500,6 +1750,7 @@ preflightForm.addEventListener('submit', async (event) => {
     submittedStrategyInput = submittedInput;
     strategyId = preflight.id;
     preflightReady = true;
+    displayedStrategyState = preflight.state;
     refreshButton.disabled = false;
     setMessage('预检完成。请核对快照并确认风险。', 'success');
   } catch (error) {
@@ -1565,7 +1816,7 @@ confirmButton.addEventListener('click', async () => {
       confirmationRevision === inputRevision
       && confirmedStrategyId === strategyId
     ) {
-      preflightReady = true;
+      riskAck.checked = false;
       setMessage(operatorFailureMessage('确认', error), 'error');
     }
   } finally {

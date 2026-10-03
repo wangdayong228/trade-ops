@@ -50,6 +50,7 @@ import { HedgeCoordinator } from './strategy/hedge-coordinator.js';
 import { HedgeReconciliation } from './strategy/hedge-reconciliation.js';
 import { OrderMonitor } from './strategy/order-monitor.js';
 import { PreflightService } from './strategy/preflight-service.js';
+import { ConfirmationService } from './strategy/confirmation-service.js';
 
 export type ConfiguredExchangeId = 'bitget' | 'okx';
 export type Clock = () => Date;
@@ -396,6 +397,10 @@ export function composeService(
     }
     const registry = new ExchangeRegistry(gateways);
     const preflightService = new PreflightService(registry, clock);
+    const confirmationService = new ConfirmationService(
+      repository,
+      preflightService
+    );
     const operationalLog = nonThrowingOperationalLog(
       options.operationalLog
         ?? (options.loggerInstance === undefined
@@ -433,6 +438,7 @@ export function composeService(
     const server = buildServer({
       registry,
       preflightService,
+      confirmationService,
       repository,
       coordinator,
       secretProvider: () => configuredSecretValues(env),
