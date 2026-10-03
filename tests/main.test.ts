@@ -1547,8 +1547,51 @@ test('creates the database parent directory during normal composition', async (t
   assert.equal(composition.repository.listRecoverable().length, 0);
 });
 
+type TestSignal = 'SIGINT' | 'SIGTERM';
+
+interface SignalTargetFailure {
+  readonly signal: TestSignal;
+  readonly value: unknown;
+}
+
 class SignalTarget extends EventEmitter {
   exitCode: number | undefined;
+  readonly registrationAttempts: TestSignal[] = [];
+  readonly removalAttempts: TestSignal[] = [];
+
+  constructor(
+    private readonly registrationFailure?: SignalTargetFailure,
+    private readonly removalFailure?: SignalTargetFailure
+  ) {
+    super();
+  }
+
+  override on(
+    eventName: string | symbol,
+    listener: (...args: any[]) => void
+  ): this {
+    const result = super.on(eventName, listener);
+    if (eventName === 'SIGINT' || eventName === 'SIGTERM') {
+      this.registrationAttempts.push(eventName);
+      if (this.registrationFailure?.signal === eventName) {
+        throw this.registrationFailure.value;
+      }
+    }
+    return result;
+  }
+
+  override removeListener(
+    eventName: string | symbol,
+    listener: (...args: any[]) => void
+  ): this {
+    if (eventName === 'SIGINT' || eventName === 'SIGTERM') {
+      this.removalAttempts.push(eventName);
+      if (this.removalFailure?.signal === eventName) {
+        throw this.removalFailure.value;
+      }
+    }
+    return super.removeListener(eventName, listener);
+  }
 }
 
 interface CapturedOperation {
@@ -1943,6 +1986,127 @@ test('starts monitoring before loopback listen and installs each signal once', a
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
   assert.equal(signals.exitCode, 0);
+});
+
+test('cleans partial signal registration failures before startup actions', async (t) => {
+  const cases: ReadonlyArray<{
+    readonly name: string;
+    readonly registrationSignal: TestSignal;
+    readonly registrationFailure: unknown;
+    readonly expectedRegistrations: readonly TestSignal[];
+    readonly expectedActual: string;
+    readonly removalFailure?: Error;
+  }> = [
+    {
+      name: 'first registration installs then throws Error',
+      registrationSignal: 'SIGINT',
+      registrationFailure: new Error('signal-on-sigint-secret'),
+      expectedRegistrations: ['SIGINT'],
+      expectedActual: 'object-failure'
+    },
+    {
+      name: 'second registration installs then throws undefined',
+      registrationSignal: 'SIGTERM',
+      registrationFailure: undefined,
+      expectedRegistrations: ['SIGINT', 'SIGTERM'],
+      expectedActual: 'undefined-thrown'
+    },
+    {
+      name: 'registration remains primary when listener removal fails',
+      registrationSignal: 'SIGTERM',
+      registrationFailure: 'signal-on-sigterm-secret',
+      expectedRegistrations: ['SIGINT', 'SIGTERM'],
+      expectedActual: 'string-thrown',
+      removalFailure: new Error('signal-remove-sigint-secret')
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const events: string[] = [];
+      const fixture = fundingRunnableFixture(events);
+      const signals = new SignalTarget(
+        {
+          signal: item.registrationSignal,
+          value: item.registrationFailure
+        },
+        item.removalFailure === undefined
+          ? undefined
+          : { signal: 'SIGINT', value: item.removalFailure }
+      );
+      const unrelatedSigint = (): void => {};
+      const unrelatedSigterm = (): void => {};
+      signals.addListener('SIGINT', unrelatedSigint);
+      signals.addListener('SIGTERM', unrelatedSigterm);
+      let listenCalls = 0;
+
+      const error = await rejectedValue(startService(fixture.composition, {
+        signalTarget: signals,
+        listen: async () => {
+          listenCalls += 1;
+        }
+      }));
+
+      assert.deepEqual(events, [
+        'funding.stop',
+        'monitor.stop',
+        'server.close',
+        'database.close'
+      ], item.name);
+      assert.deepEqual(fixture.counts(), {
+        monitorStarts: 0,
+        monitorStops: 1,
+        serverCloses: 1,
+        databaseCloses: 1,
+        fundingStarts: 0,
+        fundingStops: 1,
+        strategyTransitions: 0,
+        coordinatorActions: 0,
+        monitorTradingActions: 0
+      }, item.name);
+      assert.equal(listenCalls, 0, item.name);
+      assert.deepEqual(
+        signals.registrationAttempts,
+        item.expectedRegistrations,
+        item.name
+      );
+      assert.equal(
+        signals.listeners('SIGINT').includes(unrelatedSigint),
+        true,
+        item.name
+      );
+      assert.equal(
+        signals.listeners('SIGTERM').includes(unrelatedSigterm),
+        true,
+        item.name
+      );
+      if (item.removalFailure === undefined) {
+        assert.equal(signals.listenerCount('SIGINT'), 1, item.name);
+        assert.equal(signals.listenerCount('SIGTERM'), 1, item.name);
+      } else {
+        assert.deepEqual(
+          [...signals.removalAttempts].sort(),
+          ['SIGINT', 'SIGTERM'],
+          item.name
+        );
+        assert.equal(signals.listenerCount('SIGTERM'), 1, item.name);
+      }
+
+      const detail = assertStartupDetail(
+        error,
+        'SERVICE_COMPONENT_FAILED',
+        configurationSubject('service-component:signal-listeners')
+      );
+      assert.equal(detail.actual, item.expectedActual, item.name);
+      assert.doesNotMatch(
+        JSON.stringify(detail),
+        /signal-on-sigint-secret|signal-on-sigterm-secret|signal-remove-sigint-secret/,
+        item.name
+      );
+      assert.equal('stack' in detail, false, item.name);
+      assert.equal('cause' in detail, false, item.name);
+    });
+  }
 });
 
 test('a signal during listen is owned by the same idempotent shutdown', async () => {

@@ -704,16 +704,36 @@ export async function startService<T extends RunnableComposition>(
       ? {}
       : { exchangeIds: composition.config.exchangeIds })
   };
-  let signalsInstalled = false;
+  let sigintRegistrationAttempted = false;
+  let sigtermRegistrationAttempted = false;
   let shutdownPromise: Promise<void> | null = null;
 
   const removeSignalListeners = (): void => {
-    if (!signalsInstalled) {
-      return;
+    let hasFirstError = false;
+    let firstError: unknown;
+    if (sigintRegistrationAttempted) {
+      sigintRegistrationAttempted = false;
+      try {
+        signalTarget.removeListener('SIGINT', handleSignal);
+      } catch (error) {
+        hasFirstError = true;
+        firstError = error;
+      }
     }
-    signalsInstalled = false;
-    signalTarget.removeListener('SIGINT', handleSignal);
-    signalTarget.removeListener('SIGTERM', handleSignal);
+    if (sigtermRegistrationAttempted) {
+      sigtermRegistrationAttempted = false;
+      try {
+        signalTarget.removeListener('SIGTERM', handleSignal);
+      } catch (error) {
+        if (!hasFirstError) {
+          hasFirstError = true;
+          firstError = error;
+        }
+      }
+    }
+    if (hasFirstError) {
+      throw firstError;
+    }
   };
 
   const closeResources = async (): Promise<void> => {
@@ -779,10 +799,13 @@ export async function startService<T extends RunnableComposition>(
     });
   };
 
-  signalTarget.on('SIGINT', handleSignal);
-  signalTarget.on('SIGTERM', handleSignal);
-  signalsInstalled = true;
   try {
+    runStartupBoundary(() => {
+      sigintRegistrationAttempted = true;
+      signalTarget.on('SIGINT', handleSignal);
+      sigtermRegistrationAttempted = true;
+      signalTarget.on('SIGTERM', handleSignal);
+    }, componentContext('signal-listeners', 'started'));
     operationalLog?.info('service_starting', runtimeFields);
     runStartupBoundary(
       () => composition.monitor.start(MONITOR_INTERVAL_MS),

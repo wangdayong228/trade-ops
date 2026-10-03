@@ -1,3 +1,4 @@
+import { isProxy } from 'node:util/types';
 import type Database from 'better-sqlite3';
 import {
   createTradeOpsError,
@@ -28,13 +29,24 @@ export class SqliteOwnershipError extends Error {
 }
 
 function sqliteErrorCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) return undefined;
+  if (
+    typeof error !== 'object'
+    || error === null
+    || isProxy(error)
+  ) {
+    return undefined;
+  }
+  let descriptor: PropertyDescriptor | undefined;
   try {
-    const code = Reflect.get(error, 'code');
-    return typeof code === 'string' ? code : undefined;
+    descriptor = Object.getOwnPropertyDescriptor(error, 'code');
   } catch {
     return undefined;
   }
+  return descriptor !== undefined
+      && 'value' in descriptor
+      && typeof descriptor.value === 'string'
+    ? descriptor.value
+    : undefined;
 }
 
 function isSqliteContentionCode(code: string | undefined): boolean {

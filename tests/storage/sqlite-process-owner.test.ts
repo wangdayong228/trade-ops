@@ -244,6 +244,131 @@ for (const sqliteCode of [
   });
 }
 
+test('reads SQLite contention codes only from own data properties', async (t) => {
+  const cases: ReadonlyArray<{
+    readonly name: string;
+    readonly createFailure: () => {
+      readonly value: unknown;
+      readonly observationCount: () => number;
+      readonly forbidden: RegExp;
+    };
+  }> = [
+    {
+      name: 'own accessor',
+      createFailure: () => {
+        let getterReads = 0;
+        const value = new Error('sqlite-accessor-secret');
+        Object.defineProperty(value, 'code', {
+          configurable: true,
+          enumerable: true,
+          get(): string {
+            getterReads += 1;
+            return 'SQLITE_BUSY';
+          }
+        });
+        return {
+          value,
+          observationCount: () => getterReads,
+          forbidden: /sqlite-accessor-secret/
+        };
+      }
+    },
+    {
+      name: 'inherited data property',
+      createFailure: () => {
+        const value = Object.create({ code: 'SQLITE_BUSY' }) as {
+          marker?: string;
+        };
+        value.marker = 'sqlite-inherited-secret';
+        return {
+          value,
+          observationCount: () => 0,
+          forbidden: /sqlite-inherited-secret/
+        };
+      }
+    },
+    {
+      name: 'Proxy traps',
+      createFailure: () => {
+        let trapCalls = 0;
+        const value = new Proxy(
+          { marker: 'sqlite-proxy-secret' },
+          {
+            get(target, property, receiver): unknown {
+              trapCalls += 1;
+              if (property === 'code') return 'SQLITE_BUSY';
+              return Reflect.get(target, property, receiver);
+            },
+            getOwnPropertyDescriptor(target, property): PropertyDescriptor | undefined {
+              trapCalls += 1;
+              return Reflect.getOwnPropertyDescriptor(target, property);
+            }
+          }
+        );
+        return {
+          value,
+          observationCount: () => trapCalls,
+          forbidden: /sqlite-proxy-secret/
+        };
+      }
+    },
+    {
+      name: 'revoked Proxy',
+      createFailure: () => {
+        let trapCalls = 0;
+        const revocable = Proxy.revocable(
+          { marker: 'sqlite-revoked-secret' },
+          {
+            get(target, property, receiver): unknown {
+              trapCalls += 1;
+              return Reflect.get(target, property, receiver);
+            }
+          }
+        );
+        revocable.revoke();
+        return {
+          value: revocable.proxy,
+          observationCount: () => trapCalls,
+          forbidden: /sqlite-revoked-secret/
+        };
+      }
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, () => {
+      const failure = item.createFailure();
+      const unavailableDatabase = {
+        pragma: () => 'exclusive',
+        exec: () => { throw failure.value; }
+      } as unknown as Database.Database;
+      let caught: unknown;
+      let didThrow = false;
+
+      try {
+        claimSqliteProcessOwnership(
+          unavailableDatabase,
+          '/safe/service.sqlite'
+        );
+      } catch (error) {
+        caught = error;
+        didThrow = true;
+      }
+
+      assert.equal(didThrow, true, item.name);
+      assert.equal(failure.observationCount(), 0, item.name);
+      const detail = ownershipDetail(caught);
+      assert.equal(
+        detail.code,
+        'DATABASE_OWNERSHIP_UNAVAILABLE',
+        item.name
+      );
+      assert.equal(detail.actual, 'object-failure', item.name);
+      assert.doesNotMatch(JSON.stringify(detail), failure.forbidden, item.name);
+    });
+  }
+});
+
 for (const sqliteCode of [
   'SQLITE_BUSYISH',
   'SQLITE_LOCKEDISH'
