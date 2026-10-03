@@ -303,6 +303,9 @@ function boundedString(
   if (typeof value !== 'string') {
     return invalid(path, `长度不超过 ${limit} 的字符串`, valueCategory(value));
   }
+  if (value.length > limit) {
+    return invalid(path, `原始长度不超过 ${limit}`, `原始长度为 ${value.length}`);
+  }
   const safe = redact(value, secrets);
   if (!allowEmpty && safe.length === 0) {
     return invalid(path, '非空字符串', '长度为 0');
@@ -617,39 +620,58 @@ function isCredentialField(subject: ErrorSubject): boolean {
     );
 }
 
+function encodeMessageString(value: string): string {
+  return JSON.stringify(value);
+}
+
 function describeSubject(subject: ErrorSubject): string {
   switch (subject.type) {
     case 'configuration':
-      return `配置项字段「${subject.field}」`;
+      return `配置项字段 ${encodeMessageString(subject.field)}`;
     case 'request':
-      return `请求字段「${subject.field}」`;
+      return `请求字段 ${encodeMessageString(subject.field)}`;
     case 'exchange':
-      return `交易所「${subject.exchangeId}」操作「${subject.operation}」`;
+      return `交易所 ${encodeMessageString(subject.exchangeId)}`
+        + ` 操作 ${encodeMessageString(subject.operation)}`;
     case 'market':
       return [
-        `交易所「${subject.exchangeId}」`,
-        `市场「${subject.symbol}」`,
-        `类型「${subject.kind}」`,
-        ...(subject.field === undefined ? [] : [`字段「${subject.field}」`])
+        `交易所 ${encodeMessageString(subject.exchangeId)}`,
+        `市场 ${encodeMessageString(subject.symbol)}`,
+        `类型 ${encodeMessageString(subject.kind)}`,
+        ...(subject.field === undefined
+          ? []
+          : [`字段 ${encodeMessageString(subject.field)}`])
       ].join('、');
     case 'account':
       return [
-        `交易所「${subject.exchangeId}」`,
-        `账户市场「${subject.symbol}」`,
-        `字段「${subject.field}」`
+        `交易所 ${encodeMessageString(subject.exchangeId)}`,
+        `账户市场 ${encodeMessageString(subject.symbol)}`,
+        `字段 ${encodeMessageString(subject.field)}`
       ].join('、');
     case 'strategy':
       return [
-        `策略「${subject.strategyId}」`,
-        ...(subject.field === undefined ? [] : [`字段「${subject.field}」`])
+        `策略 ${encodeMessageString(subject.strategyId)}`,
+        ...(subject.field === undefined
+          ? []
+          : [`字段 ${encodeMessageString(subject.field)}`])
       ].join('、');
     case 'database': {
       const parts = [
-        ...(subject.path === undefined ? [] : [`路径「${subject.path}」`]),
-        ...(subject.table === undefined ? [] : [`表「${subject.table}」`]),
-        ...(subject.recordId === undefined ? [] : [`记录「${subject.recordId}」`]),
-        ...(subject.field === undefined ? [] : [`字段「${subject.field}」`]),
-        ...(subject.operation === undefined ? [] : [`操作「${subject.operation}」`])
+        ...(subject.path === undefined
+          ? []
+          : [`路径 ${encodeMessageString(subject.path)}`]),
+        ...(subject.table === undefined
+          ? []
+          : [`表 ${encodeMessageString(subject.table)}`]),
+        ...(subject.recordId === undefined
+          ? []
+          : [`记录 ${encodeMessageString(subject.recordId)}`]),
+        ...(subject.field === undefined
+          ? []
+          : [`字段 ${encodeMessageString(subject.field)}`]),
+        ...(subject.operation === undefined
+          ? []
+          : [`操作 ${encodeMessageString(subject.operation)}`])
       ];
       return parts.length === 0
         ? '数据库对象'
@@ -663,7 +685,7 @@ function describeDiagnostic(value: SafeDiagnosticValue): string {
     return '空值 null';
   }
   if (typeof value === 'string') {
-    return `字符串「${value}」`;
+    return `字符串 ${encodeMessageString(value)}`;
   }
   if (typeof value === 'number') {
     return `数值 ${Object.is(value, -0) ? '-0' : String(value)}`;
@@ -703,20 +725,35 @@ function buildDetail(
   const phase = enumProperty<ErrorPhase>(
     properties, 'phase', ERROR_PHASE_SET, '已定义错误阶段'
   );
-  const subject = parseSubject(propertyValue(properties, 'subject'), secrets);
-  const expected = parseDiagnosticValue(
-    propertyValue(properties, 'expected'), 'expected', secrets
-  );
-  const actual = parseDiagnosticValue(
-    propertyValue(properties, 'actual'), 'actual', secrets
-  );
-  if (isCredentialField(subject)
-    && actual !== 'missing'
-    && actual !== 'present-but-invalid') {
+  const rawSubject = propertyValue(properties, 'subject');
+  const originalSubject = parseSubject(rawSubject, []);
+  const rawActual = propertyValue(properties, 'actual');
+  const credentialField = isCredentialField(originalSubject);
+  if (credentialField
+    && rawActual !== 'missing'
+    && rawActual !== 'present-but-invalid') {
     invalid(
       'actual',
       '凭证安全类别 missing 或 present-but-invalid',
       '非允许凭证类别'
+    );
+  }
+  const subject = secrets.length === 0
+    ? originalSubject
+    : parseSubject(rawSubject, secrets);
+  const expected = parseDiagnosticValue(
+    propertyValue(properties, 'expected'), 'expected', secrets
+  );
+  const actual = parseDiagnosticValue(
+    rawActual, 'actual', secrets
+  );
+  if (credentialField
+    && actual !== 'missing'
+    && actual !== 'present-but-invalid') {
+    invalid(
+      'actual',
+      '脱敏后仍为凭证缺失或凭证存在但无效类别',
+      '脱敏后为非允许凭证类别'
     );
   }
 

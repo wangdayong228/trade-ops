@@ -339,6 +339,68 @@ test('可信精确错误契约', async (t) => {
     assert.equal(new Set(messages).size, ALL_ERROR_CODES.length);
   });
 
+  await t.test('动态消息字符串编码无歧义且不保留原始控制字符', () => {
+    const subjectCases: readonly ErrorSubject[] = [
+      { type: 'configuration', field: '配置」，"quoted"\nline' },
+      { type: 'request', field: '请求」，"quoted"\nline' },
+      {
+        type: 'exchange', exchangeId: '交易所」，"quoted"\nline',
+        operation: '操作」，"quoted"\nline'
+      },
+      {
+        type: 'market', exchangeId: '市场交易所」，"quoted"\nline',
+        symbol: 'BTC/USDT」，"quoted"\nline', kind: '类型」，"quoted"\nline',
+        field: '字段」，"quoted"\nline'
+      },
+      {
+        type: 'account', exchangeId: '账户交易所」，"quoted"\nline',
+        symbol: 'ETH/USDT」，"quoted"\nline', field: '账户字段」，"quoted"\nline'
+      },
+      {
+        type: 'strategy', strategyId: '策略」，"quoted"\nline',
+        field: '策略字段」，"quoted"\nline'
+      },
+      {
+        type: 'database', path: '/tmp/路径」，"quoted"\nline',
+        table: '表」，"quoted"\nline', recordId: '记录」，"quoted"\nline',
+        field: '库字段」，"quoted"\nline', operation: '库操作」，"quoted"\nline'
+      }
+    ];
+    for (const subject of subjectCases) {
+      const detail = contract.createTradeOpsError(baseInput({
+        subject,
+        expected: '期望」，实际为 字符串「值，"quoted"\nline',
+        actual: ['实际」，期望 字符串「值，"quoted"\nline']
+      })).detail;
+      for (const [key, value] of Object.entries(subject)) {
+        if (key !== 'type' && typeof value === 'string') {
+          assert.ok(detail.message.includes(JSON.stringify(value)));
+        }
+      }
+      assert.ok(detail.message.includes(JSON.stringify(detail.expected)));
+      assert.ok(detail.message.includes(JSON.stringify(detail.actual)));
+      assert.equal(/[\u0000-\u001f]/u.test(detail.message), false);
+    }
+
+    const diagnosticCollisionA = contract.createTradeOpsError(baseInput({
+      expected: 'x」，实际为 字符串「y', actual: 'z'
+    })).message;
+    const diagnosticCollisionB = contract.createTradeOpsError(baseInput({
+      expected: 'x', actual: 'y」，实际为 字符串「z'
+    })).message;
+    assert.notEqual(diagnosticCollisionA, diagnosticCollisionB);
+
+    const subjectCollisionA = contract.createTradeOpsError(baseInput({
+      code: 'EXCHANGE_NOT_CONFIGURED',
+      subject: { type: 'exchange', exchangeId: 'x」操作「y', operation: 'z' }
+    })).message;
+    const subjectCollisionB = contract.createTradeOpsError(baseInput({
+      code: 'EXCHANGE_NOT_CONFIGURED',
+      subject: { type: 'exchange', exchangeId: 'x', operation: 'y」操作「z' }
+    })).message;
+    assert.notEqual(subjectCollisionA, subjectCollisionB);
+  });
+
   await t.test('保留七种异构对象和全部安全诊断值而不改变数值精度', () => {
     const cases: readonly {
       code: string;
@@ -514,6 +576,31 @@ test('可信精确错误契约', async (t) => {
     }), [secret]), [secret]);
   });
 
+  await t.test('凭证字段和实际类别必须在脱敏前完成判定', () => {
+    const secret = 'SECRET';
+    for (const actual of [
+      secret,
+      `missing${secret}`,
+      `present-but-invalid${secret}`
+    ]) {
+      assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
+        code: 'CONFIG_FIELD_INVALID',
+        phase: 'startup',
+        subject: { type: 'configuration', field: 'TRADING_OKX_SECRET' },
+        expected: 'configured credential',
+        actual
+      }), [secret]), [secret]);
+    }
+
+    assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
+      code: 'CONFIG_FIELD_INVALID',
+      phase: 'startup',
+      subject: { type: 'configuration', field: 'TRADING_OKX_SECRET' },
+      expected: 'configured credential',
+      actual: 'missing'
+    }), ['missing']), ['missing']);
+  });
+
   await t.test('标识、symbol 与 path 在上限处接受并在越界时拒绝', () => {
     const identifierCases: readonly {
       label: string;
@@ -654,6 +741,37 @@ test('可信精确错误契约', async (t) => {
     assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
       actual: ['a'.repeat(2_001)]
     })));
+  });
+
+  await t.test('脱敏不得使原始越界字符串通过长度校验', () => {
+    const secret = 'S';
+    const inputs: readonly ErrorInput[] = [
+      baseInput({
+        subject: { type: 'request', field: `${'i'.repeat(128)}${secret}` }
+      }),
+      baseInput({
+        code: 'MARKET_RULE_INVALID',
+        subject: {
+          type: 'market', exchangeId: 'okx',
+          symbol: `${'s'.repeat(64)}${secret}`, kind: 'swap'
+        }
+      }),
+      baseInput({
+        code: 'DATABASE_OPEN_FAILED', phase: 'startup',
+        subject: {
+          type: 'database', path: `${'p'.repeat(512)}${secret}`, operation: 'open'
+        }
+      }),
+      baseInput({ expected: `${'e'.repeat(2_000)}${secret}` }),
+      baseInput({ actual: [`${'a'.repeat(2_000)}${secret}`] })
+    ];
+
+    for (const input of inputs) {
+      assertRejectsSynchronously(
+        () => contract.createTradeOpsError(input, [secret]),
+        [secret]
+      );
+    }
   });
 
   await t.test('拒绝非有限数字、对象及非字符串列表项', () => {
