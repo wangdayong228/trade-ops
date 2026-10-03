@@ -260,17 +260,21 @@ export const SQLITE_V3_SCHEMA_METADATA = `
   VALUES (1, 3);
 `;
 
-export const SQLITE_STRATEGY_SCHEMA = `
-  ${SQLITE_V3_STRATEGIES_TABLE}
-
-  ${SQLITE_STRATEGY_ORDERS_TABLE}
-
+export const SQLITE_ORDER_EVENTS_TABLE = `
   CREATE TABLE order_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     strategy_order_id TEXT NOT NULL REFERENCES strategy_orders(id),
     snapshot_json TEXT NOT NULL,
     recorded_at TEXT NOT NULL
   );
+`;
+
+export const SQLITE_STRATEGY_SCHEMA = `
+  ${SQLITE_V3_STRATEGIES_TABLE}
+
+  ${SQLITE_STRATEGY_ORDERS_TABLE}
+
+  ${SQLITE_ORDER_EVENTS_TABLE}
 
   CREATE INDEX strategies_recoverable_idx
     ON strategies(state, created_at);

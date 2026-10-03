@@ -21,10 +21,12 @@ import {
   safeFailureCategory,
   TradeOpsError,
   withErrorPhase,
-  type ErrorDetail
+  type ErrorDetail,
+  type SafeDiagnosticValue
 } from '../errors/trade-ops-error.js';
 import {
   SQLITE_MIGRATED_STRATEGY_ORDERS_TABLE,
+  SQLITE_ORDER_EVENTS_TABLE,
   SQLITE_STRATEGY_ORDERS_TABLE,
   SQLITE_STRATEGY_SCHEMA,
   SQLITE_V2_STRATEGIES_TABLE,
@@ -1296,7 +1298,7 @@ function trustedTradeOpsFailure(
 
 function schemaOperationError(
   operation: string,
-  error: unknown
+  actual: string
 ): TradeOpsError {
   return createTradeOpsError({
     code: 'STORAGE_OPERATION_FAILED',
@@ -1307,7 +1309,46 @@ function schemaOperationError(
       operation
     },
     expected: 'successful strategy schema storage operation',
-    actual: safeFailureCategory(error)
+    actual
+  });
+}
+
+function safePragmaActual(value: unknown): SafeDiagnosticValue {
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'boolean'
+  ) {
+    return value;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : 'non-finite-number';
+  }
+  if (
+    typeof value === 'bigint'
+    && value >= BigInt(Number.MIN_SAFE_INTEGER)
+    && value <= BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    return Number(value);
+  }
+  return `${typeof value}-value`;
+}
+
+function foreignKeyStateError(
+  operation: string,
+  expected: 0 | 1,
+  actual: unknown
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_OPERATION_FAILED',
+    phase: 'startup',
+    subject: {
+      type: 'database',
+      table: 'strategies',
+      operation
+    },
+    expected,
+    actual: safePragmaActual(actual)
   });
 }
 
@@ -1319,7 +1360,7 @@ function throwSchemaFailure(operation: string, error: unknown): never {
   ) {
     throw trusted;
   }
-  throw schemaOperationError(operation, error);
+  throw schemaOperationError(operation, safeFailureCategory(error));
 }
 
 function schemaMetadata(database: Database.Database): SchemaMetadataRow[] {
@@ -1545,7 +1586,11 @@ function assertKnownBusinessSchema(
     'strategy_orders',
     'strategy_orders'
   ).sql);
-  object('table', 'order_events', 'order_events');
+  const orderEventsSql = canonicalSql(object(
+    'table',
+    'order_events',
+    'order_events'
+  ).sql);
   const recoverableIndexSql = canonicalSql(object(
     'index',
     'strategies_recoverable_idx',
@@ -1608,7 +1653,8 @@ function assertKnownBusinessSchema(
     throw schemaError('strategies-table-definition-mismatch');
   }
   if (
-    recoverableIndexSql !== canonicalSql(`
+    orderEventsSql !== canonicalSql(SQLITE_ORDER_EVENTS_TABLE)
+    || recoverableIndexSql !== canonicalSql(`
       CREATE INDEX strategies_recoverable_idx
       ON strategies(state, created_at)
     `)
@@ -1794,14 +1840,27 @@ function migrateToV3Schema(
   database: Database.Database,
   source: 'v1' | 'v2'
 ): void {
+  const disableOperation = 'disable-strategy-schema-foreign-keys';
+  const restoreOperation = 'restore-strategy-schema-foreign-keys';
+  let migrationFailed = false;
   let migrationFailure: unknown;
   try {
-    database.pragma('foreign_keys = OFF');
-    if (!sqliteIntegerEquals(
-      database.pragma('foreign_keys', { simple: true }),
-      0
-    )) {
-      throw schemaError('foreign-keys-could-not-be-disabled');
+    try {
+      database.pragma('foreign_keys = OFF');
+      const disabledState = database.pragma(
+        'foreign_keys',
+        { simple: true }
+      );
+      if (!sqliteIntegerEquals(disabledState, 0)) {
+        throw foreignKeyStateError(disableOperation, 0, disabledState);
+      }
+    } catch (error) {
+      const trusted = trustedTradeOpsFailure(error, 'startup');
+      if (trusted?.detail.code === 'STORAGE_OPERATION_FAILED') throw trusted;
+      throw schemaOperationError(
+        disableOperation,
+        safeFailureCategory(error)
+      );
     }
     database.transaction(() => {
       if (source === 'v1') {
@@ -1816,24 +1875,42 @@ function migrateToV3Schema(
       assertCompleteV3Schema(database);
     })();
   } catch (error) {
+    migrationFailed = true;
     migrationFailure = error;
   } finally {
+    let restoreFailure: TradeOpsError | undefined;
     try {
       database.pragma('foreign_keys = ON');
-      if (!sqliteIntegerEquals(
-        database.pragma('foreign_keys', { simple: true }),
-        1
-      )) {
-        migrationFailure = schemaError('foreign-keys-could-not-be-restored');
+      const restoredState = database.pragma(
+        'foreign_keys',
+        { simple: true }
+      );
+      if (!sqliteIntegerEquals(restoredState, 1)) {
+        restoreFailure = foreignKeyStateError(
+          restoreOperation,
+          1,
+          restoredState
+        );
       }
     } catch (error) {
-      migrationFailure = schemaError(
-        `foreign-key-restoration:${safeFailureCategory(error)}`
-      );
+      const trusted = trustedTradeOpsFailure(error, 'startup');
+      restoreFailure = trusted?.detail.code === 'STORAGE_OPERATION_FAILED'
+        ? trusted
+        : schemaOperationError(
+          restoreOperation,
+          safeFailureCategory(error)
+        );
+    }
+    if (!migrationFailed && restoreFailure !== undefined) {
+      migrationFailed = true;
+      migrationFailure = restoreFailure;
     }
   }
-  if (migrationFailure !== undefined) {
-    throwSchemaFailure(`migrate-${source}-to-v3`, migrationFailure);
+  if (migrationFailed) {
+    throwSchemaFailure(
+      `migrate-${source}-to-v3`,
+      migrationFailure
+    );
   }
   try {
     assertForeignKeysClean(database);

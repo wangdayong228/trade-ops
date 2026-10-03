@@ -155,6 +155,35 @@ function assertSchemaMismatch(action: () => unknown): TradeOpsError {
   return error;
 }
 
+function assertStartupStorageError(
+  error: unknown,
+  operation: RegExp,
+  secretMarkers: readonly string[] = [],
+  expectedActual?: string
+): asserts error is TradeOpsError {
+  assert.ok(error instanceof TradeOpsError);
+  assert.equal(error.detail.code, 'STORAGE_OPERATION_FAILED');
+  assert.equal(error.detail.phase, 'startup');
+  assert.equal(error.detail.subject.type, 'database');
+  if (error.detail.subject.type === 'database') {
+    assert.equal(error.detail.subject.table, 'strategies');
+    assert.match(error.detail.subject.operation ?? '', operation);
+  }
+  assert.notEqual(error.detail.actual, null);
+  if (expectedActual !== undefined) {
+    assert.equal(error.detail.actual, expectedActual);
+  }
+  const exposed = [
+    error.message,
+    JSON.stringify(error.detail),
+    error.stack ?? '',
+    String((error as Error & { cause?: unknown }).cause ?? '')
+  ].join('\n');
+  for (const marker of secretMarkers) {
+    assert.equal(exposed.includes(marker), false);
+  }
+}
+
 function preflight(
   overrides: Partial<PreflightResult> = {}
 ): PreflightResult {
@@ -804,6 +833,45 @@ function seedV2Strategy(
   );
 }
 
+function seedFundingMigrationCoverage(database: Database.Database): void {
+  database.exec(SQLITE_FUNDING_RATE_SCHEMA);
+  database.prepare(`
+    INSERT INTO funding_rate_history (
+      exchange_id, exchange_market_id, symbol, funding_timestamp_ms,
+      funding_rate, raw_json, content_hash,
+      first_observed_at, last_observed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'okx',
+    'BTC-USDT-SWAP',
+    'BTC/USDT:USDT',
+    1_788_649_200_000,
+    '0.0001',
+    '{"fundingRate":"0.0001"}',
+    'a'.repeat(64),
+    '2026-09-06T00:02:00.000Z',
+    '2026-09-06T00:03:00.000Z'
+  );
+  database.prepare(`
+    INSERT INTO funding_rate_revisions (
+      exchange_id, exchange_market_id, symbol, funding_timestamp_ms,
+      funding_rate, raw_json, content_hash,
+      first_observed_at, last_observed_at, replaced_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'okx',
+    'BTC-USDT-SWAP',
+    'BTC/USDT:USDT',
+    1_788_649_200_000,
+    '0.00009',
+    '{"fundingRate":"0.00009"}',
+    'b'.repeat(64),
+    '2026-09-06T00:01:00.000Z',
+    '2026-09-06T00:02:00.000Z',
+    '2026-09-06T00:03:00.000Z'
+  );
+}
+
 function seedV2MigrationCoverage(database: Database.Database): void {
   const base = preflight();
   const precise = preflight({
@@ -918,42 +986,7 @@ function seedV2MigrationCoverage(database: Database.Database): void {
     observedSnapshot.updatedAt
   );
 
-  database.exec(SQLITE_FUNDING_RATE_SCHEMA);
-  database.prepare(`
-    INSERT INTO funding_rate_history (
-      exchange_id, exchange_market_id, symbol, funding_timestamp_ms,
-      funding_rate, raw_json, content_hash,
-      first_observed_at, last_observed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    'okx',
-    'BTC-USDT-SWAP',
-    'BTC/USDT:USDT',
-    1_788_649_200_000,
-    '0.0001',
-    '{"fundingRate":"0.0001"}',
-    'a'.repeat(64),
-    '2026-09-06T00:02:00.000Z',
-    '2026-09-06T00:03:00.000Z'
-  );
-  database.prepare(`
-    INSERT INTO funding_rate_revisions (
-      exchange_id, exchange_market_id, symbol, funding_timestamp_ms,
-      funding_rate, raw_json, content_hash,
-      first_observed_at, last_observed_at, replaced_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    'okx',
-    'BTC-USDT-SWAP',
-    'BTC/USDT:USDT',
-    1_788_649_200_000,
-    '0.00009',
-    '{"fundingRate":"0.00009"}',
-    'b'.repeat(64),
-    '2026-09-06T00:01:00.000Z',
-    '2026-09-06T00:02:00.000Z',
-    '2026-09-06T00:03:00.000Z'
-  );
+  seedFundingMigrationCoverage(database);
 }
 
 function jsonWithBigInts(value: unknown): string {
@@ -961,6 +994,102 @@ function jsonWithBigInts(value: unknown): string {
     typeof nested === 'bigint' ? nested.toString() : nested
   ));
 }
+
+function strategyDatabaseFingerprint(database: Database.Database): string {
+  const catalog = database.prepare(`
+    SELECT type, name, tbl_name, rootpage, sql
+    FROM sqlite_master
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name
+  `).all() as Array<{ type: unknown; name: unknown }>;
+  const tableNames = new Set(catalog.flatMap(({ type, name }) => (
+    type === 'table' && typeof name === 'string' ? [name] : []
+  )));
+  const rows = (table: string, orderBy: string): unknown[] => (
+    tableNames.has(table)
+      ? database.prepare(`SELECT * FROM ${table} ORDER BY ${orderBy}`).all()
+      : []
+  );
+  const hasSequence = database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name = 'sqlite_sequence'
+  `).get() !== undefined;
+  return jsonWithBigInts({
+    catalog,
+    strategies: rows('strategies', 'id'),
+    orders: rows('strategy_orders', 'id'),
+    events: rows('order_events', 'id'),
+    metadata: rows('strategy_schema_metadata', 'singleton'),
+    fundingHistory: rows(
+      'funding_rate_history',
+      'exchange_id, exchange_market_id, funding_timestamp_ms'
+    ),
+    fundingRevisions: rows('funding_rate_revisions', 'id'),
+    fundingState: rows(
+      'funding_rate_sync_state',
+      'exchange_id, exchange_market_id'
+    ),
+    sequence: hasSequence
+      ? database.prepare('SELECT * FROM sqlite_sequence ORDER BY name').all()
+      : []
+  });
+}
+
+function strategySchemaVersion(database: Database.Database): unknown {
+  return database.prepare(`
+    SELECT version FROM strategy_schema_metadata WHERE singleton = 1
+  `).pluck().get();
+}
+
+function tableColumnNames(
+  database: Database.Database,
+  table: string
+): readonly string[] {
+  return (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>).map(({ name }) => name);
+}
+
+function isV3MigrationSql(source: string): boolean {
+  return source.includes('CREATE TABLE strategies_v3')
+    && source.includes('DROP TABLE strategy_schema_metadata');
+}
+
+function isV1MigrationSql(source: string): boolean {
+  return source.includes('CREATE TABLE strategies_v2')
+    && source.includes('ALTER TABLE strategy_orders ADD COLUMN');
+}
+
+const ORDER_EVENTS_DDL_DRIFTS = [
+  {
+    name: 'missing AUTOINCREMENT',
+    rewrite: (sql: string): string => sql.replace(
+      'id INTEGER PRIMARY KEY AUTOINCREMENT',
+      'id INTEGER PRIMARY KEY'
+    )
+  },
+  {
+    name: 'nullable snapshot',
+    rewrite: (sql: string): string => sql.replace(
+      'snapshot_json TEXT NOT NULL',
+      'snapshot_json TEXT'
+    )
+  },
+  {
+    name: 'changed recorded type',
+    rewrite: (sql: string): string => sql.replace(
+      'recorded_at TEXT NOT NULL',
+      'recorded_at BLOB NOT NULL'
+    )
+  },
+  {
+    name: 'changed FK action',
+    rewrite: (sql: string): string => sql.replace(
+      'REFERENCES strategy_orders(id)',
+      'REFERENCES strategy_orders(id) ON DELETE CASCADE'
+    )
+  }
+] as const;
 
 function v2PreservedFingerprint(database: Database.Database): string {
   const protectedNames = [
@@ -1281,6 +1410,176 @@ test('classifies an unknown strategy schema pragma failure as a storage operatio
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
   `).all(), []);
+});
+
+test('repair: classifies a thrown foreign-key restoration failure as startup storage failure', (t) => {
+  const restoreMarker = 'foreign-key-restore-secret-marker';
+  const database = new Database(':memory:');
+  const originalPragma = database.pragma.bind(database);
+  t.after(() => {
+    if (database.open) {
+      originalPragma('foreign_keys = ON');
+      database.close();
+    }
+  });
+  database.exec(V2_FRESH_SCHEMA_SQL);
+  seedV2MigrationCoverage(database);
+  let migrationStarted = false;
+  t.mock.method(database, 'pragma', (
+    source: string,
+    options?: Database.PragmaOptions
+  ): unknown => {
+    if (source === 'foreign_keys = OFF') {
+      const result = originalPragma(source, options);
+      migrationStarted = true;
+      return result;
+    }
+    if (migrationStarted && source === 'foreign_keys = ON') {
+      throw new Error(restoreMarker);
+    }
+    return originalPragma(source, options);
+  });
+
+  const error = captureError(() => new SqliteStrategyRepository(database));
+
+  assert.equal(strategySchemaVersion(database), 3);
+  assertStartupStorageError(
+    error,
+    /(?:restore|enable).*foreign|foreign.*(?:restore|enable)/i,
+    [restoreMarker]
+  );
+});
+
+test('repair: rejects an unverified foreign-key restoration as startup storage failure', (t) => {
+  const database = new Database(':memory:');
+  const originalPragma = database.pragma.bind(database);
+  t.after(() => {
+    if (database.open) database.close();
+  });
+  database.exec(V2_FRESH_SCHEMA_SQL);
+  seedV2MigrationCoverage(database);
+  let migrationStarted = false;
+  let returnUnverifiedRestore = false;
+  t.mock.method(database, 'pragma', (
+    source: string,
+    options?: Database.PragmaOptions
+  ): unknown => {
+    if (source === 'foreign_keys = OFF') {
+      const result = originalPragma(source, options);
+      migrationStarted = true;
+      return result;
+    }
+    if (migrationStarted && source === 'foreign_keys = ON') {
+      const result = originalPragma(source, options);
+      returnUnverifiedRestore = true;
+      return result;
+    }
+    if (
+      returnUnverifiedRestore
+      && source === 'foreign_keys'
+      && options?.simple === true
+    ) {
+      returnUnverifiedRestore = false;
+      return 0;
+    }
+    return originalPragma(source, options);
+  });
+
+  const error = captureError(() => new SqliteStrategyRepository(database));
+
+  assert.equal(strategySchemaVersion(database), 3);
+  assert.equal(originalPragma('foreign_keys', { simple: true }), 1);
+  assertStartupStorageError(
+    error,
+    /(?:restore|enable).*foreign|foreign.*(?:restore|enable)/i
+  );
+});
+
+test('repair: preserves the primary v3 migration failure when foreign-key restoration also fails', (t) => {
+  const restoreMarker = 'secondary-restore-secret-marker';
+  const database = new Database(':memory:');
+  const originalPragma = database.pragma.bind(database);
+  const originalExec = database.exec.bind(database);
+  t.after(() => {
+    if (database.open) {
+      originalPragma('foreign_keys = ON');
+      database.close();
+    }
+  });
+  database.exec(V2_FRESH_SCHEMA_SQL);
+  seedV2MigrationCoverage(database);
+  const before = strategyDatabaseFingerprint(database);
+  let migrationStarted = false;
+  t.mock.method(database, 'pragma', (
+    source: string,
+    options?: Database.PragmaOptions
+  ): unknown => {
+    if (source === 'foreign_keys = OFF') {
+      const result = originalPragma(source, options);
+      migrationStarted = true;
+      return result;
+    }
+    if (migrationStarted && source === 'foreign_keys = ON') {
+      throw new Error(restoreMarker);
+    }
+    return originalPragma(source, options);
+  });
+  t.mock.method(database, 'exec', (source: string): Database.Database => {
+    if (!isV3MigrationSql(source)) return originalExec(source);
+    assert.equal(strategySchemaVersion(database), 2);
+    originalExec(source);
+    assert.equal(strategySchemaVersion(database), 3);
+    assert.equal(
+      tableColumnNames(database, 'strategies').includes('preflight_failure_json'),
+      true
+    );
+    assert.equal(database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'strategies_v3'
+    `).get(), undefined);
+    throw undefined;
+  });
+
+  const error = captureError(() => new SqliteStrategyRepository(database));
+
+  assert.equal(strategyDatabaseFingerprint(database), before);
+  originalPragma('foreign_keys = ON');
+  assert.equal(originalPragma('foreign_keys', { simple: true }), 1);
+  assertStartupStorageError(
+    error,
+    /^migrate-v2-to-v3$/,
+    [restoreMarker],
+    'undefined-thrown'
+  );
+});
+
+test('repair: classifies a foreign-key disable failure as startup storage failure', (t) => {
+  const disableMarker = 'foreign-key-disable-secret-marker';
+  const database = new Database(':memory:');
+  const originalPragma = database.pragma.bind(database);
+  t.after(() => {
+    if (database.open) database.close();
+  });
+  database.exec(V2_FRESH_SCHEMA_SQL);
+  seedV2MigrationCoverage(database);
+  const before = strategyDatabaseFingerprint(database);
+  t.mock.method(database, 'pragma', (
+    source: string,
+    options?: Database.PragmaOptions
+  ): unknown => {
+    if (source === 'foreign_keys = OFF') throw new Error(disableMarker);
+    return originalPragma(source, options);
+  });
+
+  const error = captureError(() => new SqliteStrategyRepository(database));
+
+  assert.equal(strategyDatabaseFingerprint(database), before);
+  assert.equal(originalPragma('foreign_keys', { simple: true }), 1);
+  assertStartupStorageError(
+    error,
+    /disable.*foreign|foreign.*disable/i,
+    [disableMarker]
+  );
 });
 
 for (const fixture of [
@@ -1898,6 +2197,97 @@ for (const missingForeignKey of [
   });
 }
 
+for (const generation of ['v2', 'v3', 'v1'] as const) {
+  for (const drift of ORDER_EVENTS_DDL_DRIFTS) {
+    test(`repair: rejects ${generation} ${drift.name} order_events DDL drift without modifying evidence`, (t) => {
+      const directory = mkdtempSync(join(
+        tmpdir(),
+        `trade-ops-order-events-${generation}-`
+      ));
+      const databasePath = join(directory, 'strategies.sqlite');
+      let database = new Database(databasePath);
+      t.after(() => {
+        if (database.open) database.close();
+        rmSync(directory, { recursive: true, force: true });
+      });
+
+      if (generation === 'v2') {
+        database.exec(V2_FRESH_SCHEMA_SQL);
+        seedV2MigrationCoverage(database);
+      } else if (generation === 'v3') {
+        const repository = new SqliteStrategyRepository(database);
+        const strategyId = repository.createPending(preflight()).id;
+        assert.equal(repository.claimForExecution(strategyId), true);
+        const request = requestFor(strategyId, 'SPOT_MARKET');
+        const order = repository.planOrder(
+          strategyId,
+          'SPOT_MARKET',
+          request
+        );
+        assert.equal(
+          repository.attachOrderSnapshot(
+            order.id,
+            snapshotFor(request, 'bitget')
+          ),
+          'attached'
+        );
+        seedFundingMigrationCoverage(database);
+      } else {
+        database.exec(LEGACY_SCHEMA);
+        seedLegacyExecutingStrategy(database, 'repair-v1-strategy');
+        seedLegacyPlannedOrder(
+          database,
+          'repair-v1-strategy',
+          'repair-v1-planned-order'
+        );
+        seedLegacyObservedOrder(
+          database,
+          'repair-v1-strategy',
+          'repair-v1-observed-order'
+        );
+        seedFundingMigrationCoverage(database);
+      }
+
+      rewriteTableDefinition(database, 'order_events', drift.rewrite);
+      const corruptedDefinition = tableDefinition(database, 'order_events');
+      database.close();
+      database = new Database(databasePath);
+      database.pragma('foreign_keys = ON');
+      assert.equal(
+        tableDefinition(database, 'order_events'),
+        corruptedDefinition
+      );
+      const before = strategyDatabaseFingerprint(database);
+
+      assertSchemaMismatch(() => new SqliteStrategyRepository(database));
+
+      assert.equal(strategyDatabaseFingerprint(database), before);
+      assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+      assert.equal(
+        database.prepare('SELECT COUNT(*) FROM order_events').pluck().get(),
+        1
+      );
+      if (generation === 'v1') {
+        assert.equal(database.prepare(`
+          SELECT name FROM sqlite_master
+          WHERE type = 'table' AND name = 'strategy_schema_metadata'
+        `).get(), undefined);
+        assert.equal(
+          tableColumnNames(database, 'strategy_orders').includes(
+            'submission_disposition'
+          ),
+          false
+        );
+      } else {
+        assert.equal(
+          strategySchemaVersion(database),
+          generation === 'v2' ? 2 : 3
+        );
+      }
+    });
+  }
+}
+
 test('persists definite no-submit evidence with a single compare-and-set', (t) => {
   const { repository } = setup(t);
   const strategyId = repository.createPending(preflight()).id;
@@ -2351,13 +2741,22 @@ test('constructs a v3 repository twice without changing migrated data', (t) => {
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
 });
 
-for (const failurePoint of ['early malformed copy', 'late index install'] as const) {
-  test(`rolls back the whole v1 migration after ${failurePoint}`, (t) => {
+for (const preflightRejection of [
+  {
+    name: 'a v1 schema missing a required column before migration',
+    kind: 'missing-column'
+  },
+  {
+    name: 'a reserved object name before v1 migration',
+    kind: 'reserved-object'
+  }
+] as const) {
+  test(`rejects ${preflightRejection.name}`, (t) => {
     const database = legacyDatabase(t);
     seedLegacyExecutingStrategy(database, 'legacy-strategy');
     seedLegacyPlannedOrder(database, 'legacy-strategy', 'planned-order');
     seedLegacyObservedOrder(database, 'legacy-strategy', 'observed-order');
-    if (failurePoint === 'early malformed copy') {
+    if (preflightRejection.kind === 'missing-column') {
       makeMalformedLegacyStrategies(database);
     } else {
       database.exec(`
@@ -2415,7 +2814,7 @@ for (const failurePoint of ['early malformed copy', 'late index install'] as con
   });
 }
 
-test('rolls back the whole v1 to v3 chain when the v3 rebuild is blocked', (t) => {
+test('rejects a reserved v3 table before v1 migration and preserves data', (t) => {
   const database = legacyDatabase(t);
   seedLegacyExecutingStrategy(database, 'legacy-chain-strategy');
   seedLegacyPlannedOrder(
@@ -2456,7 +2855,7 @@ test('rolls back the whole v1 to v3 chain when the v3 rebuild is blocked', (t) =
   `).all(), []);
 });
 
-test('rolls back a v2 to v3 migration when the v3 rebuild is blocked', (t) => {
+test('rejects a reserved v3 table before v2 migration and preserves data', (t) => {
   const database = new Database(':memory:');
   t.after(() => database.close());
   database.exec(V2_FRESH_SCHEMA_SQL);
@@ -2475,6 +2874,141 @@ test('rolls back a v2 to v3 migration when the v3 rebuild is blocked', (t) => {
   `).pluck().get(), 0);
   assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
   assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+});
+
+test('repair: rolls v2 migration back after completed v3 DDL', (t) => {
+  const migrationMarker = 'v2-post-ddl-secret-marker';
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec(V2_FRESH_SCHEMA_SQL);
+  seedV2MigrationCoverage(database);
+  const before = strategyDatabaseFingerprint(database);
+  const originalExec = database.exec.bind(database);
+  let v3ExecCompleted = 0;
+  t.mock.method(database, 'exec', (source: string): Database.Database => {
+    if (!isV3MigrationSql(source)) return originalExec(source);
+    assert.equal(strategySchemaVersion(database), 2);
+    assert.equal(
+      tableColumnNames(database, 'strategies').includes('preflight_failure_json'),
+      false
+    );
+    originalExec(source);
+    assert.equal(strategySchemaVersion(database), 3);
+    assert.equal(
+      tableColumnNames(database, 'strategies').includes('preflight_failure_json'),
+      true
+    );
+    assert.equal(database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'strategies_v3'
+    `).get(), undefined);
+    v3ExecCompleted += 1;
+    throw new Error(migrationMarker);
+  });
+
+  const error = captureError(() => new SqliteStrategyRepository(database));
+
+  assert.equal(v3ExecCompleted, 1);
+  assert.equal(strategyDatabaseFingerprint(database), before);
+  assert.equal(strategySchemaVersion(database), 2);
+  assert.equal(
+    tableColumnNames(database, 'strategies').includes('preflight_failure_json'),
+    false
+  );
+  assert.equal(database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name = 'strategies_v3'
+  `).get(), undefined);
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+  assertStartupStorageError(
+    error,
+    /^migrate-v2-to-v3$/,
+    [migrationMarker]
+  );
+});
+
+test('repair: rolls v1 migration chain back after completed v3 DDL', (t) => {
+  const migrationMarker = 'v1-chain-post-ddl-secret-marker';
+  const database = legacyDatabase(t);
+  seedLegacyExecutingStrategy(database, 'repair-v1-rollback-strategy');
+  seedLegacyPlannedOrder(
+    database,
+    'repair-v1-rollback-strategy',
+    'repair-v1-rollback-planned-order'
+  );
+  seedLegacyObservedOrder(
+    database,
+    'repair-v1-rollback-strategy',
+    'repair-v1-rollback-observed-order'
+  );
+  seedFundingMigrationCoverage(database);
+  const before = strategyDatabaseFingerprint(database);
+  const originalExec = database.exec.bind(database);
+  let v1ExecCompleted = 0;
+  let v3ExecCompleted = 0;
+  t.mock.method(database, 'exec', (source: string): Database.Database => {
+    if (isV1MigrationSql(source)) {
+      const result = originalExec(source);
+      assert.equal(
+        tableColumnNames(database, 'strategy_orders').includes(
+          'submission_disposition'
+        ),
+        true
+      );
+      v1ExecCompleted += 1;
+      return result;
+    }
+    if (!isV3MigrationSql(source)) return originalExec(source);
+    assert.equal(strategySchemaVersion(database), 2);
+    assert.equal(
+      tableColumnNames(database, 'strategy_orders').includes(
+        'submission_disposition'
+      ),
+      true
+    );
+    originalExec(source);
+    assert.equal(strategySchemaVersion(database), 3);
+    assert.equal(
+      tableColumnNames(database, 'strategies').includes('preflight_failure_json'),
+      true
+    );
+    assert.equal(database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name = 'strategies_v3'
+    `).get(), undefined);
+    v3ExecCompleted += 1;
+    throw new Error(migrationMarker);
+  });
+
+  const error = captureError(() => new SqliteStrategyRepository(database));
+
+  assert.equal(v1ExecCompleted, 1);
+  assert.equal(v3ExecCompleted, 1);
+  assert.equal(strategyDatabaseFingerprint(database), before);
+  assert.equal(database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name = 'strategy_schema_metadata'
+  `).get(), undefined);
+  assert.equal(
+    tableColumnNames(database, 'strategy_orders').includes(
+      'submission_disposition'
+    ),
+    false
+  );
+  assert.equal(
+    tableColumnNames(database, 'strategies').includes('preflight_failure_json'),
+    false
+  );
+  assert.equal(database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name = 'strategies_v3'
+  `).get(), undefined);
+  assert.equal(database.pragma('foreign_keys', { simple: true }), 1);
+  assertStartupStorageError(
+    error,
+    /^migrate-v1-to-v3$/,
+    [migrationMarker]
+  );
 });
 
 test('supports foreign keys and event persistence with SQLite safe integers', (t) => {
