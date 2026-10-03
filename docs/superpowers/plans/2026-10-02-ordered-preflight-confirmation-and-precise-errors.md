@@ -60,9 +60,9 @@ function safeFailureCategory(error: unknown): string;
 
 Subject 字段：configuration/request 使用 `field`；exchange 使用 `exchangeId, operation`；market 使用 `exchangeId, symbol, kind, field?`；account 使用 `exchangeId, symbol, field`；strategy 使用 `strategyId, field?`；database 使用 `path?, table?, recordId?, field?, operation?`。标识上限 128 字符、symbol 64、path 512；诊断字符串上限 2000，列表上限 16 项且每项上限 2000。字段只允许相应变体所列成员。
 
-- [ ] RED：安全字段与中文文案一致、不可变快照、阶段转换保留时间与证据、所有码均有工厂文案；恶意 getter/proxy/未知抛出值、额外字段、超界值、NaN、凭证、伪造持久化消息均有拒绝或安全类别测试。新模块未存在时先用动态 import 验证缺少能力，再以实际行为断言覆盖。
-- [ ] GREEN：实现上述契约；直接秘密替换只处理调用方显式提供的测试值/运行时注入值，不在模块导入时读取环境。
-- [ ] 验证与审查：`npm run build`；`node --test dist/tests/errors/trade-ops-error.test.js`；主代理审核并提交。
+- [x] RED：安全字段与中文文案一致、不可变快照、阶段转换保留时间与证据、所有码均有工厂文案；恶意 getter/proxy/未知抛出值、额外字段、超界值、NaN、凭证、伪造持久化消息均有拒绝或安全类别测试。新模块未存在时先用动态 import 验证缺少能力，再以实际行为断言覆盖。
+- [x] GREEN：实现上述契约；直接秘密替换只处理调用方显式提供的测试值/运行时注入值，不在模块导入时读取环境。
+- [x] 验证与审查：`npm run build`；`node --test dist/tests/errors/trade-ops-error.test.js`；主代理审核并提交。
 
 ### Task 2：有序预检与市场刷新
 
