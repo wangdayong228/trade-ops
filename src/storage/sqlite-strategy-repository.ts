@@ -16,9 +16,20 @@ import type {
 } from '../domain/types.js';
 import type { PreflightResult } from '../strategy/preflight-service.js';
 import {
+  createTradeOpsError,
+  parseErrorDetail,
+  safeFailureCategory,
+  TradeOpsError,
+  withErrorPhase,
+  type ErrorDetail
+} from '../errors/trade-ops-error.js';
+import {
   SQLITE_MIGRATED_STRATEGY_ORDERS_TABLE,
   SQLITE_STRATEGY_ORDERS_TABLE,
-  SQLITE_STRATEGY_SCHEMA
+  SQLITE_STRATEGY_SCHEMA,
+  SQLITE_V2_STRATEGIES_TABLE,
+  SQLITE_V3_SCHEMA_METADATA,
+  SQLITE_V3_STRATEGIES_TABLE
 } from './schema.js';
 import type {
   OrderSubmissionDisposition,
@@ -37,12 +48,18 @@ import {
   StrategyNotFoundError
 } from './strategy-repository.js';
 
-const STRATEGY_SCHEMA_ERROR = 'SQLite strategy schema migration failed';
 const REQUIRED_BUSINESS_TABLES = [
   'strategies',
   'strategy_orders',
   'order_events'
 ] as const;
+const RESERVED_STRATEGY_TABLE_NAMES = new Set([
+  'strategies_v2',
+  'strategies_v3',
+  'strategies_recoverable_idx',
+  'strategy_orders_strategy_idx',
+  'order_events_order_idx'
+]);
 
 const EXECUTION_MODES = new Set<ExecutionMode>([
   'CONCURRENT',
@@ -51,6 +68,7 @@ const EXECUTION_MODES = new Set<ExecutionMode>([
 ]);
 const STRATEGY_STATES = new Set<StrategyState>([
   'PENDING_CONFIRMATION',
+  'PREFLIGHT_INVALIDATED',
   'EXECUTING',
   'WAITING_HEDGE',
   'HEDGED',
@@ -117,6 +135,7 @@ const ALLOWED_TRANSITIONS: Readonly<Record<
   ReadonlySet<StrategyState>
 >> = {
   PENDING_CONFIRMATION: new Set(['EXECUTING']),
+  PREFLIGHT_INVALIDATED: new Set(),
   EXECUTING: new Set([
     'WAITING_HEDGE',
     'HEDGED',
@@ -235,6 +254,7 @@ interface StrategyDbRow {
   effective_base_quantity: unknown;
   preflight_json: unknown;
   failure_code: unknown;
+  preflight_failure_json: unknown;
   created_at: unknown;
   updated_at: unknown;
 }
@@ -1211,7 +1231,7 @@ const SQLITE_V1_MIGRATION = `
     ON order_events(strategy_order_id, id);
 `;
 
-const SQLITE_SCHEMA_METADATA = `
+const SQLITE_V2_SCHEMA_METADATA = `
   CREATE TABLE IF NOT EXISTS strategy_schema_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     version INTEGER NOT NULL CHECK (version = 2)
@@ -1220,8 +1240,86 @@ const SQLITE_SCHEMA_METADATA = `
   VALUES (1, 2);
 `;
 
-function schemaError(): Error {
-  return new Error(STRATEGY_SCHEMA_ERROR);
+const SQLITE_V3_MIGRATION_STRATEGIES_TABLE = SQLITE_V3_STRATEGIES_TABLE.replace(
+  'CREATE TABLE strategies (',
+  'CREATE TABLE strategies_v3 ('
+);
+
+const SQLITE_V2_TO_V3_MIGRATION = `
+  ${SQLITE_V3_MIGRATION_STRATEGIES_TABLE}
+
+  INSERT INTO strategies_v3 (
+    id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
+    requested_base_quantity, effective_base_quantity, preflight_json,
+    failure_code, preflight_failure_json, created_at, updated_at
+  )
+  SELECT
+    id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
+    requested_base_quantity, effective_base_quantity, preflight_json,
+    failure_code, NULL, created_at, updated_at
+  FROM strategies;
+
+  DROP INDEX strategies_recoverable_idx;
+  DROP TABLE strategies;
+  ALTER TABLE strategies_v3 RENAME TO strategies;
+  CREATE INDEX strategies_recoverable_idx
+    ON strategies(state, created_at);
+
+  DROP TABLE strategy_schema_metadata;
+  ${SQLITE_V3_SCHEMA_METADATA}
+`;
+
+function schemaError(actual = 'schema-shape-invalid'): TradeOpsError {
+  return createTradeOpsError({
+    code: 'DATABASE_SCHEMA_VERSION_MISMATCH',
+    phase: 'startup',
+    subject: {
+      type: 'database',
+      table: 'strategies',
+      operation: 'prepare strategy schema'
+    },
+    expected: 'exact known strategy schema version 1, 2, or 3',
+    actual
+  });
+}
+
+function trustedTradeOpsFailure(
+  error: unknown,
+  phase: 'startup' | 'storage'
+): TradeOpsError | undefined {
+  try {
+    return withErrorPhase(error as TradeOpsError, phase);
+  } catch {
+    return undefined;
+  }
+}
+
+function schemaOperationError(
+  operation: string,
+  error: unknown
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_OPERATION_FAILED',
+    phase: 'startup',
+    subject: {
+      type: 'database',
+      table: 'strategies',
+      operation
+    },
+    expected: 'successful strategy schema storage operation',
+    actual: safeFailureCategory(error)
+  });
+}
+
+function throwSchemaFailure(operation: string, error: unknown): never {
+  const trusted = trustedTradeOpsFailure(error, 'startup');
+  if (
+    trusted?.detail.code === 'DATABASE_SCHEMA_VERSION_MISMATCH'
+    || trusted?.detail.code === 'STORAGE_OPERATION_FAILED'
+  ) {
+    throw trusted;
+  }
+  throw schemaOperationError(operation, error);
 }
 
 function schemaMetadata(database: Database.Database): SchemaMetadataRow[] {
@@ -1231,15 +1329,18 @@ function schemaMetadata(database: Database.Database): SchemaMetadataRow[] {
   `).all() as SchemaMetadataRow[];
 }
 
-function validV2Metadata(rows: readonly SchemaMetadataRow[]): boolean {
+function validMetadata(
+  rows: readonly SchemaMetadataRow[],
+  version: 2 | 3
+): boolean {
   return rows.length === 1
     && sqliteIntegerEquals(rows[0]?.singleton, 1)
-    && sqliteIntegerEquals(rows[0]?.version, 2);
+    && sqliteIntegerEquals(rows[0]?.version, version);
 }
 
 function classifyStrategySchema(
   database: Database.Database
-): 'empty' | 'v1' | 'v2' {
+): 'empty' | 'v1' | 'v2' | 'v3' {
   const rows = database.prepare(`
     SELECT type, name, tbl_name, sql
     FROM sqlite_master
@@ -1255,19 +1356,42 @@ function classifyStrategySchema(
   if (tableNames.size === 0) {
     return 'empty';
   }
+  if ([...RESERVED_STRATEGY_TABLE_NAMES].some((name) => tableNames.has(name))) {
+    throw schemaError('reserved-strategy-object-name-used-as-table');
+  }
   const hasBusinessTables = REQUIRED_BUSINESS_TABLES.every(
     (name) => tableNames.has(name)
   );
   if (!tableNames.has('strategy_schema_metadata')) {
     if (hasBusinessTables) {
+      assertV1MigrationSourceColumns(database);
       return 'v1';
     }
     throw schemaError();
   }
-  if (!hasBusinessTables || !validV2Metadata(schemaMetadata(database))) {
+  if (!hasBusinessTables) {
     throw schemaError();
   }
-  return 'v2';
+  const metadata = schemaMetadata(database);
+  if (validMetadata(metadata, 2)) return 'v2';
+  if (validMetadata(metadata, 3)) return 'v3';
+  throw schemaError('schema-metadata-version-or-singleton-invalid');
+}
+
+function assertV1MigrationSourceColumns(database: Database.Database): void {
+  assertColumns(database, 'strategies', [
+    'id', 'state', 'mode', 'spot_exchange_id', 'contract_exchange_id',
+    'symbol', 'requested_base_quantity', 'effective_base_quantity',
+    'preflight_json', 'failure_code', 'created_at', 'updated_at'
+  ]);
+  assertColumns(database, 'strategy_orders', [
+    'id', 'strategy_id', 'role', 'exchange_id', 'client_order_id',
+    'exchange_order_id', 'request_json', 'snapshot_json', 'status',
+    'created_at', 'updated_at'
+  ]);
+  assertColumns(database, 'order_events', [
+    'id', 'strategy_order_id', 'snapshot_json', 'recorded_at'
+  ]);
 }
 
 function canonicalSql(value: unknown): string {
@@ -1388,7 +1512,11 @@ function assertParentForeignKey(
   }
 }
 
-function assertV2BusinessSchema(database: Database.Database): void {
+function assertKnownBusinessSchema(
+  database: Database.Database,
+  expectedStrategiesTable: string,
+  expectedStrategyColumns: readonly string[]
+): void {
   const rows = database.prepare(`
     SELECT type, name, tbl_name, sql
     FROM sqlite_master
@@ -1444,11 +1572,7 @@ function assertV2BusinessSchema(database: Database.Database): void {
     'order_events'
   ).sql);
 
-  assertColumns(database, 'strategies', [
-    'id', 'state', 'mode', 'spot_exchange_id', 'contract_exchange_id',
-    'symbol', 'requested_base_quantity', 'effective_base_quantity',
-    'preflight_json', 'failure_code', 'created_at', 'updated_at'
-  ]);
+  assertColumns(database, 'strategies', expectedStrategyColumns);
   assertColumns(database, 'strategy_orders', [
     'id', 'strategy_id', 'role', 'exchange_id', 'client_order_id',
     'exchange_order_id', 'request_json', 'snapshot_json', 'status',
@@ -1473,18 +1597,18 @@ function assertV2BusinessSchema(database: Database.Database): void {
     'id'
   );
 
+  const renamedStrategiesTable = expectedStrategiesTable.replace(
+    'CREATE TABLE strategies (',
+    'CREATE TABLE "strategies" ('
+  );
   if (
-    !strategiesSql.includes("'HEDGE_RESIDUAL_NOT_TRADABLE'")
-    || !strategiesSql.includes(canonicalSql(`
-      CHECK (
-        (state IN ('HEDGE_INCOMPLETE', 'FAILED')
-          AND failure_code IS NOT NULL)
-        OR
-        (state NOT IN ('HEDGE_INCOMPLETE', 'FAILED')
-          AND failure_code IS NULL)
-      )
-    `))
-    || recoverableIndexSql !== canonicalSql(`
+    strategiesSql !== canonicalSql(expectedStrategiesTable)
+    && strategiesSql !== canonicalSql(renamedStrategiesTable)
+  ) {
+    throw schemaError('strategies-table-definition-mismatch');
+  }
+  if (
+    recoverableIndexSql !== canonicalSql(`
       CREATE INDEX strategies_recoverable_idx
       ON strategies(state, created_at)
     `)
@@ -1584,14 +1708,33 @@ function assertV2BusinessSchema(database: Database.Database): void {
   }
 }
 
+function assertV2BusinessSchema(database: Database.Database): void {
+  assertKnownBusinessSchema(database, SQLITE_V2_STRATEGIES_TABLE, [
+    'id', 'state', 'mode', 'spot_exchange_id', 'contract_exchange_id',
+    'symbol', 'requested_base_quantity', 'effective_base_quantity',
+    'preflight_json', 'failure_code', 'created_at', 'updated_at'
+  ]);
+}
+
+function assertV3BusinessSchema(database: Database.Database): void {
+  assertKnownBusinessSchema(database, SQLITE_V3_STRATEGIES_TABLE, [
+    'id', 'state', 'mode', 'spot_exchange_id', 'contract_exchange_id',
+    'symbol', 'requested_base_quantity', 'effective_base_quantity',
+    'preflight_json', 'failure_code', 'preflight_failure_json',
+    'created_at', 'updated_at'
+  ]);
+}
+
 function assertForeignKeysClean(database: Database.Database): void {
   if (database.prepare('PRAGMA foreign_key_check').all().length !== 0) {
-    throw schemaError();
+    throw schemaError('foreign-key-check-failed');
   }
 }
 
-function assertCompleteV2Schema(database: Database.Database): void {
-  assertV2BusinessSchema(database);
+function assertMetadataSchema(
+  database: Database.Database,
+  version: 2 | 3
+): void {
   const metadataSql = canonicalSql(database.prepare(`
     SELECT sql FROM sqlite_master
     WHERE type = 'table' AND name = 'strategy_schema_metadata'
@@ -1600,52 +1743,80 @@ function assertCompleteV2Schema(database: Database.Database): void {
     'singleton',
     'version'
   ]);
+  const metadataTable = canonicalSql(`
+    CREATE TABLE strategy_schema_metadata (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      version INTEGER NOT NULL CHECK (version = ${version})
+    )
+  `);
+  const metadataTableIfMissing = canonicalSql(`
+    CREATE TABLE IF NOT EXISTS strategy_schema_metadata (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      version INTEGER NOT NULL CHECK (version = ${version})
+    )
+  `);
   if (
-    !metadataSql.includes(
-      'singleton integer primary key check(singleton=1)'
-    )
-    || !metadataSql.includes(
-      'version integer not null check(version=2)'
-    )
-    || !validV2Metadata(schemaMetadata(database))
+    metadataSql !== metadataTable
+    && !(version === 2 && metadataSql === metadataTableIfMissing)
   ) {
-    throw schemaError();
+    throw schemaError('schema-metadata-table-definition-mismatch');
+  }
+  if (!validMetadata(schemaMetadata(database), version)) {
+    throw schemaError('schema-metadata-row-mismatch');
   }
 }
 
-function createFreshV2Schema(database: Database.Database): void {
+function assertCompleteV2Schema(database: Database.Database): void {
+  assertV2BusinessSchema(database);
+  assertMetadataSchema(database, 2);
+}
+
+function assertCompleteV3Schema(database: Database.Database): void {
+  assertV3BusinessSchema(database);
+  assertMetadataSchema(database, 3);
+}
+
+function createFreshV3Schema(database: Database.Database): void {
   try {
     database.transaction(() => {
       database.exec(SQLITE_STRATEGY_SCHEMA);
       assertForeignKeysClean(database);
-      assertCompleteV2Schema(database);
+      assertCompleteV3Schema(database);
     })();
     assertForeignKeysClean(database);
-    assertCompleteV2Schema(database);
-  } catch {
-    throw schemaError();
+    assertCompleteV3Schema(database);
+  } catch (error) {
+    throwSchemaFailure('create-fresh-v3-schema', error);
   }
 }
 
-function migrateV1Schema(database: Database.Database): void {
-  let migrationFailed = false;
+function migrateToV3Schema(
+  database: Database.Database,
+  source: 'v1' | 'v2'
+): void {
+  let migrationFailure: unknown;
   try {
     database.pragma('foreign_keys = OFF');
     if (!sqliteIntegerEquals(
       database.pragma('foreign_keys', { simple: true }),
       0
     )) {
-      throw schemaError();
+      throw schemaError('foreign-keys-could-not-be-disabled');
     }
     database.transaction(() => {
-      database.exec(SQLITE_V1_MIGRATION);
-      assertForeignKeysClean(database);
-      assertV2BusinessSchema(database);
-      database.exec(SQLITE_SCHEMA_METADATA);
+      if (source === 'v1') {
+        database.exec(SQLITE_V1_MIGRATION);
+        assertForeignKeysClean(database);
+        assertV2BusinessSchema(database);
+        database.exec(SQLITE_V2_SCHEMA_METADATA);
+      }
       assertCompleteV2Schema(database);
+      database.exec(SQLITE_V2_TO_V3_MIGRATION);
+      assertForeignKeysClean(database);
+      assertCompleteV3Schema(database);
     })();
-  } catch {
-    migrationFailed = true;
+  } catch (error) {
+    migrationFailure = error;
   } finally {
     try {
       database.pragma('foreign_keys = ON');
@@ -1653,39 +1824,41 @@ function migrateV1Schema(database: Database.Database): void {
         database.pragma('foreign_keys', { simple: true }),
         1
       )) {
-        migrationFailed = true;
+        migrationFailure = schemaError('foreign-keys-could-not-be-restored');
       }
-    } catch {
-      migrationFailed = true;
+    } catch (error) {
+      migrationFailure = schemaError(
+        `foreign-key-restoration:${safeFailureCategory(error)}`
+      );
     }
   }
-  if (migrationFailed) {
-    throw schemaError();
+  if (migrationFailure !== undefined) {
+    throwSchemaFailure(`migrate-${source}-to-v3`, migrationFailure);
   }
   try {
     assertForeignKeysClean(database);
-    assertCompleteV2Schema(database);
-  } catch {
-    throw schemaError();
+    assertCompleteV3Schema(database);
+  } catch (error) {
+    throwSchemaFailure(`verify-${source}-to-v3`, error);
   }
 }
 
 function prepareStrategySchema(database: Database.Database): void {
   if (database.inTransaction) {
-    throw schemaError();
+    throw schemaError('external-transaction-active');
   }
-  let schemaGeneration: 'empty' | 'v1' | 'v2';
+  let schemaGeneration: 'empty' | 'v1' | 'v2' | 'v3';
   try {
     database.pragma('foreign_keys = ON');
     if (!sqliteIntegerEquals(
       database.pragma('foreign_keys', { simple: true }),
       1
     )) {
-      throw schemaError();
+      throw schemaError('foreign-keys-could-not-be-enabled');
     }
     schemaGeneration = classifyStrategySchema(database);
-  } catch {
-    throw schemaError();
+  } catch (error) {
+    throwSchemaFailure('classify-strategy-schema', error);
   }
 
   try {
@@ -1700,29 +1873,183 @@ function prepareStrategySchema(database: Database.Database): void {
       typeof journalMode !== 'string'
       || journalMode.toLowerCase() !== expectedJournalMode
     ) {
-      throw schemaError();
+      throw schemaError('journal-mode-mismatch');
     }
-  } catch {
-    throw schemaError();
+  } catch (error) {
+    throwSchemaFailure('enable-strategy-journal', error);
   }
 
   if (schemaGeneration === 'empty') {
-    createFreshV2Schema(database);
+    createFreshV3Schema(database);
   } else if (schemaGeneration === 'v1') {
-    migrateV1Schema(database);
+    migrateToV3Schema(database, 'v1');
+  } else if (schemaGeneration === 'v2') {
+    migrateToV3Schema(database, 'v2');
   } else {
     try {
       assertForeignKeysClean(database);
-      assertCompleteV2Schema(database);
-    } catch {
-      throw schemaError();
+      assertCompleteV3Schema(database);
+    } catch (error) {
+      throwSchemaFailure('verify-v3-schema', error);
     }
   }
+}
+
+interface ConfirmationExpectedRow {
+  readonly id: string;
+  readonly state: 'PENDING_CONFIRMATION';
+  readonly mode: ExecutionMode;
+  readonly spotExchangeId: string;
+  readonly contractExchangeId: string;
+  readonly symbol: string;
+  readonly requestedBaseQuantity: string;
+  readonly effectiveBaseQuantity: string;
+  readonly preflightJson: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+function storageTransitionError(
+  strategyId: string,
+  actual: string
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_TRANSITION_REJECTED',
+    phase: 'storage',
+    subject: { type: 'strategy', strategyId },
+    expected: 'unchanged pending confirmation snapshot without failures or orders',
+    actual
+  });
+}
+
+function storageOperationError(
+  strategyId: string,
+  actual: string
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_OPERATION_FAILED',
+    phase: 'storage',
+    subject: {
+      type: 'database',
+      table: 'strategies',
+      recordId: strategyId,
+      operation: 'confirmation transaction'
+    },
+    expected: 'transaction committed or rolled back with the original snapshot intact',
+    actual
+  });
+}
+
+function storageRecordError(
+  recordId: string,
+  actual: string
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_RECORD_INVALID',
+    phase: 'storage',
+    subject: {
+      type: 'database',
+      table: 'strategies',
+      recordId,
+      operation: 'read strategy record'
+    },
+    expected: 'valid strategy state, failures, snapshot, and order relationship',
+    actual
+  });
+}
+
+function confirmationExpectedRow(
+  expected: Readonly<StrategyRecord>
+): ConfirmationExpectedRow {
+  const id = nonEmptyString(expected.id, 'confirmation strategy id', 128);
+  if (expected.state !== 'PENDING_CONFIRMATION') {
+    throw storageTransitionError(id, 'expected-record-state-is-not-pending');
+  }
+  if (expected.failureCode !== null || expected.preflightFailure !== null) {
+    throw storageTransitionError(id, 'expected-record-already-has-failure');
+  }
+  const preflight = publicPreflightSnapshot(expected.preflight);
+  const mode = enumValue(expected.mode, EXECUTION_MODES, 'confirmation mode');
+  const spotExchangeId = nonEmptyString(
+    expected.spotExchangeId,
+    'confirmation spot exchange id',
+    128
+  );
+  const contractExchangeId = nonEmptyString(
+    expected.contractExchangeId,
+    'confirmation contract exchange id',
+    128
+  );
+  const symbol = nonEmptyString(expected.symbol, 'confirmation symbol', 256);
+  const requestedBaseQuantity = decimalValue(
+    expected.requestedBaseQuantity,
+    'confirmation requested quantity',
+    false
+  );
+  const effectiveBaseQuantity = decimalValue(
+    expected.effectiveBaseQuantity,
+    'confirmation effective quantity',
+    false
+  );
+  if (
+    mode !== preflight.mode
+    || spotExchangeId !== preflight.spotExchangeId
+    || contractExchangeId !== preflight.contractExchangeId
+    || symbol !== preflight.symbol
+    || requestedBaseQuantity !== preflight.requestedBaseQuantity
+    || effectiveBaseQuantity !== preflight.effectiveBaseQuantity
+  ) {
+    throw storageTransitionError(id, 'expected-record-columns-differ-from-snapshot');
+  }
+  return {
+    id,
+    state: 'PENDING_CONFIRMATION',
+    mode,
+    spotExchangeId,
+    contractExchangeId,
+    symbol,
+    requestedBaseQuantity,
+    effectiveBaseQuantity,
+    preflightJson: JSON.stringify(preflight),
+    createdAt: isoTimestamp(expected.createdAt, 'confirmation creation time'),
+    updatedAt: isoTimestamp(expected.updatedAt, 'confirmation update time')
+  };
+}
+
+function confirmationMismatch(
+  row: StrategyDbRow | undefined,
+  expected: ConfirmationExpectedRow,
+  orderCount: unknown
+): string | null {
+  if (row === undefined) return 'strategy-record-missing';
+  for (const [field, actual, wanted] of [
+    ['id', row.id, expected.id],
+    ['state', row.state, expected.state],
+    ['mode', row.mode, expected.mode],
+    ['spot-exchange-id', row.spot_exchange_id, expected.spotExchangeId],
+    ['contract-exchange-id', row.contract_exchange_id, expected.contractExchangeId],
+    ['symbol', row.symbol, expected.symbol],
+    ['requested-base-quantity', row.requested_base_quantity,
+      expected.requestedBaseQuantity],
+    ['effective-base-quantity', row.effective_base_quantity,
+      expected.effectiveBaseQuantity],
+    ['preflight-snapshot', row.preflight_json, expected.preflightJson],
+    ['creation-time', row.created_at, expected.createdAt],
+    ['update-time', row.updated_at, expected.updatedAt]
+  ] as const) {
+    if (actual !== wanted) return `${field}-changed`;
+  }
+  if (row.failure_code !== null) return 'execution-failure-present';
+  if (row.preflight_failure_json !== null) return 'preflight-failure-present';
+  if (!sqliteIntegerEquals(orderCount, 0)) return 'strategy-orders-present';
+  return null;
 }
 
 export class SqliteStrategyRepository implements StrategyRepository {
   private readonly insertStrategy;
   private readonly selectStrategy;
+  private readonly countStrategyOrders;
+  private readonly updateConfirmation;
   private readonly claimStrategy;
   private readonly selectRecoverable;
   private readonly insertOrder;
@@ -1736,6 +2063,14 @@ export class SqliteStrategyRepository implements StrategyRepository {
   private readonly planOrderTransaction;
   private readonly planOrdersAtomicallyTransaction;
   private readonly attachSnapshotTransaction;
+  private confirmPreflightTransaction: (
+    expected: Readonly<StrategyRecord>
+  ) => void;
+  private readonly invalidatePreflightTransaction: (
+    expected: Readonly<StrategyRecord>,
+    failure: ErrorDetail
+  ) => void;
+  private poisonedError: TradeOpsError | null = null;
 
   constructor(
     private readonly database: Database.Database,
@@ -1746,23 +2081,61 @@ export class SqliteStrategyRepository implements StrategyRepository {
       INSERT INTO strategies (
         id, state, mode, spot_exchange_id, contract_exchange_id, symbol,
         requested_base_quantity, effective_base_quantity, preflight_json,
-        failure_code, created_at, updated_at
+        failure_code, preflight_failure_json, created_at, updated_at
       ) VALUES (
         @id, @state, @mode, @spotExchangeId, @contractExchangeId, @symbol,
         @requestedBaseQuantity, @effectiveBaseQuantity, @preflightJson,
-        NULL, @createdAt, @updatedAt
+        NULL, NULL, @createdAt, @updatedAt
       )
     `);
     this.selectStrategy = this.database.prepare(
       'SELECT * FROM strategies WHERE id = ?'
     );
+    this.countStrategyOrders = this.database.prepare(`
+      SELECT COUNT(*)
+      FROM strategy_orders
+      WHERE strategy_id = ?
+    `).pluck();
+    this.updateConfirmation = this.database.prepare(`
+      UPDATE strategies
+      SET
+        state = @targetState,
+        failure_code = NULL,
+        preflight_failure_json = @preflightFailureJson,
+        updated_at = @nextUpdatedAt
+      WHERE
+        id = @id
+        AND state = @state
+        AND mode = @mode
+        AND spot_exchange_id = @spotExchangeId
+        AND contract_exchange_id = @contractExchangeId
+        AND symbol = @symbol
+        AND requested_base_quantity = @requestedBaseQuantity
+        AND effective_base_quantity = @effectiveBaseQuantity
+        AND preflight_json = @preflightJson
+        AND failure_code IS NULL
+        AND preflight_failure_json IS NULL
+        AND created_at = @createdAt
+        AND updated_at = @updatedAt
+        AND NOT EXISTS (
+          SELECT 1 FROM strategy_orders WHERE strategy_id = @id
+        )
+    `);
     this.claimStrategy = this.database.prepare(`
       UPDATE strategies
-      SET state = 'EXECUTING', failure_code = NULL, updated_at = @updatedAt
+      SET
+        state = 'EXECUTING',
+        failure_code = NULL,
+        preflight_failure_json = NULL,
+        updated_at = @updatedAt
       WHERE
         id = @id
         AND state = 'PENDING_CONFIRMATION'
         AND failure_code IS NULL
+        AND preflight_failure_json IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM strategy_orders WHERE strategy_id = @id
+        )
     `);
     this.selectRecoverable = this.database.prepare(`
       SELECT *
@@ -1881,9 +2254,25 @@ export class SqliteStrategyRepository implements StrategyRepository {
       strategyOrderId: string,
       snapshot: OrderSnapshot
     ) => this.attachSnapshotInsideTransaction(strategyOrderId, snapshot));
+    this.confirmPreflightTransaction = this.database.transaction((
+      expected: Readonly<StrategyRecord>
+    ) => this.writeConfirmation(
+      confirmationExpectedRow(expected),
+      'EXECUTING',
+      null
+    ));
+    this.invalidatePreflightTransaction = this.database.transaction((
+      expected: Readonly<StrategyRecord>,
+      failure: ErrorDetail
+    ) => this.writeConfirmation(
+      confirmationExpectedRow(expected),
+      'PREFLIGHT_INVALIDATED',
+      JSON.stringify(failure)
+    ));
   }
 
   createPending(preflight: PreflightResult): StrategyRecord {
+    this.assertUsable();
     const snapshot = publicPreflightSnapshot(preflight);
     const id = randomUUID();
     const now = this.clock().toISOString();
@@ -1904,6 +2293,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
   }
 
   getStrategy(id: string): StrategyRecord {
+    this.assertUsable();
     const strategyId = nonEmptyString(id, 'strategy id', 128);
     const row = this.selectStrategy.get(strategyId) as StrategyDbRow | undefined;
     if (row === undefined) {
@@ -1912,7 +2302,47 @@ export class SqliteStrategyRepository implements StrategyRepository {
     return this.strategyFromRow(row);
   }
 
+  confirmPreflight(expected: Readonly<StrategyRecord>): void {
+    this.assertUsable();
+    const snapshot = confirmationExpectedRow(expected);
+    if (this.database.inTransaction) {
+      throw storageOperationError(snapshot.id, 'external-transaction-active');
+    }
+    this.runConfirmationOperation(
+      snapshot,
+      () => this.confirmPreflightTransaction(expected)
+    );
+  }
+
+  invalidatePreflight(
+    expected: Readonly<StrategyRecord>,
+    failure: ErrorDetail
+  ): void {
+    this.assertUsable();
+    const snapshot = confirmationExpectedRow(expected);
+    let validatedFailure: ErrorDetail;
+    try {
+      validatedFailure = parseErrorDetail(failure);
+      if (validatedFailure.phase !== 'confirmation') {
+        throw new TypeError('confirmation failure phase is not confirmation');
+      }
+    } catch {
+      throw storageRecordError(
+        snapshot.id,
+        'confirmation-failure-contract-invalid'
+      );
+    }
+    if (this.database.inTransaction) {
+      throw storageOperationError(snapshot.id, 'external-transaction-active');
+    }
+    this.runConfirmationOperation(
+      snapshot,
+      () => this.invalidatePreflightTransaction(expected, validatedFailure)
+    );
+  }
+
   claimForExecution(id: string): boolean {
+    this.assertUsable();
     const strategyId = nonEmptyString(id, 'strategy id', 128);
     const result = this.claimStrategy.run({
       id: strategyId,
@@ -1926,6 +2356,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     role: OrderRole,
     request: OrderRequest
   ): StrategyOrderRecord {
+    this.assertUsable();
     return this.planOrderTransaction(strategyId, role, request);
   }
 
@@ -1933,6 +2364,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     strategyId: string,
     plans: readonly Readonly<StrategyOrderPlan>[]
   ): StrategyOrderRecord[] {
+    this.assertUsable();
     return this.planOrdersAtomicallyTransaction(strategyId, plans);
   }
 
@@ -1940,6 +2372,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     strategyOrderId: string,
     snapshot: OrderSnapshot
   ): SnapshotAttachmentResult {
+    this.assertUsable();
     return this.attachSnapshotTransaction(strategyOrderId, snapshot);
   }
 
@@ -1947,6 +2380,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     strategyOrderId: string,
     failureCode: OrderSubmissionFailureCode
   ): boolean {
+    this.assertUsable();
     const orderId = nonEmptyString(
       strategyOrderId,
       'strategy order id',
@@ -1966,12 +2400,14 @@ export class SqliteStrategyRepository implements StrategyRepository {
   }
 
   listOrders(strategyId: string): StrategyOrderRecord[] {
+    this.assertUsable();
     const strategy = this.getStrategy(strategyId);
     const rows = this.selectOrders.all(strategy.id) as StrategyOrderDbRow[];
     return rows.map((row) => this.orderFromRow(row, strategy, true));
   }
 
   listOrderEvents(strategyOrderId: string): OrderSnapshot[] {
+    this.assertUsable();
     const order = this.getOrder(strategyOrderId, false);
     const rows = this.selectEvents.all(order.id) as OrderEventDbRow[];
     const events: OrderSnapshot[] = [];
@@ -2020,6 +2456,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     to: StrategyState,
     failureCode?: StrategyFailureCode
   ): boolean {
+    this.assertUsable();
     const id = nonEmptyString(strategyId, 'strategy id', 128);
     const target = enumValue(to, STRATEGY_STATES, 'strategy state');
     if (!Array.isArray(from) || from.length === 0) {
@@ -2059,6 +2496,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         id = ?
         AND state IN (${placeholders})
         AND failure_code IS NULL
+        AND preflight_failure_json IS NULL
     `);
     const result = statement.run(
       target,
@@ -2071,8 +2509,86 @@ export class SqliteStrategyRepository implements StrategyRepository {
   }
 
   listRecoverable(): StrategyRecord[] {
+    this.assertUsable();
     return (this.selectRecoverable.all() as StrategyDbRow[])
       .map((row) => this.strategyFromRow(row));
+  }
+
+  private assertUsable(): void {
+    if (this.poisonedError !== null) throw this.poisonedError;
+  }
+
+  private poison(expected: ConfirmationExpectedRow, actual: string): void {
+    this.poisonedError ??= storageOperationError(expected.id, actual);
+  }
+
+  private confirmationMismatch(
+    expected: ConfirmationExpectedRow
+  ): string | null {
+    const row = this.selectStrategy.get(expected.id) as StrategyDbRow | undefined;
+    const orderCount = this.countStrategyOrders.get(expected.id);
+    return confirmationMismatch(row, expected, orderCount);
+  }
+
+  private runConfirmationOperation(
+    expected: ConfirmationExpectedRow,
+    operation: () => void
+  ): void {
+    try {
+      operation();
+    } catch (error) {
+      if (this.database.inTransaction) {
+        this.poison(expected, 'confirmation-transaction-still-active');
+        throw this.poisonedError;
+      }
+      const trusted = trustedTradeOpsFailure(error, 'storage');
+      if (
+        trusted?.detail.code === 'STORAGE_TRANSITION_REJECTED'
+      ) {
+        throw trusted;
+      }
+      let mismatch: string | null;
+      try {
+        mismatch = this.confirmationMismatch(expected);
+      } catch (verificationError) {
+        this.poison(
+          expected,
+          `rollback-verification:${safeFailureCategory(verificationError)}`
+        );
+        throw this.poisonedError;
+      }
+      if (mismatch !== null) {
+        this.poison(expected, `rollback-verification:${mismatch}`);
+        throw this.poisonedError;
+      }
+      throw storageOperationError(
+        expected.id,
+        `transaction-failed:${safeFailureCategory(error)};rollback-verified`
+      );
+    }
+  }
+
+  private writeConfirmation(
+    expected: ConfirmationExpectedRow,
+    targetState: 'EXECUTING' | 'PREFLIGHT_INVALIDATED',
+    preflightFailureJson: string | null
+  ): void {
+    const mismatch = this.confirmationMismatch(expected);
+    if (mismatch !== null) {
+      throw storageTransitionError(expected.id, mismatch);
+    }
+    const result = this.updateConfirmation.run({
+      ...expected,
+      targetState,
+      preflightFailureJson,
+      nextUpdatedAt: this.clock().toISOString()
+    });
+    if (!sqliteIntegerEquals(result.changes, 1)) {
+      throw storageTransitionError(
+        expected.id,
+        'conditional-confirmation-cas-updated-zero-rows'
+      );
+    }
   }
 
   private planOrderInsideTransaction(
@@ -2081,6 +2597,21 @@ export class SqliteStrategyRepository implements StrategyRepository {
     request: OrderRequest
   ): StrategyOrderRecord {
     const strategy = this.getStrategy(strategyId);
+    if (strategy.state === 'PENDING_CONFIRMATION') {
+      return invalid(
+        'order plan',
+        'strategy state requires confirmation before order planning'
+      );
+    }
+    if (strategy.state === 'PREFLIGHT_INVALIDATED') {
+      return invalid(
+        'order plan',
+        'strategy state is invalidated and cannot plan orders'
+      );
+    }
+    if (strategy.state !== 'EXECUTING' && strategy.state !== 'WAITING_HEDGE') {
+      return invalid('order plan', 'strategy state does not allow order planning');
+    }
     const validated = validatedRequestForRole(strategy, role, request, false);
     const id = randomUUID();
     const now = this.clock().toISOString();
@@ -2151,98 +2682,146 @@ export class SqliteStrategyRepository implements StrategyRepository {
   }
 
   private strategyFromRow(row: StrategyDbRow): StrategyRecord {
-    return safely('persisted strategy', () => {
-      const id = nonEmptyString(row.id, 'persisted strategy id', 128);
-      const state = enumValue(
-        row.state,
-        STRATEGY_STATES,
-        'persisted strategy state'
-      );
-      const mode = enumValue(
-        row.mode,
-        EXECUTION_MODES,
-        'persisted strategy execution mode'
-      );
-      const preflight = publicPreflightSnapshot(
-        parseJson(row.preflight_json, 'persisted strategy')
-      );
-      const spotExchangeId = nonEmptyString(
-        row.spot_exchange_id,
-        'persisted strategy spot exchange id',
-        128
-      );
-      const contractExchangeId = nonEmptyString(
-        row.contract_exchange_id,
-        'persisted strategy contract exchange id',
-        128
-      );
-      const symbol = nonEmptyString(
-        row.symbol,
-        'persisted strategy symbol',
-        256
-      );
-      const requestedBaseQuantity = decimalValue(
-        row.requested_base_quantity,
-        'persisted strategy requested quantity',
-        false
-      );
-      const effectiveBaseQuantity = decimalValue(
-        row.effective_base_quantity,
-        'persisted strategy effective quantity',
-        false
-      );
-      if (
-        mode !== preflight.mode
-        || spotExchangeId !== preflight.spotExchangeId
-        || contractExchangeId !== preflight.contractExchangeId
-        || symbol !== preflight.symbol
-        || requestedBaseQuantity !== preflight.requestedBaseQuantity
-        || effectiveBaseQuantity !== preflight.effectiveBaseQuantity
-      ) {
-        return invalid(
-          'persisted strategy',
-          'columns do not match preflight snapshot'
+    const recordId = typeof row.id === 'string'
+      && row.id.length > 0
+      && row.id.length <= 128
+      ? row.id
+      : 'unknown-strategy-record';
+    try {
+      return safely('persisted strategy', () => {
+        const id = nonEmptyString(row.id, 'persisted strategy id', 128);
+        const state = enumValue(
+          row.state,
+          STRATEGY_STATES,
+          'persisted strategy state'
         );
-      }
-      const createdAt = isoTimestamp(
-        row.created_at,
-        'persisted strategy creation time'
-      );
-      const updatedAt = isoTimestamp(
-        row.updated_at,
-        'persisted strategy update time'
-      );
-      if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
-        return invalid('persisted strategy', 'update time precedes creation');
-      }
-      const failureCode = row.failure_code === null
-        ? null
-        : enumValue(
-          row.failure_code,
-          STRATEGY_FAILURE_CODES,
-          'persisted strategy failure code'
+        const mode = enumValue(
+          row.mode,
+          EXECUTION_MODES,
+          'persisted strategy execution mode'
         );
-      if (FAILURE_STATES.has(state) !== (failureCode !== null)) {
-        return invalid(
-          'persisted strategy',
-          'failure code does not match state'
+        const preflight = publicPreflightSnapshot(
+          parseJson(row.preflight_json, 'persisted strategy')
         );
-      }
-      return deepFreeze({
-        id,
-        state,
-        mode,
-        spotExchangeId,
-        contractExchangeId,
-        symbol,
-        requestedBaseQuantity,
-        effectiveBaseQuantity,
-        preflight: deepFreeze(preflight),
-        failureCode,
-        createdAt,
-        updatedAt
+        const spotExchangeId = nonEmptyString(
+          row.spot_exchange_id,
+          'persisted strategy spot exchange id',
+          128
+        );
+        const contractExchangeId = nonEmptyString(
+          row.contract_exchange_id,
+          'persisted strategy contract exchange id',
+          128
+        );
+        const symbol = nonEmptyString(
+          row.symbol,
+          'persisted strategy symbol',
+          256
+        );
+        const requestedBaseQuantity = decimalValue(
+          row.requested_base_quantity,
+          'persisted strategy requested quantity',
+          false
+        );
+        const effectiveBaseQuantity = decimalValue(
+          row.effective_base_quantity,
+          'persisted strategy effective quantity',
+          false
+        );
+        if (
+          mode !== preflight.mode
+          || spotExchangeId !== preflight.spotExchangeId
+          || contractExchangeId !== preflight.contractExchangeId
+          || symbol !== preflight.symbol
+          || requestedBaseQuantity !== preflight.requestedBaseQuantity
+          || effectiveBaseQuantity !== preflight.effectiveBaseQuantity
+        ) {
+          return invalid(
+            'persisted strategy',
+            'columns do not match preflight snapshot'
+          );
+        }
+        const createdAt = isoTimestamp(
+          row.created_at,
+          'persisted strategy creation time'
+        );
+        const updatedAt = isoTimestamp(
+          row.updated_at,
+          'persisted strategy update time'
+        );
+        if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
+          return invalid('persisted strategy', 'update time precedes creation');
+        }
+        const failureCode = row.failure_code === null
+          ? null
+          : enumValue(
+            row.failure_code,
+            STRATEGY_FAILURE_CODES,
+            'persisted strategy failure code'
+          );
+        if (FAILURE_STATES.has(state) !== (failureCode !== null)) {
+          return invalid(
+            'persisted strategy',
+            'execution failure code does not match state'
+          );
+        }
+        const preflightFailure = row.preflight_failure_json === null
+          ? null
+          : parseErrorDetail(parseJson(
+            row.preflight_failure_json,
+            'persisted strategy preflight failure'
+          ));
+        if (
+          preflightFailure !== null
+          && preflightFailure.phase !== 'confirmation'
+        ) {
+          return invalid(
+            'persisted strategy',
+            'preflight failure phase is not confirmation'
+          );
+        }
+        if (
+          (state === 'PREFLIGHT_INVALIDATED')
+          !== (preflightFailure !== null)
+        ) {
+          return invalid(
+            'persisted strategy',
+            'preflight failure does not match state'
+          );
+        }
+        if (
+          (state === 'PENDING_CONFIRMATION'
+            || state === 'PREFLIGHT_INVALIDATED')
+          && !sqliteIntegerEquals(this.countStrategyOrders.get(id), 0)
+        ) {
+          return invalid(
+            'persisted strategy',
+            'pending or invalidated strategy has orders'
+          );
+        }
+        return deepFreeze({
+          id,
+          state,
+          mode,
+          spotExchangeId,
+          contractExchangeId,
+          symbol,
+          requestedBaseQuantity,
+          effectiveBaseQuantity,
+          preflight: deepFreeze(preflight),
+          failureCode,
+          preflightFailure,
+          createdAt,
+          updatedAt
+        });
       });
-    });
+    } catch (error) {
+      const actual = error instanceof Error
+        && error.message.startsWith('invalid persisted strategy:')
+        ? error.message
+        : `strategy-validation:${safeFailureCategory(error)}`;
+      throw storageRecordError(recordId, actual);
+    }
   }
 
   private getOrder(

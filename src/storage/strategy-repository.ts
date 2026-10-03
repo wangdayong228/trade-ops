@@ -5,6 +5,7 @@ import type {
   OrderSnapshot,
   StrategyState
 } from '../domain/types.js';
+import type { ErrorDetail } from '../errors/trade-ops-error.js';
 import type { PreflightResult } from '../strategy/preflight-service.js';
 
 export class StrategyNotFoundError extends Error {
@@ -65,6 +66,7 @@ export interface StrategyRecord {
   readonly effectiveBaseQuantity: string;
   readonly preflight: PreflightResult;
   readonly failureCode: StrategyFailureCode | null;
+  readonly preflightFailure: ErrorDetail | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -95,6 +97,11 @@ export interface StrategyOrderPlan {
 export interface StrategyRepository {
   createPending(preflight: PreflightResult): StrategyRecord;
   getStrategy(id: string): StrategyRecord;
+  confirmPreflight(expected: Readonly<StrategyRecord>): void;
+  invalidatePreflight(
+    expected: Readonly<StrategyRecord>,
+    failure: ErrorDetail
+  ): void;
   claimForExecution(id: string): boolean;
   planOrder(
     strategyId: string,

@@ -291,6 +291,7 @@ function monitorStrategy(
     effectiveBaseQuantity: preview.effectiveBaseQuantity,
     preflight: preview,
     failureCode: null,
+    preflightFailure: null,
     createdAt: preview.createdAt,
     updatedAt: preview.createdAt
   };

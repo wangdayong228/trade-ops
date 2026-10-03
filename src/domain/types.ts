@@ -4,6 +4,7 @@ export type OrderType = 'market' | 'limit';
 export type ExecutionMode = 'CONCURRENT' | 'CONTRACT_FIRST' | 'SPOT_FIRST';
 export type StrategyState =
   | 'PENDING_CONFIRMATION'
+  | 'PREFLIGHT_INVALIDATED'
   | 'EXECUTING'
   | 'WAITING_HEDGE'
   | 'HEDGED'

@@ -135,7 +135,7 @@ export const SQLITE_MIGRATED_STRATEGY_ORDERS_TABLE = `
   );
 `;
 
-export const SQLITE_STRATEGY_SCHEMA = `
+export const SQLITE_V2_STRATEGIES_TABLE = `
   CREATE TABLE strategies (
     id TEXT PRIMARY KEY,
     state TEXT NOT NULL CHECK (state IN (
@@ -186,6 +186,82 @@ export const SQLITE_STRATEGY_SCHEMA = `
       )
     )
   );
+`;
+
+export const SQLITE_V3_STRATEGIES_TABLE = `
+  CREATE TABLE strategies (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN (
+      'PENDING_CONFIRMATION',
+      'PREFLIGHT_INVALIDATED',
+      'EXECUTING',
+      'WAITING_HEDGE',
+      'HEDGED',
+      'HEDGE_INCOMPLETE',
+      'FAILED'
+    )),
+    mode TEXT NOT NULL CHECK (mode IN (
+      'CONCURRENT',
+      'CONTRACT_FIRST',
+      'SPOT_FIRST'
+    )),
+    spot_exchange_id TEXT NOT NULL,
+    contract_exchange_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    requested_base_quantity TEXT NOT NULL,
+    effective_base_quantity TEXT NOT NULL,
+    preflight_json TEXT NOT NULL,
+    failure_code TEXT CHECK (
+      failure_code IS NULL
+      OR failure_code IN (
+        'ORDER_SUBMISSION_FAILED',
+        'ORDER_SUBMISSION_UNKNOWN',
+        'ORDER_NOT_FOUND',
+        'NO_FILL',
+        'MISSING_AVERAGE_PRICE',
+        'HEDGE_ORDER_REJECTED',
+        'HEDGE_ORDER_CANCELED',
+        'HEDGE_RESIDUAL_NOT_TRADABLE',
+        'ORDER_RECONCILIATION_FAILED',
+        'INCONSISTENT_ORDER_STATE'
+      )
+    ),
+    preflight_failure_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+      (
+        state = 'PREFLIGHT_INVALIDATED'
+        AND failure_code IS NULL
+        AND preflight_failure_json IS NOT NULL
+      )
+      OR
+      (
+        state IN ('HEDGE_INCOMPLETE', 'FAILED')
+        AND failure_code IS NOT NULL
+        AND preflight_failure_json IS NULL
+      )
+      OR
+      (
+        state NOT IN ('PREFLIGHT_INVALIDATED', 'HEDGE_INCOMPLETE', 'FAILED')
+        AND failure_code IS NULL
+        AND preflight_failure_json IS NULL
+      )
+    )
+  );
+`;
+
+export const SQLITE_V3_SCHEMA_METADATA = `
+  CREATE TABLE strategy_schema_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version INTEGER NOT NULL CHECK (version = 3)
+  );
+  INSERT INTO strategy_schema_metadata (singleton, version)
+  VALUES (1, 3);
+`;
+
+export const SQLITE_STRATEGY_SCHEMA = `
+  ${SQLITE_V3_STRATEGIES_TABLE}
 
   ${SQLITE_STRATEGY_ORDERS_TABLE}
 
@@ -215,10 +291,5 @@ export const SQLITE_STRATEGY_SCHEMA = `
     SELECT RAISE(ABORT, 'order events are immutable');
   END;
 
-  CREATE TABLE IF NOT EXISTS strategy_schema_metadata (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 2)
-  );
-  INSERT OR IGNORE INTO strategy_schema_metadata (singleton, version)
-  VALUES (1, 2);
+  ${SQLITE_V3_SCHEMA_METADATA}
 `;

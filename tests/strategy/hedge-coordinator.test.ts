@@ -5,6 +5,7 @@ import test, { type TestContext } from 'node:test';
 import Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
+import { TradeOpsError } from '../../src/errors/trade-ops-error.js';
 import type {
   AccountSettings,
   ExecutionMode,
@@ -2653,23 +2654,40 @@ test('an active execution owner blocks restart recovery across coordinator insta
 test('pre-existing planned or snapshotted pending roles are never submitted', async (t) => {
   await t.test('planned', async (t) => {
     const context = setup(t, 'SPOT_FIRST');
-    context.repository.planOrder(
+    assert.equal(context.repository.claimForExecution(context.strategyId), true);
+    const planned = context.repository.planOrder(
       context.strategyId,
       'SPOT_MARKET',
       requestFor(context.strategyId, 'SPOT_MARKET', '1')
     );
+    const persistedBeforeConfirmation = context.database.prepare(`
+      SELECT status, submission_disposition, snapshot_json
+      FROM strategy_orders WHERE id = ?
+    `).get(planned.id);
+    context.database.prepare(`
+      UPDATE strategies SET state = 'PENDING_CONFIRMATION' WHERE id = ?
+    `).run(context.strategyId);
 
-    await context.coordinator.confirmAndExecute(context.strategyId);
-
-    assert.equal(
-      context.repository.getStrategy(context.strategyId).state,
-      'EXECUTING'
+    await assert.rejects(
+      context.coordinator.confirmAndExecute(context.strategyId),
+      (error: unknown) => error instanceof TradeOpsError
+        && error.detail.code === 'STORAGE_RECORD_INVALID'
     );
+
+    assert.equal(context.database.prepare(`
+      SELECT state FROM strategies WHERE id = ?
+    `).pluck().get(context.strategyId), 'PENDING_CONFIRMATION');
+    assert.deepEqual(context.database.prepare(`
+      SELECT status, submission_disposition, snapshot_json
+      FROM strategy_orders WHERE id = ?
+    `).get(planned.id), persistedBeforeConfirmation);
     assert.equal(context.spot.createdRequests.length, 0);
+    assert.equal(context.contract.createdRequests.length, 0);
   });
 
   await t.test('snapshot', async (t) => {
     const context = setup(t, 'SPOT_FIRST');
+    assert.equal(context.repository.claimForExecution(context.strategyId), true);
     const planned = context.repository.planOrder(
       context.strategyId,
       'SPOT_MARKET',
@@ -2679,13 +2697,27 @@ test('pre-existing planned or snapshotted pending roles are never submitted', as
       planned.id,
       snapshotFor(context.strategyId, 'SPOT_MARKET', '1')
     );
+    const persistedBeforeConfirmation = context.database.prepare(`
+      SELECT status, submission_disposition, snapshot_json
+      FROM strategy_orders WHERE id = ?
+    `).get(planned.id);
+    context.database.prepare(`
+      UPDATE strategies SET state = 'PENDING_CONFIRMATION' WHERE id = ?
+    `).run(context.strategyId);
 
-    await context.coordinator.confirmAndExecute(context.strategyId);
-
-    assert.equal(
-      context.repository.getStrategy(context.strategyId).state,
-      'EXECUTING'
+    await assert.rejects(
+      context.coordinator.confirmAndExecute(context.strategyId),
+      (error: unknown) => error instanceof TradeOpsError
+        && error.detail.code === 'STORAGE_RECORD_INVALID'
     );
+
+    assert.equal(context.database.prepare(`
+      SELECT state FROM strategies WHERE id = ?
+    `).pluck().get(context.strategyId), 'PENDING_CONFIRMATION');
+    assert.deepEqual(context.database.prepare(`
+      SELECT status, submission_disposition, snapshot_json
+      FROM strategy_orders WHERE id = ?
+    `).get(planned.id), persistedBeforeConfirmation);
     assert.equal(context.spot.createdRequests.length, 0);
     assert.equal(context.contract.createdRequests.length, 0);
   });
