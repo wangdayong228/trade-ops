@@ -133,8 +133,7 @@ test('exports fixed no-argument nominal request errors without payload fields', 
   >;
 
   for (const exportName of [
-    'FundingRequestCanceledError',
-    'FundingRequestRetryExhaustedError'
+    'FundingRequestCanceledError'
   ] as const) {
     const ErrorType = contracts[exportName];
     if (typeof ErrorType !== 'function') {
@@ -537,4 +536,27 @@ test('rejects direct and indirect cycles', () => {
 
   assert.throws(() => record('0', timestampMs, direct), /raw/i);
   assert.throws(() => record('0', timestampMs, first), /raw/i);
+});
+
+test('funding scalar failures preserve actual values without coercing objects', () => {
+  for (const rate of ['bad-rate', 'NaN', 42, undefined]) {
+    assert.throws(() => settledFundingRate(identity, rate, timestampMs, {}), (error: unknown) => {
+      assert(error instanceof Error);
+      assert.match(error.message, /funding rate.*expected.*actual/u);
+      assert.ok(error.message.includes(String(rate)));
+      return true;
+    });
+  }
+  for (const value of [-1, 1.5, '01', 8640000000000001]) {
+    assert.throws(() => record('0', value, {}), (error: unknown) => {
+      assert(error instanceof Error);
+      assert.match(error.message, /timestamp.*expected.*actual/u);
+      assert.ok(error.message.includes(String(value)));
+      return true;
+    });
+  }
+  let coerced = 0;
+  const hostile = { toString() { coerced++; return 'DO-NOT-EXPOSE'; } };
+  assert.throws(() => record('0', timestampMs, {}, { ...identity, exchangeMarketId: hostile as unknown as string }), /exchangeMarketId.*actual.*object/u);
+  assert.equal(coerced, 0);
 });

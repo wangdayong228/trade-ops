@@ -12,6 +12,7 @@ import {
   claimSqliteProcessOwnership
 } from '../../src/storage/sqlite-process-owner.js';
 import {
+  projectTradeOpsError,
   withErrorPhase,
   type ErrorDetail,
   type TradeOpsError
@@ -220,11 +221,14 @@ for (const sqliteCode of [
   'SQLITE_LOCKED',
   'SQLITE_LOCKED_SHAREDCACHE'
 ] as const) {
-  test(`classifies ${sqliteCode} as busy without retaining SQLite messages`, () => {
+  test(`classifies ${sqliteCode} as busy with safe SQLite evidence`, () => {
+    const configuredSecret = 'SYNTHETIC-SQLITE-CONFIGURED-SECRET';
     const lockedDatabase = {
       pragma: () => 'exclusive',
       exec: () => {
-        throw Object.assign(new Error('secret sqlite detail'), {
+        throw Object.assign(new Error(
+          `database is locked during ownership probe ${configuredSecret}`
+        ), {
           code: sqliteCode
         });
       }
@@ -237,7 +241,16 @@ for (const sqliteCode of [
       (error: unknown) => {
         const detail = ownershipDetail(error);
         assert.equal(detail.code, 'DATABASE_OWNERSHIP_BUSY');
-        assert.doesNotMatch(JSON.stringify(detail), /secret sqlite detail/);
+        const projected = projectTradeOpsError(
+          error as TradeOpsError,
+          [configuredSecret],
+          false
+        );
+        const serialized = JSON.stringify(projected);
+        assert.match(serialized, /database is locked during ownership probe/);
+        assert.match(serialized, new RegExp(sqliteCode));
+        assert.doesNotMatch(serialized, new RegExp(configuredSecret));
+        assert.doesNotMatch(serialized, /"stack"/);
         return true;
       }
     );
@@ -408,17 +421,21 @@ test('classifies non-contention ownership failures as unavailable', () => {
   assert.throws(
     () => claimSqliteProcessOwnership(unsupported, '/safe/service.sqlite'),
     (error: unknown) => {
-      assert.equal(
-        ownershipDetail(error).code,
-        'DATABASE_OWNERSHIP_UNAVAILABLE'
-      );
+      const detail = ownershipDetail(error);
+      assert.equal(detail.code, 'DATABASE_OWNERSHIP_UNAVAILABLE');
+      assert.match(JSON.stringify(detail.actual), /normal/);
       return true;
     }
   );
 
   const unavailable = {
     pragma: () => 'exclusive',
-    exec: () => { throw new Error('private filesystem detail'); }
+    exec: () => {
+      throw Object.assign(
+        new Error('readonly filesystem blocked ownership transaction'),
+        { code: 'SQLITE_READONLY' }
+      );
+    }
   } as unknown as Database.Database;
   assert.throws(
     () => claimSqliteProcessOwnership(
@@ -428,7 +445,14 @@ test('classifies non-contention ownership failures as unavailable', () => {
     (error: unknown) => {
       const detail = ownershipDetail(error);
       assert.equal(detail.code, 'DATABASE_OWNERSHIP_UNAVAILABLE');
-      assert.doesNotMatch(JSON.stringify(detail), /private filesystem detail/);
+      const serialized = JSON.stringify(projectTradeOpsError(
+        error as TradeOpsError,
+        [],
+        false
+      ));
+      assert.match(serialized, /readonly filesystem blocked ownership transaction/);
+      assert.match(serialized, /SQLITE_READONLY/);
+      assert.doesNotMatch(serialized, /"stack"/);
       return true;
     }
   );

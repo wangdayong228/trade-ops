@@ -808,7 +808,7 @@ test('fails closed when final GTC price quantization is unavailable', async (t) 
   );
   assert.equal(
     JSON.stringify(operations.warnings).includes('private price adapter'),
-    false
+    true
   );
 });
 
@@ -952,7 +952,7 @@ test('waits for both submissions and retains the operation lock after one reject
     JSON.stringify(operations.warnings).includes(
       'unexpected internal submission failure'
     ),
-    false
+    true
   );
 });
 
@@ -1093,7 +1093,7 @@ for (const behavior of ['false', 'throw'] as const) {
     );
     assert.equal(
       JSON.stringify(operations.warnings).includes('private sqlite detail'),
-      false
+      behavior === 'throw'
     );
   });
 }
@@ -1550,6 +1550,8 @@ test('fresh settings fetch uncertainty stays executing and submits only after a 
     ).length,
     1
   );
+
+  assert.match(JSON.stringify(operations.warnings), /temporary account settings failure/);
 
   context.contract.accountSettingsResults.push({
     marginMode: 'cross',

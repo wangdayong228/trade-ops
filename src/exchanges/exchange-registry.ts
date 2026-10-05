@@ -17,9 +17,10 @@ export class ExchangeRegistry {
       assertSupportedExchangeId(exchangeId);
     }
     for (const [exchangeId, gateway] of snapshot) {
-      if (gateway.exchangeId !== exchangeId) {
+      const actualExchangeId = gateway.exchangeId;
+    if (actualExchangeId !== exchangeId) {
         throw new Error(
-          `gateway identity mismatch for configured exchange ${exchangeId}`
+          `gateway identity mismatch for configured exchange ${exchangeId}: expected ${exchangeId}; actual ${actualExchangeId}`
         );
       }
     }
@@ -32,9 +33,10 @@ export class ExchangeRegistry {
     if (gateway === undefined) {
       throw new Error(`exchange is not configured: ${exchangeId}`);
     }
-    if (gateway.exchangeId !== exchangeId) {
+    const actualExchangeId = gateway.exchangeId;
+    if (actualExchangeId !== exchangeId) {
       throw new Error(
-        `gateway identity mismatch for configured exchange ${exchangeId}`
+        `gateway identity mismatch for configured exchange ${exchangeId}: expected ${exchangeId}; actual ${actualExchangeId}`
       );
     }
     return gateway;

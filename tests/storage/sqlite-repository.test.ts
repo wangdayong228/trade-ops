@@ -1,3 +1,4 @@
+import { projectErrorEvidence } from '../../src/errors/trade-ops-error.js';
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
@@ -173,12 +174,7 @@ function assertStartupStorageError(
   if (expectedActual !== undefined) {
     assert.equal(error.detail.actual, expectedActual);
   }
-  const exposed = [
-    error.message,
-    JSON.stringify(error.detail),
-    error.stack ?? '',
-    String((error as Error & { cause?: unknown }).cause ?? '')
-  ].join('\n');
+  const exposed = JSON.stringify(projectErrorEvidence(error, secretMarkers));
   for (const marker of secretMarkers) {
     assert.equal(exposed.includes(marker), false);
   }
@@ -1404,6 +1400,7 @@ test('classifies an unknown strategy schema pragma failure as a storage operatio
     assert.equal(error.detail.subject.table, 'strategies');
     assert.equal(error.detail.subject.operation, 'enable-strategy-journal');
   }
+  assert.match(JSON.stringify(projectErrorEvidence(error)), new RegExp(rawMarker));
   assert.equal(error.detail.actual, 'object-failure');
   assert.equal(JSON.stringify(error.detail).includes(rawMarker), false);
   assert.deepEqual(database.prepare(`
@@ -1542,6 +1539,7 @@ test('repair: preserves the primary v3 migration failure when foreign-key restor
 
   const error = captureError(() => new SqliteStrategyRepository(database));
 
+  assert.match(JSON.stringify(projectErrorEvidence(error)), /undefined[\s\S]*secondary-restore-secret-marker/u);
   assert.equal(strategyDatabaseFingerprint(database), before);
   originalPragma('foreign_keys = ON');
   assert.equal(originalPragma('foreign_keys', { simple: true }), 1);
@@ -1549,7 +1547,7 @@ test('repair: preserves the primary v3 migration failure when foreign-key restor
     error,
     /^migrate-v2-to-v3$/,
     [restoreMarker],
-    'undefined-thrown'
+    'object-failure'
   );
 });
 
@@ -3909,7 +3907,10 @@ test('fails closed on invalid preflight failure and state combinations', async (
 
 test('fails closed after an unconfirmed confirmation transaction result', (t) => {
   const rawMarker = 'raw-open-transaction-secret-marker';
-  const { database, repository } = setup(t);
+  let sqlCalls = 0;
+  const database = new Database(':memory:', { verbose: () => { sqlCalls += 1; } });
+  t.after(() => database.close());
+  const repository = new SqliteStrategyRepository(database);
   const existingStrategyId = createExecutingStrategy(repository, preflight({
     mode: 'SPOT_FIRST'
   }));
@@ -3999,9 +4000,14 @@ test('fails closed after an unconfirmed confirmation transaction result', (t) =>
     ],
     ['listRecoverable', () => repository.listRecoverable()]
   ];
+  const sqlCallsBefore = sqlCalls;
+  const originalEvidence = projectErrorEvidence(error);
   for (const [name, action] of blockedCalls) {
     const blockedError = captureError(action);
     assert.ok(blockedError instanceof TradeOpsError, name);
+    assert.strictEqual(blockedError, error, name);
+    assert.deepEqual(projectErrorEvidence(blockedError), originalEvidence, name);
+    assert.equal(sqlCalls, sqlCallsBefore, name);
     assert.equal(blockedError.detail.code, 'STORAGE_OPERATION_FAILED', name);
     assert.equal(blockedError.detail.phase, 'storage', name);
     assert.equal(
@@ -4058,6 +4064,9 @@ test('poisons the repository when rollback verification cannot reread the strate
     pending.id,
     [rawMarker, 'controlled confirmation abort']
   );
+  const projected = JSON.stringify(projectErrorEvidence(error));
+  assert.match(projected, /controlled confirmation abort[\s\S]*raw-reread-secret-marker/u);
+  assert.doesNotMatch(JSON.stringify(projectErrorEvidence(error, [rawMarker])), new RegExp(rawMarker));
   assert.equal(database.inTransaction, false);
   assert.equal(reads, 2);
   assert.throws(() => repository.listRecoverable(), TradeOpsError);
@@ -4749,7 +4758,7 @@ test('rejects inconsistent, non-finite, and regressing snapshot quantities', (t)
         row.id,
         snapshotFor(request, 'bitget', overrides)
       ),
-      /snapshot quantity/i
+      /snapshot quantity|filled quantity|remaining quantity/i
     );
     assert.deepEqual(repository.listOrderEvents(row.id), []);
   }
@@ -4816,7 +4825,7 @@ test('uses exact snapshot arithmetic independently of global Decimal precision',
               '0.00000000000000000000000000000000000000002'
           })
         ),
-        /snapshot quantity/i
+        /snapshot quantity|filled quantity|remaining quantity/i
       );
       assert.equal(
         database.prepare(
@@ -4915,7 +4924,7 @@ test('does not let ambient Decimal exponent settings underflow snapshot quantiti
         remainingBaseQuantity: '.001'
       })
     ),
-    /snapshot quantity/i
+    /snapshot quantity|filled quantity|remaining quantity/i
   );
   assert.equal(
     database.prepare(
@@ -4952,7 +4961,7 @@ test('rejects nonzero decimals beyond the private exponent range', (t) => {
         remainingBaseQuantity: '1e-9000000000000001'
       })
     ),
-    /snapshot quantity/i
+    /snapshot quantity|filled quantity|remaining quantity/i
   );
   assert.equal(
     database.prepare(
@@ -5128,4 +5137,82 @@ test('rejects invalid runtime enum values before they reach SQL', (t) => {
     ),
     /market kind/i
   );
+});
+
+test('storage record errors retain the invalid scalar without dumping the stored row', (t) => {
+  const { repository } = setup(t);
+  assert.throws(() => repository.createPending(preflight({ symbol: 'INVALID-SYMBOL' })), (error: unknown) => {
+    assert.match(JSON.stringify(projectErrorEvidence(error)), /symbol[\s\S]*INVALID-SYMBOL/u);
+    return true;
+  });
+});
+
+test('schema startup readback failures identify the expected and observed pragma values', async (t) => {
+  for (const [pragma, actual, expected] of [
+    ['foreign_keys', 0, /foreign_keys.*expected 1.*actual number 0/u],
+    ['journal_mode = WAL', 'delete', /journal_mode.*expected memory.*actual.*delete/u]
+  ] as const) {
+    await t.test(pragma, (child) => {
+      const database = new Database(':memory:');
+      child.after(() => database.close());
+      const originalPragma = database.pragma.bind(database);
+      child.mock.method(database, 'pragma', (source: string, options?: Database.PragmaOptions): unknown => (
+        source === pragma ? actual : originalPragma(source, options)
+      ));
+      const error = captureError(() => new SqliteStrategyRepository(database));
+      assert.ok(error instanceof TradeOpsError);
+      assert.equal(error.detail.code, 'DATABASE_SCHEMA_VERSION_MISMATCH');
+      assert.match(JSON.stringify(projectErrorEvidence(error)), expected);
+      assert.deepEqual(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), []);
+    });
+  }
+});
+
+test('migration schema mismatch retains its code when foreign-key restoration also fails', (t) => {
+  const database = new Database(':memory:');
+  const originalPragma = database.pragma.bind(database);
+  const originalExec = database.exec.bind(database);
+  t.after(() => { originalPragma('foreign_keys = ON'); database.close(); });
+  database.exec(V2_FRESH_SCHEMA_SQL);
+  seedV2MigrationCoverage(database);
+  const before = strategyDatabaseFingerprint(database);
+  let migrationStarted = false;
+  t.mock.method(database, 'pragma', (source: string, options?: Database.PragmaOptions): unknown => {
+    if (source === 'foreign_keys = OFF') migrationStarted = true;
+    if (migrationStarted && source === 'foreign_keys = ON') throw new Error('secondary restore failure');
+    return originalPragma(source, options);
+  });
+  t.mock.method(database, 'exec', (source: string): Database.Database => {
+    const result = originalExec(source);
+    if (isV3MigrationSql(source)) originalExec('DROP INDEX strategies_recoverable_idx');
+    return result;
+  });
+  const error = captureError(() => new SqliteStrategyRepository(database));
+  assert.ok(error instanceof TradeOpsError);
+  assert.equal(error.detail.code, 'DATABASE_SCHEMA_VERSION_MISMATCH');
+  assert.equal(error.detail.phase, 'startup');
+  const evidence = JSON.stringify(projectErrorEvidence(error));
+  assert.match(evidence, /strategies_recoverable_idx[\s\S]*secondary restore failure/u);
+  assert.equal(strategyDatabaseFingerprint(database), before);
+});
+
+test('poisons on rollback state mismatch and retains the original operation cause', (t) => {
+  const { database, repository } = setup(t);
+  const pending = repository.createPending(preflight());
+  const original = new Error('synthetic failure after autocommit');
+  const internals = repository as unknown as Task3RepositoryInternals;
+  internals.confirmPreflightTransaction = () => {
+    database.prepare("UPDATE strategies SET state = 'EXECUTING' WHERE id = ?").run(pending.id);
+    throw original;
+  };
+  const error = captureError(() => repository.confirmPreflight(pending));
+  assert.ok(error instanceof TradeOpsError);
+  assert.equal(error.detail.code, 'STORAGE_OPERATION_FAILED');
+  assert.match(error.detail.actual as string, /rollback-verification:state-changed.*expected.*PENDING_CONFIRMATION.*actual.*EXECUTING/u);
+  assert.strictEqual(error.cause, original);
+  assert.match(JSON.stringify(projectErrorEvidence(error)), /synthetic failure after autocommit/u);
+  assert.equal(database.inTransaction, false);
+  assert.equal(database.prepare('SELECT state FROM strategies WHERE id = ?').pluck().get(pending.id), 'EXECUTING');
+  assert.strictEqual(captureError(() => repository.getStrategy(pending.id)), error);
+  assert.strictEqual(captureError(() => repository.listRecoverable()), error);
 });

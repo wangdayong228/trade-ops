@@ -42,7 +42,7 @@ function environmentLoadFailure(error: unknown): never {
     subject: { type: 'configuration', field: 'environment-file' },
     expected: 'readable environment file or missing file',
     actual: safeFailureCategory(error)
-  });
+  }, undefined, { cause: error });
 }
 
 export function loadEnvironmentFile(

@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import {
   fundingRateEvent,
   nonThrowingFundingRateEventSink,
@@ -30,10 +31,10 @@ export class FundingRateSyncService {
 
   constructor(options: FundingRateSyncServiceOptions) {
     if (options.bitgetSource.exchangeId !== 'bitget') {
-      throw new Error('invalid Bitget funding source identity');
+      throw new Error(`invalid Bitget funding source identity: expected bitget; actual ${diagnosticValue(options.bitgetSource.exchangeId)}`);
     }
     if (options.okxSource.exchangeId !== 'okx') {
-      throw new Error('invalid OKX funding source identity');
+      throw new Error(`invalid OKX funding source identity: expected okx; actual ${diagnosticValue(options.okxSource.exchangeId)}`);
     }
     this.events = nonThrowingFundingRateEventSink(options.events);
     const common = {

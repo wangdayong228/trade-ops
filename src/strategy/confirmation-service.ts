@@ -3,6 +3,7 @@ import { Decimal } from 'decimal.js';
 import type { MarketRules } from '../domain/types.js';
 import {
   createTradeOpsError,
+  projectTradeOpsError,
   safeFailureCategory,
   withErrorPhase,
   type ErrorPhase,
@@ -52,7 +53,9 @@ function trustedFailure(
   phase: ErrorPhase
 ): TradeOpsError | undefined {
   try {
-    return withErrorPhase(error as TradeOpsError, phase);
+    const trusted = error as TradeOpsError;
+    const phased = withErrorPhase(trusted, phase);
+    return trusted.detail.phase === phase ? trusted : phased;
   } catch {
     return undefined;
   }
@@ -73,11 +76,22 @@ function isLegacyStrategyNotFound(error: unknown): boolean {
 function storageFailure(
   error: unknown,
   strategyId: string,
-  operation: string
+  operation: string,
+  options?: ErrorOptions
 ): TradeOpsError {
   const trusted = trustedFailure(error, 'storage');
   if (trusted !== undefined) {
-    return trusted;
+    if (options === undefined) return trusted;
+    const detail = trusted.detail;
+    return createTradeOpsError({
+      code: detail.code,
+      phase: detail.phase,
+      subject: detail.subject,
+      expected: detail.expected,
+      actual: detail.actual,
+      occurredAt: detail.occurredAt,
+      ...(detail.evidence === undefined ? {} : { evidence: detail.evidence })
+    }, undefined, options);
   }
   return createTradeOpsError({
     code: 'STORAGE_OPERATION_FAILED',
@@ -90,7 +104,7 @@ function storageFailure(
     },
     expected: `successful ${operation}`,
     actual: safeFailureCategory(error)
-  });
+  }, undefined, options ?? { cause: error });
 }
 
 function operationBusy(strategyId: string): TradeOpsError {
@@ -368,13 +382,35 @@ function unknownRevalidationFailure(
     subject: { type: 'strategy', strategyId, field: 'preflight' },
     expected: 'successful confirmation preflight',
     actual: safeFailureCategory(error)
+  }, undefined, { cause: error });
+}
+
+function evidenceProjectionFailure(
+  strategyId: string,
+  failure: TradeOpsError,
+  error: unknown
+): TradeOpsError {
+  return createTradeOpsError({
+    code: 'STORAGE_OPERATION_FAILED',
+    phase: 'storage',
+    subject: {
+      type: 'database',
+      table: 'strategies',
+      recordId: strategyId,
+      operation: 'preflight invalidation evidence projection'
+    },
+    expected: 'safe preflight failure projection before persistence',
+    actual: safeFailureCategory(error)
+  }, undefined, {
+    cause: new AggregateError([failure, error], 'preflight failure and evidence projection failed')
   });
 }
 
 export class ConfirmationService {
   constructor(
     private readonly repository: StrategyRepository,
-    private readonly preflight: Pick<PreflightService, 'run'>
+    private readonly preflight: Pick<PreflightService, 'run'>,
+    private readonly secretProvider: () => readonly string[] = () => []
   ) {}
 
   async confirm(strategyId: string): Promise<void> {
@@ -442,10 +478,30 @@ export class ConfirmationService {
     record: Readonly<StrategyRecord>,
     failure: TradeOpsError
   ): void {
+    let persistedFailure;
     try {
-      this.repository.invalidatePreflight(record, failure.detail);
+      persistedFailure = projectTradeOpsError(
+        failure,
+        this.secretProvider(),
+        false
+      );
     } catch (error) {
-      throw storageFailure(error, record.id, 'preflight invalidation');
+      throw evidenceProjectionFailure(record.id, failure, error);
+    }
+    try {
+      this.repository.invalidatePreflight(record, persistedFailure);
+    } catch (error) {
+      throw storageFailure(
+        error,
+        record.id,
+        'preflight invalidation',
+        {
+          cause: new AggregateError(
+            [failure, error],
+            'preflight invalidation and persistence failed'
+          )
+        }
+      );
     }
   }
 

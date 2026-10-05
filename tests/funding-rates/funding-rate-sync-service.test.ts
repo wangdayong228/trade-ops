@@ -555,8 +555,8 @@ task8Test('uses initial plus three retries with exact backoff and exact discover
     'okx',
     [],
     [],
-    [1, 2, 3, 4].map(() => ({
-      responseError: new ccxt.NetworkError('temporary secret=hidden')
+    [1, 2, 3, 4].map((attempt) => ({
+      responseError: new ccxt.NetworkError(`attempt-${attempt} secret=hidden`)
     })),
     clock.nowMs
   );
@@ -571,6 +571,7 @@ task8Test('uses initial plus three retries with exact backoff and exact discover
   );
   await worker.stop();
 
+  assert.match(JSON.stringify(events.events.find(({ event }) => event === 'funding_market_discovery_incomplete')), /attempt-1[\s\S]*attempt-2[\s\S]*attempt-3[\s\S]*attempt-4/u);
   assert.equal(source.discoveryCalls.length, 4);
   assert.deepEqual(sleeper.calls, [1_000, 2_000, 4_000]);
   const retries = events.events.filter(({ event }) => event === 'funding_request_retry');
@@ -1992,11 +1993,12 @@ task8Test('joins both fatal roots and deterministically reports Bitget first', a
     clock.nowMs
   );
   const { FundingRateSyncService } = task8Modules();
+  const events = new RecordingEventSink();
   const service = new FundingRateSyncService({
     bitgetSource: bitget,
     okxSource: okx,
     repository: probe.repository,
-    events: new RecordingEventSink(),
+    events,
     intervalMs: INTERVAL_MS,
     nowMs: clock.nowMs,
     sleep: sleeper.sleep
@@ -2016,6 +2018,9 @@ task8Test('joins both fatal roots and deterministically reports Bitget first', a
 
   bitgetGate.release();
   await assert.rejects(stopping, (error: unknown) => error === bitgetError);
+  const fatalEvents = events.events.filter(({ event }) => event === 'funding_sync_fatal');
+  assert.equal(fatalEvents.length, 2);
+  assert.match(JSON.stringify(fatalEvents), /okx internal fatal[\s\S]*bitget internal fatal/u);
   assert.deepEqual(
     callsNamed(probe.calls, 'applyCompleteDiscovery').map((call) => call.arguments[0]).sort(),
     ['bitget', 'okx']

@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import { NetworkError } from 'ccxt';
 import {
   fundingRateEvent,
@@ -77,6 +78,7 @@ class ExchangeRequestExecutor implements FundingRequestExecutor {
     operation: () => Promise<Value>,
     onRetry: FundingRequestRetryObserver
   ): Promise<Value> {
+    const failures: unknown[] = [];
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
       await this.waitForSpacing();
       this.throwIfCanceled();
@@ -88,9 +90,10 @@ class ExchangeRequestExecutor implements FundingRequestExecutor {
           throw new FundingRequestCanceledError();
         }
         if (!(error instanceof NetworkError)) throw error;
+        failures.push(error);
         const retryDelayMs = RETRY_DELAYS_MS[attempt];
         if (retryDelayMs === undefined) {
-          throw new FundingRequestRetryExhaustedError();
+          throw new FundingRequestRetryExhaustedError(failures);
         }
         try {
           onRetry({
@@ -104,7 +107,7 @@ class ExchangeRequestExecutor implements FundingRequestExecutor {
         await this.wait(retryDelayMs);
       }
     }
-    throw new FundingRequestRetryExhaustedError();
+    throw new FundingRequestRetryExhaustedError(failures);
   }
 
   private async waitForSpacing(): Promise<void> {
@@ -142,7 +145,7 @@ function marketIdentity(state: FundingMarketState): FundingMarketIdentity {
 function timestampMs(value: string, context: string): number {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) {
-    throw new Error(`invalid funding scheduler ${context}`);
+    throw new Error(`invalid funding scheduler ${context}: expected parseable timestamp; actual ${diagnosticValue(value)}`);
   }
   return parsed;
 }
@@ -197,7 +200,7 @@ export class FundingRateExchangeWorker {
 
   constructor(private readonly options: FundingRateExchangeWorkerOptions) {
     if (options.source.exchangeId !== 'bitget' && options.source.exchangeId !== 'okx') {
-      throw new Error('invalid funding worker exchange identity');
+      throw new Error(`invalid funding worker exchange identity: expected bitget or okx; actual ${diagnosticValue(options.source.exchangeId)}`);
     }
     this.events = nonThrowingFundingRateEventSink(options.events);
     this.requestExecutor = new ExchangeRequestExecutor(
@@ -566,7 +569,7 @@ export class FundingRateExchangeWorker {
     const value = this.options.nowMs();
     const date = new Date(value);
     if (!Number.isSafeInteger(value) || Number.isNaN(date.getTime())) {
-      throw new Error('invalid funding worker clock');
+      throw new Error(`invalid funding worker clock: expected safe-integer timestamp in Date range; actual ${diagnosticValue(value)}`);
     }
     return date;
   }

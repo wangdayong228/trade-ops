@@ -564,7 +564,12 @@ test('validates interval input before starting recovery', () => {
   ]) {
     assert.throws(
       () => monitor.start(interval),
-      /interval must be a positive safe integer/
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.match(error.message, /interval must be a positive safe integer.*2147483647/u);
+        assert.ok(error.message.includes(String(interval)));
+        return true;
+      }
     );
   }
 });

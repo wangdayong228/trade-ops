@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import {
   nonThrowingOperationalLog,
   type OperationalLog
@@ -67,7 +68,7 @@ export class OrderMonitor {
       || intervalMs > MAX_TIMER_INTERVAL_MS
     ) {
       throw new Error(
-        'monitor interval must be a positive safe integer within the timer range'
+        `monitor interval must be a positive safe integer within the timer range (0, ${MAX_TIMER_INTERVAL_MS}]; actual ${diagnosticValue(intervalMs)}`
       );
     }
     if (this.activeStop !== null) {

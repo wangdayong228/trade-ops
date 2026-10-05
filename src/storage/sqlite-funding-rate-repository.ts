@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import Database from 'better-sqlite3';
 import {
   settledFundingRate,
@@ -133,8 +134,8 @@ interface ValidatedHistoryRow extends SettledFundingRate {
   readonly lastObservedAt: string;
 }
 
-function schemaError(): Error {
-  return new Error(FUNDING_SCHEMA_ERROR);
+function schemaError(detail: string, options?: ErrorOptions): Error {
+  return new Error(`${FUNDING_SCHEMA_ERROR}: ${detail}`, options);
 }
 
 function sqliteIntegerEquals(value: unknown, expected: number): boolean {
@@ -170,7 +171,7 @@ function sqliteInteger(
       if (Number.isSafeInteger(converted)) return converted;
     }
   }
-  throw new Error(`invalid ${context}: expected a safe SQLite integer`);
+  throw new Error(`invalid ${context}: expected a safe SQLite integer in [${minimum}, ${maximum}]; actual ${diagnosticValue(value)}`);
 }
 
 function nullableSqliteInteger(
@@ -186,7 +187,7 @@ function nullableSqliteInteger(
 
 function exchangeId(value: unknown, context: string): FundingExchangeId {
   if (value !== 'bitget' && value !== 'okx') {
-    throw new Error(`invalid ${context}: unsupported exchange`);
+    throw new Error(`invalid ${context}: expected bitget or okx; actual ${diagnosticValue(value)}`);
   }
   return value;
 }
@@ -197,7 +198,7 @@ function nonEmptyString(value: unknown, context: string): string {
     || value.length === 0
     || value.trim() !== value
   ) {
-    throw new Error(`invalid ${context}: expected a non-empty string`);
+    throw new Error(`invalid ${context}: expected a non-empty trimmed string; actual ${diagnosticValue(value)}`);
   }
   return value;
 }
@@ -208,8 +209,8 @@ function isoTimestamp(value: unknown, context: string): string {
     if (new Date(timestamp).toISOString() !== timestamp) {
       throw new Error('not canonical');
     }
-  } catch {
-    throw new Error(`invalid ${context}: expected a canonical UTC timestamp`);
+  } catch (error) {
+    throw new Error(`invalid ${context}: expected a canonical UTC timestamp; actual ${diagnosticValue(value)}`, { cause: error });
   }
   return timestamp;
 }
@@ -220,19 +221,19 @@ function nullableIsoTimestamp(value: unknown, context: string): string | null {
 
 function dateTimestamp(value: Date, context: string): string {
   if (!(value instanceof Date)) {
-    throw new Error(`invalid ${context}: expected a Date`);
+    throw new Error(`invalid ${context}: expected a Date; actual ${diagnosticValue(value)}`);
   }
   try {
     return Date.prototype.toISOString.call(value);
-  } catch {
-    throw new Error(`invalid ${context}: expected a valid Date`);
+  } catch (error) {
+    throw new Error(`invalid ${context}: expected a valid Date; actual invalid date`, { cause: error });
   }
 }
 
 function timestampMs(value: unknown, context: string): number {
   const result = sqliteInteger(value, 0, MAX_UNIX_TIMESTAMP_MS, context);
   if (Number.isNaN(new Date(result).getTime())) {
-    throw new Error(`invalid ${context}: expected a valid Unix millisecond timestamp`);
+    throw new Error(`invalid ${context}: expected a valid Unix millisecond timestamp; actual ${result}`);
   }
   return result;
 }
@@ -247,7 +248,7 @@ function enumValue<T extends string>(
   context: string
 ): T {
   if (typeof value !== 'string' || !values.has(value as T)) {
-    throw new Error(`invalid ${context}: unsupported value`);
+    throw new Error(`invalid ${context}: expected ${[...values].join("|")}; actual ${diagnosticValue(value)}`);
   }
   return value as T;
 }
@@ -267,16 +268,16 @@ function sqliteBoolean(value: unknown, context: string): boolean {
 
 function parsedObjectJson(value: unknown, context: string): object {
   if (typeof value !== 'string') {
-    throw new Error(`invalid ${context}: expected JSON text`);
+    throw new Error(`invalid ${context}: expected JSON text; actual ${typeof value}`);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
   } catch {
-    throw new Error(`invalid ${context}: expected valid JSON`);
+    throw new Error(`invalid ${context}: expected valid JSON; actual malformed text length ${value.length}; parser body omitted`);
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`invalid ${context}: expected a JSON object`);
+    throw new Error(`invalid ${context}: expected a JSON object; actual ${typeof parsed}`);
   }
   return parsed;
 }
@@ -294,17 +295,18 @@ function marketIdentity(market: FundingMarketIdentity): FundingMarketIdentity {
 
 function contentHash(value: unknown, context: string): string {
   if (typeof value !== 'string' || !CONTENT_HASH_PATTERN.test(value)) {
-    throw new Error(`invalid ${context}: expected a lowercase SHA-256 hash`);
+    throw new Error(`invalid ${context}: expected a lowercase SHA-256 hash; actual ${diagnosticValue(value)}`);
   }
   return value;
 }
 
 function corruptHistory(
   market: FundingMarketIdentity,
-  field: string
+  field: string,
+  options?: ErrorOptions
 ): never {
   throw new Error(
-    `invalid funding history for ${market.exchangeId}/${market.exchangeMarketId}: ${field}`
+    `invalid funding history for ${market.exchangeId}/${market.exchangeMarketId}: ${field}`, options
   );
 }
 
@@ -317,29 +319,29 @@ function validateHistoryRow(
   let symbol: string;
   try {
     storedExchangeId = exchangeId(row.exchange_id, 'history exchange_id');
-  } catch {
-    return corruptHistory(market, 'exchange_id');
+  } catch (error) {
+    return corruptHistory(market, 'exchange_id', { cause: error });
   }
   try {
     storedMarketId = nonEmptyString(
       row.exchange_market_id,
       'history exchange_market_id'
     );
-  } catch {
-    return corruptHistory(market, 'exchange_market_id');
+  } catch (error) {
+    return corruptHistory(market, 'exchange_market_id', { cause: error });
   }
   if (
     storedExchangeId !== market.exchangeId
     || storedMarketId !== market.exchangeMarketId
   ) {
-    return corruptHistory(market, 'market_identity');
+    return corruptHistory(market, `market_identity: expected ${market.exchangeId}/${market.exchangeMarketId}; actual ${storedExchangeId}/${storedMarketId}`);
   }
   try {
     symbol = nonEmptyString(row.symbol, 'history symbol');
-  } catch {
-    return corruptHistory(market, 'symbol');
+  } catch (error) {
+    return corruptHistory(market, 'symbol', { cause: error });
   }
-  if (symbol !== market.symbol) return corruptHistory(market, 'symbol');
+  if (symbol !== market.symbol) return corruptHistory(market, `symbol: expected ${market.symbol}; actual ${symbol}`);
 
   let fundingTimestampMs: number;
   try {
@@ -347,11 +349,11 @@ function validateHistoryRow(
       row.funding_timestamp_ms,
       'history funding_timestamp_ms'
     );
-  } catch {
-    return corruptHistory(market, 'funding_timestamp_ms');
+  } catch (error) {
+    return corruptHistory(market, 'funding_timestamp_ms', { cause: error });
   }
   if (typeof row.funding_rate !== 'string') {
-    return corruptHistory(market, 'funding_rate');
+    return corruptHistory(market, `funding_rate: expected decimal string; actual ${diagnosticValue(row.funding_rate)}`);
   }
   try {
     settledFundingRate(
@@ -360,15 +362,15 @@ function validateHistoryRow(
       fundingTimestampMs,
       {}
     );
-  } catch {
-    return corruptHistory(market, 'funding_rate');
+  } catch (error) {
+    return corruptHistory(market, 'funding_rate', { cause: error });
   }
 
   let raw: object;
   try {
     raw = parsedObjectJson(row.raw_json, 'history raw_json');
-  } catch {
-    return corruptHistory(market, 'raw_json');
+  } catch (error) {
+    return corruptHistory(market, 'raw_json', { cause: error });
   }
 
   let normalized: SettledFundingRate;
@@ -379,21 +381,21 @@ function validateHistoryRow(
       fundingTimestampMs,
       raw
     );
-  } catch {
-    return corruptHistory(market, 'raw_json');
+  } catch (error) {
+    return corruptHistory(market, 'raw_json', { cause: error });
   }
   if (normalized.rawJson !== row.raw_json) {
-    return corruptHistory(market, 'raw_json');
+    return corruptHistory(market, `raw_json: expected canonical JSON; actual noncanonical text length ${typeof row.raw_json === 'string' ? row.raw_json.length : 'not string'}`);
   }
 
   let hash: string;
   try {
     hash = contentHash(row.content_hash, 'history content_hash');
-  } catch {
-    return corruptHistory(market, 'content_hash');
+  } catch (error) {
+    return corruptHistory(market, 'content_hash', { cause: error });
   }
   if (hash !== normalized.contentHash) {
-    return corruptHistory(market, 'content_hash');
+    return corruptHistory(market, `content_hash: expected ${normalized.contentHash}; actual ${hash}`);
   }
 
   let firstObservedAt: string;
@@ -407,11 +409,11 @@ function validateHistoryRow(
       row.last_observed_at,
       'history last_observed_at'
     );
-  } catch {
-    return corruptHistory(market, 'observation_timestamp');
+  } catch (error) {
+    return corruptHistory(market, 'observation_timestamp', { cause: error });
   }
   if (firstObservedAt > lastObservedAt) {
-    return corruptHistory(market, 'observation_timestamp');
+    return corruptHistory(market, `observation_timestamp: expected first <= last; actual first=${firstObservedAt}, last=${lastObservedAt}`);
   }
 
   return {
@@ -437,7 +439,9 @@ function validatePageRecord(
     || recordMarket.exchangeMarketId !== market.exchangeMarketId
     || recordMarket.symbol !== market.symbol
   ) {
-    throw new Error('invalid funding page record: market identity mismatch');
+    for (const field of ['exchangeId', 'exchangeMarketId', 'symbol'] as const) {
+      if (recordMarket[field] !== market[field]) throw new Error(`invalid funding page record: ${field} mismatch; expected ${market[field]}; actual ${recordMarket[field]}`);
+    }
   }
   const fundingTimestampMs = timestampMs(
     record.fundingTimestampMs,
@@ -451,7 +455,7 @@ function validatePageRecord(
     raw
   );
   if (normalized.rawJson !== record.rawJson) {
-    throw new Error('invalid funding page record: raw_json is not canonical');
+    throw new Error(`invalid funding page record: raw_json is not canonical; expected length ${normalized.rawJson.length}; actual length ${record.rawJson.length}`);
   }
   const suppliedHash = contentHash(
     record.contentHash,
@@ -459,7 +463,7 @@ function validatePageRecord(
   );
   if (suppliedHash !== normalized.contentHash) {
     throw new Error(
-      'invalid funding page record: content_hash does not match canonical content'
+      `invalid funding page record: content_hash does not match canonical content; expected ${normalized.contentHash}; actual ${suppliedHash}`
     );
   }
   return normalized;
@@ -494,7 +498,7 @@ function deduplicatePageRecords(
       byTimestamp.set(record.fundingTimestampMs, record);
       result.push(record);
     } else if (!recordsEqual(previous, record)) {
-      throw new Error('invalid funding page: conflicting natural key');
+      throw new Error(`invalid funding page: conflicting natural key ${market.exchangeId}/${market.exchangeMarketId}/${record.fundingTimestampMs}; expected contentHash=${previous.contentHash}; actual ${record.contentHash}`);
     }
   }
   return result;
@@ -509,7 +513,7 @@ function assertTableContract(
     ? `PRAGMA temp.table_info(${table.slice('temp.'.length)})`
     : `PRAGMA table_info(${table})`;
   const rows = database.prepare(pragma).all() as unknown as TableInfoDbRow[];
-  if (rows.length !== expected.length) throw schemaError();
+  if (rows.length !== expected.length) throw schemaError(`${table} column count: expected ${expected.length}; actual ${rows.length}`);
   for (let index = 0; index < expected.length; index += 1) {
     const row = rows[index];
     const contract = expected[index];
@@ -520,7 +524,7 @@ function assertTableContract(
       || row.type !== contract[1]
       || !sqliteIntegerEquals(row.pk, contract[2])
     ) {
-      throw schemaError();
+      throw schemaError(`${table} column ${index}: expected ${contract?.join(",")}; actual ${diagnosticValue(row?.name)},${diagnosticValue(row?.type)},pk=${diagnosticValue(row?.pk)}`);
     }
   }
 }
@@ -557,7 +561,7 @@ function assertFundingSchemaCatalog(
       )
     ORDER BY type, name
   `).all(...expectedNames, ...managedTableNames) as unknown as SqliteMasterDbRow[];
-  if (rows.length !== expected.length) throw schemaError();
+  if (rows.length !== expected.length) throw schemaError(`${scope} catalog: expected ${expectedNames.join(",")}; actual ${rows.map(({ name }) => diagnosticValue(name)).join(",")}`);
   for (let index = 0; index < expected.length; index += 1) {
     const row = rows[index];
     const object = expected[index];
@@ -569,7 +573,7 @@ function assertFundingSchemaCatalog(
       || row.tbl_name !== object.tableName
       || row.sql !== object.storedSql
     ) {
-      throw schemaError();
+      throw schemaError(`${scope} catalog object ${object?.name}: expected ${object?.type}:${object?.name}:${object?.tableName} with locked definition; actual ${diagnosticValue(row?.type)}:${diagnosticValue(row?.name)}:${diagnosticValue(row?.tbl_name)}, definitionMatches=${row?.sql === object?.storedSql}`);
     }
   }
 }
@@ -643,28 +647,28 @@ function assertFundingSchema(database: Database.Database): void {
 }
 
 function prepareFundingSchema(database: Database.Database): void {
-  if (database.inTransaction) throw schemaError();
+  if (database.inTransaction) throw schemaError('external transaction: expected false; actual true');
   try {
     database.pragma('foreign_keys = ON');
-    if (!sqliteIntegerEquals(
-      database.pragma('foreign_keys', { simple: true }),
-      1
-    )) {
-      throw schemaError();
+    const foreignKeys = database.pragma('foreign_keys', { simple: true });
+    if (!sqliteIntegerEquals(foreignKeys, 1)) {
+      throw schemaError(`foreign_keys: expected 1; actual ${diagnosticValue(foreignKeys)}`);
     }
     database.transaction(() => {
       database.exec(SQLITE_FUNDING_RATE_SCHEMA);
       assertFundingSchema(database);
-      if (database.prepare('PRAGMA foreign_key_check').all().length !== 0) {
-        throw schemaError();
+      const violations = database.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length !== 0) {
+        throw schemaError(`foreign_key_check: expected 0 violations; actual ${violations.length}`);
       }
     })();
     assertFundingSchema(database);
-    if (database.prepare('PRAGMA foreign_key_check').all().length !== 0) {
-      throw schemaError();
+    const violations = database.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length !== 0) {
+        throw schemaError(`foreign_key_check: expected 0 violations; actual ${violations.length}`);
     }
-  } catch {
-    throw schemaError();
+  } catch (error) {
+    throw schemaError('storage operation failed', { cause: error });
   }
 }
 
@@ -675,7 +679,7 @@ function createBitgetScanTable(database: Database.Database): void {
       && object.type === 'table'
       && object.name === 'funding_rate_bitget_scan'
     ));
-    if (scanSchema === undefined) throw schemaError();
+    if (scanSchema === undefined) throw schemaError('temp.funding_rate_bitget_scan: expected schema definition; actual missing');
     database.transaction(() => {
       database.exec(scanSchema.installSql);
       assertFundingSchemaCatalog(database, 'temp');
@@ -691,8 +695,8 @@ function createBitgetScanTable(database: Database.Database): void {
         ['content_hash', 'TEXT', 0]
       ]);
     })();
-  } catch {
-    throw schemaError();
+  } catch (error) {
+    throw schemaError('storage operation failed', { cause: error });
   }
 }
 
@@ -709,17 +713,17 @@ function nullableFailure(
   }
   const code = enumValue(codeValue, FAILURE_CODES, `${context} code`);
   if (typeof summaryValue !== 'string') {
-    throw new Error(`invalid ${context} summary: expected text`);
+    throw new Error(`invalid ${context} summary: expected text; actual ${typeof summaryValue}`);
   }
   if (fundingTaskFailure(code).summary !== summaryValue) {
-    throw new Error(`invalid ${context} summary: does not match code`);
+    throw new Error(`invalid ${context} summary: expected static summary for ${code}; actual different text length ${summaryValue.length}`);
   }
   return { code, summary: summaryValue };
 }
 
 function normalizedFailure(untrusted: FundingTaskFailure): FundingTaskFailure {
   if (typeof untrusted !== 'object' || untrusted === null) {
-    throw new Error('invalid funding task failure: expected normalized failure');
+    throw new Error(`invalid funding task failure: expected normalized failure; actual ${diagnosticValue(untrusted)}`);
   }
   const record = untrusted as unknown as Record<string, unknown>;
   const code = enumValue(
@@ -736,7 +740,7 @@ function normalizedFailure(untrusted: FundingTaskFailure): FundingTaskFailure {
       > MAX_FUNDING_TASK_FAILURE_SUMMARY_BYTES
     || !/^[\x20-\x7e]+$/.test(record.summary)
   ) {
-    throw new Error('invalid funding task failure: failure summary is not normalized');
+    throw new Error(`invalid funding task failure: failure summary is not normalized; expected static summary for ${code} within ${MAX_FUNDING_TASK_FAILURE_SUMMARY_BYTES} UTF-8 bytes; actual ${typeof record.summary === 'string' ? `text length ${record.summary.length}, bytes ${Buffer.byteLength(record.summary, 'utf8')}, matches=${record.summary === expected.summary}` : typeof record.summary}`);
   }
   return expected;
 }
@@ -756,7 +760,7 @@ function normalizedExhaustionEvidence(
   context: string
 ): FundingExhaustionEvidence {
   if (typeof untrusted !== 'object' || untrusted === null || Array.isArray(untrusted)) {
-    throw new Error(`invalid ${context}: expected an exhaustion evidence object`);
+    throw new Error(`invalid ${context}: expected an exhaustion evidence object; actual ${diagnosticValue(untrusted)}`);
   }
   const record = untrusted as Readonly<Record<string, unknown>>;
   if (record.exchangeId === 'bitget') {
@@ -767,7 +771,7 @@ function normalizedExhaustionEvidence(
       'matchingRounds',
       'emptyPageNo'
     ])) {
-      throw new Error(`invalid ${context}: unexpected Bitget evidence fields`);
+      throw new Error(`invalid ${context}: unexpected Bitget evidence fields; expected exchangeId,generation,cutoffMs,matchingRounds,emptyPageNo; actual keys ${Object.keys(record).join(",")}`);
     }
     const matchingRounds = record.matchingRounds;
     if (
@@ -778,7 +782,7 @@ function normalizedExhaustionEvidence(
         || (matchingRounds[0] === 2 && matchingRounds[1] === 3)
       )
     ) {
-      throw new Error(`invalid ${context}: invalid Bitget matching rounds`);
+      throw new Error(`invalid ${context}: invalid Bitget matching rounds; expected [1,2] or [2,3]; actual ${diagnosticValue(matchingRounds)}${Array.isArray(matchingRounds) ? ` first=${diagnosticValue(matchingRounds[0])},second=${diagnosticValue(matchingRounds[1])}` : ''}`);
     }
     return {
       exchangeId: 'bitget',
@@ -806,10 +810,10 @@ function normalizedExhaustionEvidence(
       'explicitEmpty',
       'finalRequestAfterMs'
     ])) {
-      throw new Error(`invalid ${context}: unexpected OKX evidence fields`);
+      throw new Error(`invalid ${context}: unexpected OKX evidence fields; expected exchangeId,generation,cutoffMs,explicitEmpty,finalRequestAfterMs; actual keys ${Object.keys(record).join(",")}`);
     }
     if (record.explicitEmpty !== true) {
-      throw new Error(`invalid ${context}: OKX explicit-empty proof is required`);
+      throw new Error(`invalid ${context}: OKX explicit-empty proof is required; expected true; actual ${diagnosticValue(record.explicitEmpty)}`);
     }
     return {
       exchangeId: 'okx',
@@ -827,11 +831,11 @@ function normalizedExhaustionEvidence(
       )
     };
   }
-  throw new Error(`invalid ${context}: unsupported evidence exchange`);
+  throw new Error(`invalid ${context}: expected bitget or okx evidence exchange; actual ${diagnosticValue(record.exchangeId)}`);
 }
 
-function corruptState(context: string, field: string): never {
-  throw new Error(`invalid funding state ${context}: ${field}`);
+function corruptState(context: string, field: string, options?: ErrorOptions): never {
+  throw new Error(`invalid funding state ${context}: ${field}`, options);
 }
 
 function validateStateRow(row: FundingStateDbRow): FundingMarketState {
@@ -934,7 +938,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   if ((oldest === null) !== (latest === null) || (
     oldest !== null && latest !== null && oldest > latest
   )) {
-    return corruptState(stateContext, 'funding bounds');
+    return corruptState(stateContext, `funding bounds: expected both null or oldest <= latest; actual ${JSON.stringify({ oldest, latest })}`);
   }
   const coverageStartedAt = nullableIsoTimestamp(
     row.coverage_started_at,
@@ -995,14 +999,14 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
   ];
   const presentProofValues = proofValues.filter((value) => value !== null).length;
   if (presentProofValues !== 0 && presentProofValues !== proofValues.length) {
-    return corruptState(stateContext, 'coverage evidence fields');
+    return corruptState(stateContext, `coverage evidence fields: expected all proof fields present or all absent; actual ${JSON.stringify({ presentProofValues, proofFieldCount: proofValues.length })}`);
   }
   if (
     (coverageStatus === 'BACKFILLING' || coverageStatus === 'INCOMPLETE')
     && lastCaughtUpGeneration !== null
     && lastCaughtUpGeneration >= coverageGeneration
   ) {
-    return corruptState(stateContext, 'coverage proof generation');
+    return corruptState(stateContext, `coverage proof generation: expected saved proof generation less than current coverage generation; actual ${JSON.stringify({ lastCaughtUpGeneration, coverageGeneration, coverageStatus })}`);
   }
   if (
     lastExhaustionEvidenceJson !== null
@@ -1018,8 +1022,8 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
         ),
         `${stateContext} exhaustion evidence`
       );
-    } catch {
-      return corruptState(stateContext, 'exhaustion evidence');
+    } catch (error) {
+      return corruptState(stateContext, 'exhaustion evidence validation failed', { cause: error });
     }
     if (
       evidence.exchangeId !== stateExchangeId
@@ -1027,12 +1031,12 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || evidence.cutoffMs !== lastCaughtUpCutoffMs
       || JSON.stringify(evidence) !== lastExhaustionEvidenceJson
     ) {
-      return corruptState(stateContext, 'exhaustion evidence');
+      return corruptState(stateContext, `exhaustion evidence: expected exchangeId/generation/cutoff equal saved proof and JSON canonical; actual ${JSON.stringify({ expectedExchangeId: stateExchangeId, actualExchangeId: evidence.exchangeId, expectedGeneration: lastCaughtUpGeneration, actualGeneration: evidence.generation, expectedCutoffMs: lastCaughtUpCutoffMs, actualCutoffMs: evidence.cutoffMs, canonical: JSON.stringify(evidence) === lastExhaustionEvidenceJson })}`);
     }
   }
 
   if ((okxResumeAfterMs === null) !== (okxResumeGeneration === null)) {
-    return corruptState(stateContext, 'OKX anchor fields');
+    return corruptState(stateContext, `OKX anchor fields: expected anchor and generation both null or both present; actual ${JSON.stringify({ okxResumeAfterMs, okxResumeGeneration })}`);
   }
   if (
     okxResumeAfterMs !== null
@@ -1042,7 +1046,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || okxResumeGeneration !== coverageGeneration
     )
   ) {
-    return corruptState(stateContext, 'OKX anchor generation');
+    return corruptState(stateContext, `OKX anchor generation: expected OKX BACKFILLING with anchor generation equal coverage generation; actual ${JSON.stringify({ stateExchangeId, coverageStatus, okxResumeGeneration, coverageGeneration })}`);
   }
   if (coverageStatus === 'BACKFILLING') {
     if (
@@ -1057,17 +1061,17 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
         )
       )
     ) {
-      return corruptState(stateContext, 'coverage task-start provenance');
+      return corruptState(stateContext, `coverage task-start provenance: expected Bitget has no OKX anchor; OKX has no Bitget boundary and current anchor <= initial anchor; actual ${JSON.stringify({ stateExchangeId, coverageInitialOkxAfterMs, coverageRequiredBitgetBoundaryMs, okxResumeAfterMs })}`);
     }
   } else if (
     coverageRequiredBitgetBoundaryMs !== null
     || coverageInitialOkxAfterMs !== null
   ) {
-    return corruptState(stateContext, 'terminal coverage task-start provenance');
+    return corruptState(stateContext, `terminal coverage task-start provenance: expected both task-start boundaries null; actual ${JSON.stringify({ coverageStatus, coverageRequiredBitgetBoundaryMs, coverageInitialOkxAfterMs })}`);
   }
 
   if (reactivationRequired !== (reactivationAfterGeneration !== null)) {
-    return corruptState(stateContext, 'reactivation fields');
+    return corruptState(stateContext, `reactivation fields: expected reactivation flag equals presence of generation; when required active=true, inactive proof=null, generation<=coverage generation; actual ${JSON.stringify({ reactivationRequired, active, inactiveFinalCaughtUpAt, reactivationAfterGeneration, coverageGeneration })}`);
   }
   if (
     reactivationRequired
@@ -1078,7 +1082,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || reactivationAfterGeneration > coverageGeneration
     )
   ) {
-    return corruptState(stateContext, 'reactivation fields');
+    return corruptState(stateContext, `reactivation fields: expected reactivation flag equals presence of generation; when required active=true, inactive proof=null, generation<=coverage generation; actual ${JSON.stringify({ reactivationRequired, active, inactiveFinalCaughtUpAt, reactivationAfterGeneration, coverageGeneration })}`);
   }
   if (
     inactiveFinalCaughtUpAt !== null
@@ -1089,7 +1093,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || inactiveFinalCaughtUpAt !== coverageLastSuccessAt
     )
   ) {
-    return corruptState(stateContext, 'inactive final proof');
+    return corruptState(stateContext, `inactive final proof: expected inactive, CAUGHT_UP, INACTIVE_FINAL and final time equals success time; actual ${JSON.stringify({ active, coverageStatus, coverageTaskKind, inactiveFinalCaughtUpAt, coverageLastSuccessAt })}`);
   }
 
   if (coverageStatus === 'PENDING') {
@@ -1101,7 +1105,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || coverageFailure.code !== null
       || presentProofValues !== 0
     ) {
-      return corruptState(stateContext, 'PENDING coverage evidence');
+      return corruptState(stateContext, `PENDING coverage evidence: expected task kind/cutoff/start/end/failure null and no proof; actual ${JSON.stringify({ coverageTaskKind, coverageCutoffMs, coverageStartedAt, coverageEndedAt, failureCode: coverageFailure.code, presentProofValues })}`);
     }
   } else if (coverageStatus === 'BACKFILLING') {
     if (
@@ -1111,7 +1115,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || coverageEndedAt !== null
       || coverageFailure.code !== null
     ) {
-      return corruptState(stateContext, 'coverage BACKFILLING fields');
+      return corruptState(stateContext, `coverage BACKFILLING fields: expected kind/cutoff/start present and end/failure null; actual ${JSON.stringify({ coverageTaskKind, coverageCutoffMs, coverageStartedAt, coverageEndedAt, failureCode: coverageFailure.code })}`);
     }
   } else if (coverageStatus === 'INCOMPLETE') {
     if (
@@ -1121,7 +1125,7 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || coverageEndedAt === null
       || coverageFailure.code === null
     ) {
-      return corruptState(stateContext, 'coverage INCOMPLETE fields');
+      return corruptState(stateContext, `coverage INCOMPLETE fields: expected kind/cutoff/start/end/failure all present; actual ${JSON.stringify({ coverageTaskKind, coverageCutoffMs, coverageStartedAt, coverageEndedAt, failureCode: coverageFailure.code })}`);
     }
   } else if (
     coverageTaskKind === null
@@ -1134,13 +1138,13 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
     || lastCaughtUpCutoffMs !== coverageCutoffMs
     || presentProofValues !== proofValues.length
   ) {
-    return corruptState(stateContext, 'coverage CAUGHT_UP cutoff evidence');
+    return corruptState(stateContext, `coverage CAUGHT_UP cutoff evidence: expected kind/cutoff/start/end/success present, failure null, matching proof generation/cutoff and all proof fields present; actual ${JSON.stringify({ coverageTaskKind, coverageCutoffMs, coverageStartedAt, coverageEndedAt, coverageLastSuccessAt, failureCode: coverageFailure.code, lastCaughtUpGeneration, coverageGeneration, lastCaughtUpCutoffMs, presentProofValues })}`);
   }
   if (
     reactivationRequired
     && coverageStatus === 'CAUGHT_UP'
   ) {
-    return corruptState(stateContext, 'reactivation coverage status');
+    return corruptState(stateContext, `reactivation coverage status: expected required reactivation cannot be CAUGHT_UP; actual ${JSON.stringify({ reactivationRequired, coverageStatus })}`);
   }
   if (
     coverageStatus === 'CAUGHT_UP'
@@ -1150,14 +1154,14 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || inactiveFinalCaughtUpAt === null
     )
   ) {
-    return corruptState(stateContext, 'inactive final coverage proof');
+    return corruptState(stateContext, `inactive final coverage proof: expected inactive CAUGHT_UP has INACTIVE_FINAL kind and final proof time; actual ${JSON.stringify({ active, coverageStatus, coverageTaskKind, inactiveFinalCaughtUpAt })}`);
   }
   if (
     coverageStatus === 'CAUGHT_UP'
     && active
     && coverageTaskKind === 'INACTIVE_FINAL'
   ) {
-    return corruptState(stateContext, 'inactive final coverage state');
+    return corruptState(stateContext, `inactive final coverage state: expected INACTIVE_FINAL CAUGHT_UP is inactive; actual ${JSON.stringify({ active, coverageStatus, coverageTaskKind })}`);
   }
 
   if (
@@ -1172,11 +1176,11 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       )
     )
   ) {
-    return corruptState(stateContext, 'incremental frozen boundary provenance');
+    return corruptState(stateContext, `incremental frozen boundary provenance: expected non-running boundary null; running boundary null or <= latest; actual ${JSON.stringify({ incrementalStatus, incrementalFrozenBoundaryMs, latest })}`);
   }
   if (incrementalStatus === 'IDLE') {
     if (incrementalFailure.code !== null) {
-      return corruptState(stateContext, 'incremental IDLE fields');
+      return corruptState(stateContext, `incremental IDLE fields: expected failure null; actual ${JSON.stringify({ failureCode: incrementalFailure.code })}`);
     }
   } else if (incrementalStatus === 'RUNNING') {
     if (
@@ -1184,14 +1188,14 @@ function validateStateRow(row: FundingStateDbRow): FundingMarketState {
       || incrementalEndedAt !== null
       || incrementalFailure.code !== null
     ) {
-      return corruptState(stateContext, 'incremental RUNNING fields');
+      return corruptState(stateContext, `incremental RUNNING fields: expected start present, end/failure null; actual ${JSON.stringify({ incrementalStartedAt, incrementalEndedAt, failureCode: incrementalFailure.code })}`);
     }
   } else if (
     incrementalStartedAt === null
     || incrementalEndedAt === null
     || incrementalFailure.code === null
   ) {
-    return corruptState(stateContext, 'incremental INCOMPLETE fields');
+    return corruptState(stateContext, `incremental INCOMPLETE fields: expected start/end/failure all present; actual ${JSON.stringify({ incrementalStartedAt, incrementalEndedAt, failureCode: incrementalFailure.code })}`);
   }
   isoTimestamp(row.created_at, `${stateContext} created_at`);
   isoTimestamp(row.updated_at, `${stateContext} updated_at`);
@@ -1248,7 +1252,7 @@ function coverageLease(lease: CoverageLease): CoverageLease {
   const cutoffMs = timestampMs(lease.cutoffMs, 'coverage lease cutoff_ms');
   if (market.exchangeId === 'bitget') {
     if (lease.okxResumeAfterMs !== null) {
-      throw new Error('invalid Bitget coverage lease OKX anchor');
+      throw new Error(`invalid Bitget coverage lease OKX anchor: expected null; actual ${diagnosticValue(lease.okxResumeAfterMs)}`);
     }
     const requiredBitgetBoundaryMs = lease.requiredBitgetBoundaryMs === null
       ? null
@@ -1268,7 +1272,7 @@ function coverageLease(lease: CoverageLease): CoverageLease {
     };
   }
   if (lease.requiredBitgetBoundaryMs !== null) {
-    throw new Error('invalid OKX coverage lease Bitget boundary');
+    throw new Error(`invalid OKX coverage lease Bitget boundary: expected null; actual ${diagnosticValue(lease.requiredBitgetBoundaryMs)}`);
   }
   return {
     exchangeId: 'okx',
@@ -1824,7 +1828,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     for (const untrusted of untrustedObservations) {
       const market = marketIdentity(untrusted);
       if (market.exchangeId !== discoveryExchangeId) {
-        throw new Error('invalid funding discovery: exchange identity mismatch');
+        throw new Error(`invalid funding discovery: exchange identity mismatch; expected ${discoveryExchangeId}; actual ${market.exchangeId}`);
       }
       const activeDescriptor = Object.getOwnPropertyDescriptor(untrusted, 'active');
       if (
@@ -1832,11 +1836,11 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         || !('value' in activeDescriptor)
         || typeof activeDescriptor.value !== 'boolean'
       ) {
-        throw new Error('invalid funding discovery: active must be boolean');
+        throw new Error(`invalid funding discovery: active must be boolean; actual ${activeDescriptor === undefined ? 'missing' : 'value' in activeDescriptor ? diagnosticValue(activeDescriptor.value) : 'accessor'}`);
       }
       const active = activeDescriptor.value;
       if (marketIds.has(market.exchangeMarketId) || symbols.has(market.symbol)) {
-        throw new Error('invalid funding discovery: duplicate market identity');
+        throw new Error(`invalid funding discovery: duplicate market identity; expected unique ID and symbol; actual id=${market.exchangeMarketId}, symbol=${market.symbol}, duplicateId=${marketIds.has(market.exchangeMarketId)}, duplicateSymbol=${symbols.has(market.symbol)}`);
       }
       marketIds.add(market.exchangeMarketId);
       symbols.add(market.symbol);
@@ -1858,7 +1862,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     return rows.map((row) => {
       const state = validateStateRow(row);
       if (state.exchangeId !== requestedExchangeId) {
-        throw new Error('invalid funding state: exchange scope mismatch');
+        throw new Error(`invalid funding state: exchange scope mismatch; expected ${requestedExchangeId}; actual ${state.exchangeId}`);
       }
       return state;
     });
@@ -1928,10 +1932,10 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         || state.coverageCutoffMs === null
         || state.coverageStartedAt === null
       ) {
-        throw new Error('funding market has no interrupted coverage task');
+        throw new Error(`funding market has no interrupted coverage task: expected symbol=${market.symbol}, coverageStatus=BACKFILLING and non-null task kind, cutoff and startedAt; actual symbol=${state?.symbol ?? 'missing'}, coverageStatus=${state?.coverageStatus ?? 'missing'}, kind=${state?.coverageTaskKind ?? 'null'}, cutoff=${state?.coverageCutoffMs ?? 'null'}, startedAt=${state?.coverageStartedAt ?? 'null'}`);
       }
       if (state.coverageGeneration === MAX_SAFE_INTEGER) {
-        throw new Error('funding coverage generation exhausted');
+        throw new Error(`funding coverage generation exhausted: expected generation < ${MAX_SAFE_INTEGER}; actual ${state.coverageGeneration}`);
       }
       const generation = state.coverageGeneration + 1;
       const requiredBitgetBoundaryMs = state.exchangeId === 'bitget'
@@ -1961,7 +1965,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
             requiredBitgetBoundaryMs: null
           };
       if (!coverageStateAllowsLease(state, lease)) {
-        throw new Error('interrupted coverage task is no longer eligible');
+        throw new Error(`interrupted coverage task is no longer eligible: expected ${lease.kind === 'INACTIVE_FINAL' ? 'inactive market' : lease.kind === 'REACTIVATION' ? 'active reactivation with generation newer than boundary' : 'active market without required reactivation'}; actual active=${state.active}, reactivationRequired=${state.reactivationRequired}, generation=${lease.generation}, boundary=${state.reactivationAfterGeneration}`);
       }
       this.deleteBitgetScansForMarket.run(
         state.exchangeId,
@@ -2025,7 +2029,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       || (right !== 2 && right !== 3)
       || right !== left + 1
     ) {
-      throw new Error('invalid Bitget funding scan round comparison');
+      throw new Error(`invalid Bitget funding scan round comparison: expected bitget and consecutive rounds [1,2] or [2,3]; actual exchangeId=${lease.exchangeId}, left=${diagnosticValue(left)}, right=${diagnosticValue(right)}`);
     }
     return this.database.transaction((): boolean => {
       this.requireCurrentCoverageState(lease);
@@ -2048,7 +2052,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       || evidence.generation !== lease.generation
       || evidence.cutoffMs !== lease.cutoffMs
     ) {
-      throw new Error('invalid funding exhaustion evidence: lease mismatch');
+      throw new Error(`invalid funding exhaustion evidence: lease mismatch; expected exchangeId=${lease.exchangeId}, generation=${lease.generation}, cutoffMs=${lease.cutoffMs}; actual exchangeId=${evidence.exchangeId}, generation=${evidence.generation}, cutoffMs=${evidence.cutoffMs}`);
     }
     const completedAtText = dateTimestamp(
       completedAt,
@@ -2070,12 +2074,12 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       ) {
         throw new Error(
           'invalid funding exhaustion evidence: '
-          + 'OKX final request after_ms conflicts with committed anchor'
+          + `OKX final request after_ms conflicts with committed anchor; expected ${state.okxResumeAfterMs === null ? 'null' : `non-null <= ${state.okxResumeAfterMs}`}; actual ${evidence.finalRequestAfterMs}`
         );
       }
       if (evidence.exchangeId === 'bitget') {
         if (lease.exchangeId !== 'bitget') {
-          throw new Error('invalid funding exhaustion evidence: lease mismatch');
+          throw new Error(`invalid funding exhaustion evidence: lease mismatch; expected exchangeId=${lease.exchangeId}, generation=${lease.generation}, cutoffMs=${lease.cutoffMs}; actual exchangeId=${evidence.exchangeId}, generation=${evidence.generation}, cutoffMs=${evidence.cutoffMs}`);
         }
         const [left, right] = evidence.matchingRounds;
         if (!this.bitgetRoundsEqualInsideCurrentTransaction(
@@ -2083,7 +2087,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           left,
           right
         )) {
-          throw new Error('invalid funding exhaustion evidence: Bitget rounds are not equal');
+          throw new Error(`invalid funding exhaustion evidence: Bitget rounds are not equal; expected identical records; actual rounds ${left},${right} differ for generation ${lease.generation}`);
         }
       }
       this.deleteBitgetScansForLease.run(
@@ -2154,13 +2158,13 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         || state.symbol !== market.symbol
         || !stateAllowsIncremental(state)
       ) {
-        throw new Error('funding market is not eligible for incremental sync');
+        throw new Error(`funding market is not eligible for incremental sync: expected matching symbol=${market.symbol} and active market, no reactivation, complete successful coverage evidence; actual symbol=${state?.symbol ?? "missing"}, active=${state?.active ?? "missing"}, reactivationRequired=${state?.reactivationRequired ?? "missing"}, caughtUpGeneration=${state?.lastCaughtUpGeneration ?? "null"}, cutoff=${state?.lastCaughtUpCutoffMs ?? "null"}, exhaustedAt=${state?.lastExhaustedAt ?? "null"}, evidencePresent=${state?.lastExhaustionEvidenceJson != null}, coverageLastSuccessAt=${state?.coverageLastSuccessAt ?? "null"}`);
       }
       if (state.incrementalStatus === 'RUNNING') {
-        throw new Error('funding incremental task is already RUNNING');
+        throw new Error(`funding incremental task is already RUNNING: expected status other than RUNNING; actual ${state.incrementalStatus}, generation=${state.incrementalGeneration}`);
       }
       if (state.incrementalGeneration === MAX_SAFE_INTEGER) {
-        throw new Error('funding incremental generation exhausted');
+        throw new Error(`funding incremental generation exhausted: expected generation < ${MAX_SAFE_INTEGER}; actual ${state.incrementalGeneration}`);
       }
       const generation = state.incrementalGeneration + 1;
       const frozenBoundaryMs = state.latestFundingTimestampMs;
@@ -2201,13 +2205,13 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         || state.symbol !== market.symbol
         || state.incrementalStatus !== 'RUNNING'
       ) {
-        throw new Error('funding market has no interrupted RUNNING incremental task');
+        throw new Error(`funding market has no interrupted RUNNING incremental task: expected symbol=${market.symbol} and status=RUNNING; actual symbol=${state?.symbol ?? 'missing'}, status=${state?.incrementalStatus ?? 'missing'}`);
       }
       if (!stateAllowsIncremental(state)) {
-        throw new Error('interrupted incremental task is no longer eligible');
+        throw new Error(`interrupted incremental task is no longer eligible: expected matching symbol=${market.symbol} and active market, no reactivation, complete successful coverage evidence; actual symbol=${state?.symbol ?? "missing"}, active=${state?.active ?? "missing"}, reactivationRequired=${state?.reactivationRequired ?? "missing"}, caughtUpGeneration=${state?.lastCaughtUpGeneration ?? "null"}, cutoff=${state?.lastCaughtUpCutoffMs ?? "null"}, exhaustedAt=${state?.lastExhaustedAt ?? "null"}, evidencePresent=${state?.lastExhaustionEvidenceJson != null}, coverageLastSuccessAt=${state?.coverageLastSuccessAt ?? "null"}`);
       }
       if (state.incrementalGeneration === MAX_SAFE_INTEGER) {
-        throw new Error('funding incremental generation exhausted');
+        throw new Error(`funding incremental generation exhausted: expected generation < ${MAX_SAFE_INTEGER}; actual ${state.incrementalGeneration}`);
       }
       const generation = state.incrementalGeneration + 1;
       const frozenBoundaryMs = state.latestFundingTimestampMs;
@@ -2423,13 +2427,13 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       }
       if (state.active !== observation.active) {
         if (state.coverageGeneration === MAX_SAFE_INTEGER) {
-          throw new Error('funding coverage generation exhausted');
+          throw new Error(`funding coverage generation exhausted: expected generation < ${MAX_SAFE_INTEGER}; actual ${state.coverageGeneration}`);
         }
         if (
           state.incrementalStatus === 'RUNNING'
           && state.incrementalGeneration === MAX_SAFE_INTEGER
         ) {
-          throw new Error('funding incremental generation exhausted');
+          throw new Error(`funding incremental generation exhausted: expected generation < ${MAX_SAFE_INTEGER}; actual ${state.incrementalGeneration}`);
         }
       }
     }
@@ -2452,7 +2456,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           observedAt
         });
         if (!sqliteIntegerEquals(update.changes, 1)) {
-          throw new Error('funding discovery state changed during update');
+          throw new Error(`funding discovery state changed during update: expected 1 changed row; actual ${diagnosticValue(update.changes)}`);
         }
         continue;
       }
@@ -2507,7 +2511,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           : existing.incrementalErrorSummary
       });
       if (!sqliteIntegerEquals(update.changes, 1)) {
-        throw new Error('funding discovery state changed during transition');
+        throw new Error(`funding discovery state changed during transition: expected 1 changed row; actual ${diagnosticValue(update.changes)}`);
       }
       if (reactivated) {
         reactivatedMarketIds.push(observation.exchangeMarketId);
@@ -2535,30 +2539,30 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       market.exchangeMarketId
     ) as FundingStateDbRow | undefined;
     if (row === undefined) {
-      throw new Error('unknown funding market');
+      throw new Error(`unknown funding market: expected stored ${market.exchangeId}/${market.exchangeMarketId}; actual missing`);
     }
     const state = validateStateRow(row);
     if (state.symbol !== market.symbol) {
-      throw new Error('funding market is not eligible for coverage');
+      throw new Error(`funding market is not eligible for coverage: expected symbol ${market.symbol}; actual ${state.symbol}`);
     }
     if (kind === 'INACTIVE_FINAL') {
       if (state.active) {
-        throw new Error('active funding market is not eligible for inactive final coverage');
+        throw new Error(`active funding market is not eligible for inactive final coverage: expected active=false; actual ${state.active}`);
       }
       if (state.inactiveFinalCaughtUpAt !== null) {
-        throw new Error('inactive funding market already completed final coverage');
+        throw new Error(`inactive funding market already completed final coverage: expected inactiveFinalCaughtUpAt=null; actual ${state.inactiveFinalCaughtUpAt}`);
       }
     } else if (kind === 'REACTIVATION') {
       if (!state.active || !state.reactivationRequired) {
-        throw new Error('funding market is not eligible for reactivation coverage');
+        throw new Error(`funding market is not eligible for reactivation coverage: expected active=true and reactivationRequired=true; actual active=${state.active}, reactivationRequired=${state.reactivationRequired}`);
       }
     } else if (!state.active) {
-      throw new Error('inactive funding market is not eligible for coverage');
+      throw new Error(`inactive funding market is not eligible for coverage: expected active=true; actual ${state.active}`);
     } else if (state.reactivationRequired) {
-      throw new Error('funding market requires reactivation coverage');
+      throw new Error(`funding market requires reactivation coverage: expected kind=REACTIVATION; actual kind=${kind}, reactivationRequired=${state.reactivationRequired}`);
     }
     if (state.coverageGeneration === MAX_SAFE_INTEGER) {
-      throw new Error('funding coverage generation exhausted');
+      throw new Error(`funding coverage generation exhausted: expected generation < ${MAX_SAFE_INTEGER}; actual ${state.coverageGeneration}`);
     }
     const generation = state.coverageGeneration + 1;
     if (
@@ -2568,7 +2572,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
         || generation <= state.reactivationAfterGeneration
       )
     ) {
-      throw new Error('funding reactivation coverage generation is not newer');
+      throw new Error(`funding reactivation coverage generation is not newer: expected non-null reactivationAfterGeneration < ${generation}; actual ${state.reactivationAfterGeneration}`);
     }
     this.deleteBitgetScansForMarket.run(
       market.exchangeId,
@@ -2624,12 +2628,12 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           && checkpoint.round !== 2
           && checkpoint.round !== 3)
       ) {
-        throw new Error('invalid Bitget funding coverage checkpoint');
+        throw new Error(`invalid Bitget funding coverage checkpoint: expected exchangeId=bitget and round=1|2|3; actual exchangeId=${diagnosticValue(checkpoint.exchangeId)}, round=${checkpoint.exchangeId === 'bitget' ? diagnosticValue(checkpoint.round) : 'not applicable'}`);
       }
       return { exchangeId: 'bitget', round: checkpoint.round };
     }
     if (checkpoint.exchangeId !== 'okx') {
-      throw new Error('invalid OKX funding coverage checkpoint');
+      throw new Error(`invalid OKX funding coverage checkpoint: expected exchangeId=okx; actual ${diagnosticValue(checkpoint.exchangeId)}`);
     }
     return {
       exchangeId: 'okx',
@@ -2656,7 +2660,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
     ) {
       throw new Error(
         'funding page transaction failed validation: '
-        + 'invalid OKX funding checkpoint; anchor must equal page maximum'
+        + `invalid OKX funding checkpoint; anchor must equal page maximum; expected ${pageLatestMs}; actual ${checkpoint.recoveryAnchorMs}`
       );
     }
 
@@ -2727,7 +2731,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
 
       const existing = validateHistoryRow(row, market);
       if (observedAt < existing.lastObservedAt) {
-        throw new Error('funding page observation time moved backwards');
+        throw new Error(`funding page observation time moved backwards: expected observedAt >= ${existing.lastObservedAt}; actual ${observedAt}; record ${record.exchangeId}/${record.exchangeMarketId}/${record.fundingTimestampMs}`);
       }
       if (recordsEqual(existing, record)) {
         const update = this.updateUnchangedHistory.run({
@@ -2735,7 +2739,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
           observedAt
         });
         if (!sqliteIntegerEquals(update.changes, 1)) {
-          throw new Error('funding history changed during observation update');
+          throw new Error(`funding history changed during observation update: expected 1 changed row; actual ${diagnosticValue(update.changes)}`);
         }
         unchanged += 1;
         continue;
@@ -2747,7 +2751,7 @@ export class SqliteFundingRateRepository implements FundingRateRepository {
       });
       const update = this.updateRevisedHistory.run({ ...record, observedAt });
       if (!sqliteIntegerEquals(update.changes, 1)) {
-        throw new Error('funding history changed during revision update');
+        throw new Error(`funding history changed during revision update: expected 1 changed row; actual ${diagnosticValue(update.changes)}`);
       }
       revised += 1;
       revisedKeys.push({

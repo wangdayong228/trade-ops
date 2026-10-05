@@ -1,3 +1,4 @@
+import { invalidSourceValue, normalizedCurrencyCode, sourceSettledFundingRate } from '../../src/funding-rates/funding-market-discovery.js';
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
@@ -565,5 +566,24 @@ test('OKX discovery validates the complete documented envelope', async () => {
     const { source } = sourceForOkx(response);
     await rejectsWithLocation('OKX', new RegExp(field, 'i'), () =>
       source.discoverMarkets());
+  }
+});
+
+test('discovery preserves long actual values and currency conversion causes', () => {
+  const actual = 'x'.repeat(200) + 'terminal-discovery-evidence';
+  assert.throws(() => invalidSourceValue('Bitget', 'symbol', 'supported symbol', actual), /terminal-discovery-evidence/u);
+  for (const exchange of ['Bitget', 'OKX'] as const) {
+    const original = new Error(`${exchange}-currency-root`);
+    assert.throws(() => normalizedCurrencyCode(exchange, { safeCurrencyCode() { throw original; } }, 'BTC', 'base'), (error: unknown) => {
+      assert(error instanceof Error);
+      assert.equal(error.cause, original);
+      return true;
+    });
+    assert.throws(() => sourceSettledFundingRate(exchange, { exchangeId: exchange === 'Bitget' ? 'bitget' : 'okx', exchangeMarketId: 'BTC', symbol: 'BTC/USDT:USDT' }, 'bad-rate', 1, {}), (error: unknown) => {
+      assert(error instanceof Error);
+      assert(error.cause instanceof Error);
+      assert.match(error.cause.message, /bad-rate/u);
+      return true;
+    });
   }
 });

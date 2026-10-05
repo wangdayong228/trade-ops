@@ -75,8 +75,8 @@ export type NoOrderSubmittedReason =
 export class NoOrderSubmittedError extends Error {
   readonly code = 'NO_ORDER_SUBMITTED';
 
-  constructor(readonly reason: NoOrderSubmittedReason = 'UNCLASSIFIED') {
-    super('order was not submitted');
+  constructor(readonly reason: NoOrderSubmittedReason = 'UNCLASSIFIED', options?: ErrorOptions) {
+    super('order was not submitted', options);
     this.name = 'NoOrderSubmittedError';
   }
 }
@@ -84,15 +84,15 @@ export class NoOrderSubmittedError extends Error {
 function parsedDecimal(value: string, field: string): Decimal {
   try {
     return decimal(value);
-  } catch {
-    throw new Error(`invalid ${field}: must be a decimal`);
+  } catch (error) {
+    throw new Error(`invalid ${field}: expected decimal; actual ${value}`, { cause: error });
   }
 }
 
 function positiveDecimal(value: string, field: string): Decimal {
   const parsed = parsedDecimal(value, field);
   if (!parsed.isFinite() || parsed.lte('0')) {
-    throw new Error(`invalid ${field}: must be finite and greater than zero`);
+    throw new Error(`invalid ${field}: must be finite and greater than zero; actual ${value}`);
   }
   return parsed;
 }
@@ -100,20 +100,21 @@ function positiveDecimal(value: string, field: string): Decimal {
 function nonNegativeDecimal(value: string, field: string): Decimal {
   const parsed = parsedDecimal(value, field);
   if (!parsed.isFinite() || parsed.lt('0')) {
-    throw new Error(`invalid ${field}: must be finite and non-negative`);
+    throw new Error(`invalid ${field}: must be finite and non-negative; actual ${value}`);
   }
   return parsed;
 }
 
 function exactDecimalConstructor(
   requiredPrecision: number,
-  field: string
+  field: string,
+  operands: string
 ): Decimal.Constructor {
   if (
     !Number.isSafeInteger(requiredPrecision)
     || requiredPrecision > 1_000_000_000
   ) {
-    throw new Error(`invalid ${field}: exact result exceeds supported precision`);
+    throw new Error(`invalid ${field}: required precision ${requiredPrecision} exceeds supported maximum 1000000000; ${operands}`);
   }
   return Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -130,16 +131,17 @@ export function baseToExchangeAmount(
   const integerDigits = Math.max(1, base.e - size.e + 1);
   const ExactDecimal = exactDecimalConstructor(
     Math.max(base.sd() + size.sd() + 2, integerDigits + 2),
-    'contract count'
+    'contract count',
+    `baseQuantity=${baseQuantity}, contractSize=${contractSize}`
   );
   const exactBase = new ExactDecimal(baseQuantity);
   const exactSize = new ExactDecimal(contractSize);
   if (!exactBase.mod(exactSize).isZero()) {
-    throw new Error('base quantity does not produce a whole contract count');
+    throw new Error(`base quantity does not produce a whole contract count: baseQuantity=${baseQuantity}, contractSize=${contractSize}, actual contracts=${exactBase.div(exactSize).toString()}`);
   }
   const contracts = exactBase.div(exactSize);
   if (!contracts.isFinite() || contracts.lte('0')) {
-    throw new Error('invalid contract count: derived value must be finite and greater than zero');
+    throw new Error(`invalid contract count: expected finite and greater than zero; actual ${contracts.toString()}; baseQuantity=${baseQuantity}, contractSize=${contractSize}`);
   }
   return contracts.toFixed();
 }
@@ -152,7 +154,8 @@ export function exchangeAmountToBase(
   const size = positiveDecimal(contractSize, 'contractSize');
   const ExactDecimal = exactDecimalConstructor(
     exchangeAmount.sd() + size.sd() + 2,
-    'base quantity'
+    'base quantity',
+    `amount=${amount}, contractSize=${contractSize}`
   );
   const baseQuantity = new ExactDecimal(amount).mul(contractSize);
   if (
@@ -160,7 +163,7 @@ export function exchangeAmountToBase(
     || baseQuantity.lt('0')
     || (exchangeAmount.gt('0') && baseQuantity.isZero())
   ) {
-    throw new Error('invalid base quantity: derived value must be finite and must not underflow');
+    throw new Error(`invalid base quantity: derived value must be finite and must not underflow; actual ${baseQuantity.toString()}; amount=${amount}, contractSize=${contractSize}`);
   }
   return baseQuantity.toFixed();
 }

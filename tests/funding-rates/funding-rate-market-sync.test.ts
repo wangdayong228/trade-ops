@@ -2830,3 +2830,67 @@ test('OKX createIncrementalTask rejects forged boundary with zero side effects',
     persistenceUnchanged: true
   });
 });
+
+for (const category of ['coverage', 'incremental'] as const) {
+  test(`retains page failure before ${category} failure-write error`, async (t) => {
+    const { repository: target } = setupRepository(t, [BITGET_MARKET]);
+    if (category === 'incremental') seedCaughtUpHistory(target, BITGET_MARKET, [fundingRecord(BITGET_MARKET, 70)]);
+    const repository = new ObservedFundingRateRepository(target);
+    const original = new Error('original-page-failure');
+    const secondary = new Error('failure-write-failure');
+    t.mock.method(repository, category === 'coverage' ? 'failCoverage' : 'failIncremental', () => { throw secondary; });
+    const source = new FakeFundingRateSource('bitget', [{ marketId: BITGET_MARKET.exchangeMarketId, cursor: { exchangeId: 'bitget', pageNo: 1 }, responseError: original }]);
+    const executor = new FakeFundingRequestExecutor();
+    const task = category === 'coverage'
+      ? coverageTask(source, repository, executor, startCoverage(repository, BITGET_MARKET))
+      : incrementalTask(source, repository, executor, repository.startIncremental(BITGET_MARKET, STARTED_AT));
+    await assert.rejects(task.runNextPage(), (error: unknown) => {
+      assert(error instanceof AggregateError);
+      assert.deepEqual(error.errors, [original, secondary]);
+      return true;
+    });
+    assert.equal(repository.coverageCommits.length, 0);
+    assert.equal(repository.incrementalCommits.length, 0);
+    assert.equal(source.fetchCalls.length, 1);
+  });
+}
+
+for (const [field, value] of [['exchangeId', 'okx'], ['exchangeMarketId', 'OTHER'], ['symbol', 'ETH/USDT:USDT'], ['fundingTimestampMs', -1], ['contentHash', 'wrong-hash']] as const) {
+  test(`bad funding page exposes ${field} and stops before commit`, async (t) => {
+    const { repository: target } = setupRepository(t, [BITGET_MARKET]);
+    const repository = new ObservedFundingRateRepository(target);
+    const events = new RecordingEventSink();
+    const source = new FakeFundingRateSource('bitget', [bitgetStep(BITGET_MARKET, 1, [{ ...fundingRecord(BITGET_MARKET, 79), [field]: value } as SettledFundingRate])]);
+    const task = coverageTask(source, repository, new FakeFundingRequestExecutor(), startCoverage(repository, BITGET_MARKET), events);
+    assert.equal(await task.runNextPage(), 'done');
+    const output = JSON.stringify(events.events);
+    assert.match(output, new RegExp(field));
+    assert.ok(output.includes(String(value)));
+    assert.match(output, /expected.*actual/u);
+    assert.equal(repository.coverageCommits.length, 0);
+    assert.equal(source.fetchCalls.length, 1);
+    assert.equal(repository.listHistory(BITGET_MARKET).length, 0);
+  });
+}
+
+test('cursor failure diagnostics do not coerce an untrusted cursor value', async (t) => {
+  const { repository: target } = setupRepository(t, [BITGET_MARKET]);
+  const repository = new ObservedFundingRateRepository(target);
+  let calls = 0;
+  const hostile = {
+    toJSON() { calls++; return 'UNSAFE-CURSOR'; },
+    toString() { calls++; return 'UNSAFE-CURSOR'; }
+  };
+  const source = new FakeFundingRateSource('bitget', [{
+    marketId: BITGET_MARKET.exchangeMarketId,
+    cursor: { exchangeId: 'bitget', pageNo: 1 },
+    page: { ...fakeBitgetPage(1, []), cursor: { exchangeId: 'bitget', pageNo: hostile as unknown as number } }
+  }]);
+  const events = new RecordingEventSink();
+  const task = coverageTask(source, repository, new FakeFundingRequestExecutor(), startCoverage(repository, BITGET_MARKET), events);
+  assert.equal(await task.runNextPage(), 'done');
+  assert.equal(calls, 0);
+  assert.doesNotMatch(JSON.stringify(events.events), /UNSAFE-CURSOR/u);
+  assert.equal(repository.coverageCommits.length, 0);
+  assert.equal(source.fetchCalls.length, 1);
+});

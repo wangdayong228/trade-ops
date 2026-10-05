@@ -1,3 +1,5 @@
+import { projectErrorEvidence } from '../errors/trade-ops-error.js';
+import type { ErrorEvidence } from '../errors/error-evidence.js';
 import { Decimal } from 'decimal.js';
 import type { ExecutionMode, OrderSnapshot } from '../domain/types.js';
 import type { ExchangeRegistry } from '../exchanges/exchange-registry.js';
@@ -32,6 +34,8 @@ export interface EvidencePending {
   readonly strategyOrderId?: string;
   readonly clientOrderId?: string;
   readonly exchangeId?: string;
+  readonly check?: string;
+  readonly evidence?: ErrorEvidence;
   readonly expected?: string;
   readonly actual?: string;
 }
@@ -53,11 +57,14 @@ interface PendingContext {
   readonly strategyOrderId?: string;
   readonly clientOrderId?: string;
   readonly exchangeId?: string;
+  readonly check?: string;
+  readonly evidence?: ErrorEvidence;
   readonly expected?: string;
   readonly actual?: string;
 }
 
 interface MismatchContext {
+  readonly check: string;
   readonly expected: string;
   readonly actual: string;
 }
@@ -170,11 +177,13 @@ function exposureKnown(
 }
 
 function invalidTopology(
-  orders: readonly Readonly<StrategyOrderRecord>[]
+  orders: readonly Readonly<StrategyOrderRecord>[],
+  mismatch: MismatchContext
 ): EvidencePending {
   return {
     kind: 'pending',
     reason: 'INVALID_LOCAL_TOPOLOGY',
+    ...mismatch,
     exposureKnown: exposureKnown(orders)
   };
 }
@@ -199,7 +208,7 @@ function gtcFollowsRequiredMarkets(
 function orderPending(
   order: Readonly<StrategyOrderRecord>,
   reason: EvidencePendingReason,
-  mismatch?: Readonly<MismatchContext>
+  mismatch?: Readonly<Partial<MismatchContext> & { evidence?: ErrorEvidence }>
 ): PendingContext {
   const context: PendingContext = {
     reason,
@@ -230,10 +239,11 @@ function terminalOrderStatus(
 }
 
 function scalarMismatch(
+  check: string,
   expected: string,
   actual: string
 ): MismatchContext {
-  return { expected, actual };
+  return { check, expected, actual };
 }
 
 function remoteEvidenceMismatch(
@@ -241,22 +251,22 @@ function remoteEvidenceMismatch(
   snapshot: Readonly<OrderSnapshot>
 ): MismatchContext | null {
   if (snapshot.exchangeId !== order.exchangeId) {
-    return scalarMismatch(order.exchangeId, snapshot.exchangeId);
+    return scalarMismatch('exchangeId', order.exchangeId, snapshot.exchangeId);
   }
   if (snapshot.clientOrderId !== order.clientOrderId) {
-    return scalarMismatch(order.clientOrderId, snapshot.clientOrderId);
+    return scalarMismatch('clientOrderId', order.clientOrderId, snapshot.clientOrderId);
   }
   if (snapshot.symbol !== order.request.symbol) {
-    return scalarMismatch(order.request.symbol, snapshot.symbol);
+    return scalarMismatch('symbol', order.request.symbol, snapshot.symbol);
   }
   if (snapshot.kind !== order.request.kind) {
-    return scalarMismatch(order.request.kind, snapshot.kind);
+    return scalarMismatch('kind', order.request.kind, snapshot.kind);
   }
   if (snapshot.type !== order.request.type) {
-    return scalarMismatch(order.request.type, snapshot.type);
+    return scalarMismatch('type', order.request.type, snapshot.type);
   }
   if (snapshot.side !== order.request.side) {
-    return scalarMismatch(order.request.side, snapshot.side);
+    return scalarMismatch('side', order.request.side, snapshot.side);
   }
 
   const requested = parsedDecimal(snapshot.requestedBaseQuantity);
@@ -268,6 +278,7 @@ function remoteEvidenceMismatch(
     )
   ) {
     return scalarMismatch(
+      'requestedBaseQuantity',
       order.request.baseQuantity,
       snapshot.requestedBaseQuantity
     );
@@ -276,13 +287,13 @@ function remoteEvidenceMismatch(
     order.exchangeOrderId !== null
     && snapshot.exchangeOrderId !== order.exchangeOrderId
   ) {
-    return scalarMismatch(order.exchangeOrderId, snapshot.exchangeOrderId);
+    return scalarMismatch('exchangeOrderId', order.exchangeOrderId, snapshot.exchangeOrderId);
   }
   if (
     SNAPSHOT_STATUSES.has(snapshot.status)
     && !STATUS_TRANSITIONS[order.status].has(snapshot.status)
   ) {
-    return scalarMismatch(order.status, snapshot.status);
+    return scalarMismatch('status', order.status, snapshot.status);
   }
   return null;
 }
@@ -306,13 +317,19 @@ export function inspectLocalTopology(
       strategy.effectiveBaseQuantity
     )
   ));
-  if (
-    !legalRoleSet.has(roles)
-    || waitingWithoutGtc
-    || !marketQuantitiesMatch
-    || !gtcFollowsRequiredMarkets(strategy, orders)
-  ) {
-    return invalidTopology(orders);
+  if (!legalRoleSet.has(roles)) {
+    return invalidTopology(orders, scalarMismatch('roles', [...legalRoleSet].join(' or '), roles));
+  }
+  if (waitingWithoutGtc) {
+    return invalidTopology(orders, scalarMismatch('WAITING_HEDGE.gtc', 'at least one hedge GTC', roles));
+  }
+  if (!marketQuantitiesMatch) {
+    const invalid = orders.find((order) => order.role.endsWith('_MARKET')
+      && !decimalEquals(order.request.baseQuantity, strategy.effectiveBaseQuantity));
+    return invalidTopology(orders, scalarMismatch('market.baseQuantity', strategy.effectiveBaseQuantity, `${invalid?.role}:${invalid?.request.baseQuantity}`));
+  }
+  if (!gtcFollowsRequiredMarkets(strategy, orders)) {
+    return invalidTopology(orders, scalarMismatch('orderSequence', 'GTC after all required markets', orders.map(({ role }, index) => `${index}:${role}`).join(',')));
   }
   return { kind: 'valid', orders };
 }
@@ -339,8 +356,8 @@ export class HedgeOrderEvidenceCollector {
       let snapshot: OrderSnapshot | null;
       try {
         snapshot = await this.lookup(lookupOrder);
-      } catch {
-        firstPending ??= orderPending(lookupOrder, 'ORDER_LOOKUP_FAILED');
+      } catch (error) {
+        firstPending ??= orderPending(lookupOrder, 'ORDER_LOOKUP_FAILED', { check: 'orderLookup', evidence: projectErrorEvidence(error) });
         continue;
       }
 
@@ -350,7 +367,7 @@ export class HedgeOrderEvidenceCollector {
         firstPending ??= orderPending(
           lookupOrder,
           'ORDER_EVIDENCE_MISMATCH',
-          scalarMismatch(lookupOrder.id, 'missing')
+          scalarMismatch('strategyOrderId', lookupOrder.id, 'missing')
         );
         continue;
       }
@@ -379,11 +396,11 @@ export class HedgeOrderEvidenceCollector {
         attachment = this.repository.attachOrderSnapshot(order.id, snapshot);
       } catch (error) {
         if (error instanceof OrderSnapshotValidationError) {
-          firstPending ??= orderPending(order, 'ORDER_SNAPSHOT_INVALID');
+          firstPending ??= orderPending(order, 'ORDER_SNAPSHOT_INVALID', { check: 'attachOrderSnapshot', evidence: projectErrorEvidence(error) });
         } else if (error instanceof OrderSnapshotWriteConflictError) {
           const filled = parsedDecimal(snapshot.filledBaseQuantity);
           validatedUnpersistedExposure ||= filled !== null && filled.gt(0);
-          firstPending ??= orderPending(order, 'SNAPSHOT_WRITE_CONFLICT');
+          firstPending ??= orderPending(order, 'SNAPSHOT_WRITE_CONFLICT', { check: 'attachOrderSnapshot', evidence: projectErrorEvidence(error) });
         } else {
           throw error;
         }
@@ -397,7 +414,7 @@ export class HedgeOrderEvidenceCollector {
         firstPending ??= orderPending(
           order,
           'ORDER_EVIDENCE_MISMATCH',
-          scalarMismatch('DEFINITELY_NOT_SUBMITTED', 'REMOTE_OBSERVED')
+          scalarMismatch('submissionDisposition', 'DEFINITELY_NOT_SUBMITTED', 'REMOTE_OBSERVED')
         );
       }
     }
@@ -429,12 +446,14 @@ export class HedgeOrderEvidenceCollector {
         order.request.symbol,
         order.request.kind
       );
-    } catch {
-      return gateway.findOrderByClientId(
-        order.clientOrderId,
-        order.request.symbol,
-        order.request.kind
-      );
+    } catch (fetchError) {
+      try {
+        return await gateway.findOrderByClientId(
+          order.clientOrderId, order.request.symbol, order.request.kind
+        );
+      } catch (findError) {
+        throw new AggregateError([fetchError, findError], 'order lookup failed by exchange ID and client ID');
+      }
     }
   }
 

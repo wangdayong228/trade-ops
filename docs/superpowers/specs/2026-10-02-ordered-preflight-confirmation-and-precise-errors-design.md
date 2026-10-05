@@ -4,6 +4,8 @@
 
 状态：已批准（用户于 2026-10-02 授权完成计划并实施，过程自动确认）
 
+2026-10-05 补充：用户已批准 [Fail-fast 错误证据修订](2026-10-05-fail-fast-with-evidence-design.md)。本文第 6 节及相关验收中“第三方消息/cause 一律丢弃”和错误证据长度截断的要求由新设计替代；具体原因经白名单投影与脱敏后可以输出和持久化，原始任意对象及秘密仍禁止输出。本文的预检顺序、状态转换、事务和权限不变量继续有效。
+
 ## 1. 这份文档是什么
 
 本文只从已批准的 `docs/superpowers/specs/2026-08-09-ordered-workflows-and-precise-errors-design.md` 抽出 **当前 `main` 还没实现** 的需求。实现基线是今天的 `main`：对账模块、schema v2、`failure_code`、`submission_disposition` 和现有启动顺序都保留。

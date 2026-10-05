@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { Decimal } from 'decimal.js';
@@ -352,8 +353,8 @@ function isNonNegativeSqliteInteger(value: unknown): boolean {
   );
 }
 
-function invalid(context: string, detail: string): never {
-  throw new StorageValidationError(`invalid ${context}: ${detail}`);
+function invalid(context: string, detail: string, options?: ErrorOptions): never {
+  throw new StorageValidationError(`invalid ${context}: ${detail}`, options);
 }
 
 function dataObject(
@@ -368,28 +369,28 @@ function dataObject(
     || Array.isArray(value)
     || Object.getPrototypeOf(value) !== Object.prototype
   ) {
-    return invalid(context, 'must be a plain data object');
+    return invalid(context, `must be a plain data object; actual ${diagnosticValue(value)}`);
   }
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const ownKeys = Reflect.ownKeys(value);
   if (ownKeys.some((key) => typeof key !== 'string')) {
-    return invalid(context, 'contains unsupported keys');
+    return invalid(context, 'expected string keys; actual symbol key');
   }
   for (const key of ownKeys as string[]) {
     if (!requiredKeys.has(key) && !optionalKeys.has(key)) {
-      return invalid(context, 'contains unsupported fields');
+      return invalid(context, `unsupported field ${key}; expected ${[...requiredKeys, ...optionalKeys].join(',')}`);
     }
     const descriptor = descriptors[key];
     if (
       descriptor === undefined
       || !Object.prototype.hasOwnProperty.call(descriptor, 'value')
     ) {
-      return invalid(context, 'contains accessors');
+      return invalid(context, `field ${key}: expected data property; actual accessor`);
     }
   }
   for (const key of requiredKeys) {
     if (!Object.prototype.hasOwnProperty.call(descriptors, key)) {
-      return invalid(context, 'is missing required fields');
+      return invalid(context, `field ${key}: expected required field; actual missing`);
     }
   }
   const result: DataObject = {};
@@ -410,7 +411,7 @@ function nonEmptyString(
     || value.trim() !== value
     || value.length > maximumLength
   ) {
-    return invalid(context, 'must be a non-empty bounded string');
+    return invalid(context, `must be a non-empty trimmed string at most ${maximumLength} characters; actual ${diagnosticValue(value)}`);
   }
   return value;
 }
@@ -421,7 +422,7 @@ function enumValue<T extends string>(
   context: string
 ): T {
   if (typeof value !== 'string' || !values.has(value as T)) {
-    return invalid(context, 'contains an unsupported value');
+    return invalid(context, `contains an unsupported value; expected ${[...values].join("|")}; actual ${diagnosticValue(value)}`);
   }
   return value as T;
 }
@@ -430,10 +431,10 @@ function isoTimestamp(value: unknown, context: string): string {
   const timestamp = nonEmptyString(value, context, 64);
   try {
     if (new Date(timestamp).toISOString() !== timestamp) {
-      return invalid(context, 'must be a canonical ISO timestamp');
+      return invalid(context, `must be a canonical ISO timestamp; actual ${diagnosticValue(value)}`);
     }
   } catch {
-    return invalid(context, 'must be a canonical ISO timestamp');
+    return invalid(context, `must be a canonical ISO timestamp; actual ${diagnosticValue(value)}`);
   }
   return timestamp;
 }
@@ -449,18 +450,18 @@ function decimalValue(
     || value.length > 10_000
     || !DECIMAL_STRING_PATTERN.test(value)
   ) {
-    return invalid(context, 'must be a bounded decimal string');
+    return invalid(context, `must be a bounded decimal string; actual ${diagnosticValue(value)}`);
   }
   let parsed: Decimal;
   try {
     parsed = new StorageDecimal(value);
   } catch {
-    return invalid(context, 'must be a decimal string');
+    return invalid(context, `must be a decimal string; actual ${diagnosticValue(value)}`);
   }
   const coefficient = value.split(/[eE]/, 1)[0] ?? '';
   const lexicalValueIsZero = !/[1-9]/.test(coefficient);
   if (parsed.isZero() && !lexicalValueIsZero) {
-    return invalid(context, 'must be within the supported exponent range');
+    return invalid(context, `must be within the supported exponent range; actual ${diagnosticValue(value)}`);
   }
   if (
     !parsed.isFinite()
@@ -469,7 +470,7 @@ function decimalValue(
   ) {
     return invalid(context, allowZero
       ? 'must be finite and non-negative'
-      : 'must be finite and greater than zero');
+      : 'must be finite and greater than zero', { cause: new Error(`actual ${diagnosticValue(value)}`) });
   }
   return value;
 }
@@ -502,7 +503,7 @@ function exactSumEquals(
   ) {
     return invalid(
       context,
-      'exact snapshot quantity comparison exceeds supported precision'
+      `exact snapshot quantity comparison exceeds supported precision; expected at most ${MAX_EXACT_DECIMAL_PRECISION}; actual ${requiredPrecision}`
     );
   }
   const ExactDecimal = StorageDecimal.clone({ precision: requiredPrecision });
@@ -524,12 +525,12 @@ function deepFreeze<T>(value: T): T {
 
 function parseJson(json: unknown, context: string): unknown {
   if (typeof json !== 'string') {
-    return invalid(context, 'JSON storage is not text');
+    return invalid(context, `JSON storage is not text; actual ${typeof json}`);
   }
   try {
     return JSON.parse(json) as unknown;
   } catch {
-    return invalid(context, 'JSON is malformed');
+    return invalid(context, `JSON is malformed; actual text length ${json.length}; parser body omitted`);
   }
 }
 
@@ -559,10 +560,10 @@ function publicMarketSnapshot(
   const kind = enumValue(object.kind, MARKET_KINDS, `${context} market kind`);
   const base = nonEmptyString(object.base, `${context} base asset`, 64);
   if (object.quote !== 'USDT') {
-    return invalid(context, 'quote must be USDT');
+    return invalid(context, `quote must be USDT; actual ${diagnosticValue(object.quote)}`);
   }
   if (object.active !== true) {
-    return invalid(context, 'market must be active');
+    return invalid(context, `market must be active; expected true; actual ${diagnosticValue(object.active)}`);
   }
   if (
     exchangeId !== expected.exchangeId
@@ -570,7 +571,9 @@ function publicMarketSnapshot(
     || kind !== expected.kind
     || base !== expected.base
   ) {
-    return invalid(context, 'identity does not match preflight');
+    for (const [field, actual] of [['exchangeId', exchangeId], ['symbol', symbol], ['kind', kind], ['base', base]] as const) {
+      if (actual !== expected[field]) return invalid(context, `${field} identity does not match preflight; expected ${expected[field]}; actual ${actual}`);
+    }
   }
   const amountStep = decimalValue(
     object.amountStep,
@@ -622,14 +625,14 @@ function publicMarketSnapshot(
     result.maxBaseAmount !== undefined
     && new StorageDecimal(result.minBaseAmount).gt(result.maxBaseAmount)
   ) {
-    return invalid(context, 'minimum base amount exceeds maximum');
+    return invalid(context, `minimum base amount exceeds maximum; minimum=${result.minBaseAmount}, maximum=${result.maxBaseAmount}`);
   }
   if (
     result.minQuoteNotional !== undefined
     && result.maxQuoteNotional !== undefined
     && new StorageDecimal(result.minQuoteNotional).gt(result.maxQuoteNotional)
   ) {
-    return invalid(context, 'minimum quote notional exceeds maximum');
+    return invalid(context, `minimum quote notional exceeds maximum; minimum=${result.minQuoteNotional}, maximum=${result.maxQuoteNotional}`);
   }
   return result;
 }
@@ -672,7 +675,7 @@ function publicPreflightSnapshot(value: unknown): PreflightResult {
     128
   );
   if (spotExchangeId === contractExchangeId) {
-    return invalid(context, 'spot and contract exchanges must differ');
+    return invalid(context, `spot and contract exchanges must differ; actual spot=${spotExchangeId}, contract=${contractExchangeId}`);
   }
   const symbol = nonEmptyString(object.symbol, `${context} symbol`, 256);
   const symbolParts = symbol.split('/');
@@ -682,7 +685,7 @@ function publicPreflightSnapshot(value: unknown): PreflightResult {
     || symbolParts[0].length === 0
     || symbolParts[1] !== 'USDT'
   ) {
-    return invalid(context, 'symbol must be a BASE/USDT pair');
+    return invalid(context, `symbol must be a BASE/USDT pair; actual ${symbol}`);
   }
   const mode = enumValue(
     object.mode,
@@ -700,7 +703,7 @@ function publicPreflightSnapshot(value: unknown): PreflightResult {
     false
   );
   if (new StorageDecimal(effectiveBaseQuantity).gt(requestedBaseQuantity)) {
-    return invalid(context, 'effective quantity exceeds requested quantity');
+    return invalid(context, `effective quantity exceeds requested quantity; requested=${requestedBaseQuantity}, effective=${effectiveBaseQuantity}`);
   }
   const spotMarket = publicMarketSnapshot(object.spotMarket, {
     exchangeId: spotExchangeId,
@@ -719,7 +722,7 @@ function publicPreflightSnapshot(value: unknown): PreflightResult {
     `${context} account settings`
   );
   if (object.riskAcknowledgementRequired !== true) {
-    return invalid(context, 'risk acknowledgement must be required');
+    return invalid(context, `risk acknowledgement must be required; expected true; actual ${diagnosticValue(object.riskAcknowledgementRequired)}`);
   }
   return {
     spotExchangeId,
@@ -784,13 +787,13 @@ function publicOrderRequest(value: unknown, context: string): OrderRequest {
   }
   if (Object.prototype.hasOwnProperty.call(object, 'timeInForce')) {
     if (object.timeInForce !== 'GTC') {
-      return invalid(context, 'contains unsupported time in force');
+      return invalid(context, `contains unsupported time in force; expected GTC; actual ${diagnosticValue(object.timeInForce)}`);
     }
     request.timeInForce = 'GTC';
   }
   if (Object.prototype.hasOwnProperty.call(object, 'positionSide')) {
     if (object.positionSide !== 'SHORT') {
-      return invalid(context, 'contains unsupported position side');
+      return invalid(context, `contains unsupported position side; expected SHORT; actual ${diagnosticValue(object.positionSide)}`);
     }
     request.positionSide = 'SHORT';
   }
@@ -860,25 +863,25 @@ function validatedRequestForRole(
   const request = publicOrderRequest(value, `${prefix} request`);
   const expected = expectedLeg(strategy, role);
   if (request.symbol !== strategy.symbol) {
-    return invalid(prefix, 'request symbol does not match strategy');
+    return invalid(prefix, `request symbol does not match strategy; expected ${strategy.symbol}; actual ${request.symbol}`);
   }
   if (request.kind !== expected.kind) {
     return invalid(
       prefix,
       role.startsWith('SPOT_')
-        ? 'spot role requires spot market kind'
-        : 'contract role requires swap market kind'
+        ? `spot role requires spot market kind; actual ${request.kind}`
+        : `contract role requires swap market kind; actual ${request.kind}`
     );
   }
   if (request.side !== expected.side) {
-    return invalid(prefix, 'request side does not match order role');
+    return invalid(prefix, `request side does not match order role ${role}; expected ${expected.side}; actual ${request.side}`);
   }
   if (request.type !== expected.type) {
     return invalid(
       prefix,
       role.endsWith('_MARKET')
-        ? 'market role requires a market request'
-        : 'hedge role requires a limit request'
+        ? `market role requires a market request; actual ${request.type}`
+        : `hedge role requires a limit request; actual ${request.type}`
     );
   }
   const isHedge = role.endsWith('_HEDGE_GTC');
@@ -886,7 +889,7 @@ function validatedRequestForRole(
     isHedge
     && (request.timeInForce !== 'GTC' || request.price === undefined)
   ) {
-    return invalid(prefix, 'hedge role requires a priced GTC limit request');
+    return invalid(prefix, `hedge role requires a priced GTC limit request; actual timeInForce=${diagnosticValue(request.timeInForce)}, price=${diagnosticValue(request.price)}`);
   }
   if (
     !isHedge
@@ -895,7 +898,7 @@ function validatedRequestForRole(
       || request.price !== undefined
     )
   ) {
-    return invalid(prefix, 'market role cannot contain limit fields');
+    return invalid(prefix, `market role cannot contain limit fields; actual timeInForce=${diagnosticValue(request.timeInForce)}, price=${diagnosticValue(request.price)}`);
   }
   const isContract = role.startsWith('CONTRACT_');
   if (
@@ -907,7 +910,7 @@ function validatedRequestForRole(
   ) {
     return invalid(
       prefix,
-      'contract request requires SHORT and the confirmed margin mode'
+      `contract request requires SHORT and the confirmed margin mode ${strategy.preflight.accountSettings.marginMode}; actual positionSide=${diagnosticValue(request.positionSide)}, marginMode=${diagnosticValue(request.marginMode)}`
     );
   }
   if (
@@ -917,17 +920,17 @@ function validatedRequestForRole(
       || request.marginMode !== undefined
     )
   ) {
-    return invalid(prefix, 'spot request cannot contain contract fields');
+    return invalid(prefix, `spot request cannot contain contract fields; actual positionSide=${diagnosticValue(request.positionSide)}, marginMode=${diagnosticValue(request.marginMode)}`);
   }
   if (
     new StorageDecimal(request.baseQuantity).gt(
       strategy.effectiveBaseQuantity
     )
   ) {
-    return invalid(prefix, 'request quantity exceeds strategy quantity');
+    return invalid(prefix, `request quantity exceeds strategy quantity; expected at most ${strategy.effectiveBaseQuantity}; actual ${request.baseQuantity}`);
   }
   if (request.clientOrderId !== makeClientOrderId(strategy.id, role)) {
-    return invalid(prefix, 'client order id does not match saved role');
+    return invalid(prefix, `client order id does not match saved role ${role}; expected ${makeClientOrderId(strategy.id, role)}; actual ${request.clientOrderId}`);
   }
   return { role, exchangeId: expected.exchangeId, request };
 }
@@ -993,10 +996,10 @@ function validatedSnapshot(
 ): OrderSnapshot {
   const snapshot = publicOrderSnapshot(value, context);
   if (snapshot.exchangeId !== order.exchangeId) {
-    return invalid(context, 'exchange does not match planned order');
+    return invalid(context, `exchange does not match planned order; expected ${order.exchangeId}; actual ${snapshot.exchangeId}`);
   }
   if (snapshot.clientOrderId !== order.clientOrderId) {
-    return invalid(context, 'client order id does not match planned order');
+    return invalid(context, `client order id does not match planned order; expected ${order.clientOrderId}; actual ${snapshot.clientOrderId}`);
   }
   if (
     snapshot.symbol !== order.request.symbol
@@ -1013,7 +1016,7 @@ function validatedSnapshot(
             ? 'type'
             : 'side'
     );
-    return invalid(context, `${differingField} does not match planned request`);
+    return invalid(context, `${differingField} does not match planned request; expected ${order.request[differingField]}; actual ${snapshot[differingField]}`);
   }
   if (
     !decimalEqual(
@@ -1021,29 +1024,22 @@ function validatedSnapshot(
       order.request.baseQuantity
     )
   ) {
-    return invalid(context, 'requested quantity does not match planned request');
+    return invalid(context, `requested quantity does not match planned request; expected ${order.request.baseQuantity}; actual ${snapshot.requestedBaseQuantity}`);
   }
   const requested = new StorageDecimal(snapshot.requestedBaseQuantity);
   const filled = new StorageDecimal(snapshot.filledBaseQuantity);
   const remaining = new StorageDecimal(snapshot.remainingBaseQuantity);
-  if (
-    filled.gt(requested)
-    || remaining.gt(requested)
-    || !exactSumEquals(
-      snapshot.requestedBaseQuantity,
-      snapshot.filledBaseQuantity,
-      snapshot.remainingBaseQuantity,
-      context
-    )
-  ) {
-    return invalid(context, 'snapshot quantity totals are inconsistent');
+  if (filled.gt(requested)) return invalid(context, `filled quantity: expected at most ${requested.toString()}; actual ${filled.toString()}`);
+  if (remaining.gt(requested)) return invalid(context, `remaining quantity: expected at most ${requested.toString()}; actual ${remaining.toString()}`);
+  if (!exactSumEquals(snapshot.requestedBaseQuantity, snapshot.filledBaseQuantity, snapshot.remainingBaseQuantity, context)) {
+    return invalid(context, `snapshot quantity totals are inconsistent: expected filled + remaining = ${snapshot.requestedBaseQuantity}; actual filled=${snapshot.filledBaseQuantity}, remaining=${snapshot.remainingBaseQuantity}`);
   }
   if (!STATUS_TRANSITIONS[order.status].has(snapshot.status)) {
-    return invalid(context, 'order status would regress');
+    return invalid(context, `order status would regress; expected one of ${[...STATUS_TRANSITIONS[order.status]].join("|")} from ${order.status}; actual ${snapshot.status}`);
   }
   if (previous !== null) {
     if (snapshot.exchangeOrderId !== previous.exchangeOrderId) {
-      return invalid(context, 'exchange order id changed');
+      return invalid(context, `exchange order id changed; expected ${previous.exchangeOrderId}; actual ${snapshot.exchangeOrderId}`);
     }
     if (
       filled.lt(previous.filledBaseQuantity)
@@ -1051,7 +1047,9 @@ function validatedSnapshot(
       || new Date(snapshot.updatedAt).getTime()
         < new Date(previous.updatedAt).getTime()
     ) {
-      return invalid(context, 'snapshot quantities or time regress');
+      if (filled.lt(previous.filledBaseQuantity)) return invalid(context, `filled quantity regresses: expected at least ${previous.filledBaseQuantity}; actual ${snapshot.filledBaseQuantity}`);
+      if (remaining.gt(previous.remainingBaseQuantity)) return invalid(context, `remaining quantity regresses: expected at most ${previous.remainingBaseQuantity}; actual ${snapshot.remainingBaseQuantity}`);
+      return invalid(context, `snapshot time regresses: expected at least ${previous.updatedAt}; actual ${snapshot.updatedAt}`);
     }
   }
   return snapshot;
@@ -1087,7 +1085,7 @@ function safely<T>(context: string, operation: () => T): T {
     if (error instanceof Error && error.message.startsWith(`invalid ${context}:`)) {
       throw error;
     }
-    throw new Error(`invalid ${context}: stored values failed validation`);
+    throw new Error(`invalid ${context}: stored values failed validation`, { cause: error });
   }
 }
 
@@ -1271,7 +1269,7 @@ const SQLITE_V2_TO_V3_MIGRATION = `
   ${SQLITE_V3_SCHEMA_METADATA}
 `;
 
-function schemaError(actual = 'schema-shape-invalid'): TradeOpsError {
+function schemaError(actual: string): TradeOpsError {
   return createTradeOpsError({
     code: 'DATABASE_SCHEMA_VERSION_MISMATCH',
     phase: 'startup',
@@ -1281,8 +1279,8 @@ function schemaError(actual = 'schema-shape-invalid'): TradeOpsError {
       operation: 'prepare strategy schema'
     },
     expected: 'exact known strategy schema version 1, 2, or 3',
-    actual
-  });
+    actual: actual.length <= 2000 ? actual : `schema diagnostic length ${actual.length}; full detail in evidence`
+  }, undefined, actual.length <= 2000 ? undefined : { cause: new Error(actual) });
 }
 
 function trustedTradeOpsFailure(
@@ -1298,7 +1296,8 @@ function trustedTradeOpsFailure(
 
 function schemaOperationError(
   operation: string,
-  actual: string
+  actual: string,
+  options?: ErrorOptions
 ): TradeOpsError {
   return createTradeOpsError({
     code: 'STORAGE_OPERATION_FAILED',
@@ -1309,8 +1308,8 @@ function schemaOperationError(
       operation
     },
     expected: 'successful strategy schema storage operation',
-    actual
-  });
+    actual: actual.length <= 2000 ? actual : `diagnostic length ${actual.length}; full detail in evidence`
+  }, undefined, options);
 }
 
 function safePragmaActual(value: unknown): SafeDiagnosticValue {
@@ -1360,7 +1359,7 @@ function throwSchemaFailure(operation: string, error: unknown): never {
   ) {
     throw trusted;
   }
-  throw schemaOperationError(operation, safeFailureCategory(error));
+  throw schemaOperationError(operation, safeFailureCategory(error), { cause: error });
 }
 
 function schemaMetadata(database: Database.Database): SchemaMetadataRow[] {
@@ -1390,7 +1389,7 @@ function classifyStrategySchema(
   `).all() as SqliteMasterRow[];
   const tableNames = new Set(rows.map(({ name }) => {
     if (typeof name !== 'string') {
-      throw schemaError();
+      throw schemaError(`table name: expected string; actual ${diagnosticValue(name)}`);
     }
     return name;
   }));
@@ -1398,7 +1397,7 @@ function classifyStrategySchema(
     return 'empty';
   }
   if ([...RESERVED_STRATEGY_TABLE_NAMES].some((name) => tableNames.has(name))) {
-    throw schemaError('reserved-strategy-object-name-used-as-table');
+    throw schemaError(`reserved-strategy-object-name-used-as-table; expected no reserved table names; actual ${[...RESERVED_STRATEGY_TABLE_NAMES].filter((name) => tableNames.has(name)).join(',')}`);
   }
   const hasBusinessTables = REQUIRED_BUSINESS_TABLES.every(
     (name) => tableNames.has(name)
@@ -1408,15 +1407,15 @@ function classifyStrategySchema(
       assertV1MigrationSourceColumns(database);
       return 'v1';
     }
-    throw schemaError();
+    throw schemaError(`business tables: expected ${REQUIRED_BUSINESS_TABLES.join(',')}; actual ${[...tableNames].join(',')}`);
   }
   if (!hasBusinessTables) {
-    throw schemaError();
+    throw schemaError(`business tables: expected ${REQUIRED_BUSINESS_TABLES.join(',')}; actual ${[...tableNames].join(',')}`);
   }
   const metadata = schemaMetadata(database);
   if (validMetadata(metadata, 2)) return 'v2';
   if (validMetadata(metadata, 3)) return 'v3';
-  throw schemaError('schema-metadata-version-or-singleton-invalid');
+  throw schemaError(`schema-metadata-version-or-singleton-invalid; expected one singleton=1 version=2|3; actual ${metadata.map((row) => `singleton=${diagnosticValue(row.singleton)},version=${diagnosticValue(row.version)}`).join(';')}; count=${metadata.length}`);
 }
 
 function assertV1MigrationSourceColumns(database: Database.Database): void {
@@ -1437,7 +1436,7 @@ function assertV1MigrationSourceColumns(database: Database.Database): void {
 
 function canonicalSql(value: unknown): string {
   if (typeof value !== 'string') {
-    throw schemaError();
+    throw schemaError(`schema definition: expected SQL text; actual ${typeof value}`);
   }
   let result = '';
   let pendingSpace = false;
@@ -1502,7 +1501,7 @@ function canonicalSql(value: unknown): string {
     appendText(character.toLowerCase());
   }
   if (quotedTerminator !== null) {
-    throw schemaError();
+    throw schemaError(`schema definition: expected closed quoted term; actual unterminated ${quotedTerminator}`);
   }
   return result.replace(/;+$/g, '');
 }
@@ -1522,7 +1521,7 @@ function assertColumns(
     || actual.length !== expected.length
     || expected.some((name) => !actualNames.has(name))
   ) {
-    throw schemaError();
+    throw schemaError(`${table} columns: expected ${expected.join(',')}; actual ${actual.map(diagnosticValue).join(',')}`);
   }
 }
 
@@ -1549,7 +1548,7 @@ function assertParentForeignKey(
     || row.on_delete !== 'NO ACTION'
     || row.match !== 'NONE'
   ) {
-    throw schemaError();
+    throw schemaError(`${childTable}.${childColumn} foreign key: expected id=0,seq=0,${parentTable}.${parentColumn}, NO ACTION/NONE; actual count=${rows.length}, ${row === undefined ? 'missing' : ['id','seq','table','from','to','on_update','on_delete','match'].map((field) => `${field}=${diagnosticValue(row[field as keyof ForeignKeyRow])}`).join(',')}`);
   }
 }
 
@@ -1571,7 +1570,7 @@ function assertKnownBusinessSchema(
       && candidate.tbl_name === table
     ));
     if (row === undefined) {
-      throw schemaError();
+      throw schemaError(`schema object ${type}:${name}:${table}: expected present; actual missing`);
     }
     return row;
   };
@@ -1652,36 +1651,44 @@ function assertKnownBusinessSchema(
   ) {
     throw schemaError('strategies-table-definition-mismatch');
   }
-  if (
-    orderEventsSql !== canonicalSql(SQLITE_ORDER_EVENTS_TABLE)
-    || recoverableIndexSql !== canonicalSql(`
+  if (orderEventsSql !== canonicalSql(SQLITE_ORDER_EVENTS_TABLE)) {
+    throw schemaError('order_events definition: expected locked definition; actual definition mismatch');
+  }
+  if (recoverableIndexSql !== canonicalSql(`
       CREATE INDEX strategies_recoverable_idx
       ON strategies(state, created_at)
-    `)
-    || strategyOrdersIndexSql !== canonicalSql(`
+    `)) {
+    throw schemaError('strategies_recoverable_idx definition: expected locked definition; actual definition mismatch');
+  }
+  if (strategyOrdersIndexSql !== canonicalSql(`
       CREATE INDEX strategy_orders_strategy_idx
       ON strategy_orders(strategy_id, created_at)
-    `)
-    || orderEventsIndexSql !== canonicalSql(`
+    `)) {
+    throw schemaError('strategy_orders_strategy_idx definition: expected locked definition; actual definition mismatch');
+  }
+  if (orderEventsIndexSql !== canonicalSql(`
       CREATE INDEX order_events_order_idx
       ON order_events(strategy_order_id, id)
-    `)
-    || noUpdateSql !== canonicalSql(`
+    `)) {
+    throw schemaError('order_events_order_idx definition: expected locked definition; actual definition mismatch');
+  }
+  if (noUpdateSql !== canonicalSql(`
       CREATE TRIGGER order_events_no_update
       BEFORE UPDATE ON order_events
       BEGIN
         SELECT RAISE(ABORT, 'order events are immutable');
       END
-    `)
-    || noDeleteSql !== canonicalSql(`
+    `)) {
+    throw schemaError('order_events_no_update definition: expected locked definition; actual definition mismatch');
+  }
+  if (noDeleteSql !== canonicalSql(`
       CREATE TRIGGER order_events_no_delete
       BEFORE DELETE ON order_events
       BEGIN
         SELECT RAISE(ABORT, 'order events are immutable');
       END
-    `)
-  ) {
-    throw schemaError();
+    `)) {
+    throw schemaError('order_events_no_delete definition: expected locked definition; actual definition mismatch');
   }
 
   const hasFreshOrderTable = ordersSql
@@ -1708,7 +1715,7 @@ function assertKnownBusinessSchema(
     !hasFreshOrderTable
     && !(hasMigratedOrderTable && hasMigrationEvidenceTriggers)
   ) {
-    throw schemaError();
+    throw schemaError(`strategy_orders definition: expected fresh table or migrated table with valid evidence triggers; actual fresh=${hasFreshOrderTable}, migrated=${hasMigratedOrderTable}, evidenceTriggers=${hasMigrationEvidenceTriggers}`);
   }
 
   const expectedBusinessObjects = new Set([
@@ -1738,7 +1745,7 @@ function assertKnownBusinessSchema(
       || typeof row.name !== 'string'
       || !expectedBusinessObjects.has(`${row.type}:${row.name}:${table}`)
     ) {
-      throw schemaError();
+      throw schemaError(`business schema object: expected known object; actual ${diagnosticValue(row.type)}:${diagnosticValue(row.name)}:${table}`);
     }
   }
 
@@ -1750,7 +1757,7 @@ function assertKnownBusinessSchema(
     LIMIT 1
   `).get(...REQUIRED_BUSINESS_TABLES);
   if (temporaryBusinessObject !== undefined) {
-    throw schemaError();
+    throw schemaError('temporary business object: expected absent; actual present');
   }
 }
 
@@ -1772,8 +1779,9 @@ function assertV3BusinessSchema(database: Database.Database): void {
 }
 
 function assertForeignKeysClean(database: Database.Database): void {
-  if (database.prepare('PRAGMA foreign_key_check').all().length !== 0) {
-    throw schemaError('foreign-key-check-failed');
+  const violations = database.prepare('PRAGMA foreign_key_check').all();
+  if (violations.length !== 0) {
+    throw schemaError(`foreign-key-check-failed; expected 0 violations; actual ${violations.length}`);
   }
 }
 
@@ -1805,10 +1813,11 @@ function assertMetadataSchema(
     metadataSql !== metadataTable
     && !(version === 2 && metadataSql === metadataTableIfMissing)
   ) {
-    throw schemaError('schema-metadata-table-definition-mismatch');
+    throw schemaError(`strategy_schema_metadata definition: expected locked version ${version} definition; actual definition mismatch`);
   }
-  if (!validMetadata(schemaMetadata(database), version)) {
-    throw schemaError('schema-metadata-row-mismatch');
+  const metadata = schemaMetadata(database);
+  if (!validMetadata(metadata, version)) {
+    throw schemaError(`strategy_schema_metadata row: expected one singleton=1 version=${version}; actual count=${metadata.length}, ${metadata.map((row) => `singleton=${diagnosticValue(row.singleton)},version=${diagnosticValue(row.version)}`).join(';')}`);
   }
 }
 
@@ -1859,7 +1868,8 @@ function migrateToV3Schema(
       if (trusted?.detail.code === 'STORAGE_OPERATION_FAILED') throw trusted;
       throw schemaOperationError(
         disableOperation,
-        safeFailureCategory(error)
+        safeFailureCategory(error),
+        { cause: error }
       );
     }
     database.transaction(() => {
@@ -1898,12 +1908,31 @@ function migrateToV3Schema(
         ? trusted
         : schemaOperationError(
           restoreOperation,
-          safeFailureCategory(error)
+          safeFailureCategory(error),
+          { cause: error }
         );
     }
-    if (!migrationFailed && restoreFailure !== undefined) {
+    if (restoreFailure !== undefined) {
+      if (migrationFailed) {
+        const primary = trustedTradeOpsFailure(migrationFailure, 'startup');
+        const combined = new AggregateError(
+          [migrationFailure, restoreFailure],
+          'schema migration and foreign-key restoration failed'
+        );
+        migrationFailure = primary === undefined
+          ? combined
+          : createTradeOpsError({
+            code: primary.detail.code,
+            phase: primary.detail.phase,
+            subject: primary.detail.subject,
+            expected: primary.detail.expected,
+            actual: primary.detail.actual,
+            occurredAt: primary.detail.occurredAt
+          }, undefined, { cause: combined });
+      } else {
+        migrationFailure = restoreFailure;
+      }
       migrationFailed = true;
-      migrationFailure = restoreFailure;
     }
   }
   if (migrationFailed) {
@@ -1922,16 +1951,14 @@ function migrateToV3Schema(
 
 function prepareStrategySchema(database: Database.Database): void {
   if (database.inTransaction) {
-    throw schemaError('external-transaction-active');
+    throw schemaError('external-transaction-active; expected inTransaction=false; actual true');
   }
   let schemaGeneration: 'empty' | 'v1' | 'v2' | 'v3';
   try {
     database.pragma('foreign_keys = ON');
-    if (!sqliteIntegerEquals(
-      database.pragma('foreign_keys', { simple: true }),
-      1
-    )) {
-      throw schemaError('foreign-keys-could-not-be-enabled');
+    const foreignKeys = database.pragma('foreign_keys', { simple: true });
+    if (!sqliteIntegerEquals(foreignKeys, 1)) {
+      throw schemaError(`foreign_keys: expected 1; actual ${diagnosticValue(foreignKeys)}`);
     }
     schemaGeneration = classifyStrategySchema(database);
   } catch (error) {
@@ -1950,7 +1977,7 @@ function prepareStrategySchema(database: Database.Database): void {
       typeof journalMode !== 'string'
       || journalMode.toLowerCase() !== expectedJournalMode
     ) {
-      throw schemaError('journal-mode-mismatch');
+      throw schemaError(`journal_mode: expected ${expectedJournalMode}; actual ${diagnosticValue(journalMode)}`);
     }
   } catch (error) {
     throwSchemaFailure('enable-strategy-journal', error);
@@ -2015,7 +2042,8 @@ function confirmationClockRollbackError(
 
 function storageOperationError(
   strategyId: string,
-  actual: string
+  actual: string,
+  options?: ErrorOptions
 ): TradeOpsError {
   return createTradeOpsError({
     code: 'STORAGE_OPERATION_FAILED',
@@ -2027,13 +2055,14 @@ function storageOperationError(
       operation: 'confirmation transaction'
     },
     expected: 'transaction committed or rolled back with the original snapshot intact',
-    actual
-  });
+    actual: actual.length <= 2000 ? actual : `diagnostic length ${actual.length}; full detail in evidence`
+  }, undefined, options);
 }
 
 function storageRecordError(
   recordId: string,
-  actual: string
+  actual: string,
+  options?: ErrorOptions
 ): TradeOpsError {
   return createTradeOpsError({
     code: 'STORAGE_RECORD_INVALID',
@@ -2045,8 +2074,8 @@ function storageRecordError(
       operation: 'read strategy record'
     },
     expected: 'valid strategy state, failures, snapshot, and order relationship',
-    actual
-  });
+    actual: actual.length <= 2000 ? actual : `diagnostic length ${actual.length}; full detail in evidence`
+  }, undefined, options);
 }
 
 function confirmationExpectedRow(
@@ -2128,11 +2157,13 @@ function confirmationMismatch(
     ['creation-time', row.created_at, expected.createdAt],
     ['update-time', row.updated_at, expected.updatedAt]
   ] as const) {
-    if (actual !== wanted) return `${field}-changed`;
+    if (actual !== wanted) return field === 'preflight-snapshot'
+      ? `${field}-changed; expected identical saved JSON; actual different JSON`
+      : `${field}-changed; expected ${diagnosticValue(wanted)}; actual ${diagnosticValue(actual)}`;
   }
   if (row.failure_code !== null) return 'execution-failure-present';
   if (row.preflight_failure_json !== null) return 'preflight-failure-present';
-  if (!sqliteIntegerEquals(orderCount, 0)) return 'strategy-orders-present';
+  if (!sqliteIntegerEquals(orderCount, 0)) return `strategy-orders-present; expected 0; actual ${diagnosticValue(orderCount)}`;
   return null;
 }
 
@@ -2415,12 +2446,13 @@ export class SqliteStrategyRepository implements StrategyRepository {
     try {
       validatedFailure = parseErrorDetail(failure);
       if (validatedFailure.phase !== 'confirmation') {
-        throw new TypeError('confirmation failure phase is not confirmation');
+        throw new TypeError(`confirmation failure phase: expected confirmation; actual ${diagnosticValue(validatedFailure.phase)}`);
       }
-    } catch {
+    } catch (error) {
       throw storageRecordError(
         snapshot.id,
-        'confirmation-failure-contract-invalid'
+        'confirmation-failure-contract-invalid',
+        { cause: error }
       );
     }
     if (this.database.inTransaction) {
@@ -2506,7 +2538,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     for (const row of rows) {
       const snapshot = safely('persisted order event', () => {
         if (!isPositiveSqliteInteger(row.id)) {
-          return invalid('persisted order event', 'id is invalid');
+          return invalid('persisted order event', `id: expected positive SQLite integer; actual ${diagnosticValue(row.id)}`);
         }
         isoTimestamp(row.recorded_at, 'persisted order event recording time');
         return validatedSnapshot(
@@ -2535,7 +2567,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     ) {
       return invalid(
         'persisted order event',
-        'latest event does not match latest order snapshot'
+        `latest event does not match latest order snapshot; expected ${order.snapshot === null ? '0 events' : 'at least one event with identical latest snapshot'}; actual count=${events.length}, latestMatches=${JSON.stringify(events.at(-1)) === JSON.stringify(order.snapshot)}`
       );
     }
     return events;
@@ -2551,7 +2583,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
     const id = nonEmptyString(strategyId, 'strategy id', 128);
     const target = enumValue(to, STRATEGY_STATES, 'strategy state');
     if (!Array.isArray(from) || from.length === 0) {
-      throw new Error('invalid source state list: at least one state is required');
+      throw new Error(`invalid source state list: at least one state is required; actual ${diagnosticValue(from)}`);
     }
     const sources = [...new Set(from.map((state) => enumValue(
       state,
@@ -2576,7 +2608,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       FAILURE_STATES.has(target) !== (safeFailureCode !== null)
     ) {
       throw new Error(
-        'invalid strategy failure code: must match the target state'
+        `invalid strategy failure code: must match the target state; expected failure present=${FAILURE_STATES.has(target)}; actual target=${target}, failureCode=${safeFailureCode}`
       );
     }
     const placeholders = sources.map(() => '?').join(', ');
@@ -2609,8 +2641,8 @@ export class SqliteStrategyRepository implements StrategyRepository {
     if (this.poisonedError !== null) throw this.poisonedError;
   }
 
-  private poison(expected: ConfirmationExpectedRow, actual: string): void {
-    this.poisonedError ??= storageOperationError(expected.id, actual);
+  private poison(expected: ConfirmationExpectedRow, actual: string, cause: unknown): void {
+    this.poisonedError ??= storageOperationError(expected.id, actual, { cause });
   }
 
   private confirmationMismatch(
@@ -2629,7 +2661,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       operation();
     } catch (error) {
       if (this.database.inTransaction) {
-        this.poison(expected, 'confirmation-transaction-still-active');
+        this.poison(expected, 'confirmation-transaction-still-active; expected inTransaction=false; actual true', error);
         throw this.poisonedError;
       }
       const trusted = trustedTradeOpsFailure(error, 'storage');
@@ -2644,17 +2676,19 @@ export class SqliteStrategyRepository implements StrategyRepository {
       } catch (verificationError) {
         this.poison(
           expected,
-          `rollback-verification:${safeFailureCategory(verificationError)}`
+          `rollback-verification:${safeFailureCategory(verificationError)}`,
+          new AggregateError([error, verificationError], 'confirmation transaction and rollback verification failed')
         );
         throw this.poisonedError;
       }
       if (mismatch !== null) {
-        this.poison(expected, `rollback-verification:${mismatch}`);
+        this.poison(expected, `rollback-verification:${mismatch}`, error);
         throw this.poisonedError;
       }
       throw storageOperationError(
         expected.id,
-        `transaction-failed:${safeFailureCategory(error)};rollback-verified`
+        `transaction-failed:${safeFailureCategory(error)};rollback-verified`,
+        { cause: error }
       );
     }
   }
@@ -2713,7 +2747,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       );
     }
     if (strategy.state !== 'EXECUTING' && strategy.state !== 'WAITING_HEDGE') {
-      return invalid('order plan', 'strategy state does not allow order planning');
+      return invalid('order plan', `strategy state does not allow order planning; expected EXECUTING or WAITING_HEDGE; actual ${strategy.state}`);
     }
     const validated = validatedRequestForRole(strategy, role, request, false);
     const id = randomUUID();
@@ -2749,7 +2783,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         && error.message.startsWith('invalid order snapshot')
         ? error.message
         : 'invalid order snapshot: validation failed';
-      throw new OrderSnapshotValidationError(detail);
+      throw new OrderSnapshotValidationError(detail, { cause: error });
     }
     if (
       order.snapshot !== null
@@ -2841,7 +2875,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy',
-            'columns do not match preflight snapshot'
+            `columns do not match preflight snapshot; expected ${JSON.stringify({ mode: preflight.mode, spotExchangeId: preflight.spotExchangeId, contractExchangeId: preflight.contractExchangeId, symbol: preflight.symbol, requestedBaseQuantity: preflight.requestedBaseQuantity, effectiveBaseQuantity: preflight.effectiveBaseQuantity })}; actual ${JSON.stringify({ mode, spotExchangeId, contractExchangeId, symbol, requestedBaseQuantity, effectiveBaseQuantity })}`
           );
         }
         const createdAt = isoTimestamp(
@@ -2853,7 +2887,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
           'persisted strategy update time'
         );
         if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
-          return invalid('persisted strategy', 'update time precedes creation');
+          return invalid('persisted strategy', `update time precedes creation; expected at least ${createdAt}; actual ${updatedAt}`);
         }
         const failureCode = row.failure_code === null
           ? null
@@ -2865,7 +2899,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         if (FAILURE_STATES.has(state) !== (failureCode !== null)) {
           return invalid(
             'persisted strategy',
-            'execution failure code does not match state'
+            `execution failure code does not match state; expected failure code present=${FAILURE_STATES.has(state)}; actual state=${state}, failureCode=${failureCode}`
           );
         }
         const preflightFailure = row.preflight_failure_json === null
@@ -2880,7 +2914,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy',
-            'preflight failure phase is not confirmation'
+            `preflight failure phase is not confirmation; actual ${preflightFailure.phase}`
           );
         }
         if (
@@ -2889,7 +2923,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy',
-            'preflight failure does not match state'
+            `preflight failure does not match state; expected present=${state === 'PREFLIGHT_INVALIDATED'}; actual present=${preflightFailure !== null}, state=${state}`
           );
         }
         if (
@@ -2923,7 +2957,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         && error.message.startsWith('invalid persisted strategy:')
         ? error.message
         : `strategy-validation:${safeFailureCategory(error)}`;
-      throw storageRecordError(recordId, actual);
+      throw storageRecordError(recordId, actual, { cause: error });
     }
   }
 
@@ -2967,7 +3001,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       if (strategyId !== strategy.id) {
         return invalid(
           'persisted strategy order',
-          'strategy id does not match parent'
+          `strategy id does not match parent; expected ${strategy.id}; actual ${strategyId}`
         );
       }
       const validated = validatedRequestForRole(
@@ -2992,7 +3026,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       ) {
         return invalid(
           'persisted strategy order',
-          'identity columns do not match request'
+          `identity columns do not match request; expected exchangeId=${validated.exchangeId}, clientOrderId=${validated.request.clientOrderId}; actual exchangeId=${exchangeId}, clientOrderId=${clientOrderId}`
         );
       }
       const status = enumValue(
@@ -3018,7 +3052,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       ) {
         return invalid(
           'persisted strategy order',
-          'submission disposition does not match failure evidence'
+          `submission disposition does not match failure evidence; expected failure present=${submissionDisposition === 'DEFINITELY_NOT_SUBMITTED'}; actual disposition=${submissionDisposition}, failureCode=${submissionFailureCode}`
         );
       }
       const createdAt = isoTimestamp(
@@ -3032,7 +3066,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
       if (new Date(updatedAt).getTime() < new Date(createdAt).getTime()) {
         return invalid(
           'persisted strategy order',
-          'update time precedes creation'
+          `update time precedes creation; expected at least ${createdAt}; actual ${updatedAt}`
         );
       }
       const baseRecord: StrategyOrderRecord = {
@@ -3060,7 +3094,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy order',
-            'planned order cannot report a snapshot or fill'
+            `planned order cannot report a snapshot or fill; expected snapshot/exchangeOrderId null and disposition not REMOTE_OBSERVED; actual snapshotPresent=${row.snapshot_json !== null}, exchangeOrderId=${diagnosticValue(row.exchange_order_id)}, disposition=${submissionDisposition}`
           );
         }
       } else {
@@ -3071,7 +3105,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy order',
-            'snapshot status requires a snapshot and exchange order id'
+            `snapshot status requires a snapshot and exchange order id and REMOTE_OBSERVED; actual status=${status}, snapshotPresent=${row.snapshot_json !== null}, exchangeOrderId=${diagnosticValue(row.exchange_order_id)}, disposition=${submissionDisposition}`
           );
         }
         exchangeOrderId = nonEmptyString(
@@ -3091,7 +3125,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy order',
-            'snapshot does not match latest status columns'
+            `snapshot does not match latest status columns; expected status=${status}, exchangeOrderId=${exchangeOrderId}; actual status=${snapshot.status}, exchangeOrderId=${snapshot.exchangeOrderId}`
           );
         }
       }
@@ -3103,7 +3137,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         if (!isNonNegativeSqliteInteger(eventRow.event_count)) {
           return invalid(
             'persisted strategy order',
-            'event count is invalid'
+            `event count is invalid; expected non-negative SQLite integer; actual ${diagnosticValue(eventRow.event_count)}`
           );
         }
         if (
@@ -3121,7 +3155,7 @@ export class SqliteStrategyRepository implements StrategyRepository {
         ) {
           return invalid(
             'persisted strategy order',
-            'latest snapshot does not match immutable events'
+            `latest snapshot does not match immutable events; expected count ${snapshot === null ? '0' : '>0 and identical snapshot'}; actual count=${diagnosticValue(eventRow.event_count)}, latestMatches=${eventRow.latest_snapshot_json === row.snapshot_json}`
           );
         }
       }

@@ -14,6 +14,17 @@ type ErrorPhase =
 type SafeDiagnosticValue = string | number | boolean | null | readonly string[];
 type ErrorSubject = Readonly<Record<string, unknown>> & { readonly type: string };
 
+interface ErrorEvidence {
+  readonly type: string;
+  readonly message: string;
+  readonly code?: string;
+  readonly stack?: string;
+  readonly status?: string | number;
+  readonly body?: string;
+  readonly cause?: ErrorEvidence;
+  readonly errors?: readonly ErrorEvidence[];
+}
+
 interface ErrorInput {
   readonly code: string;
   readonly phase: ErrorPhase;
@@ -21,6 +32,7 @@ interface ErrorInput {
   readonly expected: SafeDiagnosticValue;
   readonly actual: SafeDiagnosticValue;
   readonly occurredAt?: string;
+  readonly evidence?: ErrorEvidence;
 }
 
 interface ErrorDetail {
@@ -31,6 +43,7 @@ interface ErrorDetail {
   readonly actual: SafeDiagnosticValue;
   readonly message: string;
   readonly occurredAt: string;
+  readonly evidence?: ErrorEvidence;
 }
 
 type TradeOpsErrorLike = Error & { readonly detail: ErrorDetail };
@@ -39,7 +52,8 @@ interface ErrorContractModule {
   readonly TradeOpsError: abstract new (...args: never[]) => TradeOpsErrorLike;
   readonly createTradeOpsError: (
     input: unknown,
-    secrets?: readonly string[]
+    secrets?: readonly string[],
+    options?: { readonly cause?: unknown }
   ) => TradeOpsErrorLike;
   readonly withErrorPhase: (
     error: TradeOpsErrorLike,
@@ -47,6 +61,14 @@ interface ErrorContractModule {
   ) => TradeOpsErrorLike;
   readonly parseErrorDetail: (value: unknown) => ErrorDetail;
   readonly safeFailureCategory: (error: unknown) => string;
+}
+
+interface EvidenceErrorContractModule extends ErrorContractModule {
+  readonly projectTradeOpsError: (
+    error: TradeOpsErrorLike,
+    secrets?: readonly string[],
+    includeStack?: boolean
+  ) => ErrorDetail;
 }
 
 const ALL_ERROR_CODES = [
@@ -306,6 +328,17 @@ async function loadContract(): Promise<ErrorContractModule> {
   return candidate as ErrorContractModule;
 }
 
+async function loadEvidenceContract(): Promise<EvidenceErrorContractModule> {
+  const contract = await loadContract();
+  const candidate = contract as Partial<EvidenceErrorContractModule>;
+  assert.equal(
+    typeof candidate.projectTradeOpsError,
+    'function',
+    '缺少可信错误安全投影导出：projectTradeOpsError'
+  );
+  return candidate as EvidenceErrorContractModule;
+}
+
 test('repair: REQUEST_OPERATION_FAILED preserves safe request-operation evidence', async () => {
   const contract = await loadContract();
   const error = contract.createTradeOpsError({
@@ -328,6 +361,271 @@ test('repair: REQUEST_OPERATION_FAILED preserves safe request-operation evidence
   );
   assert.equal(error.detail.actual, 'error');
   assert.match(error.detail.message, /期望 .*实际为/u);
+});
+
+test('factory cause survives phase changes and projects with configurable stacks', async () => {
+  const contract = await loadEvidenceContract();
+  const secret = 'synthetic-cause-secret';
+  const cause = Object.assign(
+    new Error(`EACCES: open /synthetic/config with ${secret}`),
+    { code: 'EACCES' }
+  );
+  const original = contract.createTradeOpsError(
+    baseInput({ phase: 'preflight' }),
+    [secret],
+    { cause }
+  );
+  const shifted = contract.withErrorPhase(original, 'confirmation');
+
+  assert.equal(original.cause, cause);
+  assert.equal(shifted.cause, original);
+  const withoutStacks = contract.projectTradeOpsError(shifted, [secret], false);
+  const withStacks = contract.projectTradeOpsError(shifted, [secret], true);
+  assert.match(withoutStacks.message, /EACCES/u);
+  assert.match(JSON.stringify(withoutStacks.evidence), /EACCES/u);
+  assert.equal(JSON.stringify(withoutStacks.evidence).includes('"stack"'), false);
+  assert.match(JSON.stringify(withStacks.evidence), /"stack"/u);
+  assert.equal(JSON.stringify([withoutStacks, withStacks]).includes(secret), false);
+});
+
+test('evidence is frozen, survives persistence, and rejects arbitrary properties', async () => {
+  const contract = await loadContract();
+  const evidence: ErrorEvidence = {
+    type: 'AggregateError',
+    message: 'transaction and rollback verification failed',
+    errors: [
+      { type: 'Error', message: 'transaction failed', code: 'SQLITE_IOERR' },
+      { type: 'Error', message: 'rollback verification failed' }
+    ]
+  };
+  const detail = contract.createTradeOpsError(baseInput({
+    evidence,
+    occurredAt: '2026-10-02T08:09:10.123Z'
+  })).detail;
+
+  assert.match(detail.message, /transaction and rollback verification failed/u);
+  assert.equal(Object.isFrozen(detail.evidence), true);
+  assert.equal(Object.isFrozen(detail.evidence?.errors), true);
+  assert.equal(Object.isFrozen(detail.evidence?.errors?.[0]), true);
+  assert.deepEqual(contract.parseErrorDetail(structuredClone(detail)), detail);
+
+  const stored = structuredClone(detail) as unknown as Record<string, unknown>;
+  (stored.evidence as Record<string, unknown>).unexpected = 'arbitrary';
+  assertRejectsSynchronously(() => contract.parseErrorDetail(stored));
+});
+
+test('strict evidence parsing bypasses and restores custom stack formatters', async () => {
+  const contract = await loadContract();
+  const original = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+  let calls = 0;
+  Object.defineProperty(Error, 'prepareStackTrace', {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value(): string {
+      calls += 1;
+      return 'synthetic strict-parser stack';
+    }
+  });
+  const custom = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+  try {
+    const evidence = {
+      type: 'Error',
+      message: 'factory evidence with lazy stack'
+    };
+    Error.captureStackTrace(evidence);
+
+    const detail = contract.createTradeOpsError(baseInput({ evidence })).detail;
+
+    assert.equal(calls, 0);
+    assert.match(
+      detail.evidence?.stack ?? '', /Error: factory evidence with lazy stack/u
+    );
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace'),
+      custom
+    );
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(Error, 'prepareStackTrace');
+    } else {
+      Object.defineProperty(Error, 'prepareStackTrace', original);
+    }
+  }
+});
+
+test('strict evidence rejects message accessors before materializing stack', async () => {
+  const contract = await loadContract();
+  const original = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+  let formatterCalls = 0;
+  let messageReads = 0;
+  Object.defineProperty(Error, 'prepareStackTrace', {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value(): string {
+      formatterCalls += 1;
+      return 'synthetic late-accessor stack';
+    }
+  });
+  try {
+    const evidence: Record<string, unknown> = { type: 'Error' };
+    Error.captureStackTrace(evidence);
+    Object.defineProperty(evidence, 'message', {
+      enumerable: true,
+      get(): string {
+        messageReads += 1;
+        return 'synthetic late message';
+      }
+    });
+
+    assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
+      evidence: evidence as unknown as ErrorEvidence
+    })));
+
+    assert.equal(formatterCalls, 0);
+    assert.equal(messageReads, 0);
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(Error, 'prepareStackTrace');
+    } else {
+      Object.defineProperty(Error, 'prepareStackTrace', original);
+    }
+  }
+});
+
+test('strict evidence rejects inherited name accessors before materializing stack', async () => {
+  const contract = await loadContract();
+  const originalName = Object.getOwnPropertyDescriptor(Object.prototype, 'name');
+  let nameReads = 0;
+  let outcome: 'accepted' | 'rejected' = 'accepted';
+  Object.defineProperty(Object.prototype, 'name', {
+    configurable: true,
+    get(): string {
+      nameReads += 1;
+      return 'HostileInheritedName';
+    }
+  });
+  try {
+    const evidence = { type: 'Error', message: 'factory evidence' };
+    Error.captureStackTrace(evidence);
+    try {
+      contract.createTradeOpsError(baseInput({ evidence }));
+    } catch {
+      outcome = 'rejected';
+    }
+  } finally {
+    if (originalName === undefined) {
+      Reflect.deleteProperty(Object.prototype, 'name');
+    } else {
+      Object.defineProperty(Object.prototype, 'name', originalName);
+    }
+  }
+
+  assert.equal(nameReads, 0);
+  assert.equal(outcome, 'rejected');
+});
+
+test('strict records reject unexpected lazy stacks without invoking formatters', async () => {
+  const contract = await loadContract();
+  const original = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+  let calls = 0;
+  Object.defineProperty(Error, 'prepareStackTrace', {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value(): string {
+      calls += 1;
+      return 'synthetic unexpected stack';
+    }
+  });
+  try {
+    const input = { ...baseInput() };
+    Error.captureStackTrace(input);
+    assertRejectsSynchronously(() => contract.createTradeOpsError(input));
+
+    const errors: ErrorEvidence[] = [
+      { type: 'Error', message: 'nested evidence' }
+    ];
+    Error.captureStackTrace(errors);
+    assertRejectsSynchronously(() => contract.createTradeOpsError(baseInput({
+      evidence: { type: 'AggregateError', message: 'aggregate evidence', errors }
+    })));
+
+    assert.equal(calls, 0);
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(Error, 'prepareStackTrace');
+    } else {
+      Object.defineProperty(Error, 'prepareStackTrace', original);
+    }
+  }
+});
+
+test('projection preserves explicit undefined causes, both evidence sources, and stack policy', async () => {
+  const contract = await loadEvidenceContract();
+  const storedEvidence: ErrorEvidence = {
+    type: 'StoredEvidence',
+    message: 'stored transaction evidence',
+    stack: 'stored-sensitive-stack'
+  };
+  const nativeCause = Object.assign(new Error('native disk evidence'), {
+    code: 'ENOSPC'
+  });
+  const combined = contract.createTradeOpsError(
+    baseInput({ evidence: storedEvidence }),
+    [],
+    { cause: nativeCause }
+  );
+  const withoutStacks = contract.projectTradeOpsError(combined, [], false);
+  const withStacks = contract.projectTradeOpsError(combined, [], true);
+  const undefinedCause = contract.createTradeOpsError(
+    baseInput(),
+    [],
+    { cause: undefined }
+  );
+
+  assert.match(JSON.stringify(withoutStacks.evidence), /stored transaction evidence/u);
+  assert.match(JSON.stringify(withoutStacks.evidence), /native disk evidence/u);
+  assert.equal(JSON.stringify(withoutStacks.evidence).includes('stack'), false);
+  assert.match(JSON.stringify(withStacks.evidence), /stored-sensitive-stack/u);
+  assert.match(JSON.stringify(withStacks.evidence), /TradeOpsError/u);
+  assert.match(
+    JSON.stringify(contract.projectTradeOpsError(undefinedCause).evidence),
+    /undefined/u
+  );
+});
+
+test('empty native messages project through the trusted contract and optional empty fields round-trip', async () => {
+  const contract = await loadEvidenceContract();
+  const emptyLeaf = new Error();
+  Object.defineProperty(emptyLeaf, 'name', { value: '' });
+  const aggregate = new AggregateError([
+    emptyLeaf,
+    new Error('', { cause: new Error() })
+  ], '');
+  const error = contract.createTradeOpsError(baseInput(), [], {
+    cause: aggregate
+  });
+  const projected = contract.projectTradeOpsError(error, [], false);
+  const optionalEmpty = contract.createTradeOpsError(baseInput({
+    evidence: {
+      type: 'Error',
+      message: 'empty optional fields are observed facts',
+      code: '',
+      stack: '',
+      status: '',
+      body: ''
+    },
+    occurredAt: '2026-10-02T08:09:10.123Z'
+  })).detail;
+
+  assert.doesNotThrow(() => contract.parseErrorDetail(structuredClone(projected)));
+  assert.match(projected.message, /error message is empty|empty error message/iu);
+  assert.deepEqual(
+    contract.parseErrorDetail(structuredClone(optionalEmpty)),
+    optionalEmpty
+  );
 });
 
 test('可信精确错误契约', async (t) => {

@@ -21,18 +21,33 @@ interface ValidatedAmountRules {
   maxBaseAmount: Decimal | undefined;
 }
 
+export class QuantityNormalizationError extends Error {
+  constructor(
+    readonly reason: 'INVALID' | 'OUT_OF_RANGE' | 'RESOURCE_LIMIT',
+    readonly field: string,
+    readonly expected: string,
+    readonly actual: string,
+    options?: ErrorOptions
+  ) {
+    super(`invalid ${field}${field.endsWith('.minBaseAmount') ? ' minimum' : ''}: expected ${expected}; actual ${actual}`, options);
+    this.name = 'QuantityNormalizationError';
+  }
+}
+
 function parsedDecimal(value: string, field: string): Decimal {
   try {
     return decimal(value);
-  } catch {
-    throw new Error(`invalid ${field}: must be a decimal`);
+  } catch (error) {
+    throw new QuantityNormalizationError(
+      'INVALID', field, 'decimal', value, { cause: error }
+    );
   }
 }
 
 function positiveDecimal(value: string, field: string): Decimal {
   const parsed = parsedDecimal(value, field);
   if (!parsed.isFinite() || parsed.lte('0')) {
-    throw new Error(`invalid ${field}: must be finite and greater than zero`);
+    throw new QuantityNormalizationError('INVALID', field, 'finite and greater than zero', value);
   }
   return parsed;
 }
@@ -40,14 +55,14 @@ function positiveDecimal(value: string, field: string): Decimal {
 function nonNegativeDecimal(value: string, field: string): Decimal {
   const parsed = parsedDecimal(value, field);
   if (!parsed.isFinite() || parsed.lt('0')) {
-    throw new Error(`invalid ${field}: must be finite and non-negative`);
+    throw new QuantityNormalizationError('INVALID', field, 'finite and non-negative', value);
   }
   return parsed;
 }
 
 function positiveDerivedDecimal(value: Decimal, field: string): Decimal {
   if (!value.isFinite() || value.lte('0')) {
-    throw new Error(`invalid ${field}: derived value must be finite and greater than zero`);
+    throw new QuantityNormalizationError('INVALID', field, 'derived value finite and greater than zero', value.toString());
   }
   return value;
 }
@@ -62,7 +77,7 @@ function derivedBaseStep(
     !Number.isSafeInteger(requiredPrecision)
     || requiredPrecision > 1_000_000
   ) {
-    throw new Error(`invalid ${field}: exact result exceeds supported precision`);
+    throw new QuantityNormalizationError('RESOURCE_LIMIT', field, 'required precision at most 1000000', String(requiredPrecision));
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -110,7 +125,7 @@ function gcd(left: bigint, right: bigint): bigint {
 function commonStep(left: Decimal, right: Decimal): Decimal {
   const scale = Math.max(left.decimalPlaces(), right.decimalPlaces());
   if (!Number.isSafeInteger(scale) || scale > 1_000_000) {
-    throw new Error('invalid commonStep: exact result exceeds supported precision');
+    throw new QuantityNormalizationError('RESOURCE_LIMIT', 'commonStep', 'scale at most 1000000', String(scale));
   }
   const factor = 10n ** BigInt(scale);
   const ExactDecimal = Decimal.clone({
@@ -137,7 +152,7 @@ function alignedDown(value: Decimal, step: Decimal): Decimal {
     !Number.isSafeInteger(requiredPrecision)
     || requiredPrecision > 1_000_000
   ) {
-    throw new Error('invalid effective quantity: exact result exceeds supported precision');
+    throw new QuantityNormalizationError('RESOURCE_LIMIT', 'effectiveQuantity', 'required precision at most 1000000', String(requiredPrecision));
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -177,14 +192,18 @@ export function normalizeCommonBaseQuantity(input: CommonQuantityInput): string 
   }
 
   if (!effective.isFinite()) {
-    throw new Error('invalid effective quantity: must be finite');
+    throw new QuantityNormalizationError('INVALID', 'effectiveQuantity', 'finite', effective.toString());
   }
-  if (
-    effective.lte('0')
-    || effective.lt(spot.minBaseAmount)
-    || effective.lt(swap.minBaseAmount)
-  ) {
-    throw new Error('normalized quantity is below a market minimum');
+  if (effective.lte('0')) {
+    throw new QuantityNormalizationError('OUT_OF_RANGE', 'effectiveQuantity', 'greater than zero', effective.toString());
+  }
+  for (const [field, minimum] of [
+    ['spot.minBaseAmount', spot.minBaseAmount],
+    ['swap.minBaseAmount', swap.minBaseAmount]
+  ] as const) {
+    if (effective.lt(minimum)) {
+      throw new QuantityNormalizationError('OUT_OF_RANGE', field, `at least ${minimum.toString()}`, effective.toString());
+    }
   }
   return effective.toFixed();
 }

@@ -19,6 +19,7 @@ import type {
   OrderSnapshot
 } from '../../src/domain/types.js';
 import {
+  projectErrorEvidence,
   TradeOpsError,
   withErrorPhase,
   type ErrorCode,
@@ -651,7 +652,25 @@ function isNoOrderSubmittedWithReason(
     assert.equal(error.code, 'NO_ORDER_SUBMITTED');
     assert.equal(error.reason, expectedReason);
     assert.equal(error.message, 'order was not submitted');
-    assert.equal('cause' in error, false);
+    assert(error.cause instanceof Error);
+    return true;
+  };
+}
+
+function hasVisibleOrderEvidence(
+  field: RegExp,
+  expected: string,
+  actual: string,
+  options: { readonly submitted?: boolean } = {}
+): (error: unknown) => boolean {
+  return (error: unknown): boolean => {
+    assert(error instanceof Error);
+    assert.match(error.message, field);
+    assert.equal(error.message.includes(expected), true);
+    assert.equal(error.message.includes(actual), true);
+    if (options.submitted === true) {
+      assert.equal(error instanceof NoOrderSubmittedError, false);
+    }
     return true;
   };
 }
@@ -2054,6 +2073,86 @@ for (const [label, cost] of [
   });
 }
 
+test('reports exact CCXT quantity and notional range operands', async (t) => {
+  await t.test('base quantity range', async () => {
+    const brokenMarket = okxSpotMarket({
+      limits: {
+        amount: { min: '0.02', max: '0.01' },
+        price: { min: 0.1, max: 10000000 },
+        cost: { min: 1, max: 100000000 }
+      }
+    });
+    const { gateway } = makeGateway('okx', [brokenMarket]);
+    const snapshot = await snapshotGateway(gateway).loadMarketSnapshot(
+      'BTC/USDT',
+      'spot'
+    );
+
+    assert.throws(
+      () => snapshot.quantityRules(),
+      isPreciseTradeOpsFailure('MARKET_RULE_INVALID', {
+        subjectType: 'market',
+        exchangeId: 'okx',
+        symbol: 'BTC/USDT',
+        kind: 'spot',
+        field: 'baseAmountRange',
+        expected: 'minimum less than or equal to maximum',
+        actual: 'minimum 0.02 exceeds maximum 0.01'
+      })
+    );
+  });
+
+  await t.test('quote notional range', async () => {
+    const brokenMarket = okxSpotMarket({
+      limits: {
+        amount: { min: 0.000001, max: 1000 },
+        price: { min: 0.1, max: 10000000 },
+        cost: { min: '10', max: '5' }
+      }
+    });
+    const { gateway } = makeGateway('okx', [brokenMarket]);
+    const snapshot = await snapshotGateway(gateway).loadMarketSnapshot(
+      'BTC/USDT',
+      'spot'
+    );
+
+    assert.throws(
+      () => snapshot.notionalRules(),
+      isPreciseTradeOpsFailure('MARKET_RULE_INVALID', {
+        subjectType: 'market',
+        exchangeId: 'okx',
+        symbol: 'BTC/USDT',
+        kind: 'spot',
+        field: 'quoteNotionalRange',
+        expected: 'minimum less than or equal to maximum',
+        actual: 'minimum 10 exceeds maximum 5'
+      })
+    );
+  });
+});
+
+test('reports the actual unsupported CCXT precision mode', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.precisionMode = functions.SIGNIFICANT_DIGITS;
+  const snapshot = await snapshotGateway(gateway).loadMarketSnapshot(
+    'BTC/USDT',
+    'spot'
+  );
+
+  assert.throws(
+    () => snapshot.quantityRules(),
+    isPreciseTradeOpsFailure('MARKET_RULE_INVALID', {
+      subjectType: 'market',
+      exchangeId: 'bitget',
+      symbol: 'BTC/USDT',
+      kind: 'spot',
+      field: 'precisionMode',
+      expected: 'TICK_SIZE',
+      actual: functions.SIGNIFICANT_DIGITS
+    })
+  );
+});
+
 for (const [label, rejectedMarket] of [
   ['inactive', swapMarket({ active: false })],
   ['inverse', swapMarket({ linear: false, inverse: true })],
@@ -2334,6 +2433,57 @@ test('keeps price preparation failure unclassified before create', async () => {
   await assert.rejects(
     gateway.createOrder(spotMarketRequest()),
     isNoOrderSubmittedWithReason('UNCLASSIFIED')
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('preserves the native pre-create failure through no-order-submitted evidence', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  const nativeFailure = Object.assign(
+    new Error('synthetic ticker endpoint unavailable', {
+      cause: new Error('synthetic socket reset')
+    }),
+    { code: 'SYNTHETIC_TICKER_FAILURE' }
+  );
+  ccxt.tickerError = nativeFailure;
+
+  await assert.rejects(
+    gateway.createOrder(spotMarketRequest()),
+    (error: unknown) => {
+      assert(error instanceof NoOrderSubmittedError);
+      assert.equal(error.reason, 'UNCLASSIFIED');
+      assert.equal(error.cause, nativeFailure);
+      const projected = JSON.stringify(projectErrorEvidence(error, [], false));
+      assert.match(projected, /synthetic ticker endpoint unavailable/u);
+      assert.match(projected, /synthetic socket reset/u);
+      assert.match(projected, /SYNTHETIC_TICKER_FAILURE/u);
+      return true;
+    }
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('reports required exchange-amount precision before create', async () => {
+  const extremeSwap = swapMarket({
+    contractSize: '1e-1000001',
+    limits: {
+      amount: { min: 1, max: undefined },
+      price: { min: 0.1, max: 10000000 },
+      cost: { min: undefined, max: undefined }
+    }
+  });
+  const { gateway, ccxt } = makeGateway('okx', [extremeSwap]);
+
+  await assert.rejects(
+    gateway.createOrder(swapRequest({ baseQuantity: '1e1000001' })),
+    (error: unknown) => {
+      assert(error instanceof NoOrderSubmittedError);
+      assert.equal(error.reason, 'UNCLASSIFIED');
+      assert(error.cause instanceof Error);
+      assert.match(error.cause.message, /required precision 2000008/u);
+      assert.match(error.cause.message, /(?:maximum|at most) 1000000/u);
+      return true;
+    }
   );
   assert.equal(ccxt.createCalls.length, 0);
 });
@@ -2789,6 +2939,48 @@ test('Bitget spot market buy falls back to last when ask is unavailable', async 
   assert.equal(ccxt.createCalls[0]?.price, '59999');
 });
 
+test('Bitget reports both rejected ticker candidates before create', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.ticker = {
+    ask: 'invalid-ask-sentinel',
+    last: 'invalid-last-sentinel'
+  };
+
+  await assert.rejects(
+    gateway.createOrder(spotMarketRequest()),
+    (error: unknown) => {
+      assert(error instanceof NoOrderSubmittedError);
+      assert.equal(error.reason, 'UNCLASSIFIED');
+      assert(error.cause instanceof Error);
+      assert.match(error.cause.message, /ask.*invalid-ask-sentinel/u);
+      assert.match(error.cause.message, /last.*invalid-last-sentinel/u);
+      return true;
+    }
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('Bitget reports the rejected formatted conversion price before create', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  ccxt.ticker = { ask: '60001.19', last: '60000' };
+  ccxt.pricePrecisionResult = 'invalid-formatted-price-sentinel';
+
+  await assert.rejects(
+    gateway.createOrder(spotMarketRequest()),
+    (error: unknown) => {
+      assert(error instanceof NoOrderSubmittedError);
+      assert.equal(error.reason, 'UNCLASSIFIED');
+      assert(error.cause instanceof Error);
+      assert.match(
+        error.cause.message,
+        /formatted.*invalid-formatted-price-sentinel/u
+      );
+      return true;
+    }
+  );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
 for (const ticker of [
   {},
   { ask: 0, last: -1 },
@@ -2869,8 +3061,126 @@ test('rejects inconsistent normalized order arithmetic', async () => {
 
   await assert.rejects(
     gateway.fetchOrder('exchange-order-1', 'BTC/USDT', 'spot'),
-    /inconsistent order quantities/
+    hasVisibleOrderEvidence(
+      /(?:filled.*remaining|quantity sum)/iu,
+      '0.01',
+      '0.011'
+    )
   );
+  assert.equal(ccxt.createCalls.length, 0);
+});
+
+test('reports exact lookup snapshot identity evidence without submitting', async (t) => {
+  await t.test('exchange order id', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.fetchOrderResult = ccxtOrder({
+      id: 'unexpected-exchange-order-id'
+    });
+
+    await assert.rejects(
+      gateway.fetchOrder('expected-exchange-order-id', 'BTC/USDT', 'spot'),
+      hasVisibleOrderEvidence(
+        /exchange(?: order id|OrderId)/iu,
+        'expected-exchange-order-id',
+        'unexpected-exchange-order-id'
+      )
+    );
+    assert.equal(ccxt.createCalls.length, 0);
+  });
+
+  await t.test('market symbol', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.fetchOrderResult = ccxtOrder({ symbol: 'ETH/USDT' });
+
+    await assert.rejects(
+      gateway.fetchOrder('exchange-order-1', 'BTC/USDT', 'spot'),
+      hasVisibleOrderEvidence(/symbol/iu, 'BTC/USDT', 'ETH/USDT')
+    );
+    assert.equal(ccxt.createCalls.length, 0);
+  });
+
+  await t.test('client order id', async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.fetchOrderResult = ccxtOrder({
+      clientOrderId: 'unexpected-client-order-id'
+    });
+
+    await assert.rejects(
+      gateway.findOrderByClientId(
+        'expected-client-order-id',
+        'BTC/USDT',
+        'spot'
+      ),
+      hasVisibleOrderEvidence(
+        /client(?: order id|OrderId)/iu,
+        'expected-client-order-id',
+        'unexpected-client-order-id'
+      )
+    );
+    assert.equal(ccxt.createCalls.length, 0);
+  });
+});
+
+test('reports exact create snapshot evidence without a second submission', async (t) => {
+  for (const failureCase of [
+    {
+      name: 'type',
+      response: { type: 'market' },
+      field: /type/iu,
+      expected: 'limit',
+      actual: 'market'
+    },
+    {
+      name: 'side',
+      response: { side: 'sell' },
+      field: /side/iu,
+      expected: 'buy',
+      actual: 'sell'
+    },
+    {
+      name: 'requested quantity',
+      response: { amount: '0.02', filled: '0', remaining: '0.02' },
+      field: /requested/iu,
+      expected: '0.01',
+      actual: '0.02'
+    },
+    {
+      name: 'filled quantity',
+      response: { amount: '0.01', filled: '0.011', remaining: '0' },
+      field: /filled/iu,
+      expected: '0.01',
+      actual: '0.011'
+    },
+    {
+      name: 'remaining quantity',
+      response: { amount: '0.01', filled: '0', remaining: '0.011' },
+      field: /remaining/iu,
+      expected: '0.01',
+      actual: '0.011'
+    }
+  ] satisfies ReadonlyArray<{
+    readonly name: string;
+    readonly response: Partial<CcxtOrder>;
+    readonly field: RegExp;
+    readonly expected: string;
+    readonly actual: string;
+  }>) {
+    await t.test(failureCase.name, async () => {
+      const { gateway, ccxt } = makeGateway('okx');
+      ccxt.createResult = ccxtOrder(failureCase.response);
+
+      await assert.rejects(
+        gateway.createOrder(spotRequest()),
+        hasVisibleOrderEvidence(
+          failureCase.field,
+          failureCase.expected,
+          failureCase.actual,
+          { submitted: true }
+        )
+      );
+      assert.equal(ccxt.createCalls.length, 1);
+    });
+  }
 });
 
 for (const [exchangeId, kind, expectedParams] of [
@@ -3126,7 +3436,7 @@ test('registry revalidates gateway identity on every get', () => {
   currentIdentity = 'okx';
   assert.throws(
     () => registry.get('bitget'),
-    /gateway identity mismatch.*bitget/
+    /gateway identity mismatch.*bitget.*actual okx/
   );
 });
 

@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import { Decimal } from 'decimal.js';
 import {
   OrderNotFound,
@@ -186,8 +187,8 @@ interface PreparedCcxtOrder {
 class UntradableOrderRequestError extends Error {
   readonly name = 'UntradableOrderRequestError';
 
-  constructor() {
-    super('order request is definitely untradable');
+  constructor(check: string) {
+    super(check);
   }
 }
 
@@ -228,20 +229,20 @@ function decimalString(
     (typeof value !== 'number' && typeof value !== 'string')
     || String(value).trim() === ''
   ) {
-    throw new Error(`invalid ${field}: missing decimal value`);
+    throw new Error(`invalid ${field}: missing decimal value; actual ${diagnosticValue(value)}`);
   }
   let parsed: Decimal;
   try {
     parsed = decimal(String(value));
-  } catch {
-    throw new Error(`invalid ${field}: malformed decimal value`);
+  } catch (error) {
+    throw new Error(`invalid ${field}: malformed decimal value; actual ${diagnosticValue(value)}`, { cause: error });
   }
   const wrongSign = minimum === 'positive'
     ? parsed.lte(0)
     : parsed.lt(0);
   if (!parsed.isFinite() || wrongSign) {
     throw new Error(
-      `invalid ${field}: must be finite and ${minimum}`
+      `invalid ${field}: must be finite and ${minimum}; actual ${diagnosticValue(value)}`
     );
   }
   return parsed.toFixed();
@@ -321,7 +322,8 @@ function marketRuleError(
   captured: Readonly<CapturedMarket>,
   field: string,
   expected: SafeDiagnosticValue,
-  actual: SafeDiagnosticValue
+  actual: SafeDiagnosticValue,
+  options?: ErrorOptions
 ): Error {
   return marketError(
     'MARKET_RULE_INVALID',
@@ -330,7 +332,8 @@ function marketRuleError(
     captured.requestedKind,
     field,
     expected,
-    actual
+    actual,
+    options
   );
 }
 
@@ -341,7 +344,8 @@ function marketError(
   kind: MarketKind,
   field: string | undefined,
   expected: SafeDiagnosticValue,
-  actual: SafeDiagnosticValue
+  actual: SafeDiagnosticValue,
+  options?: ErrorOptions
 ): Error {
   return createTradeOpsError({
     code,
@@ -355,7 +359,7 @@ function marketError(
     },
     expected,
     actual
-  });
+  }, undefined, options);
 }
 
 function safeIdentityActual(value: unknown): SafeDiagnosticValue {
@@ -480,7 +484,7 @@ function normalizedType(
   if (value === 'market' || value === 'limit') {
     return value;
   }
-  throw new Error('malformed order response: invalid order type');
+  throw new Error(`malformed order response: invalid order type; expected market or limit; actual ${diagnosticValue(value)}`);
 }
 
 function normalizedSide(
@@ -491,7 +495,7 @@ function normalizedSide(
   if (value === 'buy' || value === 'sell') {
     return value;
   }
-  throw new Error('malformed order response: invalid order side');
+  throw new Error(`malformed order response: invalid order side; expected buy or sell; actual ${diagnosticValue(value)}`);
 }
 
 function exactSum(left: string, right: string): string {
@@ -499,7 +503,7 @@ function exactSum(left: string, right: string): string {
   const rightValue = decimal(right);
   const requiredPrecision = leftValue.sd() + rightValue.sd() + 4;
   if (!Number.isSafeInteger(requiredPrecision) || requiredPrecision > 1_000_000) {
-    throw new Error('order quantity precision exceeds supported bounds');
+    throw new Error(`order quantity required precision ${requiredPrecision} exceeds supported maximum 1000000; left=${left}, right=${right}`);
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -513,7 +517,7 @@ function exactDifference(left: string, right: string): string {
   const rightValue = decimal(right);
   const requiredPrecision = leftValue.sd() + rightValue.sd() + 4;
   if (!Number.isSafeInteger(requiredPrecision) || requiredPrecision > 1_000_000) {
-    throw new Error('order quantity precision exceeds supported bounds');
+    throw new Error(`order quantity required precision ${requiredPrecision} exceeds supported maximum 1000000; left=${left}, right=${right}`);
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -533,7 +537,7 @@ function exactProduct(
   const rightDecimal = decimal(rightValue);
   const requiredPrecision = leftDecimal.sd() + rightDecimal.sd() + 4;
   if (!Number.isSafeInteger(requiredPrecision) || requiredPrecision > 1_000_000) {
-    throw new Error(`${field} precision exceeds supported bounds`);
+    throw new Error(`${field} required precision ${requiredPrecision} exceeds supported maximum 1000000`);
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -541,7 +545,7 @@ function exactProduct(
   });
   const product = new ExactDecimal(leftValue).mul(rightValue);
   if (!product.isFinite() || product.lte(0)) {
-    throw new Error(`${field} must be finite and positive`);
+    throw new Error(`${field} must be finite and positive; actual ${product.toString()}; left=${left}, right=${right}`);
   }
   return product.toFixed();
 }
@@ -566,7 +570,7 @@ function exactAggregate(
     || requiredPrecision <= 0
     || requiredPrecision > 1_000_000
   ) {
-    throw new Error(`${field} precision exceeds supported bounds`);
+    throw new Error(`${field} required precision ${requiredPrecision} exceeds supported maximum 1000000`);
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -594,7 +598,7 @@ function exactPositiveQuotient(
     !Number.isSafeInteger(requiredPrecision)
     || requiredPrecision > 1_000_000
   ) {
-    throw new Error(`${field} precision exceeds supported bounds`);
+    throw new Error(`${field} required precision ${requiredPrecision} exceeds supported maximum 1000000`);
   }
   const ExactDecimal = Decimal.clone({
     precision: requiredPrecision,
@@ -702,13 +706,13 @@ function validateBaseAmount(
 ): void {
   const base = decimal(baseQuantity);
   if (base.lt(rules.minBaseAmount)) {
-    throw new UntradableOrderRequestError();
+    throw new UntradableOrderRequestError(`base quantity below minimum: expected at least ${rules.minBaseAmount}; actual ${baseQuantity}`);
   }
   if (
     rules.maxBaseAmount !== undefined
     && base.gt(rules.maxBaseAmount)
   ) {
-    throw new UntradableOrderRequestError();
+    throw new UntradableOrderRequestError(`base quantity above maximum: expected at most ${rules.maxBaseAmount}; actual ${baseQuantity}`);
   }
 }
 
@@ -726,13 +730,13 @@ function validateQuoteNotional(
     rules.minQuoteNotional !== undefined
     && decimal(quoteNotional).lt(rules.minQuoteNotional)
   ) {
-    throw new UntradableOrderRequestError();
+    throw new UntradableOrderRequestError(`quote notional below minimum: expected at least ${rules.minQuoteNotional}; actual ${quoteNotional}`);
   }
   if (
     rules.maxQuoteNotional !== undefined
     && decimal(quoteNotional).gt(rules.maxQuoteNotional)
   ) {
-    throw new UntradableOrderRequestError();
+    throw new UntradableOrderRequestError(`quote notional above maximum: expected at most ${rules.maxQuoteNotional}; actual ${quoteNotional}`);
   }
 }
 
@@ -763,7 +767,7 @@ function baseToCcxtAmount(
     !Number.isSafeInteger(requiredPrecision)
     || requiredPrecision > 1_000_000
   ) {
-    throw new Error('exchange amount precision exceeds supported bounds');
+    throw new Error(`exchange amount required precision ${requiredPrecision} exceeds supported maximum 1000000; baseQuantity=${baseQuantity}, contractSize=${contractSize}`);
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -771,7 +775,7 @@ function baseToCcxtAmount(
   });
   const exchangeAmount = new ExactDecimal(base).div(size).toFixed();
   if (!decimal(exchangeAmountToBase(exchangeAmount, size)).eq(base)) {
-    throw new UntradableOrderRequestError();
+    throw new UntradableOrderRequestError(`exchange amount round trip mismatch: expected baseQuantity=${base}; actual ${exchangeAmountToBase(exchangeAmount, size)}; exchangeAmount=${exchangeAmount}, contractSize=${size}`);
   }
   return exchangeAmount;
 }
@@ -1024,7 +1028,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
             : 'non-finite number'
         );
       }
-      throw new Error(`unsupported precision mode for ${this.exchangeId}`);
+      throw new Error(`unsupported precision mode for ${this.exchangeId}: expected TICK_SIZE (${functions.TICK_SIZE}); actual ${diagnosticValue(captured.precisionMode)}`);
     }
     const amountStep = this.capturedDecimal(
       captured,
@@ -1092,7 +1096,8 @@ export class CcxtExchangeGateway implements ExchangeGateway {
           captured,
           'minBaseAmount',
           'finite non-negative base amount',
-          'unrepresentable derived value'
+          'unrepresentable derived value',
+          { cause: error }
         );
       }
       throw error;
@@ -1118,7 +1123,8 @@ export class CcxtExchangeGateway implements ExchangeGateway {
           captured,
           'maxBaseAmount',
           'finite positive base amount',
-          'unrepresentable derived value'
+          'unrepresentable derived value',
+          { cause: error }
         );
       }
       throw error;
@@ -1133,10 +1139,10 @@ export class CcxtExchangeGateway implements ExchangeGateway {
           captured,
           'baseAmountRange',
           'minimum less than or equal to maximum',
-          'minimum exceeds maximum'
+          `minimum ${minBaseAmount} exceeds maximum ${maxBaseAmount}`
         );
       }
-      throw new Error('invalid base amount range');
+      throw new Error(`invalid base amount range: minimum ${minBaseAmount} exceeds maximum ${maxBaseAmount}`);
     }
     return Object.freeze({
       amountStep,
@@ -1192,10 +1198,10 @@ export class CcxtExchangeGateway implements ExchangeGateway {
           captured,
           'quoteNotionalRange',
           'minimum less than or equal to maximum',
-          'minimum exceeds maximum'
+          `minimum ${minQuoteNotional} exceeds maximum ${maxQuoteNotional}`
         );
       }
-      throw new Error('invalid quote notional range');
+      throw new Error(`invalid quote notional range: minimum ${minQuoteNotional} exceeds maximum ${maxQuoteNotional}`);
     }
     return Object.freeze({
       ...(minQuoteNotional === undefined ? {} : { minQuoteNotional }),
@@ -1347,7 +1353,8 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       throw new NoOrderSubmittedError(
         error instanceof UntradableOrderRequestError
           ? 'UNTRADABLE_REQUEST'
-          : 'UNCLASSIFIED'
+          : 'UNCLASSIFIED',
+        { cause: error }
       );
     }
     const order = await this.exchange.createOrder(
@@ -1402,7 +1409,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       'formatted amount'
     );
     if (!decimal(validFormattedAmount).eq(exchangeAmount)) {
-      throw new UntradableOrderRequestError();
+      throw new UntradableOrderRequestError(`formatted amount mismatch: expected ${exchangeAmount}; actual ${validFormattedAmount}`);
     }
 
     let formattedPrice: string | undefined;
@@ -1539,25 +1546,25 @@ export class CcxtExchangeGateway implements ExchangeGateway {
   ): OrderSnapshot {
     const request = context.request;
     if (order.id === undefined || order.id.trim() === '') {
-      throw new Error('malformed order response: missing exchange order id');
+      throw new Error(`malformed order response: missing exchange order id; expected nonempty id; actual ${diagnosticValue(order.id)}`);
     }
     if (
       context.exchangeOrderId !== undefined
       && order.id !== context.exchangeOrderId
     ) {
-      throw new Error('malformed order response: exchange order id mismatch');
+      throw new Error(`malformed order response: exchange order id mismatch; expected ${context.exchangeOrderId}; actual ${order.id}`);
     }
     if (
       order.symbol !== undefined
       && order.symbol !== market.symbol
     ) {
-      throw new Error('malformed order response: market symbol mismatch');
+      throw new Error(`malformed order response: market symbol mismatch; expected ${market.symbol}; actual ${order.symbol}`);
     }
 
     const clientOrderId = order.clientOrderId
       ?? request?.clientOrderId;
     if (clientOrderId === undefined || clientOrderId.trim() === '') {
-      throw new Error('malformed order response: missing client order id');
+      throw new Error(`malformed order response: missing client order id; expected nonempty client order id; actual ${diagnosticValue(clientOrderId)}`);
     }
     const expectedClientOrderId = context.clientOrderId
       ?? request?.clientOrderId;
@@ -1565,14 +1572,17 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       expectedClientOrderId !== undefined
       && clientOrderId !== expectedClientOrderId
     ) {
-      throw new Error('malformed order response: client order id mismatch');
+      throw new Error(`malformed order response: client order id mismatch; expected ${expectedClientOrderId}; actual ${clientOrderId}`);
     }
 
     const type = normalizedType(order.type, request?.type);
     const side = normalizedSide(order.side, request?.side);
     if (request !== undefined) {
-      if (type !== request.type || side !== request.side) {
-        throw new Error('malformed order response: order identity mismatch');
+      if (type !== request.type) {
+        throw new Error(`malformed order response: order type mismatch; expected ${request.type}; actual ${type}`);
+      }
+      if (side !== request.side) {
+        throw new Error(`malformed order response: order side mismatch; expected ${request.side}; actual ${side}`);
       }
     }
 
@@ -1586,30 +1596,28 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       'order amount'
     ) ?? fallbackExchangeAmount;
     if (exchangeAmount === undefined) {
-      throw new Error('malformed order response: missing order amount');
+      throw new Error(`malformed order response: missing order amount; expected decimal amount; actual ${diagnosticValue(order.amount)}`);
     }
     const filledExchangeAmount = optionalDecimalString(
       order.filled,
       'filled amount'
     ) ?? (request === undefined ? undefined : '0');
     if (filledExchangeAmount === undefined) {
-      throw new Error('malformed order response: missing filled amount');
+      throw new Error(`malformed order response: missing filled amount; expected decimal filled; actual ${diagnosticValue(order.filled)}`);
     }
     const remainingExchangeAmount = optionalDecimalString(
       order.remaining,
       'remaining amount'
     ) ?? exactDifference(exchangeAmount, filledExchangeAmount);
-    if (
-      decimal(filledExchangeAmount).gt(exchangeAmount)
-      || decimal(remainingExchangeAmount).gt(exchangeAmount)
-      || exactSum(
-        filledExchangeAmount,
-        remainingExchangeAmount
-      ) !== decimal(exchangeAmount).toFixed()
-    ) {
-      throw new Error(
-        'malformed order response: inconsistent order quantities'
-      );
+    if (decimal(filledExchangeAmount).gt(exchangeAmount)) {
+      throw new Error(`malformed order response: filled amount exceeds order amount; expected at most ${exchangeAmount}; actual ${filledExchangeAmount}`);
+    }
+    if (decimal(remainingExchangeAmount).gt(exchangeAmount)) {
+      throw new Error(`malformed order response: remaining amount exceeds order amount; expected at most ${exchangeAmount}; actual ${remainingExchangeAmount}`);
+    }
+    const quantitySum = exactSum(filledExchangeAmount, remainingExchangeAmount);
+    if (quantitySum !== decimal(exchangeAmount).toFixed()) {
+      throw new Error(`malformed order response: filled + remaining quantity sum mismatch; expected ${exchangeAmount}; actual ${quantitySum}; filled=${filledExchangeAmount}, remaining=${remainingExchangeAmount}`);
     }
 
     const requestedBaseQuantity = rules.kind === 'swap'
@@ -1620,7 +1628,7 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       && !decimal(requestedBaseQuantity).eq(request.baseQuantity)
     ) {
       throw new Error(
-        'malformed order response: requested quantity mismatch'
+        `malformed order response: requested quantity mismatch; expected ${request.baseQuantity}; actual ${requestedBaseQuantity}`
       );
     }
     const filledBaseQuantity = rules.kind === 'swap'

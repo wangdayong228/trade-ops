@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../../errors/error-evidence.js';
 import { decimal } from '../../domain/decimal.js';
 import type {
   AccountSettings,
@@ -86,7 +87,7 @@ export class BitgetProfile implements ExchangeProfile {
       ?? finitePositive(ticker.last);
     if (referencePrice === null) {
       throw new Error(
-        'Bitget spot market buy requires a finite positive ticker ask or last'
+        `Bitget spot market buy requires a finite positive ticker ask or last; actual ask=${diagnosticValue(ticker.ask)}, last=${diagnosticValue(ticker.last)}`
       );
     }
     const formatted = exchange.priceToPrecision(
@@ -95,7 +96,7 @@ export class BitgetProfile implements ExchangeProfile {
     );
     if (finitePositive(formatted) === null) {
       throw new Error(
-        'Bitget spot market buy conversion price is not finite and positive'
+        `Bitget spot market buy conversion price is not finite and positive; actual formatted=${diagnosticValue(formatted)}`
       );
     }
     return formatted;

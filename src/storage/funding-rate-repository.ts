@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import type {
   FundingExchangeId,
   FundingMarketIdentity,
@@ -111,11 +112,11 @@ export function fundingTaskFailure(
     typeof code !== 'string'
     || !Object.hasOwn(FUNDING_TASK_FAILURE_SUMMARIES, code)
   ) {
-    throw new Error('unsupported funding task failure code');
+    throw new Error(`unsupported funding task failure code: expected ${Object.keys(FUNDING_TASK_FAILURE_SUMMARIES).join("|")}; actual ${diagnosticValue(code)}`);
   }
   const summary = FUNDING_TASK_FAILURE_SUMMARIES[code];
   if (summary === undefined) {
-    throw new Error('unsupported funding task failure code');
+    throw new Error(`unsupported funding task failure code: expected ${Object.keys(FUNDING_TASK_FAILURE_SUMMARIES).join("|")}; actual ${diagnosticValue(code)}`);
   }
   return { code, summary };
 }

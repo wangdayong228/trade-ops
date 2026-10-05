@@ -101,13 +101,13 @@ npm start
 - `order_status_changed`
 - `order_terminal`
 
-交易事件只允许输出对冲任务/订单关联 ID、执行模式与状态、交易所、symbol、订单角色/类型/方向、委托量/成交量/剩余量、限价/成交均价、GTC、仓位方向、保证金模式、订单状态，以及有限的失败码和错误类型/错误码。相同的轮询快照不会重复记录；`closed`、`canceled`、`rejected` 等可靠终态会额外记录 `order_terminal`。
+交易事件只允许输出对冲任务/订单关联 ID、执行模式与状态、交易所、symbol、订单角色/类型/方向、委托量/成交量/剩余量、限价/成交均价、GTC、仓位方向、保证金模式、订单状态，以及失败码、失败检查、期望/实际值与脱敏后的错误证据。相同的轮询快照不会重复记录；`closed`、`canceled`、`rejected` 等可靠终态会额外记录 `order_terminal`。
 
 每个完成的 HTTP 请求只记录一条 `request completed`：状态码低于 `400` 时为 `info`，且不带失败请求快照；`4xx` 为 `warn`，`5xx` 为 `error`。失败日志带 `httpError`，以及 `httpRequest` 快照（`method`、包含 query 的 `url`、`body`、`truncated`、`originalByteLength`）。Host/Origin 会在任何 body 观察或 parser 运行前检查；该边界早拒绝的 `403` 不读取或缓存攻击 payload，日志 body 为 `null`。路由解析前发现畸形 URL 时返回结构化 `400`，保留安全响应头与一条完成日志，不读取 body，日志 URL 使用 `[Unavailable]`。
 
-全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察另有固定 `1 MiB` 安全预算；路由显式配置更大的解析上限也不会扩大观察预算。无法安全结构化的原始正文（例如畸形 JSON）一律记录为 `[Unavailable]`，不输出原文或前缀。解析后的 body 会递归隐藏 API key、secret、password、passphrase、signature、authorization、cookie 等凭证字段，以及 credentials/auth 容器；query 中对应的字段也会在解码键名后隐藏，普通诊断字段保留。当前已配置的敏感值仍先被完整替换，再将最终 body 按 UTF-8 最多 `8192` 字节截断；`1 MiB` 是原始观察安全预算，`8192` 是最终日志输出上限。任何请求 headers 和响应 body 都不记录，也不记录原始 CCXT 请求/响应、完整环境变量或任意错误属性。启动与 HTTP 错误只保留受控安全详情，不透传第三方消息、cause 链或 stack；凭证错误实际值仅为 `missing` 或 `present-but-invalid`。
+全局 Fastify body 解析上限显式为 `1 MiB`，原始 body 观察另有固定 `1 MiB` 安全预算；路由显式配置更大的解析上限也不会扩大观察预算。无法安全结构化的原始正文（例如畸形 JSON）一律记录为 `[Unavailable]`，不输出原文或前缀。解析后的 body 会递归隐藏 API key、secret、password、passphrase、signature、authorization、cookie 等凭证字段，以及 credentials/auth 容器；query 中对应的字段也会在解码键名后隐藏，普通诊断字段保留。当前已配置的敏感值仍先被完整替换，再将最终 body 按 UTF-8 最多 `8192` 字节截断；`1 MiB` 是原始观察安全预算，`8192` 是最终日志输出上限。请求 headers、服务的完整 HTTP 响应 body、原始 CCXT 请求/响应对象、完整环境变量和任意错误属性不进入日志。错误诊断通过白名单保留脱敏后的具体消息、错误码、实际可读取的远端状态与错误正文，以及 cause / AggregateError 原因链；同次失败日志还保留安全 stack。错误证据和界面消息不因显示长度截断，以上 `8192` 字节限制仅适用于请求 body 快照。凭证错误实际值仍仅为 `missing` 或 `present-but-invalid`。
 
-HTTP 错误体统一为 `{ "requestId", "error": { "code", "phase", "subject", "expected", "actual", "message", "occurredAt" } }`。中文说明与对象、期望和实际值对应；凭证错误只显示具体字段及 `missing` / `present-but-invalid`。完整响应示例与处理步骤见 [操作员使用说明](docs/usage/operator-guide.md#界面错误与日志)。
+HTTP 错误体统一为 `{ "requestId", "error": { "code", "phase", "subject", "expected", "actual", "message", "occurredAt" } }`。中文说明与对象、期望和实际值对应；有底层原因时，`error` 还包含可选的 `evidence`，展示脱敏后的错误链和远端失败证据。HTTP 证据不含堆栈，完整安全堆栈保留在同次失败日志中；确认失效证据在脱敏后写入 SQLite，重启后仍可查看。凭证错误只显示具体字段及 `missing` / `present-but-invalid`。完整响应示例与处理步骤见 [操作员使用说明](docs/usage/operator-guide.md#界面错误与日志)。
 
 失败的预检请求不会向 SQLite 写入对冲任务。同步请求失败不会再额外记录 `unhandled_http_request_failure`；确认接口返回 `202` 后的后台执行不属于该 HTTP 完成日志，异步失败仍单独记录 `background_confirmation_failed`。日志是旁路行为：stdout 写入失败不会改变 SQLite 状态、触发重试或重复下单。
 

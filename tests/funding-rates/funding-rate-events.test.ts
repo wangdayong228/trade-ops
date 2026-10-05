@@ -1,3 +1,4 @@
+const LEGACY_ERROR_FIELD_BYTES = 512;
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
@@ -8,7 +9,6 @@ import {
   createAppLogger
 } from '../../src/logging/logger.js';
 import {
-  MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES,
   NOOP_FUNDING_RATE_EVENT_SINK,
   PinoFundingRateEventSink,
   fundingRateEvent,
@@ -509,7 +509,7 @@ test('builder allowlists event, request, query, and safe error fields independen
       apiKey: 'FORBIDDEN-ERROR-KEY',
       headers: { authorization: 'FORBIDDEN-ERROR-HEADER' },
       rawResponse: 'FORBIDDEN-ERROR-RESPONSE',
-      cause: new Error('FORBIDDEN-CAUSE')
+      cause: { name: 'Error', message: 'visible-root-cause' }
     },
     apiKey: 'FORBIDDEN-ROOT-API-KEY',
     secret: 'FORBIDDEN-ROOT-SECRET',
@@ -555,12 +555,13 @@ test('builder allowlists event, request, query, and safe error fields independen
       type: 'SyntheticExchangeError',
       message: 'public request failed',
       code: 'ETIMEDOUT',
-      stack: 'SyntheticExchangeError: public request failed\n    at synthetic:test'
+      stack: 'SyntheticExchangeError: public request failed\n    at synthetic:test',
+      cause: { type: 'Error', message: 'visible-root-cause' }
     }
   });
   assert.doesNotMatch(
     JSON.stringify(event),
-    /apiKey|secret|headers|rawResponse|cause|FORBIDDEN|nested/
+    /apiKey|secret|headers|rawResponse|FORBIDDEN|nested/
   );
 
   const withoutStringCode = fundingRateEvent({
@@ -574,29 +575,30 @@ test('builder allowlists event, request, query, and safe error fields independen
   });
   assert.deepEqual(withoutStringCode.error, {
     type: 'SyntheticError',
-    message: 'failed'
+    message: 'failed',
+    code: 'code has unsupported non-string value'
   });
 });
 
-test('Pino sink reapplies nested allowlists, redacts every emitted string, and truncates UTF-8 safely', () => {
+test('Pino sink reapplies nested allowlists, redacts every emitted string, and preserves complete UTF-8 evidence', () => {
   const secret = 'SYNTHETIC-CREDENTIAL-VALUE';
   const forbidden = 'MUST-NOT-BE-LOGGED';
   const output: string[] = [];
   const sink = new PinoFundingRateEventSink(
     createAppLogger(captureDestination(output)),
-    () => [secret]
+    () => [secret, forbidden]
   );
   const redaction = '[Redacted]';
   assert.ok(
-    MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES
+    LEGACY_ERROR_FIELD_BYTES
       > Buffer.byteLength(redaction, 'utf8') + 1
   );
   const asciiAfterRedaction = 'x'.repeat(
-    MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES
+    LEGACY_ERROR_FIELD_BYTES
       - Buffer.byteLength(redaction, 'utf8')
       - 1
   );
-  const longMessage = `${secret}${asciiAfterRedaction}界`;
+  const longMessage = `${secret}${asciiAfterRedaction}界terminal-error-evidence`;
   const unsafeEvent = Object.assign(fundingRateEvent({
     event: 'funding_request_retry',
     taskCategory: 'coverage',
@@ -655,9 +657,9 @@ test('Pino sink reapplies nested allowlists, redacts every emitted string, and t
   sink.record(unsafeEvent);
 
   assert.equal(Number.isSafeInteger(
-    MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES
+    LEGACY_ERROR_FIELD_BYTES
   ), true);
-  assert.ok(MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES > 0);
+  assert.ok(LEGACY_ERROR_FIELD_BYTES > 0);
   const line = JSON.parse(output.join('').trim()) as Record<string, unknown>;
   assert.equal(line.component, 'funding-rates');
   assert.equal(line.exchangeId, 'okx');
@@ -681,19 +683,20 @@ test('Pino sink reapplies nested allowlists, redacts every emitted string, and t
   });
   const error = line.error as Record<string, unknown>;
   assert.equal(error.type, 'Synthetic-[Redacted]');
+  assert.match(JSON.stringify(error.cause), /\[Redacted\]/u);
   assert.equal(error.code, 'E-[Redacted]');
   assert.equal(error.stack, 'Synthetic-[Redacted]: [Redacted]');
   assert.equal(typeof error.message, 'string');
-  assert.equal(error.message, `${redaction}${asciiAfterRedaction}`);
+  assert.equal(error.message, `${redaction}${asciiAfterRedaction}界terminal-error-evidence`);
   assert.equal(
     Buffer.byteLength(error.message as string, 'utf8'),
-    MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES - 1
+    Buffer.byteLength(`${redaction}${asciiAfterRedaction}界terminal-error-evidence`, 'utf8')
   );
   assert.doesNotMatch(error.message as string, /\uFFFD/);
   assert.doesNotMatch(error.message as string, /[\uD800-\uDBFF]$/);
   assert.doesNotMatch(
     JSON.stringify(line),
-    new RegExp(`${secret}|${forbidden}|apiKey|headers|rawResponse|cause|authorization`)
+    new RegExp(`${secret}|${forbidden}|apiKey|headers|rawResponse|authorization`)
   );
 });
 
@@ -1075,4 +1078,12 @@ test('logger, secret provider, and synchronous or asynchronous sink failures nev
   } finally {
     process.removeListener('unhandledRejection', onUnhandled);
   }
+});
+
+test('funding error projection does not execute error accessors', () => {
+  let calls = 0;
+  const error = Object.defineProperty({}, 'message', { get() { calls++; return 'unsafe-secret'; } });
+  const event = fundingRateEvent({ event: 'funding_sync_fatal', phase: 'worker', exchangeId: 'okx', error } as unknown as FundingRateEventInput);
+  assert.equal(calls, 0);
+  assert.doesNotMatch(JSON.stringify(event), /unsafe-secret/u);
 });

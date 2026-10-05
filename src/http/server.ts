@@ -40,6 +40,7 @@ import {
 } from '../logging/logger.js';
 import {
   createTradeOpsError,
+  projectTradeOpsError,
   safeFailureCategory,
   withErrorPhase,
   type ErrorCode,
@@ -218,7 +219,8 @@ function requestFailure(
     | 'REQUEST_ROUTE_NOT_FOUND'>,
   field: string,
   expected: SafeDiagnosticValue,
-  actual: SafeDiagnosticValue
+  actual: SafeDiagnosticValue,
+  options?: ErrorOptions
 ): TradeOpsError {
   return createTradeOpsError({
     code,
@@ -226,7 +228,7 @@ function requestFailure(
     subject: { type: 'request', field },
     expected,
     actual
-  });
+  }, undefined, options);
 }
 
 function operationFailure(operation: string, error: unknown): TradeOpsError {
@@ -234,7 +236,8 @@ function operationFailure(operation: string, error: unknown): TradeOpsError {
     'REQUEST_OPERATION_FAILED',
     operation,
     `successful ${operation}`,
-    safeFailureCategory(error)
+    safeFailureCategory(error),
+    { cause: error }
   );
 }
 
@@ -611,26 +614,30 @@ function publicOrder(
   };
 }
 
-function statusDecimal(value: string): Decimal {
+function statusDecimal(value: string, field: string): Decimal {
   if (value.length === 0 || value.length > 10_000) {
-    throw new Error('invalid status quantity');
+    throw new Error(`${field}: expected string length 1..10000; actual length ${value.length}`);
   }
   let parsed: Decimal;
   try {
     parsed = new StatusDecimal(value);
-  } catch {
-    throw new Error('invalid status quantity');
+  } catch (error) {
+    throw new Error(`${field}: expected decimal; actual malformed string length ${value.length}`, { cause: error });
   }
-  if (!parsed.isFinite() || parsed.isNegative()) {
-    throw new Error('invalid status quantity');
+  if (!parsed.isFinite()) {
+    throw new Error(`${field}: expected finite decimal; actual ${parsed.toString()}`);
+  }
+  if (parsed.isNegative()) {
+    throw new Error(`${field}: expected non-negative decimal; actual ${parsed.toString()}`);
   }
   return parsed;
 }
 
 function exactStatusConstructor(
-  values: readonly string[]
+  values: readonly string[],
+  field: string
 ): Decimal.Constructor {
-  const parsed = values.map(statusDecimal);
+  const parsed = values.map((value, index) => statusDecimal(value, `${field}.source[${index}].filledBaseQuantity`));
   const highestExponent = Math.max(...parsed.map((value) => value.e));
   const lowestSignificantExponent = Math.min(...parsed.map(
     (value) => value.e - value.sd() + 1
@@ -643,7 +650,7 @@ function exactStatusConstructor(
     || requiredPrecision <= 0
     || requiredPrecision > MAX_STATUS_PRECISION
   ) {
-    throw new Error('status quantity precision exceeds supported range');
+    throw new Error(`${field}.requiredPrecision: expected safe integer in [1, ${MAX_STATUS_PRECISION}]; actual ${requiredPrecision}`);
   }
   return StatusDecimal.clone({
     precision: Math.max(StatusDecimal.precision, requiredPrecision),
@@ -663,11 +670,11 @@ function formatStatusDecimal(value: Decimal): string {
   return value.toString();
 }
 
-function exactSum(values: readonly string[]): string {
+function exactSum(values: readonly string[], field: string): string {
   if (values.length === 0) {
     return '0';
   }
-  const ExactDecimal = exactStatusConstructor(values);
+  const ExactDecimal = exactStatusConstructor(values, field);
   let total = new ExactDecimal(0);
   for (const value of values) {
     total = total.plus(value);
@@ -676,7 +683,7 @@ function exactSum(values: readonly string[]): string {
 }
 
 function exactAbsoluteDifference(left: string, right: string): string {
-  const ExactDecimal = exactStatusConstructor([left, right]);
+  const ExactDecimal = exactStatusConstructor([left, right], 'actualFills.unmatchedBaseQuantity');
   return formatStatusDecimal(
     new ExactDecimal(left).minus(right).abs()
   );
@@ -707,8 +714,8 @@ function actualFills(
       contractFills.push(snapshot.filledBaseQuantity);
     }
   }
-  const spotBuyBaseQuantity = exactSum(spotFills);
-  const contractShortBaseQuantity = exactSum(contractFills);
+  const spotBuyBaseQuantity = exactSum(spotFills, 'actualFills.spotBuyBaseQuantity');
+  const contractShortBaseQuantity = exactSum(contractFills, 'actualFills.contractShortBaseQuantity');
   return {
     spotBuyBaseQuantity,
     contractShortBaseQuantity,
@@ -1051,13 +1058,15 @@ export function buildServer(
     state.httpError = error;
   }
 
-  function projectFailure(error: unknown): {
+  function projectFailure(error: unknown, includeStack = false): {
     readonly detail: PublicErrorDetail;
     readonly specific: boolean;
   } {
     try {
       const secrets = nonEmptySecrets(dependencies.secretProvider?.() ?? []);
-      const detail = publicErrorDetail(error, secrets);
+      const detail = includeStack
+        ? projectTradeOpsError(error as TradeOpsError, secrets, true)
+        : publicErrorDetail(error, secrets);
       if (detail !== undefined) {
         return { detail, specific: true };
       }
@@ -1082,7 +1091,8 @@ export function buildServer(
         subject: detail.subject,
         expected: detail.expected,
         actual: detail.actual,
-        occurredAt: detail.occurredAt
+        occurredAt: detail.occurredAt,
+        ...(detail.evidence === undefined ? {} : { evidence: detail.evidence })
       });
       return projectFailure(error).detail;
     } catch {
@@ -1102,12 +1112,15 @@ export function buildServer(
   ): FastifyReply {
     const projected = projectFailure(failure);
     const logDetail = options.logDetail === true && projected.specific;
+    const logged = logDetail
+      ? projectFailure(failure, true)
+      : projected;
     rememberHttpError(request, {
-      code: projected.detail.code,
-      message: options.fullLogMessage === true && projected.specific
-        ? projected.detail.message
-        : errorSummary(projected.detail),
-      ...(logDetail ? { error: projected.detail } : {})
+      code: logged.detail.code,
+      message: options.fullLogMessage === true && logged.specific
+        ? logged.detail.message
+        : errorSummary(logged.detail),
+      ...(logDetail && logged.specific ? { error: logged.detail } : {})
     });
     return reply.status(statusCode).send({
       requestId: request.id,

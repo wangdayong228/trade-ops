@@ -1,4 +1,10 @@
 import { isProxy } from 'node:util/types';
+import {
+  errorEvidence,
+  inspectErrorStackDescriptor,
+  redactEvidenceText,
+  type ErrorEvidence
+} from './error-evidence.js';
 
 const ERROR_CODES = [
   'CONFIG_FIELD_MISSING',
@@ -139,6 +145,7 @@ export interface ErrorInput {
   readonly expected: SafeDiagnosticValue;
   readonly actual: SafeDiagnosticValue;
   readonly occurredAt?: string;
+  readonly evidence?: ErrorEvidence;
 }
 
 export interface ErrorDetail extends Omit<ErrorInput, 'occurredAt'> {
@@ -190,6 +197,7 @@ const ERROR_DESCRIPTIONS: Readonly<Record<ErrorCode, string>> = {
 };
 
 const ERROR_DETAILS = new WeakMap<object, ErrorDetail>();
+const ERROR_CAUSES = new WeakMap<object, unknown>();
 
 function invalid(
   path: string,
@@ -208,7 +216,12 @@ function valueCategory(value: unknown): string {
   return typeof value;
 }
 
-function recordProperties(value: unknown, path: string): DataProperties {
+function recordProperties(
+  value: unknown,
+  path: string,
+  allowed: readonly string[],
+  deferStack = false
+): DataProperties {
   if (typeof value !== 'object' || value === null) {
     return invalid(path, '普通数据对象', valueCategory(value));
   }
@@ -217,10 +230,10 @@ function recordProperties(value: unknown, path: string): DataProperties {
   }
 
   let prototype: object | null;
-  let descriptors: PropertyDescriptorMap;
+  let keys: readonly PropertyKey[];
   try {
     prototype = Object.getPrototypeOf(value) as object | null;
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    keys = Reflect.ownKeys(value);
   } catch {
     return invalid(path, '可检查的普通数据对象', '不可检查对象');
   }
@@ -228,9 +241,28 @@ function recordProperties(value: unknown, path: string): DataProperties {
     return invalid(path, '普通数据对象', '带有自定义原型的对象');
   }
 
+  const unexpectedCount = keys.filter((key) => (
+    typeof key !== 'string' || !allowed.includes(key)
+  )).length;
+  if (unexpectedCount > 0) {
+    return invalid(path, '仅含已定义字段', `包含 ${unexpectedCount} 个额外字段`);
+  }
+
   const properties = new Map<PropertyKey, PropertyDescriptor>();
-  for (const key of Reflect.ownKeys(descriptors)) {
-    const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor;
+  for (const key of keys) {
+    if (deferStack && key === 'stack') {
+      properties.set(key, { value: undefined });
+      continue;
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return invalid(path, '可检查的普通数据对象', '属性不可检查');
+    }
+    if (descriptor === undefined) {
+      return invalid(path, '稳定的 own 数据属性', 'own key 对应属性缺失');
+    }
     if (!('value' in descriptor) || descriptor.get !== undefined
       || descriptor.set !== undefined) {
       return invalid(path, '仅含数据属性', '包含访问器属性');
@@ -353,11 +385,13 @@ function denseArrayValues(value: unknown, path: string): readonly unknown[] {
 
   let isArray: boolean;
   let prototype: object | null;
-  let descriptors: PropertyDescriptorMap;
+  let keys: readonly PropertyKey[];
+  let lengthDescriptor: PropertyDescriptor | undefined;
   try {
     isArray = Array.isArray(value);
     prototype = Object.getPrototypeOf(value) as object | null;
-    descriptors = Object.getOwnPropertyDescriptors(value);
+    keys = Reflect.ownKeys(value);
+    lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
   } catch {
     return invalid(path, '可检查的数组', '不可检查对象');
   }
@@ -365,28 +399,34 @@ function denseArrayValues(value: unknown, path: string): readonly unknown[] {
     return invalid(path, '普通数组', '非普通数组对象');
   }
 
-  const lengthDescriptor = descriptors.length;
   if (lengthDescriptor === undefined || !('value' in lengthDescriptor)
     || typeof lengthDescriptor.value !== 'number') {
     return invalid(`${path}.length`, '数组长度数据属性', '无效长度属性');
   }
   const length = lengthDescriptor.value;
   const expectedKeys = new Set<PropertyKey>(['length']);
+  for (let index = 0; index < length; index += 1) {
+    expectedKeys.add(String(index));
+  }
+  for (const key of keys) {
+    if (!expectedKeys.has(key)) {
+      return invalid(path, '无额外属性的稠密数组', '包含额外或稀疏属性');
+    }
+  }
+
   const result: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
-    const key = String(index);
-    expectedKeys.add(key);
-    const descriptor = descriptors[key];
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    } catch {
+      return invalid(`${path}[${index}]`, '可检查的数据属性', '属性不可检查');
+    }
     if (descriptor === undefined || !('value' in descriptor)
       || descriptor.get !== undefined || descriptor.set !== undefined) {
       return invalid(`${path}[${index}]`, '数据属性', '缺失或访问器属性');
     }
     result.push(descriptor.value);
-  }
-  for (const key of Reflect.ownKeys(descriptors)) {
-    if (!expectedKeys.has(key)) {
-      return invalid(path, '无额外属性的稠密数组', '包含额外或稀疏属性');
-    }
   }
   return result;
 }
@@ -410,7 +450,10 @@ function normalizeSecrets(secrets: readonly string[] | undefined): readonly stri
 }
 
 function parseSubject(value: unknown, secrets: readonly string[]): ErrorSubject {
-  const properties = recordProperties(value, 'subject');
+  const properties = recordProperties(value, 'subject', [
+    'type', 'field', 'exchangeId', 'operation', 'symbol', 'kind',
+    'strategyId', 'path', 'table', 'recordId'
+  ]);
   if (!properties.has('type')) {
     invalid('subject.type', '必填对象类型', '字段缺失');
   }
@@ -603,6 +646,191 @@ function parseDiagnosticValue(
   return Object.freeze(safeItems);
 }
 
+function parseEvidence(
+  value: unknown,
+  path: string,
+  secrets: readonly string[],
+  ancestors = new WeakSet<object>()
+): ErrorEvidence {
+  const evidenceProperties = [
+    'type', 'message', 'code', 'stack', 'status', 'body', 'cause', 'errors'
+  ] as const;
+  const properties = recordProperties(value, path, evidenceProperties, true);
+  assertExactProperties(
+    properties,
+    path,
+    evidenceProperties,
+    ['type', 'message']
+  );
+  if (typeof value !== 'object' || value === null) {
+    return invalid(path, '普通错误证据对象', valueCategory(value));
+  }
+  if (ancestors.has(value)) {
+    return invalid(path, '无循环的错误证据树', '循环引用');
+  }
+  ancestors.add(value);
+  try {
+    const evidenceType = propertyValue(properties, 'type');
+    const evidenceMessage = propertyValue(properties, 'message');
+    if (typeof evidenceType !== 'string' || evidenceType.length === 0) {
+      return invalid(`${path}.type`, '非空字符串', valueCategory(evidenceType));
+    }
+    if (typeof evidenceMessage !== 'string' || evidenceMessage.length === 0) {
+      return invalid(`${path}.message`, '非空字符串', valueCategory(evidenceMessage));
+    }
+    const optionalText = (key: 'code' | 'body'): string | undefined => {
+      if (!properties.has(key)) return undefined;
+      const candidate = propertyValue(properties, key);
+      if (typeof candidate !== 'string') {
+        return invalid(`${path}.${key}`, '字符串', valueCategory(candidate));
+      }
+      return redactEvidenceText(candidate, secrets);
+    };
+    const code = optionalText('code');
+    const body = optionalText('body');
+    let stack: string | undefined;
+    if (properties.has('stack')) {
+      const inspected = inspectErrorStackDescriptor(value);
+      if (inspected.kind === 'unreadable') {
+        return invalid(
+          `${path}.stack`, '可安全读取的数据属性', inspected.reason
+        );
+      }
+      const descriptor = inspected.descriptor;
+      if (descriptor === undefined) {
+        return invalid(
+          `${path}.stack`, '稳定的 own 数据属性', 'own key 对应属性缺失'
+        );
+      }
+      if (!('value' in descriptor) || descriptor.get !== undefined
+        || descriptor.set !== undefined) {
+        return invalid(`${path}.stack`, '数据属性', '访问器属性');
+      }
+      if (typeof descriptor.value !== 'string') {
+        return invalid(
+          `${path}.stack`, '字符串', valueCategory(descriptor.value)
+        );
+      }
+      stack = redactEvidenceText(descriptor.value, secrets);
+    }
+    let status: string | number | undefined;
+    if (properties.has('status')) {
+      const candidate = propertyValue(properties, 'status');
+      if (typeof candidate === 'string') {
+        status = redactEvidenceText(candidate, secrets);
+      } else if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+        status = candidate;
+      } else {
+        invalid(`${path}.status`, '字符串或有限数字', valueCategory(candidate));
+      }
+    }
+    const cause = properties.has('cause')
+      ? parseEvidence(propertyValue(properties, 'cause'), `${path}.cause`, secrets, ancestors)
+      : undefined;
+    let errors: readonly ErrorEvidence[] | undefined;
+    if (properties.has('errors')) {
+      const items = denseArrayValues(propertyValue(properties, 'errors'), `${path}.errors`);
+      errors = Object.freeze(items.map((item, index) => parseEvidence(
+        item,
+        `${path}.errors[${index}]`,
+        secrets,
+        ancestors
+      )));
+    }
+    return Object.freeze({
+      type: redactEvidenceText(evidenceType, secrets),
+      message: redactEvidenceText(evidenceMessage, secrets),
+      ...(code === undefined ? {} : { code }),
+      ...(stack === undefined ? {} : { stack }),
+      ...(status === undefined ? {} : { status }),
+      ...(body === undefined ? {} : { body }),
+      ...(cause === undefined ? {} : { cause }),
+      ...(errors === undefined ? {} : { errors })
+    });
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function projectedEvidence(
+  evidence: ErrorEvidence,
+  secrets: readonly string[],
+  includeStack: boolean
+): ErrorEvidence {
+  const cause = evidence.cause === undefined
+    ? undefined
+    : projectedEvidence(evidence.cause, secrets, includeStack);
+  const errors = evidence.errors === undefined
+    ? undefined
+    : Object.freeze(evidence.errors.map((item) => (
+      projectedEvidence(item, secrets, includeStack)
+    )));
+  return Object.freeze({
+    type: redactEvidenceText(evidence.type, secrets),
+    message: redactEvidenceText(evidence.message, secrets),
+    ...(evidence.code === undefined
+      ? {}
+      : { code: redactEvidenceText(evidence.code, secrets) }),
+    ...(!includeStack || evidence.stack === undefined
+      ? {}
+      : { stack: redactEvidenceText(evidence.stack, secrets) }),
+    ...(evidence.status === undefined
+      ? {}
+      : {
+          status: typeof evidence.status === 'string'
+            ? redactEvidenceText(evidence.status, secrets)
+            : evidence.status
+        }),
+    ...(evidence.body === undefined
+      ? {}
+      : { body: redactEvidenceText(evidence.body, secrets) }),
+    ...(cause === undefined ? {} : { cause }),
+    ...(errors === undefined ? {} : { errors })
+  });
+}
+
+function combineEvidence(
+  stored: ErrorEvidence | undefined,
+  runtime: ErrorEvidence | undefined
+): ErrorEvidence | undefined {
+  if (stored === undefined) return runtime;
+  if (runtime === undefined) return stored;
+  return Object.freeze({
+    type: 'AggregateError',
+    message: 'stored and runtime error evidence',
+    errors: Object.freeze([stored, runtime])
+  });
+}
+
+function trustedEvidenceNode(
+  value: object,
+  runtime: ErrorEvidence,
+  secrets: readonly string[],
+  includeStack: boolean
+): ErrorEvidence | undefined {
+  const detail = ERROR_DETAILS.get(value);
+  if (detail === undefined) return undefined;
+  const stored = detail.evidence === undefined
+    ? undefined
+    : projectedEvidence(detail.evidence, secrets, includeStack);
+  return combineEvidence(stored, runtime) ?? runtime;
+}
+
+export function projectErrorEvidence(
+  error: unknown,
+  secrets: readonly string[] = [],
+  includeStack = true
+): ErrorEvidence {
+  return errorEvidence(
+    error,
+    secrets,
+    includeStack,
+    (value, runtime) => trustedEvidenceNode(
+      value, runtime, secrets, includeStack
+    )
+  );
+}
+
 function canonicalTimestamp(value: unknown): string {
   if (typeof value !== 'string') {
     return invalid('occurredAt', 'UTC ISO 8601 时间字符串', valueCategory(value));
@@ -700,14 +928,26 @@ function describeDiagnostic(value: SafeDiagnosticValue): string {
   return `字符串列表 ${JSON.stringify(value)}`;
 }
 
+function describeEvidence(evidence: ErrorEvidence): string {
+  return [
+    evidence.message,
+    ...(evidence.cause === undefined ? [] : [describeEvidence(evidence.cause)]),
+    ...(evidence.errors === undefined
+      ? []
+      : evidence.errors.map((item) => describeEvidence(item)))
+  ].join('；');
+}
+
 function createMessage(
   code: ErrorCode,
   subject: ErrorSubject,
   expected: SafeDiagnosticValue,
-  actual: SafeDiagnosticValue
+  actual: SafeDiagnosticValue,
+  evidence?: ErrorEvidence
 ): string {
   return `${ERROR_DESCRIPTIONS[code]}（${describeSubject(subject)}）：`
-    + `期望 ${describeDiagnostic(expected)}，实际为 ${describeDiagnostic(actual)}`;
+    + `期望 ${describeDiagnostic(expected)}，实际为 ${describeDiagnostic(actual)}`
+    + (evidence === undefined ? '' : `；原因：${describeEvidence(evidence)}`);
 }
 
 function rejectMessageContainingSecret(secrets: readonly string[]): never {
@@ -723,11 +963,14 @@ function buildDetail(
   rawSecrets: readonly string[] | undefined
 ): ErrorDetail {
   const secrets = normalizeSecrets(rawSecrets);
-  const properties = recordProperties(input, 'input');
+  const inputProperties = [
+    'code', 'phase', 'subject', 'expected', 'actual', 'occurredAt', 'evidence'
+  ] as const;
+  const properties = recordProperties(input, 'input', inputProperties);
   assertExactProperties(
     properties,
     'input',
-    ['code', 'phase', 'subject', 'expected', 'actual', 'occurredAt'],
+    inputProperties,
     ['code', 'phase', 'subject', 'expected', 'actual']
   );
 
@@ -772,7 +1015,10 @@ function buildDetail(
   const occurredAt = properties.has('occurredAt')
     ? canonicalTimestamp(propertyValue(properties, 'occurredAt'))
     : new Date().toISOString();
-  const message = createMessage(code, subject, expected, actual);
+  const evidence = properties.has('evidence')
+    ? parseEvidence(propertyValue(properties, 'evidence'), 'evidence', secrets)
+    : undefined;
+  const message = createMessage(code, subject, expected, actual, evidence);
   if (secrets.some((secret) => message.includes(secret))) {
     rejectMessageContainingSecret(secrets);
   }
@@ -783,28 +1029,48 @@ function buildDetail(
     expected,
     actual,
     message,
-    occurredAt
+    occurredAt,
+    ...(evidence === undefined ? {} : { evidence })
   });
+}
+
+function optionCause(options: ErrorOptions | undefined): {
+  readonly present: boolean;
+  readonly value?: unknown;
+} {
+  if (options === undefined) return { present: false };
+  const properties = recordProperties(options, 'options', ['cause']);
+  assertExactProperties(properties, 'options', ['cause'], []);
+  return properties.has('cause')
+    ? { present: true, value: propertyValue(properties, 'cause') }
+    : { present: false };
 }
 
 export class TradeOpsError extends Error {
   public readonly detail: ErrorDetail;
 
-  public constructor(input: ErrorInput, secrets?: readonly string[]) {
+  public constructor(
+    input: ErrorInput,
+    secrets?: readonly string[],
+    options?: ErrorOptions
+  ) {
     const detail = buildDetail(input, secrets);
-    super(detail.message);
+    const cause = optionCause(options);
+    super(detail.message, cause.present ? { cause: cause.value } : undefined);
     this.name = 'TradeOpsError';
     this.detail = detail;
     ERROR_DETAILS.set(this, detail);
+    if (cause.present) ERROR_CAUSES.set(this, cause.value);
     Object.freeze(this);
   }
 }
 
 export function createTradeOpsError(
   input: ErrorInput,
-  secrets?: readonly string[]
+  secrets?: readonly string[],
+  options?: ErrorOptions
 ): TradeOpsError {
-  return new TradeOpsError(input, secrets);
+  return new TradeOpsError(input, secrets, options);
 }
 
 export function withErrorPhase(
@@ -824,16 +1090,58 @@ export function withErrorPhase(
     subject: detail.subject,
     expected: detail.expected,
     actual: detail.actual,
-    occurredAt: detail.occurredAt
-  });
+    occurredAt: detail.occurredAt,
+    ...(detail.evidence === undefined ? {} : { evidence: detail.evidence })
+  }, undefined, { cause: error });
+}
+
+export function projectTradeOpsError(
+  error: TradeOpsError,
+  secrets: readonly string[] = [],
+  includeStack = false
+): ErrorDetail {
+  const detail = ERROR_DETAILS.get(error);
+  if (detail === undefined) {
+    return invalid('error', '由错误工厂创建的 TradeOpsError', '未知错误对象');
+  }
+  const storedEvidence = detail.evidence === undefined
+    ? undefined
+    : projectedEvidence(detail.evidence, secrets, includeStack);
+  const hasCause = ERROR_CAUSES.has(error);
+  const runtimeEvidence = hasCause || includeStack
+    ? errorEvidence(
+        error,
+        secrets,
+        includeStack,
+        (value, runtime) => value === error
+          ? undefined
+          : trustedEvidenceNode(value, runtime, secrets, includeStack)
+      )
+    : undefined;
+  const evidence = combineEvidence(storedEvidence, runtimeEvidence);
+  return buildDetail({
+    code: detail.code,
+    phase: detail.phase,
+    subject: detail.subject,
+    expected: detail.expected,
+    actual: detail.actual,
+    occurredAt: detail.occurredAt,
+    ...(evidence === undefined ? {} : { evidence })
+  }, secrets);
 }
 
 export function parseErrorDetail(value: unknown): ErrorDetail {
-  const properties = recordProperties(value, 'persistedDetail');
+  const detailProperties = [
+    'code', 'phase', 'subject', 'expected', 'actual', 'message',
+    'occurredAt', 'evidence'
+  ] as const;
+  const properties = recordProperties(
+    value, 'persistedDetail', detailProperties
+  );
   assertExactProperties(
     properties,
     'persistedDetail',
-    ['code', 'phase', 'subject', 'expected', 'actual', 'message', 'occurredAt'],
+    detailProperties,
     ['code', 'phase', 'subject', 'expected', 'actual', 'message', 'occurredAt']
   );
   const storedMessage = propertyValue(properties, 'message');
@@ -847,7 +1155,10 @@ export function parseErrorDetail(value: unknown): ErrorDetail {
     subject: propertyValue(properties, 'subject'),
     expected: propertyValue(properties, 'expected'),
     actual: propertyValue(properties, 'actual'),
-    occurredAt: propertyValue(properties, 'occurredAt')
+    occurredAt: propertyValue(properties, 'occurredAt'),
+    ...(properties.has('evidence')
+      ? { evidence: propertyValue(properties, 'evidence') }
+      : {})
   }, undefined);
   if (storedMessage !== rebuilt.message) {
     return invalid(

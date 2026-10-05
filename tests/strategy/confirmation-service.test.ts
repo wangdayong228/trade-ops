@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import {
   createTradeOpsError,
+  parseErrorDetail,
+  projectTradeOpsError,
   safeFailureCategory,
   TradeOpsError,
   withErrorPhase,
@@ -58,7 +60,8 @@ interface ConfirmationServiceLike {
 
 type ConfirmationServiceConstructor = new (
   repository: StrategyRepository,
-  preflight: Pick<PreflightService, 'run'>
+  preflight: Pick<PreflightService, 'run'>,
+  secretProvider?: () => readonly string[]
 ) => ConfirmationServiceLike;
 
 interface ConfirmationModule {
@@ -1114,12 +1117,183 @@ test('preserves a precise confirmation failure after invalidation commits', asyn
   assertTradeOpsError(error, 'BALANCE_INSUFFICIENT', 'confirmation');
   assert.deepEqual(error.detail, expectedFailure.detail);
   assert.equal(repository.invalidateCalls.length, 1);
+  const expectedPersisted = projectTradeOpsError(
+    expectedFailure,
+    [],
+    false
+  );
   assert.deepEqual(
     repository.invalidateCalls[0]?.failure,
-    expectedFailure.detail
+    expectedPersisted
   );
+  assert.notEqual(expectedPersisted.evidence, undefined);
+  assert.doesNotMatch(JSON.stringify(expectedPersisted), /"stack"/);
   assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED');
   assert.equal(repository.confirmCalls.length, 0);
+  assertLockAvailable(strategyId);
+});
+
+test('persists sanitized native revalidation evidence without stack', async (t) => {
+  const { ConfirmationService } = await loadConfirmationModule();
+  const strategyId = 'native-revalidation-evidence';
+  const configuredSecret = 'SYNTHETIC-CONFIRMATION-CONFIGURED-SECRET';
+  const repository = new ControlledRepository(strategy(strategyId));
+  const nativeFailure = Object.assign(
+    new Error(`account snapshot unavailable ${configuredSecret}`, {
+      cause: new Error(`gateway connection reset ${configuredSecret}`)
+    }),
+    {
+      code: 'ACCOUNT_SNAPSHOT_FAILED',
+      response: {
+        status: 503,
+        body: `temporary maintenance ${configuredSecret}`
+      }
+    }
+  );
+  const preflight = new ScriptedPreflight(() => {
+    throw nativeFailure;
+  });
+  const service = new ConfirmationService(
+    repository,
+    preflight,
+    () => [configuredSecret]
+  );
+  t.after(() => releaseStrategyOperation(strategyId));
+
+  const error = await captureRejection(service.confirm(strategyId));
+
+  assertTradeOpsError(error, 'PREFLIGHT_INVALIDATED', 'confirmation');
+  const runtimeProjection = projectTradeOpsError(
+    error,
+    [configuredSecret],
+    true
+  );
+  const runtimeSerialized = JSON.stringify(runtimeProjection);
+  assert.match(runtimeSerialized, /account snapshot unavailable/);
+  assert.match(runtimeSerialized, /gateway connection reset/);
+  assert.match(runtimeSerialized, /ACCOUNT_SNAPSHOT_FAILED/);
+  assert.match(runtimeSerialized, /503/);
+  assert.match(runtimeSerialized, /temporary maintenance/);
+  assert.match(runtimeSerialized, /"stack"/);
+  assert.doesNotMatch(runtimeSerialized, new RegExp(configuredSecret));
+
+  assert.equal(repository.invalidateCalls.length, 1);
+  const persisted = parseErrorDetail(structuredClone(
+    repository.invalidateCalls[0]?.failure
+  ));
+  const persistedSerialized = JSON.stringify(persisted);
+  assert.match(persistedSerialized, /account snapshot unavailable/);
+  assert.match(persistedSerialized, /gateway connection reset/);
+  assert.match(persistedSerialized, /ACCOUNT_SNAPSHOT_FAILED/);
+  assert.match(persistedSerialized, /503/);
+  assert.match(persistedSerialized, /temporary maintenance/);
+  assert.doesNotMatch(persistedSerialized, /"stack"/);
+  assert.doesNotMatch(persistedSerialized, new RegExp(configuredSecret));
+  assert.deepEqual(repository.record.preflightFailure, persisted);
+  assert.deepEqual(repository.calls, [
+    'getStrategy',
+    'listOrders',
+    'invalidatePreflight'
+  ]);
+  assert.equal(repository.confirmCalls.length, 0);
+  assert.deepEqual(repository.forbiddenCalls, []);
+  assertLockAvailable(strategyId);
+});
+
+test('retains revalidation and storage causes when invalidation write fails', async (t) => {
+  const { ConfirmationService } = await loadConfirmationModule();
+  const strategyId = 'invalidation-write-double-failure';
+  const configuredSecret = 'SYNTHETIC-DOUBLE-FAILURE-SECRET';
+  const repository = new ControlledRepository(strategy(strategyId));
+  repository.invalidateError = Object.assign(
+    new Error(`SQLite invalidation write failed ${configuredSecret}`),
+    { code: 'SQLITE_IOERR_WRITE' }
+  );
+  const preflight = new ScriptedPreflight(() => {
+    throw Object.assign(
+      new Error(`account balance refresh failed ${configuredSecret}`),
+      { code: 'BALANCE_REFRESH_FAILED' }
+    );
+  });
+  const service = new ConfirmationService(
+    repository,
+    preflight,
+    () => [configuredSecret]
+  );
+  t.after(() => releaseStrategyOperation(strategyId));
+
+  const error = await captureRejection(service.confirm(strategyId));
+
+  assertTradeOpsError(error, 'STORAGE_OPERATION_FAILED', 'storage');
+  const serialized = JSON.stringify(projectTradeOpsError(
+    error,
+    [configuredSecret],
+    true
+  ));
+  const businessIndex = serialized.indexOf('account balance refresh failed');
+  const storageIndex = serialized.indexOf('SQLite invalidation write failed');
+  assert.ok(businessIndex >= 0);
+  assert.ok(storageIndex > businessIndex);
+  assert.match(serialized, /BALANCE_REFRESH_FAILED/);
+  assert.match(serialized, /SQLITE_IOERR_WRITE/);
+  assert.doesNotMatch(serialized, new RegExp(configuredSecret));
+  assert.equal(repository.record.state, 'PENDING_CONFIRMATION');
+  assert.deepEqual(repository.calls, [
+    'getStrategy',
+    'listOrders',
+    'invalidatePreflight'
+  ]);
+  assert.equal(repository.invalidateCalls.length, 1);
+  assert.equal(repository.confirmCalls.length, 0);
+  assert.deepEqual(repository.forbiddenCalls, []);
+  assertLockAvailable(strategyId);
+});
+
+test('fails closed before invalidation when the secret provider throws', async (t) => {
+  const { ConfirmationService } = await loadConfirmationModule();
+  const strategyId = 'secret-provider-fail-closed';
+  const rawFailureSecret = 'RAW-REVALIDATION-PAYLOAD-SECRET';
+  const providerSecret = 'SECRET-PROVIDER-FAILURE-SENTINEL';
+  const repository = new ControlledRepository(strategy(strategyId));
+  const preflight = new ScriptedPreflight(() => {
+    throw new Error(`account refresh failed ${rawFailureSecret}`);
+  });
+  const service = new ConfirmationService(
+    repository,
+    preflight,
+    () => {
+      throw new Error(`secret provider unavailable ${providerSecret}`);
+    }
+  );
+  t.after(() => releaseStrategyOperation(strategyId));
+
+  const error = await captureRejection(service.confirm(strategyId));
+
+  assertTradeOpsError(error, 'STORAGE_OPERATION_FAILED', 'storage');
+  const serialized = JSON.stringify(projectTradeOpsError(
+    error,
+    [rawFailureSecret, providerSecret],
+    false
+  ));
+  const businessIndex = serialized.indexOf('account refresh failed');
+  const projectionIndex = serialized.indexOf('secret provider unavailable');
+  assert.ok(businessIndex >= 0);
+  assert.ok(projectionIndex > businessIndex);
+  assert.doesNotMatch(
+    serialized,
+    new RegExp(`${rawFailureSecret}|${providerSecret}`)
+  );
+  assert.doesNotMatch(serialized, /"stack"/);
+  assert.equal(repository.record.state, 'PENDING_CONFIRMATION');
+  assert.equal(repository.record.preflightFailure, null);
+  assert.deepEqual(repository.calls, ['getStrategy', 'listOrders']);
+  assert.equal(repository.invalidateCalls.length, 0);
+  assert.equal(repository.confirmCalls.length, 0);
+  assert.deepEqual(repository.forbiddenCalls, []);
+  assert.doesNotMatch(
+    JSON.stringify(repository.record),
+    new RegExp(`${rawFailureSecret}|${providerSecret}`)
+  );
   assertLockAvailable(strategyId);
 });
 
@@ -1998,11 +2172,28 @@ test(
         testCase.name
       );
       assert.equal(repository.invalidateCalls.length, 1, testCase.name);
+      const persistedFailure = parseErrorDetail(structuredClone(
+        repository.invalidateCalls[0]?.failure
+      ));
+      const projectedFailure = projectTradeOpsError(
+        error as TradeOpsError,
+        [],
+        false
+      );
       assert.deepEqual(
-        repository.invalidateCalls[0]?.failure,
-        error.detail,
+        persistedFailure,
+        projectedFailure,
         testCase.name
       );
+      assert.notEqual(persistedFailure.evidence, undefined, testCase.name);
+      const persistedSerialized = JSON.stringify(persistedFailure);
+      assert.match(persistedSerialized, /TradeOpsError/, testCase.name);
+      assert.match(
+        persistedSerialized,
+        new RegExp(String(testCase.actual).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')),
+        testCase.name
+      );
+      assert.doesNotMatch(persistedSerialized, /"stack"/, testCase.name);
       assert.equal(repository.confirmCalls.length, 0, testCase.name);
       assert.equal(repository.record.state, 'PREFLIGHT_INVALIDATED', testCase.name);
       assertPreflightReads(context, testCase.reads, testCase.name);
@@ -2040,7 +2231,7 @@ test(
       assert.equal(repository.invalidateCalls.length, 1, testCase.name);
       assert.deepEqual(
         repository.invalidateCalls[0]?.failure,
-        error.detail,
+        projectTradeOpsError(error as TradeOpsError, [], false),
         testCase.name
       );
       assert.equal(repository.confirmCalls.length, 0, testCase.name);

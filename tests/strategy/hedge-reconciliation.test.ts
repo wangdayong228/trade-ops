@@ -520,6 +520,9 @@ for (const [name, mode, state, roles] of INVALID_TOPOLOGIES) {
     assert.equal(result.kind, 'pending');
     if (result.kind === 'pending') {
       assert.equal(result.reason, 'INVALID_LOCAL_TOPOLOGY');
+      assert.equal(typeof Reflect.get(result, 'check'), 'string');
+      assert.equal(typeof result.expected, 'string');
+      assert.equal(typeof result.actual, 'string');
       assert.equal(result.exposureKnown, false);
     }
     assertNoGatewayCalls(f);
@@ -630,6 +633,7 @@ test('rejects a market intent whose quantity differs from the strategy target', 
   assert.deepEqual(result, {
     kind: 'pending',
     reason: 'INVALID_LOCAL_TOPOLOGY',
+    check: 'market.baseQuantity', expected: '1', actual: 'CONTRACT_MARKET:0.5',
     exposureKnown: false
   });
   assertNoGatewayCalls(f);
@@ -673,6 +677,9 @@ test('reports known local exposure while rejecting an invalid topology', (t) => 
   ), {
     kind: 'pending',
     reason: 'INVALID_LOCAL_TOPOLOGY',
+    check: 'roles',
+    expected: 'CONTRACT_MARKET|SPOT_MARKET or CONTRACT_HEDGE_GTC|CONTRACT_MARKET|SPOT_MARKET or CONTRACT_MARKET|SPOT_HEDGE_GTC|SPOT_MARKET',
+    actual: 'SPOT_MARKET',
     exposureKnown: true
   });
   assertNoGatewayCalls(f);
@@ -853,7 +860,7 @@ test('rejects a non-terminal state outside the run contract', async (t) => {
 
   await assert.rejects(
     f.reconciliation.run(f.strategyId),
-    /^Error: hedge reconciliation requires an executing or waiting strategy$/
+    /^Error: hedge reconciliation requires an executing or waiting strategy;.*actual PENDING_CONFIRMATION$/
   );
   assertNoGatewayCalls(f);
   assert.equal(
@@ -1077,13 +1084,14 @@ test(
       contractAverage: '60010'
     });
 
-    assert.deepEqual(await f.reconciliation.run(f.strategyId), {
+    const result = await f.reconciliation.run(f.strategyId);
+    assert.match(JSON.stringify(result), /9000000000000002/u);
+    const { evidence, check, ...classification } = result as typeof result & { evidence?: unknown; check?: unknown };
+    assert.deepEqual(classification, {
       kind: 'pending',
       reason: 'EXACT_ARITHMETIC_UNAVAILABLE',
       strategyState: 'EXECUTING',
-      exposureKnown: true,
-      expected: 'canonical decimal at most 1000000 characters',
-      actual: 'canonical decimal exceeds resource limit'
+      exposureKnown: true
     });
     assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
     assertNoTradingSideEffects(f);
@@ -1261,6 +1269,7 @@ test('persists a remote contradiction to definite no-submit then blocks', async 
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
   assert.equal(result.expected, 'DEFINITELY_NOT_SUBMITTED');
   assert.equal(result.actual, 'REMOTE_OBSERVED');
   const persisted = f.repository.listOrders(f.strategyId)[0];
@@ -1284,6 +1293,7 @@ test('uses the latest definite no-submit disposition with a stale planned input'
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
   assert.equal(result.expected, 'DEFINITELY_NOT_SUBMITTED');
   assert.equal(result.actual, 'REMOTE_OBSERVED');
   const persisted = f.repository.listOrders(f.strategyId)[0];
@@ -1316,6 +1326,7 @@ for (const [name, patch] of [
 
     assert.equal(result.kind, 'pending');
     assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
     assert.equal(f.repository.listOrders(f.strategyId)[0]?.status, 'planned');
   });
 }
@@ -1337,6 +1348,7 @@ test('reports safe scalar diagnostics for a client identity mismatch', async (t)
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
   assert.equal(result.expected, order.clientOrderId);
   assert.equal(result.actual, remoteClientOrderId);
   assert.doesNotMatch(
@@ -1423,7 +1435,7 @@ test('persists positive fill with missing average price for later decision', asy
   );
 });
 
-test('maps an attach compare-and-set conflict without retaining its cause', async (t) => {
+test('maps an attach compare-and-set conflict while retaining its cause', async (t) => {
   const f = fixture(t, 'CONTRACT_FIRST');
   const order = planOrder(f, 'CONTRACT_MARKET');
   scriptFind(f, order, snapshotForOrder(order));
@@ -1445,7 +1457,7 @@ test('maps an attach compare-and-set conflict without retaining its cause', asyn
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'SNAPSHOT_WRITE_CONFLICT');
   assert.equal(f.repository.listOrderEvents(order.id).length, 0);
-  assert.doesNotMatch(JSON.stringify(result), /strategy order changed/);
+  assert.match(JSON.stringify(result), /strategy order changed/);
 });
 
 test('rethrows an unknown snapshot attachment failure unchanged', async (t) => {
@@ -1524,6 +1536,7 @@ for (const [name, localPatch, remotePatch] of [
 
     assert.equal(result.kind, 'pending');
     assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
     assert.deepEqual(f.repository.listOrders(f.strategyId)[0], before);
     assert.equal(f.repository.listOrderEvents(planned.id).length, 1);
   });
@@ -1558,6 +1571,7 @@ test('uses the latest status for safe mismatch diagnostics with stale input', as
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
   assert.equal(result.expected, 'closed');
   assert.equal(result.actual, 'open');
   assert.doesNotMatch(
@@ -1598,10 +1612,7 @@ test('reports both exchange-id and client-id lookup failure safely', async (t) =
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_LOOKUP_FAILED');
-  assert.doesNotMatch(
-    JSON.stringify(result),
-    /private fetch detail|private client lookup detail/
-  );
+  assert.match(JSON.stringify(result), /private fetch detail[\s\S]*private client lookup detail/);
   assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
 });
 
@@ -2011,6 +2022,9 @@ test('rejects two GTC roles before any lookup', async (t) => {
 
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'INVALID_LOCAL_TOPOLOGY');
+      assert.equal(typeof Reflect.get(result, 'check'), 'string');
+      assert.equal(typeof result.expected, 'string');
+      assert.equal(typeof result.actual, 'string');
   assertNoGatewayCalls(f);
 });
 
@@ -2238,6 +2252,7 @@ for (const [name, mutate] of [
 
     assert.equal(result.kind, 'pending');
     assert.equal(result.reason, 'MARKET_RULES_UNAVAILABLE');
+    assert.ok(Reflect.get(result, 'evidence') || (Reflect.get(result, 'check') && result.expected !== undefined && result.actual !== undefined));
     assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
     assertNoTradingSideEffects(f);
   });
@@ -2275,7 +2290,12 @@ for (const [name, mutate] of [
     assert.equal(result.reason, 'PRICE_QUANTIZATION_FAILED');
     assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
     assertNoTradingSideEffects(f);
-    assert.doesNotMatch(JSON.stringify(result), /private quantize detail/);
+    if (name === 'quantize failure') assert.match(JSON.stringify(result), /private quantize detail/);
+    else {
+      assert.equal(typeof Reflect.get(result, 'check'), 'string');
+      assert.match(result.actual ?? '', name === 'non-positive candidate' ? /0/u : /60000\.05/u);
+      assert.equal(typeof result.expected, 'string');
+    }
   });
 }
 
@@ -2331,10 +2351,7 @@ for (const [behavior, expected, persistedState] of [
       f.repository.getStrategy(f.strategyId).state,
       persistedState
     );
-    assert.doesNotMatch(
-      JSON.stringify(result),
-      /private competing write detail|private post-commit detail/
-    );
+    if (behavior === 'throw after other write') assert.match(JSON.stringify(result), /private competing write detail/);
     assertNoTradingSideEffects(f);
   });
 }
@@ -2455,7 +2472,7 @@ test('deduplicates one pending revision and logs a changed reason', async (t) =>
       'MARKET_ORDER_ACTIVE'
     ]
   );
-  assert.doesNotMatch(JSON.stringify(entries), /private lookup detail/);
+  assert.match(JSON.stringify(entries), /private lookup detail/);
   assertNoTradingSideEffects(f);
 });
 
@@ -2726,6 +2743,7 @@ test('blocks a decision when an order revision changes after evidence collection
   assert.equal(mutated, true);
   assert.equal(result.kind, 'pending');
   assert.equal(result.reason, 'ORDER_EVIDENCE_MISMATCH');
+  assert.equal(typeof Reflect.get(result, 'check'), 'string');
   assert.equal(result.exposureKnown, true);
   assert.equal(transitions, 0);
   assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
@@ -3092,6 +3110,24 @@ test('pending log includes reconciled amounts for a state write conflict', async
     currentResidual: '0',
     exposureKnown: true
   });
+  assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
+  assertNoTradingSideEffects(f);
+});
+
+test('precision-limit evidence does not claim a canonical-width failure', async (t) => {
+  const f = decisionFixture(t, 'CONCURRENT');
+  const market = f.contract.markets.get(`swap:${SYMBOL}`);
+  assert.ok(market);
+  f.contract.markets.set(`swap:${SYMBOL}`, { ...market, priceStep: '1e-1000001' });
+  seedClosedConcurrentMarkets(f, {
+    requested: '1', spotFill: '1', spotRemaining: '0', spotAverage: '60000',
+    contractFill: '0.6', contractRemaining: '0.4', contractAverage: '60010'
+  });
+  const result = await f.reconciliation.run(f.strategyId);
+  assert.equal(result.kind, 'pending');
+  assert.equal(result.reason, 'EXACT_ARITHMETIC_UNAVAILABLE', JSON.stringify(result));
+  assert.match(JSON.stringify(result), /required precision.*1000000.*actual 1000012/u);
+  assert.doesNotMatch(JSON.stringify(result), /canonical decimal exceeds resource limit/u);
   assert.equal(f.repository.getStrategy(f.strategyId).state, 'EXECUTING');
   assertNoTradingSideEffects(f);
 });

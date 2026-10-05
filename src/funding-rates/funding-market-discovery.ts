@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import type {
   FundingExchangeId,
   FundingMarketIdentity,
@@ -24,34 +25,16 @@ export interface FundingResponseShape {
   readonly context: 'discovery' | 'history';
 }
 
-function describeActual(value: unknown): string {
-  if (value === null) {
-    return 'null';
-  }
-  if (typeof value === 'string') {
-    const visible = value
-      .slice(0, 64)
-      .replace(/[\u0000-\u001f\u007f]/g, '?');
-    const suffix = value.length > 64 ? '...' : '';
-    return `string ${JSON.stringify(visible + suffix)} (length ${value.length})`;
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return `${typeof value} ${String(value)}`;
-  }
-  if (Array.isArray(value)) {
-    return `array (length ${value.length})`;
-  }
-  return typeof value;
-}
 
 export function invalidSourceValue(
   exchange: FundingSourceExchangeName,
   field: string,
   expected: string,
-  actual: unknown
+  actual: unknown,
+  options?: ErrorOptions
 ): never {
   throw new Error(
-    `${exchange} ${field} invalid: expected ${expected}; actual ${describeActual(actual)}`
+    `${exchange} ${field} invalid: expected ${expected}; actual ${diagnosticValue(actual)}`, options
   );
 }
 
@@ -254,12 +237,13 @@ export function normalizedCurrencyCode(
   let value: unknown;
   try {
     value = client.safeCurrencyCode(currencyId);
-  } catch {
+  } catch (error) {
     return invalidSourceValue(
       exchange,
       field,
       'safeCurrencyCode to return a valid currency code',
-      'safeCurrencyCode threw'
+      'safeCurrencyCode threw',
+      { cause: error }
     );
   }
   return strictSourceString(exchange, value, field);
@@ -348,7 +332,7 @@ export function sourceSettledFundingRate(
     const detail = error instanceof Error && error.message.startsWith('Invalid ')
       ? error.message
       : 'record normalization failed';
-    throw new Error(`${exchange} history record invalid: ${detail}`);
+    throw new Error(`${exchange} history record invalid: ${detail}`, { cause: error });
   }
 }
 

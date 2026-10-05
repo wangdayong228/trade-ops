@@ -9,6 +9,7 @@ import type {
   MarketRules
 } from '../../src/domain/types.js';
 import {
+  projectTradeOpsError,
   TradeOpsError,
   type ErrorCode,
   type ErrorPhase
@@ -34,7 +35,9 @@ function isTradeOpsFailure(
     field?: string;
     exchangeId?: string;
     symbol?: string;
+    kind?: MarketKind;
     expected?: unknown;
+    expectedPattern?: RegExp;
     actual?: unknown;
   } = {}
 ): (error: unknown) => boolean {
@@ -60,8 +63,16 @@ function isTradeOpsFailure(
         ? error.detail.subject.symbol
         : undefined, options.symbol);
     }
+    if (options.kind !== undefined) {
+      assert.equal('kind' in error.detail.subject
+        ? error.detail.subject.kind
+        : undefined, options.kind);
+    }
     if ('expected' in options) {
       assert.deepEqual(error.detail.expected, options.expected);
+    }
+    if (options.expectedPattern !== undefined) {
+      assert.match(String(error.detail.expected), options.expectedPattern);
     }
     if ('actual' in options) {
       assert.deepEqual(error.detail.actual, options.actual);
@@ -391,6 +402,156 @@ const COMPLETE_PREFLIGHT_TRACE = [
   'swap:balance'
 ] as const;
 
+const QUANTITY_FAILURE_TRACE = COMPLETE_PREFLIGHT_TRACE.slice(0, 5);
+
+for (const failureCase of [
+  {
+    name: 'normalized zero',
+    requestedBaseQuantity: '0.5',
+    spotMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '0' },
+    contractMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '0' },
+    failure: isTradeOpsFailure('QUANTITY_OUT_OF_RANGE', {
+      subjectType: 'request',
+      field: 'effectiveQuantity',
+      expectedPattern: /greater than zero/u,
+      actual: '0'
+    })
+  },
+  {
+    name: 'spot minimum after alignment',
+    requestedBaseQuantity: '1.5',
+    spotMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '1.5' },
+    contractMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '0' },
+    failure: isTradeOpsFailure('QUANTITY_OUT_OF_RANGE', {
+      subjectType: 'market',
+      exchangeId: 'bitget',
+      symbol: SYMBOL,
+      kind: 'spot',
+      field: 'amount',
+      expected: 'at least 1.5',
+      actual: '1'
+    })
+  },
+  {
+    name: 'swap minimum after alignment',
+    requestedBaseQuantity: '1.5',
+    spotMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '0' },
+    contractMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '1.5' },
+    failure: isTradeOpsFailure('QUANTITY_OUT_OF_RANGE', {
+      subjectType: 'market',
+      exchangeId: 'okx',
+      symbol: SYMBOL,
+      kind: 'swap',
+      field: 'amount',
+      expected: 'at least 1.5',
+      actual: '1'
+    })
+  },
+  {
+    name: 'swap minimum after upper clipping',
+    requestedBaseQuantity: '3',
+    spotMarket: {
+      amountStep: '1',
+      contractSize: '1',
+      minBaseAmount: '0',
+      maxBaseAmount: '1.5'
+    },
+    contractMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '2' },
+    failure: isTradeOpsFailure('QUANTITY_OUT_OF_RANGE', {
+      subjectType: 'market',
+      exchangeId: 'okx',
+      symbol: SYMBOL,
+      kind: 'swap',
+      field: 'amount',
+      expected: 'at least 2',
+      actual: '1'
+    })
+  }
+] satisfies ReadonlyArray<{
+  readonly name: string;
+  readonly requestedBaseQuantity: string;
+  readonly spotMarket: Partial<MarketRules>;
+  readonly contractMarket: Partial<MarketRules>;
+  readonly failure: (error: unknown) => boolean;
+}>) {
+  test(`stops after quantity rules for ${failureCase.name}`, async () => {
+    const configured = orderedSetup({
+      spotMarket: failureCase.spotMarket,
+      contractMarket: failureCase.contractMarket
+    });
+
+    await assert.rejects(
+      configured.service.run(input({
+        requestedBaseQuantity: failureCase.requestedBaseQuantity
+      })),
+      failureCase.failure
+    );
+
+    assert.deepEqual(configured.trace, QUANTITY_FAILURE_TRACE);
+    assert.deepEqual(configured.spot.balanceRequests, []);
+    assert.deepEqual(configured.contract.balanceRequests, []);
+    assert.deepEqual(configured.spot.createdRequests, []);
+    assert.deepEqual(configured.contract.createdRequests, []);
+  });
+}
+
+test('maps the common-scale resource bound to request quantity evidence', async () => {
+  const configured = orderedSetup({
+    spotMarket: {
+      amountStep: '1e-1000001',
+      contractSize: '1',
+      minBaseAmount: '0'
+    },
+    contractMarket: {
+      amountStep: '1',
+      contractSize: '1',
+      minBaseAmount: '0'
+    }
+  });
+
+  await assert.rejects(
+    configured.service.run(input({ requestedBaseQuantity: '1' })),
+    isTradeOpsFailure('QUANTITY_INVALID', {
+      subjectType: 'request',
+      field: 'commonStep',
+      expectedPattern: /(?:at most|not exceed) 1000000/u,
+      actual: '1000001'
+    })
+  );
+
+  assert.deepEqual(configured.trace, QUANTITY_FAILURE_TRACE);
+  assert.deepEqual(configured.spot.balanceRequests, []);
+  assert.deepEqual(configured.contract.balanceRequests, []);
+  assert.deepEqual(configured.spot.createdRequests, []);
+  assert.deepEqual(configured.contract.createdRequests, []);
+});
+
+test('reports exact-product required precision before balance reads', async () => {
+  const requiredPrecision = 1_000_003;
+  const configured = orderedSetup({
+    spotPrice: '1'.repeat(1_000_000)
+  });
+
+  await assert.rejects(
+    configured.service.run(input({ requestedBaseQuantity: '1' })),
+    isTradeOpsFailure('QUANTITY_NOT_REPRESENTABLE', {
+      subjectType: 'market',
+      exchangeId: 'bitget',
+      symbol: SYMBOL,
+      kind: 'spot',
+      field: 'notional',
+      expectedPattern: /(?:at most|not exceed) 1000000/u,
+      actual: String(requiredPrecision)
+    })
+  );
+
+  assert.deepEqual(configured.trace, COMPLETE_PREFLIGHT_TRACE.slice(0, 7));
+  assert.deepEqual(configured.spot.balanceRequests, []);
+  assert.deepEqual(configured.contract.balanceRequests, []);
+  assert.deepEqual(configured.spot.createdRequests, []);
+  assert.deepEqual(configured.contract.createdRequests, []);
+});
+
 test('performs the thirteen preflight checks through the prescribed read order', async () => {
   const configured = orderedSetup();
 
@@ -664,8 +825,20 @@ for (const failureCase of orderedFailureCases) {
 
 test('converts unknown account failures safely and applies the requested phase', async () => {
   const configured = orderedSetup();
-  const secret = 'raw-third-party-account-failure';
-  configured.contract.accountSettingsError = new Error(secret);
+  const secret = 'SYNTHETIC-ACCOUNT-CONFIGURED-SECRET';
+  const nativeFailure = Object.assign(
+    new Error(`account settings endpoint unavailable ${secret}`, {
+      cause: new Error(`socket reset while reading account settings ${secret}`)
+    }),
+    {
+      code: 'ACCOUNT_READ_FAILED',
+      response: {
+        status: 503,
+        body: `maintenance window ${secret}`
+      }
+    }
+  );
+  configured.contract.accountSettingsError = nativeFailure;
   const phasedService = configured.service as unknown as {
     run(
       value: PreflightInput,
@@ -681,7 +854,19 @@ test('converts unknown account failures safely and applies the requested phase',
         subjectType: 'account',
         field: 'settings'
       })(error));
-      assert.doesNotMatch(JSON.stringify(error), new RegExp(secret));
+      const projected = projectTradeOpsError(
+        error as TradeOpsError,
+        [secret],
+        false
+      );
+      const serialized = JSON.stringify(projected);
+      assert.match(serialized, /account settings endpoint unavailable/);
+      assert.match(serialized, /socket reset while reading account settings/);
+      assert.match(serialized, /ACCOUNT_READ_FAILED/);
+      assert.match(serialized, /503/);
+      assert.match(serialized, /maintenance window/);
+      assert.doesNotMatch(serialized, new RegExp(secret));
+      assert.doesNotMatch(serialized, /"stack"/);
       return true;
     }
   );
@@ -1263,7 +1448,27 @@ test('rejects invalid quote-notional market limits', async () => {
     }).service.run(input()),
     isTradeOpsFailure('MARKET_RULE_INVALID', {
       subjectType: 'market',
-      field: 'quoteNotionalRange'
+      field: 'quoteNotionalRange',
+      expected: 'minimum less than or equal to maximum',
+      actual: 'minimum 101 exceeds maximum 100'
     })
   );
+});
+
+test('reports alignment resource exhaustion as quantity invalid before price reads', async () => {
+  const configured = orderedSetup({
+    spotMarket: {
+      amountStep: '1', contractSize: '1', minBaseAmount: '0',
+      maxBaseAmount: '1e1000001'
+    },
+    contractMarket: { amountStep: '1', contractSize: '1', minBaseAmount: '0' }
+  });
+  await assert.rejects(configured.service.run(input({ requestedBaseQuantity: '1' })),
+    isTradeOpsFailure('QUANTITY_INVALID', {
+      subjectType: 'request', field: 'effectiveQuantity', actual: '1000005',
+      expectedPattern: /at most 1000000/u
+    }));
+  assert.deepEqual(configured.trace, QUANTITY_FAILURE_TRACE);
+  assert.deepEqual(configured.spot.createdRequests, []);
+  assert.deepEqual(configured.contract.createdRequests, []);
 });

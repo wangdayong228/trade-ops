@@ -200,7 +200,9 @@ interface StartupFailureContext {
 
 function trustedStartupFailure(error: unknown): TradeOpsError | undefined {
   try {
-    return withErrorPhase(error as TradeOpsError, 'startup');
+    const trusted = error as TradeOpsError;
+    const phased = withErrorPhase(trusted, 'startup');
+    return trusted.detail.phase === 'startup' ? trusted : phased;
   } catch {
     return undefined;
   }
@@ -216,6 +218,26 @@ function startupFailure(
     subject: context.subject,
     expected: context.expected,
     actual: safeFailureCategory(error)
+  }, undefined, { cause: error });
+}
+
+function aggregateStartupFailures(
+  primary: TradeOpsError,
+  additional: readonly unknown[],
+  message: string
+): TradeOpsError {
+  if (additional.length === 0) return primary;
+  const detail = primary.detail;
+  return createTradeOpsError({
+    code: detail.code,
+    phase: detail.phase,
+    subject: detail.subject,
+    expected: detail.expected,
+    actual: detail.actual,
+    occurredAt: detail.occurredAt,
+    ...(detail.evidence === undefined ? {} : { evidence: detail.evidence })
+  }, undefined, {
+    cause: new AggregateError([primary, ...additional], message)
   });
 }
 
@@ -449,12 +471,16 @@ function defaultFundingRateSleep(
 
 function closeDatabaseAfterConstructionFailure(
   database: Database.Database,
-  cause: unknown
+  cause: TradeOpsError
 ): never {
   try {
     database.close();
-  } catch {
-    // Preserve the construction error without retaining a close-time cause.
+  } catch (error) {
+    throw aggregateStartupFailures(
+      cause,
+      [startupFailure(error, componentContext('database', 'stopped'))],
+      'service construction and database cleanup failed'
+    );
   }
   throw cause;
 }
@@ -588,7 +614,11 @@ export function composeService(
       componentContext('preflight-service', 'constructed')
     );
     const confirmationService = runStartupBoundary(
-      () => new ConfirmationService(repository, preflightService),
+      () => new ConfirmationService(
+        repository,
+        preflightService,
+        () => configuredSecretValues(env)
+      ),
       componentContext('confirmation-service', 'constructed')
     );
     const operationalLog = runStartupBoundary(
@@ -709,15 +739,13 @@ export async function startService<T extends RunnableComposition>(
   let shutdownPromise: Promise<void> | null = null;
 
   const removeSignalListeners = (): void => {
-    let hasFirstError = false;
-    let firstError: unknown;
+    const failures: unknown[] = [];
     if (sigintRegistrationAttempted) {
       sigintRegistrationAttempted = false;
       try {
         signalTarget.removeListener('SIGINT', handleSignal);
       } catch (error) {
-        hasFirstError = true;
-        firstError = error;
+        failures.push(error);
       }
     }
     if (sigtermRegistrationAttempted) {
@@ -725,29 +753,24 @@ export async function startService<T extends RunnableComposition>(
       try {
         signalTarget.removeListener('SIGTERM', handleSignal);
       } catch (error) {
-        if (!hasFirstError) {
-          hasFirstError = true;
-          firstError = error;
-        }
+        failures.push(error);
       }
     }
-    if (hasFirstError) {
-      throw firstError;
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, 'signal listener removal failed');
     }
   };
 
   const closeResources = async (): Promise<void> => {
-    let hasFirstError = false;
-    let firstError!: TradeOpsError;
+    const failures: TradeOpsError[] = [];
     const rememberFailure = (
       error: unknown,
       context: StartupFailureContext
     ): void => {
-      const failure = startupFailure(error, context);
-      if (!hasFirstError) {
-        hasFirstError = true;
-        firstError = failure;
-      }
+      failures.push(startupFailure(error, context));
     };
     try {
       await composition.fundingRateSync.stop();
@@ -777,9 +800,18 @@ export async function startService<T extends RunnableComposition>(
     } catch (error) {
       rememberFailure(error, componentContext('signal-listeners', 'stopped'));
     }
-    if (hasFirstError) {
-      operationalLog?.error('service_stop_failed', firstError, runtimeFields);
-      throw firstError;
+    if (failures.length > 0) {
+      const firstFailure = failures[0];
+      if (firstFailure === undefined) {
+        throw new Error('unreachable cleanup failure state');
+      }
+      const failure = aggregateStartupFailures(
+        firstFailure,
+        failures.slice(1),
+        'service cleanup failed'
+      );
+      operationalLog?.error('service_stop_failed', failure, runtimeFields);
+      throw failure;
     }
     operationalLog?.info('service_stopped', runtimeFields);
   };
@@ -840,13 +872,24 @@ export async function startService<T extends RunnableComposition>(
     }
     return { composition, shutdown };
   } catch (startupError) {
-    operationalLog?.error('service_start_failed', startupError, runtimeFields);
+    const failure = startupFailure(
+      startupError,
+      componentContext('service', 'started')
+    );
+    operationalLog?.error('service_start_failed', failure, runtimeFields);
+    let hasCleanupFailure = false;
+    let cleanupFailure: unknown;
     try {
       await shutdown();
-    } catch {
-      // The fixed startup error remains the primary failure.
+    } catch (error) {
+      hasCleanupFailure = true;
+      cleanupFailure = error;
     }
-    throw startupError;
+    throw aggregateStartupFailures(
+      failure,
+      hasCleanupFailure ? [cleanupFailure] : [],
+      'service startup and cleanup failed'
+    );
   }
 }
 

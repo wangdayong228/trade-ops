@@ -1,10 +1,10 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import type { Logger } from 'pino';
 import {
   nonEmptySecrets,
   nonThrowingLogCall,
   redactText,
   safeError,
-  utf8Prefix,
   type SafeError
 } from '../logging/logger.js';
 import type { FundingExchangeId } from './funding-rate-record.js';
@@ -13,7 +13,6 @@ import type {
   FundingRequestMetadata
 } from './funding-rate-source.js';
 
-export const MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES = 512;
 
 export type FundingCoverageKind =
   | 'INITIAL'
@@ -224,77 +223,28 @@ const APPROVED_QUERY_KEYS = [
   'limit'
 ] as const;
 
-function stringProperty(value: unknown, property: string): string | undefined {
-  if (typeof value !== 'object' || value === null) {
-    return undefined;
-  }
-  try {
-    const candidate = Reflect.get(value, property);
-    return typeof candidate === 'string' ? candidate : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function boundedErrorField(
-  value: string,
-  secrets: readonly string[]
-): string {
-  return utf8Prefix(
-    redactText(value, secrets),
-    MAX_FUNDING_RATE_EVENT_ERROR_FIELD_BYTES
-  );
-}
-
-function allowlistedError(
-  error: unknown,
-  secrets: readonly string[]
-): SafeError {
-  const errorName = stringProperty(error, 'name');
-  const errorType = stringProperty(error, 'type');
-  const source = errorName === undefined && errorType !== undefined
-    ? {
-        name: errorType,
-        message: stringProperty(error, 'message') ?? 'Unknown error',
-        ...(stringProperty(error, 'code') === undefined
-          ? {}
-          : { code: stringProperty(error, 'code') }),
-        ...(stringProperty(error, 'stack') === undefined
-          ? {}
-          : { stack: stringProperty(error, 'stack') })
-      }
-    : error;
-  const output = safeError(source, secrets);
-  return {
-    type: boundedErrorField(output.type, secrets),
-    message: boundedErrorField(output.message, secrets),
-    ...(output.code === undefined
-      ? {}
-      : { code: boundedErrorField(output.code, secrets) }),
-    ...(output.stack === undefined
-      ? {}
-      : { stack: boundedErrorField(output.stack, secrets) })
-  };
+function allowlistedError(error: unknown, secrets: readonly string[]): SafeError {
+  return safeError(error, secrets);
 }
 
 type UnknownRecord = Readonly<Record<string, unknown>>;
 
-function invalidEventField(field: string, expected: string): never {
-  throw new Error(`invalid funding rate event ${field}: expected ${expected}`);
+function invalidEventField(field: string, expected: string, actual: unknown): never {
+  throw new Error(`invalid funding rate event ${field}: expected ${expected}; actual ${diagnosticValue(actual)}`);
 }
 
 function plainRecord(value: unknown, field: string): UnknownRecord {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    return invalidEventField(field, 'a plain object');
+    return invalidEventField(field, 'a plain object', value);
   }
   let prototype: object | null;
   try {
     prototype = Object.getPrototypeOf(value);
   } catch {
-    return invalidEventField(field, 'a plain object');
+    return invalidEventField(field, 'a plain object', value);
   }
   if (prototype !== Object.prototype && prototype !== null) {
-    return invalidEventField(field, 'a plain object');
+    return invalidEventField(field, 'a plain object', value);
   }
   return value as UnknownRecord;
 }
@@ -308,15 +258,15 @@ function ownValue(
   try {
     present = Object.prototype.hasOwnProperty.call(record, property);
   } catch {
-    return invalidEventField(field, 'an own field');
+    return invalidEventField(field, 'an own field', 'unreadable property');
   }
   if (!present) {
-    return invalidEventField(field, 'an own field');
+    return invalidEventField(field, 'an own field', 'missing');
   }
   try {
     return Reflect.get(record, property);
   } catch {
-    return invalidEventField(field, 'a readable own field');
+    return invalidEventField(field, 'a readable own field', 'property read threw');
   }
 }
 
@@ -329,7 +279,7 @@ function optionalOwnValue(
   try {
     present = Object.prototype.hasOwnProperty.call(record, property);
   } catch {
-    return invalidEventField(field, 'a readable optional field');
+    return invalidEventField(field, 'a readable optional field', 'property inspection threw');
   }
   return present ? ownValue(record, property, field) : undefined;
 }
@@ -337,7 +287,7 @@ function optionalOwnValue(
 function requiredString(value: unknown, field: string): string {
   return typeof value === 'string'
     ? value
-    : invalidEventField(field, 'a string');
+    : invalidEventField(field, 'a string', value);
 }
 
 function nonNegativeSafeInteger(value: unknown, field: string): number {
@@ -345,7 +295,7 @@ function nonNegativeSafeInteger(value: unknown, field: string): number {
     && Number.isSafeInteger(value)
     && value >= 0
     ? value
-    : invalidEventField(field, 'a non-negative safe integer');
+    : invalidEventField(field, 'a non-negative safe integer', value);
 }
 
 function nullableNonNegativeSafeInteger(
@@ -362,7 +312,7 @@ function fundingExchangeId(
   if (value === 'bitget' || value === 'okx') {
     return value;
   }
-  return invalidEventField(field, 'bitget or okx');
+  return invalidEventField(field, 'bitget or okx', value);
 }
 
 function coverageKind(value: unknown): FundingCoverageKind {
@@ -373,7 +323,7 @@ function coverageKind(value: unknown): FundingCoverageKind {
     case 'REACTIVATION':
       return value;
     default:
-      return invalidEventField('taskKind', 'an approved coverage task kind');
+      return invalidEventField('taskKind', 'an approved coverage task kind', value);
   }
 }
 
@@ -385,7 +335,8 @@ function retryTaskCategory(
   }
   return invalidEventField(
     'taskCategory',
-    'coverage, incremental, or discovery'
+    'coverage, incremental, or discovery',
+    value
   );
 }
 
@@ -395,7 +346,7 @@ function incompleteTaskCategory(
   if (value === 'coverage' || value === 'incremental') {
     return value;
   }
-  return invalidEventField('taskCategory', 'coverage or incremental');
+  return invalidEventField('taskCategory', 'coverage or incremental', value);
 }
 
 function fundingRateEventName(value: unknown): FundingRateEvent['event'] {
@@ -415,7 +366,7 @@ function fundingRateEventName(value: unknown): FundingRateEvent['event'] {
     case 'funding_sync_fatal':
       return value;
     default:
-      return invalidEventField('event', 'an approved event name');
+      return invalidEventField('event', 'an approved event name', value);
   }
 }
 
@@ -469,7 +420,7 @@ function allowlistedRequest(value: unknown): FundingRequestMetadata {
   const request = plainRecord(value, 'request');
   const method = ownValue(request, 'method', 'request.method');
   if (method !== 'GET') {
-    return invalidEventField('request.method', 'GET');
+    return invalidEventField('request.method', 'GET', method);
   }
   return {
     method,

@@ -1,3 +1,5 @@
+import { diagnosticValue, type ErrorEvidence } from '../errors/error-evidence.js';
+import { projectErrorEvidence } from '../errors/trade-ops-error.js';
 import { Decimal } from 'decimal.js';
 import { makeClientOrderId } from '../domain/client-order-id.js';
 import type {
@@ -299,18 +301,19 @@ export class HedgeCoordinator {
         ? strategy.spotExchangeId
         : strategy.contractExchangeId
     );
-    const price = await this.quantizedPrice(
+    const priceResult = await this.quantizedPrice(
       gateway,
       strategy.symbol,
       kind,
       authorization.referencePrice
     );
-    if (price === null) {
+    if (priceResult.kind === 'invalid') {
       this.operationalLog?.warn('hedge_submission_price_pending', {
         strategyId: strategy.id,
         strategyState: strategy.state,
         conclusion: 'pending',
         reason: 'PRICE_QUANTIZATION_FAILED',
+        evidence: priceResult.evidence,
         role: authorization.role,
         exchangeId: gateway.exchangeId,
         exposureKnown: true
@@ -323,7 +326,7 @@ export class HedgeCoordinator {
       strategy,
       leg,
       authorization.baseQuantity,
-      price,
+      priceResult.value,
       marginMode
     );
     const record = this.repository.planOrder(
@@ -343,43 +346,22 @@ export class HedgeCoordinator {
     symbol: string,
     kind: MarketKind,
     price: string
-  ): Promise<string | null> {
+  ): Promise<{ kind: 'valid'; value: string } | { kind: 'invalid'; evidence: ErrorEvidence }> {
     let quantized: string;
     try {
       quantized = await gateway.quantizePrice(symbol, kind, price);
-    } catch {
-      return null;
+    } catch (error) {
+      return { kind: 'invalid', evidence: projectErrorEvidence(error) };
     }
-    return positivePrice(quantized) ? quantized : null;
+    return positivePrice(quantized)
+      ? { kind: 'valid', value: quantized }
+      : { kind: 'invalid', evidence: projectErrorEvidence(new Error(`quantized price: expected finite positive decimal; actual ${diagnosticValue(quantized)}`)) };
   }
 
-  private safeAccountSettingsSummary(
-    settings: Readonly<AccountSettings>
-  ): string {
-    const marginMode = settings.marginMode === 'isolated'
-      || settings.marginMode === 'cross'
-      || settings.marginMode === 'unknown'
-      ? settings.marginMode
-      : 'invalid';
-    const positionMode = settings.positionMode === 'hedged'
-      || settings.positionMode === 'one-way'
-      || settings.positionMode === 'unknown'
-      ? settings.positionMode
-      : 'invalid';
-    let leverage = 'invalid';
-    if (typeof settings.leverage === 'string') {
-      try {
-        const parsed = new Decimal(settings.leverage);
-        if (parsed.isFinite() && parsed.gt(0)) leverage = parsed.toString();
-      } catch {
-        // Invalid runtime data is represented only by the fixed token above.
-      }
-    }
-    return [
-      `marginMode=${marginMode}`,
-      `positionMode=${positionMode}`,
-      `leverage=${leverage}`
-    ].join(',');
+  private safeAccountSettingsSummary(settings: Readonly<AccountSettings>): string {
+    return ['marginMode', 'positionMode', 'leverage'].map((field) =>
+      `${field}=${diagnosticValue(settings[field as keyof AccountSettings])}`
+    ).join(',');
   }
 
   private warnSubmissionGuard(
@@ -387,7 +369,8 @@ export class HedgeCoordinator {
     event: 'hedge_submission_guard_pending' | 'hedge_submission_guard_changed',
     reason: 'ACCOUNT_SETTINGS_UNAVAILABLE' | 'ACCOUNT_SETTINGS_CHANGED',
     exposureKnown: boolean,
-    current?: Readonly<AccountSettings>
+    current?: Readonly<AccountSettings>,
+    evidence?: ErrorEvidence
   ): void {
     const key = `${strategy.id}:${reason}:${strategy.updatedAt}`;
     if (this.guardWarningKeys.has(key)) return;
@@ -397,6 +380,7 @@ export class HedgeCoordinator {
       strategyState: strategy.state,
       conclusion: 'pending',
       reason,
+      ...(evidence === undefined ? {} : { evidence }),
       expected: this.safeAccountSettingsSummary(
         strategy.preflight.accountSettings
       ),
@@ -415,12 +399,14 @@ export class HedgeCoordinator {
     try {
       current = await this.registry.get(strategy.contractExchangeId)
         .fetchAccountSettings(strategy.symbol);
-    } catch {
+    } catch (error) {
       this.warnSubmissionGuard(
         strategy,
         'hedge_submission_guard_pending',
         'ACCOUNT_SETTINGS_UNAVAILABLE',
-        exposureKnown
+        exposureKnown,
+        undefined,
+        projectErrorEvidence(error)
       );
       return false;
     }
@@ -451,6 +437,7 @@ export class HedgeCoordinator {
         strategyState: strategy.state,
         conclusion: 'pending',
         reason: 'SUBMISSION_INTERNAL_FAILURE',
+        evidence: projectErrorEvidence(result.reason),
         role: order.role,
         exchangeId: order.exchangeId,
         strategyOrderId: order.id,
@@ -463,13 +450,15 @@ export class HedgeCoordinator {
   private warnSubmissionEvidenceConflict(
     strategy: Readonly<StrategyRecord>,
     order: Readonly<StrategyOrderRecord>,
-    exposureKnown: boolean
+    exposureKnown: boolean,
+    evidence?: ErrorEvidence
   ): void {
     this.operationalLog?.warn('hedge_submission_evidence_conflict', {
       strategyId: strategy.id,
       strategyState: strategy.state,
       conclusion: 'pending',
       reason: 'SUBMISSION_EVIDENCE_WRITE_CONFLICT',
+      ...(evidence === undefined ? {} : { evidence }),
       role: order.role,
       exchangeId: order.exchangeId,
       strategyOrderId: order.id,
@@ -512,11 +501,12 @@ export class HedgeCoordinator {
               order.role.endsWith('_HEDGE_GTC')
             );
           }
-        } catch {
+        } catch (error) {
           this.warnSubmissionEvidenceConflict(
             strategy,
             order,
-            order.role.endsWith('_HEDGE_GTC')
+            order.role.endsWith('_HEDGE_GTC'),
+            projectErrorEvidence(error)
           );
         }
         return;
@@ -549,6 +539,7 @@ export class HedgeCoordinator {
           ...(details.failureCode === undefined
             ? {}
             : { failureCode: details.failureCode }),
+          ...(details.evidence === undefined ? {} : { evidence: details.evidence }),
           ...(details.errorType === undefined
             ? {}
             : { errorType: details.errorType }),
@@ -571,6 +562,7 @@ export class HedgeCoordinator {
     const errorCode = safeStringProperty(error, 'code');
     this.recordOrderEvent(name, prepared, null, {
       failureCode,
+      evidence: projectErrorEvidence(error),
       errorType: safeStringProperty(error, 'name') ?? 'UnknownError',
       ...(errorCode === undefined ? {} : { errorCode })
     });

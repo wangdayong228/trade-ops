@@ -208,7 +208,9 @@ test('Pino trade output replaces credential values inside error classifications'
     logger,
     () => ['credential-value']
   );
+  const details = { evidence: { type: 'Error', message: 'failure-credential-value', cause: { type: 'Error', message: 'root-credential-value', status: 503, body: 'body-tail' } } };
   const event = orderEvent('order_submit_uncertain', ORDER, null, {
+    ...details,
     failureCode: 'ORDER_SUBMISSION_UNKNOWN',
     errorType: 'ExchangeError-credential-value',
     errorCode: 'credential-value'
@@ -217,6 +219,8 @@ test('Pino trade output replaces credential values inside error classifications'
   sink.record(event);
 
   const line = output.join('');
+  assert.match(line, /root-\[Redacted\]/u);
+  assert.match(line, /body-tail/u);
   assert.doesNotMatch(line, /credential-value/);
   assert.match(line, /\[Redacted\]/);
 });

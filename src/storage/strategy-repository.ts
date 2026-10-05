@@ -42,8 +42,8 @@ export type SnapshotAttachmentResult = 'attached' | 'unchanged';
 export class OrderSnapshotValidationError extends Error {
   readonly name = 'OrderSnapshotValidationError';
 
-  constructor(detail: string) {
-    super(detail);
+  constructor(detail: string, options?: ErrorOptions) {
+    super(detail, options);
   }
 }
 

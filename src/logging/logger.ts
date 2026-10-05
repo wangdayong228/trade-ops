@@ -1,7 +1,11 @@
 import pino, { type DestinationStream, type Logger } from 'pino';
 import {
-  createTradeOpsError,
-  withErrorPhase,
+  redactEvidenceText,
+  type ErrorEvidence
+} from '../errors/error-evidence.js';
+import {
+  projectErrorEvidence,
+  projectTradeOpsError,
   type ErrorDetail,
   type TradeOpsError
 } from '../errors/trade-ops-error.js';
@@ -33,12 +37,7 @@ const CREDENTIAL_KEYS = [
   'TRADING_OKX_PASSWORD'
 ] as const;
 
-export interface SafeError {
-  readonly type: string;
-  readonly message: string;
-  readonly code?: string;
-  readonly stack?: string;
-}
+export interface SafeError extends ErrorEvidence {}
 
 export interface OperationalFields {
   readonly phase?: string;
@@ -56,6 +55,8 @@ export interface OperationalFields {
   readonly strategyOrderId?: string;
   readonly clientOrderId?: string;
   readonly exchangeOrderId?: string;
+  readonly check?: string;
+  readonly evidence?: ErrorEvidence;
   readonly expected?: string;
   readonly actual?: string;
   readonly exposureKnown?: boolean;
@@ -83,18 +84,6 @@ export interface OperationalLog {
   ): void;
 }
 
-function stringProperty(value: unknown, property: string): string | undefined {
-  if (typeof value !== 'object' || value === null) {
-    return undefined;
-  }
-  try {
-    const candidate = Reflect.get(value, property);
-    return typeof candidate === 'string' ? candidate : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 export function nonEmptySecrets(
   secrets: readonly string[]
 ): readonly string[] {
@@ -112,11 +101,7 @@ export function redactText(
   value: string,
   secrets: readonly string[]
 ): string {
-  let redacted = value;
-  for (const secret of nonEmptySecrets(secrets)) {
-    redacted = redacted.replaceAll(secret, '[Redacted]');
-  }
-  return redacted;
+  return redactEvidenceText(value, nonEmptySecrets(secrets));
 }
 
 export function utf8Prefix(value: string, maxBytes: number): string {
@@ -195,6 +180,8 @@ function operationalFields(
   if (fields?.exchangeOrderId !== undefined) {
     output.exchangeOrderId = redactText(fields.exchangeOrderId, secrets);
   }
+  if (fields?.check !== undefined) output.check = redactText(fields.check, secrets);
+  if (fields?.evidence !== undefined) output.evidence = projectErrorEvidence(fields.evidence, secrets);
   if (fields?.expected !== undefined) {
     output.expected = redactText(fields.expected, secrets);
   }
@@ -239,48 +226,27 @@ export function safeError(
   error: unknown,
   secrets: readonly string[] = []
 ): SafeError {
-  const type = stringProperty(error, 'name') ?? 'UnknownError';
-  const rawMessage = stringProperty(error, 'message')
-    ?? (typeof error === 'string' ? error : 'Unknown error');
-  const code = stringProperty(error, 'code');
-  const stack = stringProperty(error, 'stack');
-  return {
-    type: redactText(type, secrets),
-    message: redactText(rawMessage, secrets),
-    ...(code === undefined ? {} : { code: redactText(code, secrets) }),
-    ...(stack === undefined ? {} : { stack: redactText(stack, secrets) })
-  };
+  return projectErrorEvidence(error, secrets, true);
 }
 
-function trustedStartupDetail(
+function trustedErrorDetail(
   error: unknown,
   secrets: readonly string[]
 ): ErrorDetail | undefined {
   let detail: ErrorDetail;
   try {
-    withErrorPhase(error as TradeOpsError, 'startup');
-    detail = (error as TradeOpsError).detail;
+    detail = projectTradeOpsError(error as TradeOpsError, secrets, true);
   } catch {
     return undefined;
   }
-  if (detail.phase !== 'startup') {
-    return undefined;
-  }
-  return createTradeOpsError({
-    code: detail.code,
-    phase: detail.phase,
-    subject: detail.subject,
-    expected: detail.expected,
-    actual: detail.actual,
-    occurredAt: detail.occurredAt
-  }, secrets).detail;
+  return detail;
 }
 
 function operationalError(
   error: unknown,
   secrets: readonly string[]
 ): SafeError | ErrorDetail {
-  return trustedStartupDetail(error, secrets) ?? safeError(error, secrets);
+  return trustedErrorDetail(error, secrets) ?? safeError(error, secrets);
 }
 
 export function createAppLogger(destination?: DestinationStream): Logger {

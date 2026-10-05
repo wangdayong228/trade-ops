@@ -38,6 +38,47 @@ test('projects only a trusted TradeOpsError detail', () => {
   );
 });
 
+test('projects trusted cause status and body without stack or configured secrets', () => {
+  const configuredSecret = 'SYNTHETIC-PUBLIC-CONFIGURED-SECRET';
+  const nativeFailure = Object.assign(
+    new Error(`gateway request rejected ${configuredSecret}`, {
+      cause: new Error(`upstream socket closed ${configuredSecret}`)
+    }),
+    {
+      code: 'GATEWAY_REJECTED',
+      response: {
+        status: 429,
+        body: `rate limit exceeded ${configuredSecret}`
+      }
+    }
+  );
+  nativeFailure.stack = `Error: gateway request rejected ${configuredSecret}\nsynthetic-stack`;
+  const error = createTradeOpsError({
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request',
+    subject: { type: 'request', field: 'preflight' },
+    expected: 'successful preflight',
+    actual: 'object-failure',
+    occurredAt: '2026-10-03T00:00:00.000Z'
+  }, undefined, { cause: nativeFailure });
+
+  const projected = parseErrorDetail(
+    projectPublicError(error, [configuredSecret])
+  );
+  const serialized = JSON.stringify(projected);
+
+  assert.equal(projected.code, error.detail.code);
+  assert.equal(projected.phase, error.detail.phase);
+  assert.equal(projected.occurredAt, error.detail.occurredAt);
+  assert.match(serialized, /gateway request rejected/);
+  assert.match(serialized, /upstream socket closed/);
+  assert.match(serialized, /GATEWAY_REJECTED/);
+  assert.match(serialized, /429/);
+  assert.match(serialized, /rate limit exceeded/);
+  assert.doesNotMatch(serialized, new RegExp(configuredSecret));
+  assert.doesNotMatch(serialized, /"stack"|synthetic-stack/);
+});
+
 test('redacts configured secrets from branded details before public projection', async (t) => {
   const configuredSecret = 'CONFIGURED-PROJECTION-SECRET';
   const occurredAt = '2026-10-03T00:00:00.000Z';

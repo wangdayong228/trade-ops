@@ -41,11 +41,13 @@ export class FundingRequestCanceledError extends Error {
   }
 }
 
-export class FundingRequestRetryExhaustedError extends Error {
+export class FundingRequestRetryExhaustedError extends AggregateError {
   readonly name = 'FundingRequestRetryExhaustedError';
 
-  constructor() {
-    super('funding request retries exhausted');
+  constructor(errors: readonly unknown[] = []) {
+    super(errors, 'funding request retries exhausted', errors.length === 0
+      ? undefined
+      : { cause: errors[errors.length - 1] });
   }
 }
 

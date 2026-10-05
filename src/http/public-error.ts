@@ -1,5 +1,5 @@
 import {
-  createTradeOpsError,
+  projectTradeOpsError,
   withErrorPhase,
   type ErrorDetail,
   type TradeOpsError
@@ -20,15 +20,7 @@ export function publicErrorDetail(
   }
 
   try {
-    const detail = trusted.detail;
-    return createTradeOpsError({
-      code: detail.code,
-      phase: detail.phase,
-      subject: detail.subject,
-      expected: detail.expected,
-      actual: detail.actual,
-      occurredAt: detail.occurredAt
-    }, secrets).detail;
+    return projectTradeOpsError(trusted, secrets, false);
   } catch {
     return undefined;
   }

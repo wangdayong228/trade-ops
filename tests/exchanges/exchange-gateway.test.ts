@@ -21,6 +21,23 @@ function isNoOrderSubmitted(error: unknown): boolean {
   return true;
 }
 
+function reportsErrorEvidence(
+  action: () => unknown,
+  fragments: readonly string[],
+  options: { readonly hasCause?: boolean } = {}
+): void {
+  assert.throws(action, (error: unknown) => {
+    assert(error instanceof Error);
+    for (const fragment of fragments) {
+      assert.match(error.message, new RegExp(fragment, 'u'));
+    }
+    if (options.hasCause === true) {
+      assert(error.cause instanceof Error);
+    }
+    return true;
+  });
+}
+
 test('exposes only the closed no-order-submitted reason set', () => {
   const unclassified = new NoOrderSubmittedError();
   const untradable = new NoOrderSubmittedError('UNTRADABLE_REQUEST');
@@ -74,6 +91,21 @@ test('rejects a base quantity that is not an exact contract count', () => {
   assert.throws(
     () => baseToExchangeAmount('0.0155', '0.001'),
     /whole contract/
+  );
+});
+
+test('reports both conversion operands and the fractional contract count', () => {
+  reportsErrorEvidence(
+    () => baseToExchangeAmount('0.0155', '0.001'),
+    ['baseQuantity', '0\\.0155', 'contractSize', '0\\.001', '15\\.5', 'whole']
+  );
+});
+
+test('reports a malformed conversion operand and preserves its parse cause', () => {
+  reportsErrorEvidence(
+    () => baseToExchangeAmount('not-a-decimal', '0.001'),
+    ['baseQuantity', 'not-a-decimal', 'decimal'],
+    { hasCause: true }
   );
 });
 
@@ -132,6 +164,39 @@ test('rejects conversion results that overflow or underflow Decimal limits', () 
       '1e-5000000000000000'
     ),
     /base quantity/
+  );
+});
+
+test('reports required precision and the supported conversion bound', () => {
+  assert.throws(
+    () => baseToExchangeAmount(
+      '1e5000000000000000',
+      '1e-5000000000000000'
+    ),
+    (error: unknown) => {
+      assert(error instanceof Error);
+      assert.match(error.message, /baseQuantity.*1e5000000000000000/u);
+      assert.match(error.message, /contractSize.*1e-5000000000000000/u);
+      assert.match(error.message, /required precision [0-9]+/u);
+      assert.match(error.message, /(?:maximum|at most) 1000000000/u);
+      return true;
+    }
+  );
+});
+
+test('reports multiplication operands and the actual underflowed base quantity', () => {
+  reportsErrorEvidence(
+    () => exchangeAmountToBase(
+      '1e-5000000000000000',
+      '1e-5000000000000000'
+    ),
+    [
+      'amount',
+      '1e-5000000000000000',
+      'contractSize',
+      '1e-5000000000000000',
+      '(?:actual|derived).*0'
+    ]
   );
 });
 

@@ -7,6 +7,7 @@ import {
   type DatabaseErrorSubject,
   type TradeOpsError
 } from '../errors/trade-ops-error.js';
+import { diagnosticValue } from '../errors/error-evidence.js';
 
 export type SqliteOwnershipFailureCode =
   | 'DATABASE_OWNERSHIP_BUSY'
@@ -71,7 +72,8 @@ function ownershipSubject(
 function ownershipError(
   code: SqliteOwnershipFailureCode,
   databasePath: string,
-  actual: string
+  actual: string,
+  options?: ErrorOptions
 ): TradeOpsError {
   return createTradeOpsError({
     code,
@@ -79,12 +81,14 @@ function ownershipError(
     subject: ownershipSubject(databasePath),
     expected: 'exclusive SQLite process ownership',
     actual
-  });
+  }, undefined, options);
 }
 
 function trustedOwnershipError(error: unknown): TradeOpsError | undefined {
   try {
-    const trusted = withErrorPhase(error as TradeOpsError, 'startup');
+    const original = error as TradeOpsError;
+    const phased = withErrorPhase(original, 'startup');
+    const trusted = original.detail.phase === 'startup' ? original : phased;
     return trusted.detail.code === 'DATABASE_OWNERSHIP_BUSY'
       || trusted.detail.code === 'DATABASE_OWNERSHIP_UNAVAILABLE'
       ? trusted
@@ -107,7 +111,7 @@ export function claimSqliteProcessOwnership(
       throw ownershipError(
         'DATABASE_OWNERSHIP_UNAVAILABLE',
         databasePath,
-        'locking-mode-not-exclusive'
+        diagnosticValue(mode)
       );
     }
     database.exec('BEGIN EXCLUSIVE; COMMIT');
@@ -119,13 +123,15 @@ export function claimSqliteProcessOwnership(
       throw ownershipError(
         'DATABASE_OWNERSHIP_BUSY',
         databasePath,
-        'sqlite-contention'
+        'sqlite-contention',
+        { cause: error }
       );
     }
     throw ownershipError(
       'DATABASE_OWNERSHIP_UNAVAILABLE',
       databasePath,
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
 }

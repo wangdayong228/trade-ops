@@ -13,6 +13,7 @@ import {
   loadEnvironmentFile
 } from '../../src/config/environment-loader.js';
 import {
+  projectTradeOpsError,
   withErrorPhase,
   type ErrorDetail,
   type TradeOpsError
@@ -68,6 +69,50 @@ test('treats only ENOENT as an optional missing file', () => {
     () => loadEnvironmentFile({ load: () => output('EACCES') }),
     'object-failure',
     ['EACCES']
+  );
+});
+
+test('distinguishes dotenv permission and disk failures in safe evidence', () => {
+  const configuredSecret = 'SYNTHETIC-DOTENV-CONFIGURED-SECRET';
+  const cases = [
+    ['EACCES', 'permission denied'],
+    ['ENOSPC', 'no space left on device']
+  ] as const;
+  const projectedFailures: ErrorDetail[] = [];
+
+  for (const [code, reason] of cases) {
+    let caught: unknown;
+    const nativeFailure = Object.assign(
+      new Error(`${reason}: /synthetic/${configuredSecret}/.env`),
+      { code }
+    );
+    try {
+      loadEnvironmentFile({
+        processEnv: {},
+        load: () => ({ error: nativeFailure }) as unknown as DotenvConfigOutput
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    const branded = withErrorPhase(caught as TradeOpsError, 'startup');
+    assert.equal(branded.detail.actual, 'object-failure');
+    const projected = projectTradeOpsError(
+      branded,
+      [configuredSecret],
+      false
+    );
+    const serialized = JSON.stringify(projected);
+    assert.match(serialized, new RegExp(code));
+    assert.match(serialized, new RegExp(reason));
+    assert.doesNotMatch(serialized, new RegExp(configuredSecret));
+    assert.doesNotMatch(serialized, /"stack"/);
+    projectedFailures.push(projected);
+  }
+
+  assert.notDeepEqual(
+    projectedFailures[0]?.evidence,
+    projectedFailures[1]?.evidence
   );
 });
 

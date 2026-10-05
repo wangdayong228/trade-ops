@@ -21,6 +21,7 @@ import type { FundingRateSyncServiceOptions } from '../src/funding-rates/funding
 import {
   createTradeOpsError,
   parseErrorDetail,
+  projectTradeOpsError,
   withErrorPhase,
   type ErrorCode,
   type ErrorDetail,
@@ -37,6 +38,7 @@ import {
   claimSqliteProcessOwnership
 } from '../src/storage/sqlite-process-owner.js';
 import { SqliteStrategyRepository } from '../src/storage/sqlite-strategy-repository.js';
+import type { PreflightResult } from '../src/strategy/preflight-service.js';
 import { FakeExchangeGateway } from './support/fake-exchange-gateway.js';
 import { FakeFundingRateSource } from './support/fake-funding-rate-source.js';
 
@@ -1216,11 +1218,14 @@ test('funding repository initialization failure precedes component construction'
 });
 
 test('converts unknown funding repository initialization failures before close errors', () => {
+  const configuredSecret = VALID_ENV.TRADING_BITGET_API_KEY;
   const database = new Database(':memory:', { timeout: 0 });
   const originalClose = database.close.bind(database);
   database.close = () => {
     originalClose();
-    throw new Error('database-close-secret');
+    throw new Error(
+      `database close failed after construction ${configuredSecret}`
+    );
   };
   let caught: unknown;
   try {
@@ -1232,7 +1237,9 @@ test('converts unknown funding repository initialization failures before close e
         new FakeFundingRateSource('okx', [])
       ],
       fundingRateRepositoryFactory: () => {
-        throw { message: 'funding-repository-object-secret' };
+        throw new Error(
+          `funding repository initialization unavailable ${configuredSecret}`
+        );
       },
       logger: false
     });
@@ -1242,10 +1249,22 @@ test('converts unknown funding repository initialization failures before close e
 
   const detail = assertStartupDetail(caught, 'STORAGE_OPERATION_FAILED');
   assert.equal(detail.subject.type, 'database');
-  assert.doesNotMatch(
-    JSON.stringify(detail),
-    /funding-repository-object-secret|database-close-secret/
+  const projected = projectTradeOpsError(
+    caught as TradeOpsError,
+    Object.values(VALID_ENV),
+    false
   );
+  const serialized = JSON.stringify(projected);
+  const primaryIndex = serialized.indexOf(
+    'funding repository initialization unavailable'
+  );
+  const closeIndex = serialized.indexOf(
+    'database close failed after construction'
+  );
+  assert.ok(primaryIndex >= 0);
+  assert.ok(closeIndex > primaryIndex);
+  assert.doesNotMatch(serialized, new RegExp(configuredSecret));
+  assert.doesNotMatch(serialized, /"stack"/);
   assert.equal(database.open, false);
 });
 
@@ -1494,6 +1513,78 @@ test('composition redacts all configured credentials from detailed HTTP errors',
   }
 });
 
+test('composition injects configured credential redaction into confirmation persistence', async (t) => {
+  const composition = composeService({
+    env: VALID_ENV,
+    gatewayFactory: (exchangeId) => new FakeExchangeGateway(exchangeId),
+    databaseFactory: () => new Database(':memory:'),
+    logger: false
+  });
+  t.after(async () => {
+    await composition.server.close();
+    composition.database.close();
+  });
+  const snapshot: PreflightResult = {
+    spotExchangeId: 'bitget',
+    contractExchangeId: 'okx',
+    symbol: 'BTC/USDT',
+    requestedBaseQuantity: '1',
+    effectiveBaseQuantity: '1',
+    mode: 'CONCURRENT',
+    spotMarket: {
+      exchangeId: 'bitget', symbol: 'BTC/USDT', marketId: 'BTCUSDT',
+      kind: 'spot', base: 'BTC', quote: 'USDT', active: true,
+      amountStep: '0.001', contractSize: '1', minBaseAmount: '0.001',
+      minQuoteNotional: '5', priceStep: '0.1'
+    },
+    contractMarket: {
+      exchangeId: 'okx', symbol: 'BTC/USDT', marketId: 'BTC-USDT-SWAP',
+      kind: 'swap', base: 'BTC', quote: 'USDT', active: true,
+      amountStep: '1', contractSize: '0.001', minBaseAmount: '0.001',
+      minQuoteNotional: '5', priceStep: '0.1'
+    },
+    accountSettings: {
+      marginMode: 'isolated', positionMode: 'hedged', leverage: '2'
+    },
+    spotFreeUsdt: '100000',
+    contractFreeUsdt: '50000',
+    spotReferencePrice: '60000',
+    contractReferencePrice: '60010',
+    riskAcknowledgementRequired: true,
+    createdAt: '2026-10-03T00:00:00.000Z'
+  };
+  const pending = composition.repository.createPending(snapshot);
+  const credentialMessage = Object.values(VALID_ENV).join(' | ');
+  Reflect.set(composition.preflightService, 'run', async () => {
+    throw new Error(
+      `confirmation account refresh unavailable ${credentialMessage}`
+    );
+  });
+
+  const response = await composition.server.inject({
+    method: 'POST',
+    url: `/api/hedges/${pending.id}/confirm`,
+    headers: {
+      host: 'localhost:80',
+      origin: 'http://localhost:80'
+    },
+    payload: { riskAcknowledged: true }
+  });
+
+  assert.equal(response.statusCode, 409);
+  const stored = composition.repository.getStrategy(pending.id);
+  assert.equal(stored.state, 'PREFLIGHT_INVALIDATED');
+  assert.notEqual(stored.preflightFailure, null);
+  const persisted = parseErrorDetail(structuredClone(stored.preflightFailure));
+  const serialized = JSON.stringify(persisted);
+  assert.match(serialized, /confirmation account refresh unavailable/);
+  assert.doesNotMatch(serialized, /"stack"/);
+  for (const secret of Object.values(VALID_ENV).slice(1)) {
+    assert.doesNotMatch(serialized, new RegExp(secret));
+  }
+  assert.deepEqual(composition.repository.listOrders(pending.id), []);
+});
+
 test('composition shares one safe trade sink with submission and evidence owners', async (t) => {
   const tradeEvents = { record(): void {} };
   const composition = composeService({
@@ -1562,6 +1653,7 @@ class SignalTarget extends EventEmitter {
   constructor(
     private readonly registrationFailure?: SignalTargetFailure,
     private readonly removalFailure?: SignalTargetFailure
+      | readonly SignalTargetFailure[]
   ) {
     super();
   }
@@ -1586,8 +1678,11 @@ class SignalTarget extends EventEmitter {
   ): this {
     if (eventName === 'SIGINT' || eventName === 'SIGTERM') {
       this.removalAttempts.push(eventName);
-      if (this.removalFailure?.signal === eventName) {
-        throw this.removalFailure.value;
+      const failure = Array.isArray(this.removalFailure)
+        ? this.removalFailure.find((item) => item.signal === eventName)
+        : this.removalFailure;
+      if (failure?.signal === eventName) {
+        throw failure.value;
       }
     }
     return super.removeListener(eventName, listener);
@@ -1833,7 +1928,9 @@ test('listen failures are logged before idempotent cleanup', async () => {
   const events: string[] = [];
   const operations: CapturedOperation[] = [];
   const fixture = runnableFixture(events);
-  const failure = new Error('address unavailable secret');
+  const failure = new Error(
+    `address unavailable on synthetic listener ${VALID_ENV.TRADING_OKX_SECRET}`
+  );
 
   const error = await rejectedValue(startService(fixture.composition, {
     signalTarget: new SignalTarget(),
@@ -1843,7 +1940,18 @@ test('listen failures are logged before idempotent cleanup', async () => {
     }
   }));
   const detail = assertStartupDetail(error, 'SERVICE_LISTEN_FAILED');
-  assert.doesNotMatch(JSON.stringify(detail), /address unavailable secret/);
+  const returnedProjection = projectTradeOpsError(
+    error as TradeOpsError,
+    Object.values(VALID_ENV),
+    true
+  );
+  const returnedSerialized = JSON.stringify(returnedProjection);
+  assert.match(returnedSerialized, /address unavailable on synthetic listener/);
+  assert.match(returnedSerialized, /"stack"/);
+  assert.doesNotMatch(
+    returnedSerialized,
+    new RegExp(VALID_ENV.TRADING_OKX_SECRET)
+  );
 
   assert.deepEqual(operations.map(({ event }) => event), [
     'service_starting',
@@ -1854,6 +1962,14 @@ test('listen failures are logged before idempotent cleanup', async () => {
   assert.deepEqual(
     assertStartupDetail(operations[1]?.error, 'SERVICE_LISTEN_FAILED'),
     detail
+  );
+  assert.deepEqual(
+    projectTradeOpsError(
+      operations[1]?.error as TradeOpsError,
+      Object.values(VALID_ENV),
+      true
+    ),
+    returnedProjection
   );
 });
 
@@ -2294,26 +2410,85 @@ test('converts heterogeneous failures at each startup step before cleanup', asyn
 
 test('all cleanup steps run when startup and every cleanup step fail', async () => {
   const events: string[] = [];
+  const operations: CapturedOperation[] = [];
   const signals = new SignalTarget();
   const fixture = fundingRunnableFixture(events, {
-    fundingStopFailure: { enabled: true, value: undefined },
-    monitorStopFailure: { enabled: true, value: 'monitor-stop-secret' },
-    serverCloseFailure: { enabled: true, value: { message: 'server-close-secret' } },
-    databaseCloseFailure: { enabled: true, value: new Error('database-close-secret') }
+    fundingStopFailure: {
+      enabled: true,
+      value: new Error('funding sync cleanup failed')
+    },
+    monitorStopFailure: {
+      enabled: true,
+      value: new Error('order monitor cleanup failed')
+    },
+    serverCloseFailure: {
+      enabled: true,
+      value: new Error('HTTP server cleanup failed')
+    },
+    databaseCloseFailure: {
+      enabled: true,
+      value: new Error('database cleanup failed')
+    }
   });
 
   const error = await rejectedValue(startService(fixture.composition, {
     signalTarget: signals,
+    operationalLog: captureOperationalLog(operations),
     listen: async () => {
       events.push('listen');
-      throw undefined;
+      throw new Error('listener startup failed');
     }
   }));
   const detail = assertStartupDetail(error, 'SERVICE_LISTEN_FAILED');
-  assert.doesNotMatch(
-    JSON.stringify(detail),
-    /monitor-stop-secret|server-close-secret|database-close-secret/
+  const serialized = JSON.stringify(projectTradeOpsError(
+    error as TradeOpsError,
+    [],
+    false
+  ));
+  const reasons = [
+    'listener startup failed',
+    'funding sync cleanup failed',
+    'order monitor cleanup failed',
+    'HTTP server cleanup failed',
+    'database cleanup failed'
+  ];
+  let previousIndex = -1;
+  for (const reason of reasons) {
+    const index = serialized.indexOf(reason);
+    assert.ok(index > previousIndex, `${reason} must remain in failure order`);
+    previousIndex = index;
+  }
+  const startupLogs = operations.filter(
+    ({ event }) => event === 'service_start_failed'
   );
+  assert.equal(startupLogs.length, 1);
+  const startupSerialized = JSON.stringify(projectTradeOpsError(
+    startupLogs[0]?.error as TradeOpsError,
+    [],
+    false
+  ));
+  assert.match(startupSerialized, /listener startup failed/);
+  for (const cleanupReason of reasons.slice(1)) {
+    assert.doesNotMatch(startupSerialized, new RegExp(cleanupReason));
+  }
+  const stopLogs = operations.filter(
+    ({ event }) => event === 'service_stop_failed'
+  );
+  assert.equal(stopLogs.length, 1);
+  const stopSerialized = JSON.stringify(projectTradeOpsError(
+    stopLogs[0]?.error as TradeOpsError,
+    [],
+    false
+  ));
+  previousIndex = -1;
+  for (const cleanupReason of reasons.slice(1)) {
+    const index = stopSerialized.indexOf(cleanupReason);
+    assert.ok(
+      index > previousIndex,
+      `${cleanupReason} must remain in cleanup failure order`
+    );
+    previousIndex = index;
+  }
   assert.deepEqual(events, [
     'monitor.start:5000',
     'listen',
@@ -2335,6 +2510,51 @@ test('all cleanup steps run when startup and every cleanup step fail', async () 
   });
   assert.equal(signals.listenerCount('SIGINT'), 0);
   assert.equal(signals.listenerCount('SIGTERM'), 0);
+});
+
+test('retains both signal listener removal failures in attempt order', async () => {
+  const events: string[] = [];
+  const operations: CapturedOperation[] = [];
+  const fixture = runnableFixture(events);
+  const signals = new SignalTarget(undefined, [
+    { signal: 'SIGINT', value: new Error('SIGINT removal failed') },
+    { signal: 'SIGTERM', value: new Error('SIGTERM removal failed') }
+  ]);
+  const started = await startService(fixture.composition, {
+    signalTarget: signals,
+    operationalLog: captureOperationalLog(operations),
+    listen: async () => {
+      events.push('listen');
+    }
+  });
+
+  const error = await rejectedValue(started.shutdown());
+  const serialized = JSON.stringify(projectTradeOpsError(
+    error as TradeOpsError,
+    [],
+    false
+  ));
+  const sigintIndex = serialized.indexOf('SIGINT removal failed');
+  const sigtermIndex = serialized.indexOf('SIGTERM removal failed');
+  assert.ok(sigintIndex >= 0);
+  assert.ok(sigtermIndex > sigintIndex);
+  assert.deepEqual(signals.removalAttempts, ['SIGINT', 'SIGTERM']);
+  assert.deepEqual(events, [
+    'monitor.start:5000',
+    'listen',
+    'monitor.stop',
+    'server.close',
+    'database.close'
+  ]);
+  assert.deepEqual(
+    operations.map(({ event }) => event),
+    [
+      'service_starting',
+      'service_started',
+      'service_stopping',
+      'service_stop_failed'
+    ]
+  );
 });
 
 test('cleanup throw undefined rejects shutdown and still closes later resources', async () => {

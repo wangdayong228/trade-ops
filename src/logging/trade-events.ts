@@ -1,3 +1,5 @@
+import { projectErrorEvidence } from '../errors/trade-ops-error.js';
+import type { ErrorEvidence } from '../errors/error-evidence.js';
 import type { Logger } from 'pino';
 import type {
   ExecutionMode,
@@ -46,6 +48,7 @@ export interface TradeEvent {
   readonly marginMode?: 'isolated' | 'cross';
   readonly status: StrategyOrderStatus;
   readonly failureCode?: StrategyFailureCode;
+  readonly evidence?: ErrorEvidence;
   readonly errorType?: string;
   readonly errorCode?: string;
 }
@@ -54,6 +57,7 @@ export interface OrderEventDetails {
   readonly mode?: ExecutionMode;
   readonly strategyState?: StrategyState;
   readonly failureCode?: StrategyFailureCode;
+  readonly evidence?: ErrorEvidence;
   readonly errorType?: string;
   readonly errorCode?: string;
 }
@@ -154,6 +158,7 @@ export function orderEvent(
   optionalField(output, 'positionSide', order.request.positionSide);
   optionalField(output, 'marginMode', order.request.marginMode);
   optionalField(output, 'failureCode', details.failureCode);
+  if (details.evidence !== undefined) output.evidence = projectErrorEvidence(details.evidence);
   optionalField(output, 'errorType', details.errorType);
   optionalField(output, 'errorCode', details.errorCode);
   return output;
@@ -215,6 +220,7 @@ function allowlistedEvent(
   if (event.failureCode !== undefined) {
     output.failureCode = event.failureCode;
   }
+  if (event.evidence !== undefined) output.evidence = projectErrorEvidence(event.evidence, secrets);
   if (event.errorType !== undefined) {
     output.errorType = redactText(event.errorType, secrets);
   }

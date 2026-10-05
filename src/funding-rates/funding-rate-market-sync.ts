@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import {
   fundingRateEvent,
   nonThrowingFundingRateEventSink,
@@ -82,9 +83,10 @@ type ValidatedIncrementalPage =
 class PageValidationFailure extends Error {
   constructor(
     readonly code: PageValidationFailureCode,
-    message: string
+    message: string,
+    options?: ErrorOptions
   ) {
-    super(message);
+    super(message, options);
     this.name = 'PageValidationFailure';
   }
 }
@@ -95,11 +97,12 @@ function pageContext(lease: FundingMarketIdentity): string {
 
 function sourceResponseInvalid(
   lease: FundingMarketIdentity,
-  detail: string
+  detail: string,
+  options?: ErrorOptions
 ): never {
   throw new PageValidationFailure(
     'SOURCE_RESPONSE_INVALID',
-    `invalid funding page for ${pageContext(lease)}: ${detail}`
+    `invalid funding page for ${pageContext(lease)}: ${detail}`, options
   );
 }
 
@@ -263,16 +266,16 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
   );
 
   if (exchangeId !== 'bitget' && exchangeId !== 'okx') {
-    return invalidCoverageLease('exchangeId must be bitget or okx');
+    return invalidCoverageLease(`exchangeId must be bitget or okx; actual ${diagnosticValue(exchangeId)}`);
   }
   if (!identityString(exchangeMarketId)) {
-    return invalidCoverageLease('exchangeMarketId must be a non-empty identity string');
+    return invalidCoverageLease(`exchangeMarketId must be a non-empty identity string; actual ${diagnosticValue(exchangeMarketId)}`);
   }
   if (!identityString(symbol)) {
-    return invalidCoverageLease('symbol must be a non-empty identity string');
+    return invalidCoverageLease(`symbol must be a non-empty identity string; actual ${diagnosticValue(symbol)}`);
   }
   if (!nonNegativeSafeInteger(generation)) {
-    return invalidCoverageLease('generation must be a non-negative safe integer');
+    return invalidCoverageLease(`generation must be a non-negative safe integer; actual ${diagnosticValue(generation)}`);
   }
   if (
     kind !== 'INITIAL'
@@ -280,21 +283,21 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
     && kind !== 'INACTIVE_FINAL'
     && kind !== 'REACTIVATION'
   ) {
-    return invalidCoverageLease('kind is not supported');
+    return invalidCoverageLease(`kind is not supported; actual ${diagnosticValue(kind)}`);
   }
   if (!nonNegativeSafeInteger(cutoffMs)) {
-    return invalidCoverageLease('cutoffMs must be a non-negative safe integer');
+    return invalidCoverageLease(`cutoffMs must be a non-negative safe integer; actual ${diagnosticValue(cutoffMs)}`);
   }
   if (exchangeId === 'bitget') {
     if (okxResumeAfterMs !== null) {
-      return invalidCoverageLease('Bitget okxResumeAfterMs must be null');
+      return invalidCoverageLease(`Bitget okxResumeAfterMs must be null; actual ${diagnosticValue(okxResumeAfterMs)}`);
     }
     if (
       requiredBitgetBoundaryMs !== null
       && !nonNegativeSafeInteger(requiredBitgetBoundaryMs)
     ) {
       return invalidCoverageLease(
-        'Bitget requiredBitgetBoundaryMs must be null or a non-negative safe integer'
+        `Bitget requiredBitgetBoundaryMs must be null or a non-negative safe integer; actual ${diagnosticValue(requiredBitgetBoundaryMs)}`
       );
     }
     return Object.freeze({
@@ -310,11 +313,11 @@ function coverageLeaseSnapshot(value: unknown): CoverageLease {
   }
 
   if (requiredBitgetBoundaryMs !== null) {
-    return invalidCoverageLease('OKX requiredBitgetBoundaryMs must be null');
+    return invalidCoverageLease(`OKX requiredBitgetBoundaryMs must be null; actual ${diagnosticValue(requiredBitgetBoundaryMs)}`);
   }
   if (okxResumeAfterMs !== null && !nonNegativeSafeInteger(okxResumeAfterMs)) {
     return invalidCoverageLease(
-      'OKX okxResumeAfterMs must be null or a non-negative safe integer'
+      `OKX okxResumeAfterMs must be null or a non-negative safe integer; actual ${diagnosticValue(okxResumeAfterMs)}`
     );
   }
   return Object.freeze({
@@ -373,24 +376,24 @@ function incrementalLeaseSnapshot(value: unknown): IncrementalLease {
   );
 
   if (exchangeId !== 'bitget' && exchangeId !== 'okx') {
-    return invalidIncrementalLease('exchangeId must be bitget or okx');
+    return invalidIncrementalLease(`exchangeId must be bitget or okx; actual ${diagnosticValue(exchangeId)}`);
   }
   if (!identityString(exchangeMarketId)) {
     return invalidIncrementalLease(
-      'exchangeMarketId must be a non-empty identity string'
+      `exchangeMarketId must be a non-empty identity string; actual ${diagnosticValue(exchangeMarketId)}`
     );
   }
   if (!identityString(symbol)) {
-    return invalidIncrementalLease('symbol must be a non-empty identity string');
+    return invalidIncrementalLease(`symbol must be a non-empty identity string; actual ${diagnosticValue(symbol)}`);
   }
   if (!nonNegativeSafeInteger(generation)) {
     return invalidIncrementalLease(
-      'generation must be a non-negative safe integer'
+      `generation must be a non-negative safe integer; actual ${diagnosticValue(generation)}`
     );
   }
   if (frozenBoundaryMs !== null && !nonNegativeSafeInteger(frozenBoundaryMs)) {
     return invalidIncrementalLease(
-      'frozenBoundaryMs must be null or a non-negative safe integer'
+      `frozenBoundaryMs must be null or a non-negative safe integer; actual ${diagnosticValue(frozenBoundaryMs)}`
     );
   }
   return Object.freeze({
@@ -446,6 +449,13 @@ function cursorSnapshot(
   return Object.freeze({ exchangeId: null });
 }
 
+function cursorDiagnostic(value: CursorSnapshot | FundingPageCursor | null): string {
+  if (value === null) return 'null';
+  if (value.exchangeId === 'bitget') return `bitget pageNo=${diagnosticValue(value.pageNo)}`;
+  if (value.exchangeId === 'okx') return `okx afterMs=${diagnosticValue(value.afterMs)}`;
+  return 'unrecognized exchangeId';
+}
+
 function sameCursor(value: CursorSnapshot, expected: FundingPageCursor): boolean {
   if (value.exchangeId !== expected.exchangeId) return false;
   return expected.exchangeId === 'bitget'
@@ -481,7 +491,7 @@ function normalizedPageRecords(
     invalid
   );
   if (!nonNegativeSafeInteger(length)) {
-    return sourceResponseInvalid(lease, 'records length must be a safe integer');
+    return sourceResponseInvalid(lease, `records.length: expected safe integer; actual ${diagnosticValue(length)}`);
   }
   if (length > maximumRecords) {
     return sourceResponseInvalid(
@@ -552,38 +562,39 @@ function normalizedPageRecords(
       || exchangeMarketId !== lease.exchangeMarketId
       || symbol !== lease.symbol
     ) {
-      return sourceResponseInvalid(lease, 'record market identity mismatch');
+      for (const [field, actual] of [['exchangeId', exchangeId], ['exchangeMarketId', exchangeMarketId], ['symbol', symbol]] as const) {
+        if (actual !== lease[field]) return sourceResponseInvalid(lease, `record.${field}: expected ${lease[field]}; actual ${diagnosticValue(actual)}`);
+      }
     }
     if (!nonNegativeSafeInteger(fundingTimestampMs)) {
-      return sourceResponseInvalid(lease, 'record timestamp must be a safe integer');
+      return sourceResponseInvalid(lease, `record.fundingTimestampMs: expected non-negative safe integer; actual ${diagnosticValue(fundingTimestampMs)}`);
     }
     if (typeof rawJson !== 'string') {
-      return sourceResponseInvalid(lease, 'record raw_json must be JSON text');
+      return sourceResponseInvalid(lease, `record.rawJson: expected JSON text; actual ${typeof rawJson}`);
     }
 
     let raw: unknown;
     let normalized: SettledFundingRate;
     try {
       raw = JSON.parse(rawJson);
-      normalized = settledFundingRate(
-        lease,
-        fundingRate,
-        fundingTimestampMs,
-        raw
-      );
     } catch {
-      return sourceResponseInvalid(lease, 'record normalization failed');
+      return sourceResponseInvalid(lease, `record.rawJson: expected valid JSON; actual malformed text length ${rawJson.length}; parser body omitted`);
     }
-    if (
-      normalized.rawJson !== rawJson
-      || normalized.contentHash !== contentHash
-    ) {
-      return sourceResponseInvalid(lease, 'record canonical content mismatch');
+    try {
+      normalized = settledFundingRate(lease, fundingRate, fundingTimestampMs, raw);
+    } catch (error) {
+      return sourceResponseInvalid(lease, 'record normalization failed', { cause: error });
+    }
+    if (normalized.rawJson !== rawJson) {
+      return sourceResponseInvalid(lease, `record.rawJson: expected canonical JSON; actual noncanonical text length ${rawJson.length}`);
+    }
+    if (normalized.contentHash !== contentHash) {
+      return sourceResponseInvalid(lease, `record.contentHash: expected ${normalized.contentHash}; actual ${diagnosticValue(contentHash)}`);
     }
 
     const existing = byTimestamp.get(normalized.fundingTimestampMs);
     if (existing !== undefined && !sameRecord(existing, normalized)) {
-      return sourceResponseInvalid(lease, 'duplicate record content conflict');
+      return sourceResponseInvalid(lease, `duplicate record content conflict at timestamp ${normalized.fundingTimestampMs}: expected hash ${existing.contentHash}; actual ${normalized.contentHash}`);
     }
     byTimestamp.set(normalized.fundingTimestampMs, normalized);
   }
@@ -649,17 +660,17 @@ function validateBitgetPage(
     pageNo: requestedPageNo
   } as const;
   if (!sameCursor(page.cursor, requestedCursor)) {
-    return sourceResponseInvalid(lease, 'response cursor does not match request');
+    return sourceResponseInvalid(lease, `response cursor does not match request: expected ${cursorDiagnostic(requestedCursor)}; actual ${cursorDiagnostic(page.cursor)}`);
   }
   const { records } = page;
   if (page.recoveryAnchorMs !== null) {
-    return sourceResponseInvalid(lease, 'Bitget page carried a recovery anchor');
+    return sourceResponseInvalid(lease, `Bitget recoveryAnchorMs: expected null; actual ${diagnosticValue(page.recoveryAnchorMs)}`);
   }
   if (records.length === 0) {
     if (page.nextCursor !== null) {
       return sourceResponseInvalid(
         lease,
-        'empty Bitget page must be an explicit terminal page'
+        `empty Bitget page nextCursor: expected null; actual ${cursorDiagnostic(page.nextCursor)}`
       );
     }
     return { empty: true };
@@ -669,7 +680,7 @@ function validateBitgetPage(
     || typeof page.nextCursor !== 'object'
     || page.nextCursor.exchangeId !== 'bitget'
   ) {
-    return cursorNotAdvancing(lease, 'non-empty Bitget page has no next page');
+    return cursorNotAdvancing(lease, `non-empty Bitget page nextCursor: expected Bitget page; actual ${cursorDiagnostic(page.nextCursor)}`);
   }
   if (
     requestedPageNo === Number.MAX_SAFE_INTEGER
@@ -678,7 +689,7 @@ function validateBitgetPage(
   ) {
     return cursorNotAdvancing(
       lease,
-      `expected page ${requestedPageNo + 1}`
+      `nextCursor.pageNo: expected safe integer page ${requestedPageNo + 1}; actual ${diagnosticValue(page.nextCursor.pageNo)}`
     );
   }
   return {
@@ -704,14 +715,14 @@ function validateOkxPage(
     afterMs: requestedAfterMs
   } as const;
   if (!sameCursor(page.cursor, requestedCursor)) {
-    return sourceResponseInvalid(lease, 'response cursor does not match request');
+    return sourceResponseInvalid(lease, `response cursor does not match request: expected ${cursorDiagnostic(requestedCursor)}; actual ${cursorDiagnostic(page.cursor)}`);
   }
   const { records } = page;
   if (records.length === 0) {
     if (page.nextCursor !== null || page.recoveryAnchorMs !== null) {
       return sourceResponseInvalid(
         lease,
-        'empty OKX page must have null next cursor and recovery anchor'
+        `empty OKX page: expected null nextCursor and recoveryAnchorMs; actual nextCursor=${cursorDiagnostic(page.nextCursor)}, recoveryAnchorMs=${diagnosticValue(page.recoveryAnchorMs)}`
       );
     }
     return { empty: true };
@@ -725,7 +736,7 @@ function validateOkxPage(
   ) {
     return cursorNotAdvancing(
       lease,
-      `record timestamp must be less than after ${requestedAfterMs}`
+      `record timestamp: expected less than after ${requestedAfterMs}; actual ${records.find(({ fundingTimestampMs }) => fundingTimestampMs >= requestedAfterMs)?.fundingTimestampMs}`
     );
   }
   const newest = records[0];
@@ -742,7 +753,7 @@ function validateOkxPage(
   ) {
     return cursorNotAdvancing(
       lease,
-      `next after must equal page minimum ${oldest.fundingTimestampMs}`
+      `next after must equal page minimum ${oldest.fundingTimestampMs}; actual ${cursorDiagnostic(page.nextCursor)}`
     );
   }
   if (
@@ -751,7 +762,7 @@ function validateOkxPage(
   ) {
     return cursorNotAdvancing(
       lease,
-      `recovery anchor must equal page maximum ${newest.fundingTimestampMs}`
+      `recovery anchor must equal page maximum ${newest.fundingTimestampMs}; actual ${diagnosticValue(page.recoveryAnchorMs)}`
     );
   }
   if (
@@ -1197,7 +1208,7 @@ class CoveragePageTask implements FundingPageTask {
       );
     } catch (failureError) {
       if (!(failureError instanceof StaleFundingTaskError)) {
-        throw failureError;
+        throw new AggregateError([error, failureError], 'funding page failure and failure persistence failed');
       }
       this.finished = true;
       return 'done';
@@ -1529,7 +1540,7 @@ class IncrementalPageTask implements FundingPageTask {
       );
     } catch (failureError) {
       if (!(failureError instanceof StaleFundingTaskError)) {
-        throw failureError;
+        throw new AggregateError([error, failureError], 'funding page failure and failure persistence failed');
       }
       this.finished = true;
       return 'done';
@@ -1605,7 +1616,7 @@ export class FundingRateMarketSync {
   constructor(private readonly options: FundingRateMarketSyncOptions) {
     const { source } = options;
     if (source.exchangeId !== 'bitget' && source.exchangeId !== 'okx') {
-      throw new Error('invalid funding rate source exchange identity');
+      throw new Error(`invalid funding rate source exchange identity: expected bitget or okx; actual ${diagnosticValue(source.exchangeId)}`);
     }
     const expectedPageSize = source.exchangeId === 'bitget' ? 100 : 400;
     if (source.pageSize !== expectedPageSize) {

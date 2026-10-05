@@ -1,3 +1,4 @@
+import { projectErrorEvidence } from '../../src/errors/trade-ops-error.js';
 /// <reference types="node" />
 
 import assert from 'node:assert/strict';
@@ -415,6 +416,7 @@ function assertCorruptStateFailsClosed(
       assert.match(error.message, new RegExp(market.exchangeId, 'i'));
       assert.match(error.message, new RegExp(market.exchangeMarketId, 'i'));
       assert.match(error.message, new RegExp(field, 'i'));
+      assert.match(JSON.stringify(projectErrorEvidence(error)), /expected.*actual/u);
       return true;
     }
   );
@@ -715,7 +717,7 @@ test('rejects construction inside an external transaction before creating any sc
   try {
     assert.throws(
       () => new SqliteFundingRateRepository(database),
-      /SQLite funding rate schema initialization failed/
+      /external transaction.*expected false.*actual true/u
     );
     assert.equal(database.inTransaction, true);
     assert.deepEqual(persistentTableNames(database), []);
@@ -1537,8 +1539,8 @@ test('rejects prototype-chain failure codes at runtime with a fixed safe error',
       (error: unknown) => {
         assert.equal(error instanceof Error, true);
         if (!(error instanceof Error)) return false;
-        assert.equal(error.message, 'unsupported funding task failure code');
-        assert.equal(error.message.includes(key), false);
+        assert.match(error.message, /unsupported funding task failure code/u);
+        assert.equal(error.message.includes(key), true);
         return true;
       }
     );
@@ -1577,7 +1579,7 @@ test('rejects non-string failure codes without executing coercion', () => {
     coercionCalls: [coercibleCalls, throwingCalls],
     fixedSafeErrors: outcomes.map((outcome) => (
       outcome instanceof Error
-      && outcome.message === 'unsupported funding task failure code'
+      && /unsupported funding task failure code.*object/u.test(outcome.message)
     ))
   }, {
     coercionCalls: [0, 0],
@@ -1586,7 +1588,7 @@ test('rejects non-string failure codes without executing coercion', () => {
   for (const outcome of outcomes) {
     assert.equal(outcome instanceof Error, true);
     if (!(outcome instanceof Error)) continue;
-    assert.equal(outcome.message, 'unsupported funding task failure code');
+    assert.match(outcome.message, /unsupported funding task failure code.*object/u);
     assert.equal(outcome.message.includes('synthetic-sensitive'), false);
   }
 });
@@ -4394,4 +4396,29 @@ test('rejects an intrinsically invalid Date without calling its valid-looking ov
     overrideCalls: 0,
     persistenceUnchanged: true
   });
+});
+
+test('funding schema preserves the native storage failure without subsequent schema work', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  const original = new Error('disk-full-evidence', { cause: new Error('volume-full-root') });
+  t.mock.method(database, 'exec', () => { throw original; });
+  assert.throws(() => new SqliteFundingRateRepository(database), (error: unknown) => {
+    const evidence = JSON.stringify(projectErrorEvidence(error));
+    assert.match(evidence, /disk-full-evidence[\s\S]*volume-full-root/u);
+    return true;
+  });
+  assert.equal(database.inTransaction, false);
+  assert.deepEqual(persistentTableNames(database), []);
+});
+
+test('funding schema names the table and missing column contract', (t) => {
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  database.exec('CREATE TABLE funding_rate_history (wrong TEXT)');
+  assert.throws(() => new SqliteFundingRateRepository(database), (error: unknown) => {
+    assert.match(JSON.stringify(projectErrorEvidence(error)), /funding_rate_history[\s\S]*(?:column|no such)/u);
+    return true;
+  });
+  assert.deepEqual(database.prepare('PRAGMA table_info(funding_rate_history)').all().map((row: unknown) => (row as { name: string }).name), ['wrong']);
 });

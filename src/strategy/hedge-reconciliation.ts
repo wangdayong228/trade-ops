@@ -1,3 +1,5 @@
+import { projectErrorEvidence } from '../errors/trade-ops-error.js';
+import { diagnosticValue, type ErrorEvidence } from '../errors/error-evidence.js';
 import { Decimal } from 'decimal.js';
 import type {
   MarketKind,
@@ -48,6 +50,8 @@ export interface ReconciliationDiagnostic {
   readonly strategyOrderId?: string;
   readonly clientOrderId?: string;
   readonly exchangeId?: string;
+  readonly check?: string;
+  readonly evidence?: ErrorEvidence;
   readonly expected?: string;
   readonly actual?: string;
 }
@@ -90,6 +94,8 @@ interface PendingInput {
   readonly strategyOrderId?: string;
   readonly clientOrderId?: string;
   readonly exchangeId?: string;
+  readonly check?: string;
+  readonly evidence?: ErrorEvidence;
   readonly expected?: string;
   readonly actual?: string;
 }
@@ -183,7 +189,7 @@ function parsedDecimal(value: unknown): Decimal | null {
 function requiredDecimal(value: unknown): Decimal {
   const parsed = parsedDecimal(value);
   if (parsed === null || parsed.isNegative()) {
-    throw new ExactArithmeticUnavailable();
+    throw new ExactArithmeticUnavailable(`decimal: expected non-negative supported decimal; actual ${diagnosticValue(value)}`);
   }
   return parsed;
 }
@@ -195,7 +201,7 @@ function positiveDecimal(value: unknown): Decimal | null {
 
 function checkedMetric(value: number): number {
   if (!Number.isSafeInteger(value)) {
-    throw new ExactArithmeticUnavailable();
+    throw new ExactArithmeticUnavailable(`arithmetic metric: expected safe integer; actual ${value}`);
   }
   return value;
 }
@@ -206,7 +212,7 @@ function checkedPrecision(value: number): number {
     || value <= 0
     || value > MAX_RECONCILIATION_PRECISION
   ) {
-    throw new ExactArithmeticUnavailable();
+    throw new ExactArithmeticUnavailable(`required precision: expected integer in (0, ${MAX_RECONCILIATION_PRECISION}]; actual ${value}`);
   }
   return value;
 }
@@ -274,7 +280,7 @@ function exactSum(values: readonly Decimal[]): Decimal {
   for (const value of values) {
     result = result.plus(exactValue(ExactDecimal, value));
   }
-  if (!result.isFinite()) throw new ExactArithmeticUnavailable();
+  if (!result.isFinite()) throw new ExactArithmeticUnavailable(`arithmetic result: expected finite; actual ${result.toString()}`);
   return result;
 }
 
@@ -282,7 +288,7 @@ function exactDifference(left: Decimal, right: Decimal): Decimal {
   const ExactDecimal = exactConstructor(additivePrecision([left, right]));
   const result = exactValue(ExactDecimal, left)
     .minus(exactValue(ExactDecimal, right));
-  if (!result.isFinite()) throw new ExactArithmeticUnavailable();
+  if (!result.isFinite()) throw new ExactArithmeticUnavailable(`arithmetic result: expected finite; actual ${result.toString()}`);
   return result;
 }
 
@@ -290,18 +296,18 @@ function exactProduct(left: Decimal, right: Decimal): Decimal {
   const ExactDecimal = exactConstructor(productPrecision(left, right));
   const result = exactValue(ExactDecimal, left)
     .mul(exactValue(ExactDecimal, right));
-  if (!result.isFinite()) throw new ExactArithmeticUnavailable();
+  if (!result.isFinite()) throw new ExactArithmeticUnavailable(`arithmetic result: expected finite; actual ${result.toString()}`);
   return result;
 }
 
 function exactModuloIsZero(left: Decimal, right: Decimal): boolean {
   if (!left.isFinite() || !right.isFinite() || right.isZero()) {
-    throw new ExactArithmeticUnavailable();
+    throw new ExactArithmeticUnavailable(`modulo operands: expected finite left and finite nonzero right; actual left=${left.toString()}, right=${right.toString()}`);
   }
   const ExactDecimal = exactConstructor(moduloPrecision(left, right));
   const result = exactValue(ExactDecimal, left)
     .mod(exactValue(ExactDecimal, right));
-  if (!result.isFinite()) throw new ExactArithmeticUnavailable();
+  if (!result.isFinite()) throw new ExactArithmeticUnavailable(`arithmetic result: expected finite; actual ${result.toString()}`);
   return result.isZero();
 }
 
@@ -328,7 +334,7 @@ function canonicalDecimal(value: Decimal): string {
     !value.isFinite()
     || canonicalDecimalWidth(value) > MAX_CANONICAL_DECIMAL_CHARACTERS
   ) {
-    throw new ExactArithmeticUnavailable();
+    throw new ExactArithmeticUnavailable(`canonical decimal: expected finite and width at most ${MAX_CANONICAL_DECIMAL_CHARACTERS}; actual value=${value.toString()}, width=${value.isFinite() ? canonicalDecimalWidth(value) : 'non-finite'}`);
   }
   return value.toFixed();
 }
@@ -404,13 +410,13 @@ function remainingQuantity(order: Readonly<StrategyOrderRecord>): Decimal {
   return requiredDecimal(order.snapshot?.remainingBaseQuantity ?? '0');
 }
 
-function exactUnavailable(exposureKnown: boolean): PendingInput {
+function exactUnavailable(exposureKnown: boolean, error: unknown): PendingInput {
   return {
     kind: 'pending',
     reason: 'EXACT_ARITHMETIC_UNAVAILABLE',
-    exposureKnown,
-    expected: 'canonical decimal at most 1000000 characters',
-    actual: 'canonical decimal exceeds resource limit'
+    check: 'exactArithmetic',
+    evidence: projectErrorEvidence(error),
+    exposureKnown
   };
 }
 
@@ -418,7 +424,7 @@ function activeState(strategy: Readonly<StrategyRecord>):
   'EXECUTING' | 'WAITING_HEDGE' {
   if (strategy.state !== 'EXECUTING' && strategy.state !== 'WAITING_HEDGE') {
     throw new Error(
-      'hedge reconciliation requires an executing or waiting strategy'
+      `hedge reconciliation requires an executing or waiting strategy; strategyId=${strategy.id}; actual ${strategy.state}`
     );
   }
   return strategy.state;
@@ -443,23 +449,25 @@ function targetFor(
       };
 }
 
+class MarketRuleEvidenceError extends Error {}
+
 function marketIdentityMatches(
   market: Readonly<MarketRules>,
   expected: Readonly<MarketRules>,
   target: Readonly<GtcTarget>,
   symbol: string
 ): boolean {
-  return market.exchangeId === target.exchangeId
-    && market.exchangeId === expected.exchangeId
-    && market.symbol === symbol
-    && market.symbol === expected.symbol
-    && market.marketId === expected.marketId
-    && market.kind === target.kind
-    && market.kind === expected.kind
-    && market.base === expected.base
-    && market.quote === expected.quote
-    && market.quote === 'USDT'
-    && market.active === true;
+  for (const [field, required] of [
+    ['exchangeId', target.exchangeId], ['exchangeId', expected.exchangeId],
+    ['symbol', symbol], ['symbol', expected.symbol],
+    ['marketId', expected.marketId], ['kind', target.kind], ['kind', expected.kind],
+    ['base', expected.base], ['quote', expected.quote], ['quote', 'USDT'], ['active', true]
+  ] as const) {
+    if (market[field] !== required) {
+      throw new MarketRuleEvidenceError(`market.${field}: expected ${diagnosticValue(required)}; actual ${diagnosticValue(market[field])}`);
+    }
+  }
+  return true;
 }
 
 function parsedMarketRules(
@@ -499,7 +507,21 @@ function parsedMarketRules(
       && maxQuoteNotional.lt(minQuoteNotional)
     )
   ) {
-    return null;
+    for (const [field, value, required] of [
+      ['amountStep', amountStep, 'positive decimal'], ['contractSize', contractSize, 'positive decimal'],
+      ['minBaseAmount', minBaseAmount, 'non-negative decimal'], ['priceStep', priceStep, 'positive decimal'],
+      ['maxBaseAmount', maxBaseAmount, 'positive decimal'], ['minQuoteNotional', minQuoteNotional, 'non-negative decimal'],
+      ['maxQuoteNotional', maxQuoteNotional, 'positive decimal']
+    ] as const) {
+      if ((value === null || value === undefined) &&
+        (!['maxBaseAmount', 'minQuoteNotional', 'maxQuoteNotional'].includes(field) || market[field] !== undefined)) {
+        throw new MarketRuleEvidenceError(`market.${field}: expected ${required}; actual ${diagnosticValue(market[field])}`);
+      }
+    }
+    if (maxBaseAmount !== undefined && minBaseAmount !== undefined && maxBaseAmount.lt(minBaseAmount)) {
+      throw new MarketRuleEvidenceError(`market.baseAmountRange: expected minimum <= maximum; actual minimum=${market.minBaseAmount}, maximum=${market.maxBaseAmount}`);
+    }
+    throw new MarketRuleEvidenceError(`market.quoteNotionalRange: expected minimum <= maximum; actual minimum=${market.minQuoteNotional}, maximum=${market.maxQuoteNotional}`);
   }
   return {
     amountStep,
@@ -582,6 +604,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(entered, orders, {
         kind: 'pending',
         reason: 'ORDER_EVIDENCE_MISMATCH',
+        check: 'persistedOrderEvidence',
         exposureKnown: hasPositiveFill(orders),
         expected: orderRevision(evidence.orders),
         actual: orderRevision(orders)
@@ -629,7 +652,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(hasPositiveFill(orders))
+        exactUnavailable(hasPositiveFill(orders), error)
       );
     }
 
@@ -772,7 +795,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown),
+        exactUnavailable(amounts.fields.exposureKnown, error),
         amounts.fields
       );
     }
@@ -845,6 +868,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(entered, orders, {
         kind: 'pending',
         reason: 'ORDER_EVIDENCE_MISMATCH',
+        check: 'persistedOrderEvidence',
         exposureKnown: amounts.fields.exposureKnown,
         strategyOrderId: gtc.id,
         clientOrderId: gtc.clientOrderId,
@@ -867,7 +891,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown),
+        exactUnavailable(amounts.fields.exposureKnown, error),
         amounts.fields
       );
     }
@@ -894,7 +918,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown),
+        exactUnavailable(amounts.fields.exposureKnown, error),
         amounts.fields
       );
     }
@@ -995,16 +1019,18 @@ export class HedgeReconciliation implements ReconciliationRunner {
     try {
       gateway = this.registry.get(target.exchangeId);
       market = await gateway.loadMarket(entered.symbol, target.kind);
-    } catch {
+    } catch (error) {
       return this.pending(entered, orders, {
         kind: 'pending',
         reason: 'MARKET_RULES_UNAVAILABLE',
+        evidence: projectErrorEvidence(error),
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
       }, amounts.fields);
     }
 
     let rules: ParsedMarketRules | null;
+    let ruleFailure: unknown;
     try {
       rules = marketIdentityMatches(
         market,
@@ -1015,7 +1041,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
         ? parsedMarketRules(market)
         : null;
     } catch (error) {
-      if (error instanceof ExactArithmeticUnavailable) {
+      if (error instanceof ExactArithmeticUnavailable || error instanceof MarketRuleEvidenceError) {
+        ruleFailure = error;
         rules = null;
       } else {
         throw error;
@@ -1025,6 +1052,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(entered, orders, {
         kind: 'pending',
         reason: 'MARKET_RULES_UNAVAILABLE',
+        evidence: projectErrorEvidence(ruleFailure),
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
       }, amounts.fields);
@@ -1037,10 +1065,11 @@ export class HedgeReconciliation implements ReconciliationRunner {
         target.kind,
         referencePrice
       );
-    } catch {
+    } catch (error) {
       return this.pending(entered, orders, {
         kind: 'pending',
         reason: 'PRICE_QUANTIZATION_FAILED',
+        evidence: projectErrorEvidence(error),
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
       }, amounts.fields);
@@ -1050,6 +1079,9 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(entered, orders, {
         kind: 'pending',
         reason: 'PRICE_QUANTIZATION_FAILED',
+        check: 'candidatePrice',
+        expected: 'finite positive decimal',
+        actual: diagnosticValue(candidateValue),
         exposureKnown: amounts.fields.exposureKnown,
         exchangeId: target.exchangeId
       }, amounts.fields);
@@ -1063,6 +1095,9 @@ export class HedgeReconciliation implements ReconciliationRunner {
         return this.pending(entered, orders, {
           kind: 'pending',
           reason: 'PRICE_QUANTIZATION_FAILED',
+          check: 'candidatePrice.step',
+          expected: `multiple of ${rules.priceStep.toString()}`,
+          actual: candidateValue,
           exposureKnown: amounts.fields.exposureKnown,
           exchangeId: target.exchangeId
         }, amounts.fields);
@@ -1097,7 +1132,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
       return this.pending(
         entered,
         orders,
-        exactUnavailable(amounts.fields.exposureKnown),
+        exactUnavailable(amounts.fields.exposureKnown, error),
         amounts.fields
       );
     }
@@ -1148,6 +1183,7 @@ export class HedgeReconciliation implements ReconciliationRunner {
     amounts: Readonly<AmountFields>
   ): ReconciliationResult {
     let written = false;
+    let writeEvidence: ErrorEvidence | undefined;
     try {
       written = this.repository.transition(
         entered.id,
@@ -1155,7 +1191,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
         state,
         failureCode
       );
-    } catch {
+    } catch (error) {
+      writeEvidence = projectErrorEvidence(error);
       written = false;
     }
     if (written) {
@@ -1183,6 +1220,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
     return this.pending(entered, this.repository.listOrders(entered.id), {
       kind: 'pending',
       reason: 'STATE_WRITE_CONFLICT',
+      check: 'strategy.transition',
+      ...(writeEvidence === undefined ? {} : { evidence: writeEvidence }),
       exposureKnown: amounts.exposureKnown,
       expected: failureCode === undefined
         ? state
@@ -1220,6 +1259,8 @@ export class HedgeReconciliation implements ReconciliationRunner {
         strategyId: entered.id,
         strategyState,
         reason: input.reason,
+        ...(input.check === undefined ? {} : { check: input.check }),
+        ...(input.evidence === undefined ? {} : { evidence: input.evidence }),
         ...(amounts === undefined ? {} : amounts),
         exposureKnown: input.exposureKnown,
         ...(input.strategyOrderId === undefined

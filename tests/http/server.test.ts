@@ -31,7 +31,7 @@ import {
   type OperationalFields,
   type OperationalLog
 } from '../../src/logging/logger.js';
-import type { ConfirmationService } from '../../src/strategy/confirmation-service.js';
+import { ConfirmationService } from '../../src/strategy/confirmation-service.js';
 import {
   PreflightService,
   type PreflightInput,
@@ -699,7 +699,8 @@ function browserContractFirstWaitingStatus(
 }
 
 async function browserHarness(
-  initialFetch?: BrowserFetch
+  initialFetch?: BrowserFetch,
+  browserCrypto?: unknown
 ): Promise<BrowserHarness> {
   const ids = [
     'spot-exchange',
@@ -755,7 +756,7 @@ async function browserHarness(
   };
   const script = await readFile('public/app.js', 'utf8');
   runInNewContext(script, {
-    crypto: webcrypto,
+    crypto: arguments.length >= 2 ? browserCrypto : webcrypto,
     document,
     fetch: async (
       url: string,
@@ -806,7 +807,22 @@ const DETAILED_BROWSER_DETAIL = createTradeOpsError({
   },
   expected: '60000.00000000000000000001 USDT',
   actual: '<b>59999.99999999999999999999 USDT</b>',
-  occurredAt: '2026-10-03T00:00:00.000Z'
+  occurredAt: '2026-10-03T00:00:00.000Z',
+  evidence: {
+    type: 'GatewayError',
+    message: 'safe gateway balance reason',
+    code: 'BALANCE_READ_REJECTED',
+    status: 503,
+    body: 'synthetic balance service unavailable',
+    cause: {
+      type: 'Error',
+      message: 'synthetic connection reset'
+    },
+    errors: [{
+      type: 'Error',
+      message: 'synthetic fallback balance read failed'
+    }]
+  }
 }).detail;
 
 const DETAILED_BROWSER_ERROR = {
@@ -815,12 +831,22 @@ const DETAILED_BROWSER_ERROR = {
 } as const;
 
 const LONG_BROWSER_EXPECTED_PREFIX = 'EXPECTED-LONG-DIAGNOSTIC-';
+const LONG_BROWSER_EXPECTED_TAIL = '-EXPECTED-TERMINAL-EVIDENCE';
 const LONG_BROWSER_ACTUAL_PREFIX =
   '<img src=x onerror=LONG-ACTUAL-SENTINEL>ACTUAL-LONG-DIAGNOSTIC-';
+const LONG_BROWSER_ACTUAL_TAIL = '-ACTUAL-TERMINAL-EVIDENCE';
+const LONG_BROWSER_CAUSE_TAIL = '-CAUSE-TERMINAL-EVIDENCE';
 const LONG_BROWSER_EXPECTED = LONG_BROWSER_EXPECTED_PREFIX
-  + 'e'.repeat(2_000 - LONG_BROWSER_EXPECTED_PREFIX.length);
+  + 'e'.repeat(
+    2_000 - LONG_BROWSER_EXPECTED_PREFIX.length - LONG_BROWSER_EXPECTED_TAIL.length
+  )
+  + LONG_BROWSER_EXPECTED_TAIL;
 const LONG_BROWSER_ACTUAL = LONG_BROWSER_ACTUAL_PREFIX
-  + 'a'.repeat(2_000 - LONG_BROWSER_ACTUAL_PREFIX.length);
+  + 'a'.repeat(
+    2_000 - LONG_BROWSER_ACTUAL_PREFIX.length - LONG_BROWSER_ACTUAL_TAIL.length
+  )
+  + LONG_BROWSER_ACTUAL_TAIL;
+const LONG_BROWSER_CAUSE = 'c'.repeat(10_100) + LONG_BROWSER_CAUSE_TAIL;
 const LONG_BROWSER_DETAIL = createTradeOpsError({
   code: 'BALANCE_INSUFFICIENT',
   phase: 'confirmation',
@@ -832,19 +858,24 @@ const LONG_BROWSER_DETAIL = createTradeOpsError({
   },
   expected: LONG_BROWSER_EXPECTED,
   actual: LONG_BROWSER_ACTUAL,
-  occurredAt: '2026-10-03T00:00:00.000Z'
+  occurredAt: '2026-10-03T00:00:00.000Z',
+  evidence: {
+    type: 'Error',
+    message: LONG_BROWSER_CAUSE
+  }
 }).detail;
-const LONG_BROWSER_UNBOUNDED_DIAGNOSTIC_LENGTH =
-  LONG_BROWSER_DETAIL.message.length
-  + LONG_BROWSER_EXPECTED.length
-  + LONG_BROWSER_ACTUAL.length;
 
 function assertDetailedBrowserMessage(
   message: string,
   operation: string,
   status: number
 ): void {
-  assert.match(message, new RegExp(`^${operation}失败`));
+  assert.equal(
+    message.startsWith(DETAILED_BROWSER_DETAIL.message),
+    true,
+    'the trusted concrete failure must be the first operator-visible line'
+  );
+  assert.match(message, new RegExp(`${operation}失败`));
   assert.match(message, new RegExp(`HTTP ${status}`));
   assert.match(message, /BALANCE_INSUFFICIENT/);
   assert.match(message, new RegExp(DETAILED_BROWSER_DETAIL.message));
@@ -857,6 +888,12 @@ function assertDetailedBrowserMessage(
   assert.match(message, /60000\.00000000000000000001 USDT/);
   assert.match(message, /实际[：:]/);
   assert.match(message, /<b>59999\.99999999999999999999 USDT<\/b>/);
+  assert.match(message, /safe gateway balance reason/);
+  assert.match(message, /BALANCE_READ_REJECTED/);
+  assert.match(message, /503/);
+  assert.match(message, /synthetic balance service unavailable/);
+  assert.match(message, /synthetic connection reset/);
+  assert.match(message, /synthetic fallback balance read failed/);
   assert.match(message, /请求 ID[：:]req-3/);
 }
 
@@ -1018,42 +1055,172 @@ test('operator UI rejects legacy JSON errors without displaying untrusted fields
   await browser.element('preflight-form').emit('submit');
 
   const message = browser.element('operator-message').textContent;
-  assert.match(message, /^预检失败\nHTTP 422/);
+  assert.match(message.split('\n')[0] ?? '', /requestId|error/u);
+  assert.match(message, /预检失败/u);
+  assert.match(message, /HTTP 422/u);
   assert.match(message, /结构化.*错误|错误结构/);
   assert.doesNotMatch(message, /LEGACY_REJECTED|legacy detailed failure/);
 });
 
+test('operator UI rejects extra nested evidence fields as untrusted', async () => {
+  const browser = await browserHarness();
+  const evidence = DETAILED_BROWSER_DETAIL.evidence;
+  assert.notEqual(evidence, undefined);
+  browser.setFetch(async () => browserResponse(422, {
+    requestId: 'request-forged-evidence',
+    error: {
+      ...DETAILED_BROWSER_DETAIL,
+      evidence: {
+        ...evidence,
+        cause: {
+          ...evidence?.cause,
+          unexpected: 'FORGED-NESTED-EVIDENCE'
+        }
+      }
+    }
+  }));
+
+  await browser.element('preflight-form').emit('submit');
+
+  const message = browser.element('operator-message').textContent;
+  assert.match(message.split('\n')[0] ?? '', /evidence\.cause.*unexpected/u);
+  assert.match(message, /预检失败/u);
+  assert.match(message, /HTTP 422/u);
+  assert.match(message, /结构化.*错误|错误结构/);
+  assert.doesNotMatch(message, /FORGED-NESTED-EVIDENCE/);
+  assert.equal(browser.element('strategy-state').textContent, '—');
+  assert.equal(browser.element('risk-ack').checked, false);
+  assert.equal(browser.element('confirm-button').disabled, true);
+});
+
+test('operator UI diagnoses malformed public error fields without echoing objects', async (t) => {
+  const unsafeSubjectType = 'UNTRUSTED_SUBJECT_SECRET';
+  const cases: ReadonlyArray<{
+    readonly name: string;
+    readonly expected: readonly RegExp[];
+    readonly forbidden?: RegExp;
+    mutate(error: Record<string, unknown>): void;
+  }> = [
+    {
+      name: 'subject is not an object',
+      expected: [/error\.subject/u, /JSON.*对象|JSON object/iu, /null/u],
+      mutate(error) { error.subject = null; }
+    },
+    {
+      name: 'subject type is unsupported',
+      expected: [
+        /error\.subject\.type/u,
+        /configuration.*request.*exchange.*market.*account.*strategy.*database/u,
+        /长度|length/iu
+      ],
+      forbidden: new RegExp(unsafeSubjectType),
+      mutate(error) { error.subject = { type: unsafeSubjectType }; }
+    },
+    {
+      name: 'subject nested field has the wrong type',
+      expected: [/error\.subject\.field/u, /字符串|string/iu, /number/u],
+      mutate(error) {
+        error.subject = { type: 'request', field: 42 };
+      }
+    },
+    {
+      name: 'diagnostic number is not finite',
+      expected: [/error\.expected/u, /有限数字|finite number/iu, /Infinity/u],
+      mutate(error) { error.expected = Number.POSITIVE_INFINITY; }
+    },
+    {
+      name: 'diagnostic array is too long',
+      expected: [/error\.actual/u, /最多.*16|max.*16/iu, /17/u],
+      mutate(error) { error.actual = Array.from({ length: 17 }, () => 'x'); }
+    },
+    {
+      name: 'diagnostic array item has the wrong type',
+      expected: [/error\.actual\[1\]/u, /字符串|string/iu, /number/u],
+      mutate(error) { error.actual = ['safe', 3]; }
+    },
+    {
+      name: 'unsupported error code',
+      expected: [/error\.code/u, /支持.*错误代码|supported.*error code/iu, /UNSUPPORTED_CODE/u],
+      mutate(error) { error.code = 'UNSUPPORTED_CODE'; }
+    },
+    {
+      name: 'unsupported error phase',
+      expected: [/error\.phase/u, /支持.*阶段|supported.*phase/iu, /unsupported/u],
+      mutate(error) { error.phase = 'unsupported'; }
+    }
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const browser = await browserHarness();
+      const error = structuredClone(
+        DETAILED_BROWSER_DETAIL
+      ) as unknown as Record<string, unknown>;
+      item.mutate(error);
+      browser.setFetch(async () => browserResponse(422, {
+        requestId: 'request-malformed-public-error',
+        error
+      }));
+
+      await browser.element('preflight-form').emit('submit');
+
+      const message = browser.element('operator-message').textContent;
+      const firstLine = message.split('\n')[0] ?? '';
+      for (const expected of item.expected) assert.match(firstLine, expected);
+      if (item.forbidden !== undefined) {
+        assert.doesNotMatch(message, item.forbidden);
+      }
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('confirm-button').disabled, true);
+    });
+  }
+});
+
 test('operator UI distinguishes non-JSON and network failures', async (t) => {
   await t.test('non-JSON', async () => {
-    const browser = await browserHarness();
-    browser.setFetch(async () => ({
-      status: 502,
-      ok: false,
-      json: async (): Promise<unknown> => {
-        throw new Error('not JSON');
+    const browser = await browserWithValidPreflight();
+    browser.element('risk-ack').checked = true;
+    await browser.element('risk-ack').emit('change');
+    const rawBodySecret = 'SYNTHETIC_JSON_BODY_SECRET_9f7c';
+    browser.setFetch(async () => new Response(
+      `{"token":${rawBodySecret}}`,
+      {
+        status: 502,
+        headers: { 'content-type': 'application/json' }
       }
-    }));
+    ));
 
-    await browser.element('preflight-form').emit('submit');
+    await browser.element('refresh-button').emit('click');
 
-    assert.equal(browser.element('operator-message').textContent, [
-      '预检失败',
-      'HTTP 502',
-      '响应不是有效的结构化 JSON 错误'
-    ].join('\n'));
+    const message = browser.element('operator-message').textContent;
+    assert.match(message.split('\n')[0] ?? '', /JSON.*语法|JSON.*syntax/iu);
+    assert.match(message, /状态刷新失败/u);
+    assert.match(message, /HTTP 502/u);
+    assert.match(message, /位置|position|行|line|列|column/iu);
+    assert.doesNotMatch(message, /SYNTHETIC_JSON_BODY_SECRET|SYNTHETIC_/u);
+    assert.equal(browser.element('strategy-state').textContent, '—');
+    assert.equal(browser.element('risk-ack').checked, false);
+    assert.equal(browser.element('confirm-button').disabled, true);
   });
 
   await t.test('network', async () => {
-    const browser = await browserHarness();
+    const browser = await browserWithValidPreflight();
+    browser.element('risk-ack').checked = true;
+    await browser.element('risk-ack').emit('change');
     browser.setFetch(async () => {
       throw new Error('connection refused');
     });
 
-    await browser.element('preflight-form').emit('submit');
+    await browser.element('refresh-button').emit('click');
 
     const message = browser.element('operator-message').textContent;
-    assert.match(message, /^预检失败\n网络.*失败/);
-    assert.doesNotMatch(message, /connection refused/);
+    assert.match(message, /^connection refused/u);
+    assert.match(message, /状态刷新失败/u);
+    assert.match(message, /网络.*失败/u);
+    assert.equal(browser.element('strategy-state').textContent, '—');
+    assert.equal(browser.element('risk-ack').checked, false);
+    assert.equal(browser.element('confirm-button').disabled, true);
   });
 
   await t.test('hostile thrown value', async () => {
@@ -1087,37 +1254,69 @@ test('operator UI distinguishes non-JSON and network failures', async (t) => {
   });
 });
 
-test('operator UI bounds detailed server errors and labels invalid success responses', async (t) => {
-  await t.test('bounded detail', async () => {
+test('operator UI preserves detailed server errors and labels invalid success fields', async (t) => {
+  await t.test('complete detail', async () => {
     const browser = await browserHarness();
+    const tail = 'SERVER-DETAIL-TERMINAL-EVIDENCE';
     browser.setFetch(async () => browserResponse(422, {
       ...DETAILED_BROWSER_ERROR,
-      error: { ...DETAILED_BROWSER_ERROR.error, message: 'x'.repeat(2_100) }
+      error: {
+        ...DETAILED_BROWSER_ERROR.error,
+        message: 'x'.repeat(2_100) + tail
+      }
     }));
 
     await browser.element('preflight-form').emit('submit');
 
     const message = browser.element('operator-message').textContent;
-    assert.match(message, /…\[truncated\]/);
-    assert.ok(message.length < 2_200);
+    assert.equal(message.startsWith('x'.repeat(2_100) + tail), true);
+    assert.match(message, new RegExp(tail));
+    assert.doesNotMatch(message, /…\[truncated\]/);
   });
 
-  await t.test('invalid success response', async () => {
-    const browser = await browserHarness();
-    browser.setFetch(async () => browserResponse(201, { invalid: true }));
+  for (const item of [
+    {
+      name: 'missing id',
+      response: (() => {
+        const value = browserPreflightResponse();
+        delete value.id;
+        return value;
+      })(),
+      expected: [/id/u, /必填|required/u, /缺失|missing/u]
+    },
+    {
+      name: 'invalid id format',
+      response: browserPreflightResponse({ id: 'bad/id' }),
+      expected: [/preflight response\.id/u, /A-Za-z0-9/u, /length 6|长度 6/u]
+    },
+    {
+      name: 'invalid state',
+      response: browserPreflightResponse({ state: 'EXECUTING' }),
+      expected: [/state/u, /PENDING_CONFIRMATION/u, /EXECUTING/u]
+    }
+  ]) {
+    await t.test(item.name, async () => {
+      const browser = await browserHarness();
+      browser.setFetch(async () => browserResponse(201, item.response));
 
-    await browser.element('preflight-form').emit('submit');
+      await browser.element('preflight-form').emit('submit');
 
-    assert.match(
-      browser.element('operator-message').textContent,
-      /^预检失败\n响应校验失败：/
-    );
-    assert.equal(browser.element('strategy-state').textContent, '—');
-    assert.equal(browser.element('confirm-button').disabled, true);
-  });
+      const message = browser.element('operator-message').textContent;
+      assert.match(message, /预检失败/u);
+      assert.match(message, /响应校验失败/u);
+      for (const expected of item.expected) assert.match(message, expected);
+      const fieldEvidence = item.expected[0];
+      if (fieldEvidence === undefined) assert.fail('missing field evidence regex');
+      assert.match(message.split('\n')[0] ?? '', fieldEvidence);
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('risk-ack').checked, false);
+      assert.equal(browser.element('confirm-button').disabled, true);
+      assert.equal(browser.fetchCalls.length, 2);
+    });
+  }
 });
 
-test('operator UI preserves long structured error fields within bounded text', async () => {
+test('operator UI preserves long structured error fields and evidence without display limits', async () => {
   assert.deepEqual(
     parseErrorDetail(LONG_BROWSER_DETAIL),
     LONG_BROWSER_DETAIL
@@ -1135,6 +1334,7 @@ test('operator UI preserves long structured error fields within bounded text', a
 
   const element = browser.element('operator-message');
   const message = element.textContent;
+  assert.equal(message.startsWith(LONG_BROWSER_DETAIL.message), true);
   assert.match(message, /代码[：:].*BALANCE_INSUFFICIENT/);
   assert.match(message, /消息[：:]/);
   assert.match(message, /阶段[：:].*confirmation/);
@@ -1142,15 +1342,17 @@ test('operator UI preserves long structured error fields within bounded text', a
   assert.match(message, new RegExp(`期望[：:].*${LONG_BROWSER_EXPECTED_PREFIX}`));
   assert.match(message, new RegExp(`实际[：:].*${LONG_BROWSER_ACTUAL_PREFIX}`));
   assert.match(message, /请求 ID[：:].*request-long-detail/);
-  assert.match(message, /…\[truncated\]/);
-  assert.ok(message.length < LONG_BROWSER_UNBOUNDED_DIAGNOSTIC_LENGTH);
+  assert.match(message, new RegExp(LONG_BROWSER_EXPECTED_TAIL));
+  assert.match(message, new RegExp(LONG_BROWSER_ACTUAL_TAIL));
+  assert.match(message, new RegExp(LONG_BROWSER_CAUSE_TAIL));
+  assert.doesNotMatch(message, /…\[truncated\]/);
   assert.match(message, /<img src=x onerror=LONG-ACTUAL-SENTINEL>/);
   assert.deepEqual(element.children, []);
   assert.equal(browser.element('risk-ack').checked, false);
   assert.equal(browser.element('confirm-button').disabled, true);
 });
 
-test('operator UI bounds long persisted invalidation without enabling confirmation', async () => {
+test('operator UI preserves long persisted invalidation without enabling confirmation', async () => {
   assert.deepEqual(
     parseErrorDetail(LONG_BROWSER_DETAIL),
     LONG_BROWSER_DETAIL
@@ -1190,6 +1392,7 @@ test('operator UI bounds long persisted invalidation without enabling confirmati
   );
   const element = browser.element('operator-message');
   const message = element.textContent;
+  assert.equal(message.startsWith(LONG_BROWSER_DETAIL.message), true);
   assert.match(message, /重新预检/);
   assert.match(message, /代码[：:].*BALANCE_INSUFFICIENT/);
   assert.match(message, /消息[：:]/);
@@ -1197,8 +1400,10 @@ test('operator UI bounds long persisted invalidation without enabling confirmati
   assert.match(message, /对象[：:].*account/);
   assert.match(message, new RegExp(`期望[：:].*${LONG_BROWSER_EXPECTED_PREFIX}`));
   assert.match(message, new RegExp(`实际[：:].*${LONG_BROWSER_ACTUAL_PREFIX}`));
-  assert.match(message, /…\[truncated\]/);
-  assert.ok(message.length < LONG_BROWSER_UNBOUNDED_DIAGNOSTIC_LENGTH);
+  assert.match(message, new RegExp(LONG_BROWSER_EXPECTED_TAIL));
+  assert.match(message, new RegExp(LONG_BROWSER_ACTUAL_TAIL));
+  assert.match(message, new RegExp(LONG_BROWSER_CAUSE_TAIL));
+  assert.doesNotMatch(message, /…\[truncated\]/);
   assert.match(message, /<img src=x onerror=LONG-ACTUAL-SENTINEL>/);
   assert.deepEqual(element.children, []);
 });
@@ -2160,8 +2365,10 @@ test('real preflight operation failures remain internal HTTP failures without pe
   assert.deepEqual(detail.subject, { type: 'request', field: 'preflight' });
   assert.equal(detail.actual, 'object-failure');
   assert.deepEqual(parseErrorDetail(detail), detail);
-  assert.doesNotMatch(response.body, new RegExp(secret));
-  assert.doesNotMatch(response.body, /cause|stack/);
+  assert.match(response.body, new RegExp(`${secret} message`));
+  assert.match(response.body, new RegExp(`${secret} cause`));
+  assert.notEqual(detail.evidence, undefined);
+  assert.doesNotMatch(response.body, /"stack"/);
   assert.equal(clockCalls, 1);
   assert.deepEqual(configured.registryCalls(), { ids: 1, get: 2 });
   assert.equal(configured.spot.marketLoadRequests.length, 1);
@@ -2302,7 +2509,8 @@ test('an unknown preflight failure becomes a safe 500 without persistence', asyn
   });
   assert.equal(fixture.repository.listRecoverable().length, 0);
   assert.doesNotMatch(response.body, new RegExp(sentinel));
-  assert.doesNotMatch(response.body, /cause|stack|response/);
+  assert.match(response.body, /\[Redacted\]/);
+  assert.doesNotMatch(response.body, /"stack"|"response"/);
 });
 
 test('a failing secret provider keeps the business status with safe detail', async (t) => {
@@ -2698,8 +2906,8 @@ test('confirmation maps precise failures by context without queueing', async (t)
     {
       name: 'unknown confirmation failure',
       status: 500,
-      error: Object.assign(new Error('CONFIRM-SECRET-SENTINEL'), {
-        cause: new Error('CONFIRM-CAUSE-SENTINEL')
+      error: Object.assign(new Error('CONFIRM-DIAGNOSTIC-SENTINEL'), {
+        cause: new Error('CONFIRM-CAUSE-DIAGNOSTIC-SENTINEL')
       }),
       code: 'REQUEST_OPERATION_FAILED', phase: 'request'
     }
@@ -2727,10 +2935,17 @@ test('confirmation maps precise failures by context without queueing', async (t)
       });
       assert.equal(fixture.getConfirmationCount(), 1);
       assert.equal(fixture.getExecutionCount(), 0);
-      assert.doesNotMatch(
-        response.body,
-        /CONFIRM-SECRET-SENTINEL|CONFIRM-CAUSE-SENTINEL|cause|stack/
-      );
+      if (item.name === 'unknown confirmation failure') {
+        assert.match(response.body, /CONFIRM-DIAGNOSTIC-SENTINEL/);
+        assert.match(response.body, /CONFIRM-CAUSE-DIAGNOSTIC-SENTINEL/);
+        assert.match(response.body, /"cause"/);
+        assert.doesNotMatch(response.body, /"stack"/);
+      } else {
+        assert.doesNotMatch(
+          response.body,
+          /CONFIRM-DIAGNOSTIC-SENTINEL|CONFIRM-CAUSE-DIAGNOSTIC-SENTINEL/
+        );
+      }
     });
   }
 });
@@ -2911,21 +3126,34 @@ test('status returns the same invalidation detail after reopening SQLite', async
   let database = new Database(databasePath);
   let repository = new SqliteStrategyRepository(database);
   const pending = repository.createPending(preflight());
-  const invalidation = createTradeOpsError({
-    code: 'MARKET_INACTIVE',
-    phase: 'confirmation',
-    subject: {
-      type: 'market',
-      exchangeId: 'okx',
-      symbol: SYMBOL,
-      kind: 'swap',
-      field: 'active'
-    },
-    expected: true,
-    actual: false,
-    occurredAt: '2026-10-03T00:00:00.000Z'
-  }).detail;
-  repository.invalidatePreflight(pending, invalidation);
+  const configuredSecret = 'SYNTHETIC-SQLITE-PERSISTENCE-SECRET';
+  const nativeFailure = Object.assign(
+    new Error(`confirmation balance read failed ${configuredSecret}`, {
+      cause: new Error(`gateway socket closed ${configuredSecret}`)
+    }),
+    {
+      code: 'BALANCE_READ_FAILED',
+      response: {
+        status: 503,
+        body: `temporary account service failure ${configuredSecret}`
+      }
+    }
+  );
+  const EvidenceConfirmationService = ConfirmationService as unknown as new (
+    target: StrategyRepository,
+    preflightService: Pick<PreflightService, 'run'>,
+    secretProvider?: () => readonly string[]
+  ) => ConfirmationService;
+  const confirmation = new EvidenceConfirmationService(
+    repository,
+    { run: async () => { throw nativeFailure; } },
+    () => [configuredSecret]
+  );
+  const confirmationFailure = await confirmation.confirm(pending.id).then(
+    () => undefined,
+    (error: unknown) => error
+  );
+  const storedBeforeClose = repository.getStrategy(pending.id);
   database.close();
 
   database = new Database(databasePath);
@@ -2950,6 +3178,7 @@ test('status returns the same invalidation detail after reopening SQLite', async
         executionCalls += 1;
       }
     },
+    secretProvider: () => [configuredSecret],
     logger: false
   });
   t.after(async () => {
@@ -2966,9 +3195,26 @@ test('status returns the same invalidation detail after reopening SQLite', async
 
   assert.equal(response.statusCode, 200);
   const body = response.json();
+  assert.notEqual(confirmationFailure, undefined);
   assert.equal(body.strategy.state, 'PREFLIGHT_INVALIDATED');
   assert.equal(body.strategy.failureCode, null);
-  assert.deepEqual(body.strategy.preflightFailure, invalidation);
+  const storedAfterReopen = repository.getStrategy(pending.id);
+  const storedDetail = parseErrorDetail(structuredClone(
+    storedAfterReopen.preflightFailure
+  ));
+  const storedSerialized = JSON.stringify(storedDetail);
+  assert.match(storedSerialized, /confirmation balance read failed/);
+  assert.match(storedSerialized, /gateway socket closed/);
+  assert.match(storedSerialized, /BALANCE_READ_FAILED/);
+  assert.match(storedSerialized, /503/);
+  assert.match(storedSerialized, /temporary account service failure/);
+  assert.doesNotMatch(storedSerialized, /"stack"/);
+  assert.doesNotMatch(storedSerialized, new RegExp(configuredSecret));
+  assert.deepEqual(
+    parseErrorDetail(body.strategy.preflightFailure),
+    storedDetail
+  );
+  assert.deepEqual(storedAfterReopen, storedBeforeClose);
   assert.deepEqual(body.orders, []);
   assert.deepEqual(body.actualFills, {
     spotBuyBaseQuantity: '0',
@@ -2977,6 +3223,7 @@ test('status returns the same invalidation detail after reopening SQLite', async
   });
   assert.equal(confirmationCalls, 0);
   assert.equal(executionCalls, 0);
+  assert.deepEqual(repository.getStrategy(pending.id), storedAfterReopen);
 });
 
 test('trusted persisted projection and projection failures are side-effect free', async (t) => {
@@ -3336,6 +3583,7 @@ test('operator UI rejects malformed preflight responses without retaining action
   const malformedResponses = [
     {
       name: 'missing account settings',
+      expected: [/preflight\.accountSettings/u, /必填|required/iu, /缺失|missing/iu],
       response(): Record<string, unknown> {
         const body = browserPreflightResponse();
         const preview = body.preflight as Record<string, unknown>;
@@ -3345,6 +3593,11 @@ test('operator UI rejects malformed preflight responses without retaining action
     },
     {
       name: 'non-string effective quantity',
+      expected: [
+        /preflight\.effectiveBaseQuantity/u,
+        /字符串|string/iu,
+        /number/u
+      ],
       response(): Record<string, unknown> {
         const body = browserPreflightResponse();
         const preview = body.preflight as Record<string, unknown>;
@@ -3363,6 +3616,11 @@ test('operator UI rejects malformed preflight responses without retaining action
       });
 
       await browser.element('preflight-form').emit('submit');
+      const firstLine = browser.element('operator-message').textContent
+        .split('\n')[0] ?? '';
+      for (const expected of malformed.expected) {
+        assert.match(firstLine, expected);
+      }
       assert.equal(browser.element('requested-quantity').textContent, '—');
       assert.equal(browser.element('effective-quantity').textContent, '—');
       assert.equal(browser.element('strategy-state').textContent, '—');
@@ -3381,6 +3639,11 @@ test('operator UI rejects mismatched or non-actionable preflight semantics', asy
   const invalidResponses = [
     {
       name: 'unknown margin mode',
+      expected: [
+        /preflight\.accountSettings\.marginMode/u,
+        /isolated.*cross|cross.*isolated/u,
+        /unknown/u
+      ],
       mutate(preview: Record<string, unknown>): void {
         const settings = preview.accountSettings as Record<string, unknown>;
         settings.marginMode = 'unknown';
@@ -3388,6 +3651,11 @@ test('operator UI rejects mismatched or non-actionable preflight semantics', asy
     },
     {
       name: 'null leverage',
+      expected: [
+        /preflight\.accountSettings\.leverage/u,
+        /正数|> 0/u,
+        /null/u
+      ],
       mutate(preview: Record<string, unknown>): void {
         const settings = preview.accountSettings as Record<string, unknown>;
         settings.leverage = null;
@@ -3395,6 +3663,7 @@ test('operator UI rejects mismatched or non-actionable preflight semantics', asy
     },
     {
       name: 'swapped exchanges',
+      expected: [/preflight\.spotExchangeId/u, /bitget/u, /okx/u],
       mutate(preview: Record<string, unknown>): void {
         preview.spotExchangeId = 'okx';
         preview.contractExchangeId = 'bitget';
@@ -3402,44 +3671,116 @@ test('operator UI rejects mismatched or non-actionable preflight semantics', asy
     },
     {
       name: 'symbol mismatch',
+      expected: [/preflight\.symbol/u, /BTC\/USDT/u, /ETH\/USDT/u],
       mutate(preview: Record<string, unknown>): void {
         preview.symbol = 'ETH/USDT';
       }
     },
     {
       name: 'missing symbol',
+      expected: [/preflight\.symbol/u, /必填|required/iu, /缺失|missing/iu],
       mutate(preview: Record<string, unknown>): void {
         delete preview.symbol;
       }
     },
     {
       name: 'mode mismatch',
+      expected: [/preflight\.mode/u, /CONCURRENT/u, /SPOT_FIRST/u],
       mutate(preview: Record<string, unknown>): void {
         preview.mode = 'SPOT_FIRST';
       }
     },
     {
       name: 'requested quantity mismatch',
+      expected: [/preflight\.requestedBaseQuantity/u, /1/u, /2/u],
       mutate(preview: Record<string, unknown>): void {
         preview.requestedBaseQuantity = '2';
       }
     },
     {
       name: 'zero effective quantity',
+      expected: [/preflight\.effectiveBaseQuantity/u, /正数|> 0/u, /零|zero/iu],
       mutate(preview: Record<string, unknown>): void {
         preview.effectiveBaseQuantity = '0';
       }
     },
     {
       name: 'non-finite spot price',
+      expected: [
+        /preflight\.spotReferencePrice/u,
+        /规范.*正|canonical.*positive/iu,
+        /长度.*8|string.*8/iu
+      ],
       mutate(preview: Record<string, unknown>): void {
         preview.spotReferencePrice = 'Infinity';
       }
     },
     {
       name: 'negative contract balance',
+      expected: [
+        /preflight\.contractFreeUsdt/u,
+        /规范.*正|canonical.*positive/iu,
+        /长度.*2|string.*2/iu
+      ],
       mutate(preview: Record<string, unknown>): void {
         preview.contractFreeUsdt = '-1';
+      }
+    },
+    {
+      name: 'inactive spot market',
+      expected: [/preflight\.spotMarket\.active/u, /true/u, /false/u],
+      mutate(preview: Record<string, unknown>): void {
+        (preview.spotMarket as Record<string, unknown>).active = false;
+      }
+    },
+    {
+      name: 'inverted spot amount range',
+      expected: [
+        /preflight\.spotMarket\.(?:minBaseAmount|maxBaseAmount)/u,
+        /minBaseAmount.*<=.*maxBaseAmount/u,
+        /2.*1/u
+      ],
+      mutate(preview: Record<string, unknown>): void {
+        Object.assign(preview.spotMarket as Record<string, unknown>, {
+          minBaseAmount: '2',
+          maxBaseAmount: '1'
+        });
+      }
+    },
+    {
+      name: 'inverted contract notional range',
+      expected: [
+        /preflight\.contractMarket\.(?:minQuoteNotional|maxQuoteNotional)/u,
+        /minQuoteNotional.*<=.*maxQuoteNotional/u,
+        /10.*5/u
+      ],
+      mutate(preview: Record<string, unknown>): void {
+        Object.assign(preview.contractMarket as Record<string, unknown>, {
+          minQuoteNotional: '10',
+          maxQuoteNotional: '5'
+        });
+      }
+    },
+    {
+      name: 'risk acknowledgement flag is false',
+      expected: [
+        /preflight\.riskAcknowledgementRequired/u,
+        /true/u,
+        /false/u
+      ],
+      mutate(preview: Record<string, unknown>): void {
+        preview.riskAcknowledgementRequired = false;
+      }
+    },
+    {
+      name: 'effective quantity exceeds request',
+      expected: [
+        /preflight\.effectiveBaseQuantity/u,
+        /requestedBaseQuantity/u,
+        /2.*1/u
+      ],
+      mutate(preview: Record<string, unknown>): void {
+        preview.effectiveBaseQuantity = '2';
       }
     }
   ];
@@ -3455,6 +3796,11 @@ test('operator UI rejects mismatched or non-actionable preflight semantics', asy
       });
 
       await browser.element('preflight-form').emit('submit');
+      const firstLine = browser.element('operator-message').textContent
+        .split('\n')[0] ?? '';
+      for (const expected of invalid.expected) {
+        assert.match(firstLine, expected);
+      }
       assert.equal(browser.element('requested-quantity').textContent, '—');
       assert.equal(browser.element('effective-quantity').textContent, '—');
       assert.equal(browser.element('strategy-state').textContent, '—');
@@ -3661,6 +4007,19 @@ test('operator UI rejects every non-canonical actual-fill field', async (t) => {
 
       await browser.element('refresh-button').emit('click');
 
+      const firstLine = browser.element('operator-message').textContent
+        .split('\n')[0] ?? '';
+      assert.match(firstLine, new RegExp(`actualFills\\.${field}`, 'u'));
+      if (typeof invalidValue !== 'string') {
+        assert.match(firstLine, /字符串|string/iu);
+        assert.match(firstLine, /number/u);
+      } else if (invalidValue.length === 0 || invalidValue.length > 10_000) {
+        assert.match(firstLine, /1-10000/u);
+        assert.match(firstLine, new RegExp(String(invalidValue.length), 'u'));
+      } else {
+        assert.match(firstLine, /规范.*非负.*十进制|canonical.*non-negative.*decimal/iu);
+        assert.match(firstLine, new RegExp(`长度.*${invalidValue.length}`, 'u'));
+      }
       assert.equal(browser.element('requested-quantity').textContent, '—');
       assert.equal(browser.element('strategy-state').textContent, '—');
       assert.equal(browser.element('spot-actual-fill').textContent, '0');
@@ -4155,7 +4514,55 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
   const strategyId = '123e4567-e89b-42d3-a456-426614174002';
   const cases = [
     {
+      name: 'loaded preflight is not an object',
+      expected: [/preflight/u, /JSON.*对象|JSON object/iu, /null/u],
+      mutate(body: Record<string, unknown>): void {
+        body.preflight = null;
+      }
+    },
+    {
+      name: 'loaded symbol is invalid',
+      expected: [
+        /preflight\.symbol/u,
+        /大写.*USDT|uppercase.*USDT/iu,
+        /eth\/usdt/u
+      ],
+      mutate(body: Record<string, unknown>): void {
+        (body.preflight as Record<string, unknown>).symbol = 'eth/usdt';
+      }
+    },
+    {
+      name: 'loaded mode is unsupported',
+      expected: [
+        /preflight\.mode/u,
+        /CONCURRENT.*CONTRACT_FIRST.*SPOT_FIRST/u,
+        /UNSUPPORTED_MODE/u
+      ],
+      mutate(body: Record<string, unknown>): void {
+        (body.preflight as Record<string, unknown>).mode = 'UNSUPPORTED_MODE';
+      }
+    },
+    {
+      name: 'loaded exchanges are equal',
+      expected: [
+        /preflight\.(?:spotExchangeId|contractExchangeId)/u,
+        /不同|different/iu,
+        /bitget/u
+      ],
+      mutate(body: Record<string, unknown>): void {
+        Object.assign(body.preflight as Record<string, unknown>, {
+          spotExchangeId: 'bitget',
+          contractExchangeId: 'bitget'
+        });
+      }
+    },
+    {
       name: 'response id mismatch',
+      expected: [
+        /strategy\.id/u,
+        /123e4567-e89b-42d3-a456-426614174002/u,
+        /123e4567-e89b-42d3-a456-426614174099/u
+      ],
       mutate(body: Record<string, unknown>): void {
         (body.strategy as Record<string, unknown>).id =
           '123e4567-e89b-42d3-a456-426614174099';
@@ -4163,12 +4570,18 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
     },
     {
       name: 'strategy and preflight identity mismatch',
+      expected: [/strategy\.symbol/u, /BTC\/USDT/u, /ETH\/USDT/u],
       mutate(body: Record<string, unknown>): void {
         (body.strategy as Record<string, unknown>).symbol = 'ETH/USDT';
       }
     },
     {
       name: 'self-consistent unsupported exchange',
+      expected: [
+        /preflight\.spotExchangeId/u,
+        /已配置|configured/iu,
+        /kraken/u
+      ],
       mutate(body: Record<string, unknown>): void {
         (body.strategy as Record<string, unknown>).spotExchangeId = 'kraken';
         (body.preflight as Record<string, unknown>).spotExchangeId = 'kraken';
@@ -4176,6 +4589,11 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
     },
     {
       name: 'non-actionable preflight',
+      expected: [
+        /preflight\.accountSettings\.marginMode/u,
+        /isolated.*cross|cross.*isolated/u,
+        /unknown/u
+      ],
       mutate(body: Record<string, unknown>): void {
         const preview = body.preflight as Record<string, unknown>;
         const settings = preview.accountSettings as Record<string, unknown>;
@@ -4184,6 +4602,11 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
     },
     {
       name: 'invalid actual fills',
+      expected: [
+        /actualFills\.unmatchedBaseQuantity/u,
+        /规范.*非负.*十进制|canonical.*non-negative.*decimal/iu,
+        /长度.*2|string.*2/iu
+      ],
       mutate(body: Record<string, unknown>): void {
         const fills = body.actualFills as Record<string, unknown>;
         fills.unmatchedBaseQuantity = '-1';
@@ -4191,6 +4614,7 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
     },
     {
       name: 'invalid order projection',
+      expected: [/orders\[0\]/u, /必填|required/iu, /缺失|missing/iu],
       mutate(body: Record<string, unknown>): void {
         body.orders = [{
           role: 'UNSAFE_ROLE',
@@ -4214,6 +4638,9 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
       });
 
       await browser.element('resume-form').emit('submit');
+      const firstLine = browser.element('operator-message').textContent
+        .split('\n')[0] ?? '';
+      for (const expected of item.expected) assert.match(firstLine, expected);
       assert.equal(browser.element('requested-quantity').textContent, '—');
       assert.equal(browser.element('strategy-state').textContent, '—');
       assert.equal(browser.element('risk-ack').checked, false);
@@ -4223,10 +4650,67 @@ test('operator UI rejects an invalid or internally inconsistent loaded strategy'
   }
 });
 
+test('operator UI diagnoses a malformed exchange list without echoing its body', async () => {
+  const bodySecret = 'EXCHANGE_LIST_BODY_SECRET';
+  const browser = await browserHarness(async (url) => {
+    assert.equal(url, '/api/exchanges');
+    return browserResponse(200, {
+      exchanges: { token: bodySecret }
+    });
+  });
+
+  const message = browser.element('operator-message').textContent;
+  const firstLine = message.split('\n')[0] ?? '';
+  assert.match(firstLine, /exchanges/u);
+  assert.match(firstLine, /数组|array/iu);
+  assert.match(firstLine, /object/u);
+  assert.doesNotMatch(message, new RegExp(bodySecret));
+});
+
+test('operator UI distinguishes missing crypto and digest support', async (t) => {
+  for (const item of [
+    {
+      name: 'crypto missing',
+      crypto: undefined,
+      expected: [/crypto/u, /可用|available/iu, /undefined/u]
+    },
+    {
+      name: 'crypto subtle missing',
+      crypto: {},
+      expected: [/crypto\.subtle/u, /可用|available/iu, /undefined/u]
+    }
+  ]) {
+    await t.test(item.name, async () => {
+      const browser = await browserHarness(undefined, item.crypto);
+      browser.setFetch(async (url) => {
+        if (url === '/api/hedges/preflight') {
+          return browserResponse(201, browserPreflightResponse());
+        }
+        if (url === '/api/hedges/strategy-browser-1') {
+          return browserResponse(200, browserStatusResponse({
+            orders: [browserOrderResponse('strategy-browser-1')]
+          }));
+        }
+        throw new Error(`unexpected crypto-boundary URL: ${url}`);
+      });
+
+      await browser.element('preflight-form').emit('submit');
+      await browser.element('refresh-button').emit('click');
+
+      const firstLine = browser.element('operator-message').textContent
+        .split('\n')[0] ?? '';
+      for (const expected of item.expected) assert.match(firstLine, expected);
+      assert.equal(browser.element('strategy-state').textContent, '—');
+      assert.equal(browser.element('confirm-button').disabled, true);
+    });
+  }
+});
+
 test('operator UI rejects every malformed full status DTO before enabling confirmation', async (t) => {
   const strategyId = '123e4567-e89b-42d3-a456-426614174009';
   type StatusMutation = {
     readonly name: string;
+    readonly expected?: readonly RegExp[];
     mutate(body: Record<string, unknown>): void;
   };
   const oneOrder = (
@@ -4246,13 +4730,57 @@ test('operator UI rejects every malformed full status DTO before enabling confir
   };
   const cases: StatusMutation[] = [
     {
+      name: 'status orders is not an array',
+      expected: [/status\.orders/u, /数组|array/iu, /object/u],
+      mutate(body) {
+        body.orders = {};
+      }
+    },
+    {
+      name: 'status contains too many orders',
+      expected: [/status\.orders/u, /最多.*4|max.*4/iu, /5/u],
+      mutate(body) {
+        body.orders = Array.from({ length: 5 }, () => ({}));
+      }
+    },
+    {
       name: 'strategy omits preflight failure field',
       mutate(body) {
         delete (body.strategy as Record<string, unknown>).preflightFailure;
       }
     },
     {
+      name: 'strategy state is unsupported',
+      expected: [
+        /strategy\.state/u,
+        /支持.*状态|supported.*state/iu,
+        /UNSUPPORTED_STATE/u
+      ],
+      mutate(body) {
+        (body.strategy as Record<string, unknown>).state = 'UNSUPPORTED_STATE';
+      }
+    },
+    {
+      name: 'failure strategy omits failure code',
+      expected: [
+        /strategy\.failureCode/u,
+        /失败.*代码|failure.*code/iu,
+        /null/u
+      ],
+      mutate(body) {
+        Object.assign(body.strategy as Record<string, unknown>, {
+          state: 'FAILED',
+          failureCode: null
+        });
+      }
+    },
+    {
       name: 'pending strategy carries a preflight failure',
+      expected: [
+        /strategy\.preflightFailure/u,
+        /null/u,
+        /object|对象/iu
+      ],
       mutate(body) {
         (body.strategy as Record<string, unknown>).preflightFailure =
           DETAILED_BROWSER_DETAIL;
@@ -4260,6 +4788,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'invalidated strategy omits its preflight failure',
+      expected: [
+        /strategy\.preflightFailure/u,
+        /JSON.*对象|JSON object/iu,
+        /null/u
+      ],
       mutate(body) {
         Object.assign(body.strategy as Record<string, unknown>, {
           state: 'PREFLIGHT_INVALIDATED',
@@ -4271,6 +4804,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'invalidated strategy contains an order',
+      expected: [
+        /status\.orders\.topology/u,
+        /PREFLIGHT_INVALIDATED/u,
+        /SPOT_MARKET/u
+      ],
       mutate(body) {
         Object.assign(body.strategy as Record<string, unknown>, {
           state: 'PREFLIGHT_INVALIDATED',
@@ -4295,6 +4833,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'contract-first contains the spot-first market role',
+      expected: [
+        /status\.orders\.topology/u,
+        /CONTRACT_FIRST/u,
+        /SPOT_MARKET/u
+      ],
       mutate(body) {
         setMode(body, 'CONTRACT_FIRST');
         oneOrder(body, 'SPOT_MARKET');
@@ -4349,6 +4892,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'concurrent difference hedge is on the larger fill side',
+      expected: [
+        /status\.orders\.execution/u,
+        /CONCURRENT/u,
+        /SPOT_HEDGE_GTC/u
+      ],
       mutate(body) {
         const spotMarket = browserOrderResponse(
           strategyId,
@@ -4695,13 +5243,56 @@ test('operator UI rejects every malformed full status DTO before enabling confir
       }
     },
     {
+      name: 'spot actual fill differs from validated orders',
+      expected: [
+        /actualFills\.spotBuyBaseQuantity/u,
+        /0/u,
+        /1/u
+      ],
+      mutate(body) {
+        setBrowserActualFills(body, '1', '0', '1');
+      }
+    },
+    {
+      name: 'contract actual fill differs from validated orders',
+      expected: [
+        /actualFills\.contractShortBaseQuantity/u,
+        /0/u,
+        /1/u
+      ],
+      mutate(body) {
+        setBrowserActualFills(body, '0', '1', '1');
+      }
+    },
+    {
+      name: 'unmatched actual fill differs from validated orders',
+      expected: [
+        /actualFills\.unmatchedBaseQuantity/u,
+        /0/u,
+        /1/u
+      ],
+      mutate(body) {
+        setBrowserActualFills(body, '0', '0', '1');
+      }
+    },
+    {
       name: 'nonfailure strategy state carries a failure code',
+      expected: [
+        /strategy\.failureCode/u,
+        /null/u,
+        /NO_FILL/u
+      ],
       mutate(body) {
         (body.strategy as Record<string, unknown>).failureCode = 'NO_FILL';
       }
     },
     {
       name: 'strategy update time precedes creation',
+      expected: [
+        /strategy\.updatedAt/u,
+        /createdAt.*<=.*updatedAt/u,
+        /2026-07-31.*2026-07-30/u
+      ],
       mutate(body) {
         (body.strategy as Record<string, unknown>).updatedAt =
           '2026-07-30T23:59:59.000Z';
@@ -4742,6 +5333,7 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'order request is missing',
+      expected: [/orders\[0\]\.request/u, /必填|required/iu, /缺失|missing/iu],
       mutate(body) {
         delete oneOrder(body).request;
       }
@@ -4754,18 +5346,33 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'order status differs from snapshot',
+      expected: [
+        /orders\[0\]\.snapshot\.status/u,
+        /closed/u,
+        /open/u
+      ],
       mutate(body) {
         oneOrder(body).status = 'closed';
       }
     },
     {
       name: 'order timestamp is not canonical',
+      expected: [
+        /orders\[0\]\.createdAt/u,
+        /UTC.*ISO 8601/u,
+        /not-a-time/u
+      ],
       mutate(body) {
         oneOrder(body).createdAt = 'not-a-time';
       }
     },
     {
       name: 'client order id has invalid format',
+      expected: [
+        /orders\[0\]\.clientOrderId/u,
+        /32.*小写.*十六进制|32.*lowercase.*hex/iu,
+        /client-id/u
+      ],
       mutate(body) {
         const order = oneOrder(body);
         order.clientOrderId = 'client-id';
@@ -4775,6 +5382,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'client order id is formatted but not deterministic',
+      expected: [
+        /orders\[0\]\.clientOrderId/u,
+        /确定|deterministic/iu,
+        /0{32}/u
+      ],
       mutate(body) {
         const order = oneOrder(body);
         const wrongId = '0'.repeat(32);
@@ -4785,6 +5397,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'duplicate order role',
+      expected: [
+        /status\.orders\.role/u,
+        /唯一|unique/iu,
+        /1.*2/u
+      ],
       mutate(body) {
         body.orders = [
           browserOrderResponse(
@@ -4801,7 +5418,13 @@ test('operator UI rejects every malformed full status DTO before enabling confir
       }
     },
     {
-      name: 'duplicate client id across roles',
+      name: 'duplicate client id across roles fails deterministic identity first',
+      expected: [
+        /orders\[1\]\.clientOrderId/u,
+        /确定|deterministic/iu,
+        new RegExp(makeClientOrderId(strategyId, 'SPOT_MARKET'), 'u'),
+        new RegExp(makeClientOrderId(strategyId, 'CONTRACT_MARKET'), 'u')
+      ],
       mutate(body) {
         const first = browserOrderResponse(
           strategyId,
@@ -4818,6 +5441,28 @@ test('operator UI rejects every malformed full status DTO before enabling confir
         (second.request as Record<string, unknown>).clientOrderId = duplicateId;
         (second.snapshot as Record<string, unknown>).clientOrderId = duplicateId;
         body.orders = [first, second];
+      }
+    },
+    {
+      name: 'duplicate order id across roles',
+      expected: [
+        /status\.orders\.id/u,
+        /唯一|unique/iu,
+        /1.*2/u
+      ],
+      mutate(body) {
+        body.orders = [
+          browserOrderResponse(
+            strategyId,
+            'SPOT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174004'
+          ),
+          browserOrderResponse(
+            strategyId,
+            'CONTRACT_MARKET',
+            '223e4567-e89b-42d3-a456-426614174004'
+          )
+        ];
       }
     },
     {
@@ -4887,6 +5532,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
     },
     {
       name: 'snapshot quantities do not sum to request',
+      expected: [
+        /orders\[0\]\.snapshot\.(?:filledBaseQuantity|remainingBaseQuantity)/u,
+        /filledBaseQuantity.*\+.*remainingBaseQuantity.*requestedBaseQuantity/u,
+        /1.*0.*0\.5|0.*0\.5.*1/u
+      ],
       mutate(body) {
         (oneOrder(body).snapshot as Record<string, unknown>)
           .remainingBaseQuantity = '0.5';
@@ -4915,6 +5565,11 @@ test('operator UI rejects every malformed full status DTO before enabling confir
       browser.element('risk-ack').checked = true;
       await browser.element('risk-ack').emit('change');
       await browser.element('confirm-button').emit('click');
+      if (item.expected !== undefined) {
+        const firstLine = browser.element('operator-message').textContent
+          .split('\n')[0] ?? '';
+        for (const expected of item.expected) assert.match(firstLine, expected);
+      }
       assert.equal(
         browser.fetchCalls.filter(({ url }) => url.endsWith('/confirm')).length,
         0
@@ -5553,12 +6208,21 @@ test('one status-aware completion log is emitted for success redirect and failur
 
 test('completion captures valid body invalid JSON and stable known errors', async (t) => {
   const capture = completionCapture();
+  const configuredSecret = 'SYNTHETIC-HTTP-CONFIGURED-SECRET';
   const fixture = setup(t, {
     loggerInstance: capture.logger,
+    secretProvider: () => [configuredSecret],
     runPreflight: async () => {
-      throw Object.assign(new Error('authentication failed'), {
+      throw Object.assign(new Error(
+        `authentication rejected by gateway ${configuredSecret}`,
+        { cause: new Error(`TLS connection closed ${configuredSecret}`) }
+      ), {
         name: 'AuthenticationError',
         code: '40101',
+        response: {
+          status: 401,
+          body: `synthetic credential rejected ${configuredSecret}`
+        },
         extra: 'ERROR-EXTRA-SENTINEL',
         validation: [{ message: 'VALIDATION-ARRAY-SENTINEL' }]
       });
@@ -5571,6 +6235,18 @@ test('completion captures valid body invalid JSON and stable known errors', asyn
   const invalid = await server.inject({ method: 'POST', url: '/api/hedges/preflight?source=raw', headers: { ...LOCAL_HEADERS, 'content-type': 'application/json' }, payload: invalidText });
   assert.equal(valid.statusCode, 500);
   assert.equal(invalid.statusCode, 400);
+  const publicDetail = assertPublicHttpError(valid, {
+    code: 'REQUEST_OPERATION_FAILED',
+    phase: 'request'
+  });
+  const publicSerialized = JSON.stringify(publicDetail);
+  assert.match(publicSerialized, /authentication rejected by gateway/);
+  assert.match(publicSerialized, /TLS connection closed/);
+  assert.match(publicSerialized, /40101/);
+  assert.match(publicSerialized, /401/);
+  assert.match(publicSerialized, /synthetic credential rejected/);
+  assert.doesNotMatch(publicSerialized, /"stack"/);
+  assert.doesNotMatch(publicSerialized, new RegExp(configuredSecret));
   const completions = completionLines(capture.lines());
   const preflightLine = completionForStatus(completions, 500);
   assert.notEqual(preflightLine.httpError, undefined);
@@ -5581,6 +6257,14 @@ test('completion captures valid body invalid JSON and stable known errors', asyn
   assert.equal(loggedError.message, loggedDetail.message);
   assert.equal(loggedDetail.code, 'REQUEST_OPERATION_FAILED');
   assert.equal(loggedDetail.phase, 'request');
+  assert.equal(loggedDetail.occurredAt, publicDetail.occurredAt);
+  const loggedSerialized = JSON.stringify(loggedDetail);
+  assert.match(loggedSerialized, /authentication rejected by gateway/);
+  assert.match(loggedSerialized, /TLS connection closed/);
+  assert.match(loggedSerialized, /40101/);
+  assert.match(loggedSerialized, /synthetic credential rejected/);
+  assert.match(loggedSerialized, /"stack"/);
+  assert.doesNotMatch(loggedSerialized, new RegExp(configuredSecret));
   assert.deepEqual((preflightLine.httpRequest as Record<string, unknown>).body, validBody);
   assert.equal((preflightLine.httpRequest as Record<string, unknown>).url, '/api/hedges/preflight?dryRun=false');
   const invalidLine = completionForStatus(completions, 400);
@@ -5601,7 +6285,7 @@ test('completion captures valid body invalid JSON and stable known errors', asyn
   assert.equal(fixture.getExecutionCount(), 0);
   assert.doesNotMatch(
     JSON.stringify(completions),
-    /AuthenticationError|authentication failed|40101|stack|ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL|RAW-CREDENTIAL-SENTINEL/
+    /ERROR-EXTRA-SENTINEL|VALIDATION-ARRAY-SENTINEL|RAW-CREDENTIAL-SENTINEL|SYNTHETIC-HTTP-CONFIGURED-SECRET/
   );
 });
 
@@ -6333,7 +7017,7 @@ test('concurrent preflight completions correlate response requestId with isolate
       ).code,
       'REQUEST_OPERATION_FAILED'
     );
-    assert.doesNotMatch(JSON.stringify(line.httpError), new RegExp(ownError));
+    assert.match(JSON.stringify(line.httpError), new RegExp(ownError));
     assert.doesNotMatch(JSON.stringify(line), new RegExp(otherError));
   }
 });
@@ -6438,4 +7122,46 @@ test('operator docs describe failure request snapshots and safety boundaries', a
     assert.match(document, /配置.*敏感值.*(?:替换|脱敏)/);
     assert.match(document, /失败.*预检|预检失败/);
   }
+});
+
+test('status quantity failures identify the leg and operands without execution', async (t) => {
+  for (const role of ['SPOT_MARKET', 'CONTRACT_MARKET'] as const) {
+    for (const value of ['', 'not-a-decimal', 'Infinity', '-1', 'x'.repeat(10001)]) {
+      await t.test(`${role} ${value.length > 50 ? 'long' : value}`, async (subtest) => {
+        const f = setup(subtest);
+        const strategy = f.repository.createPending(preflight({ mode: 'CONCURRENT' }));
+        f.repository.claimForExecution(strategy.id);
+        const request = requestFor(strategy.id, role, '1');
+        const planned = f.repository.planOrder(strategy.id, role, request);
+        const synthetic = { ...planned, snapshot: snapshotFor(request, planned.exchangeId, { filledBaseQuantity: value }) };
+        subtest.mock.method(f.repository, 'listOrders', () => [synthetic]);
+        const response = await f.server.inject({ method: 'GET', url: `/api/hedges/${strategy.id}`, headers: LOCAL_HEADERS });
+        assert.equal(response.statusCode, 500);
+        assert.match(response.body, role === 'SPOT_MARKET' ? /spotBuyBaseQuantity/u : /contractShortBaseQuantity/u);
+        assert.match(response.body, /expected/u);
+        assert.match(response.body, /actual/u);
+        assert.doesNotMatch(response.body, /x{10001}/u);
+        assert.equal(f.getConfirmationCount(), 0);
+        assert.equal(f.getExecutionCount(), 0);
+      });
+    }
+  }
+});
+
+test('status difference reports the required precision before responding', async (t) => {
+  const f = setup(t);
+  const strategy = f.repository.createPending(preflight({ mode: 'CONCURRENT' }));
+  f.repository.claimForExecution(strategy.id);
+  const orders = (['SPOT_MARKET', 'CONTRACT_MARKET'] as const).map((role, index) => {
+    const request = requestFor(strategy.id, role, '1');
+    const order = f.repository.planOrder(strategy.id, role, request);
+    return { ...order, snapshot: snapshotFor(request, order.exchangeId, { filledBaseQuantity: index === 0 ? '1' : '1e-1000001' }) };
+  });
+  t.mock.method(f.repository, 'listOrders', () => orders);
+  const response = await f.server.inject({ method: 'GET', url: `/api/hedges/${strategy.id}`, headers: LOCAL_HEADERS });
+  assert.equal(response.statusCode, 500);
+  assert.match(response.body, /unmatchedBaseQuantity.*requiredPrecision/u);
+  assert.match(response.body, /1000000/u);
+  assert.match(response.body, /1000006/u);
+  assert.equal(f.getExecutionCount(), 0);
 });

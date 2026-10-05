@@ -110,11 +110,20 @@ test('writes JSON and replaces configured secrets in errors', () => {
   assert.match(JSON.stringify(line), /\[Redacted\]/);
 });
 
-test('writes complete trusted startup details without Error branding or stack', () => {
+test('writes trusted startup details with redacted cause evidence and stack', () => {
   const output: string[] = [];
   const logger = createAppLogger(captureDestination(output));
   const operations = createOperationalLog(logger, () => ['startup-secret']);
-  const failure = createTradeOpsError({
+  const createWithCause = createTradeOpsError as unknown as (
+    input: Parameters<typeof createTradeOpsError>[0],
+    secrets?: readonly string[],
+    options?: { readonly cause?: unknown }
+  ) => ReturnType<typeof createTradeOpsError>;
+  const cause = Object.assign(
+    new Error('EACCES: open /synthetic/config with startup-secret'),
+    { code: 'EACCES' }
+  );
+  const failure = createWithCause({
     code: 'CONFIG_FIELD_MISSING',
     phase: 'startup',
     subject: {
@@ -124,7 +133,7 @@ test('writes complete trusted startup details without Error branding or stack', 
     expected: 'non-empty credential',
     actual: 'missing',
     occurredAt: '2026-10-03T00:00:00.000Z'
-  }, ['startup-secret']);
+  }, ['startup-secret'], { cause });
 
   operations.error('service_start_failed', failure);
   operations.fatal('service_startup_failed', failure);
@@ -132,12 +141,91 @@ test('writes complete trusted startup details without Error branding or stack', 
   const entries = capturedEntries(output);
   assert.equal(entries.length, 2);
   for (const entry of entries) {
-    assert.deepEqual(entry.error, failure.detail);
-    assert.equal('stack' in (entry.error as object), false);
-    assert.equal('type' in (entry.error as object), false);
-    assert.equal('cause' in (entry.error as object), false);
-    assert.doesNotMatch(JSON.stringify(entry), /startup-secret/);
+    const logged = entry.error as Record<string, unknown>;
+    assert.equal(logged.code, failure.detail.code);
+    assert.equal(logged.phase, failure.detail.phase);
+    assert.deepEqual(logged.subject, failure.detail.subject);
+    assert.equal('stack' in logged, false);
+    assert.equal('type' in logged, false);
+    assert.equal('cause' in logged, false);
+    assert.equal(typeof logged.evidence, 'object');
+    assert.match(JSON.stringify(logged.evidence), /EACCES/u);
+    assert.match(JSON.stringify(logged.evidence), /"stack"/u);
+    assert.doesNotMatch(JSON.stringify(entry), /startup-secret/u);
   }
+});
+
+test('trusted errors without causes retain their own stack in operational logs', () => {
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+  const operations = createOperationalLog(logger, () => []);
+  const failure = createTradeOpsError({
+    code: 'SERVICE_COMPONENT_FAILED',
+    phase: 'startup',
+    subject: { type: 'configuration', field: 'startup' },
+    expected: 'component starts',
+    actual: 'component failed'
+  });
+
+  operations.error('service_startup_failed', failure);
+
+  const [entry] = capturedEntries(output);
+  assert.ok(entry !== undefined);
+  assert.match(JSON.stringify(entry.error), /TradeOpsError/u);
+  assert.match(JSON.stringify(entry.error), /"stack"/u);
+});
+
+test('trusted storage errors retain stored and runtime evidence at logging boundaries', () => {
+  const secret = 'synthetic-storage-secret';
+  const runtimeCause = new Error(`native runtime cause with ${secret}`);
+  const failure = createTradeOpsError({
+    code: 'STORAGE_OPERATION_FAILED',
+    phase: 'storage',
+    subject: { type: 'database', table: 'strategies', operation: 'write' },
+    expected: 'storage write succeeds',
+    actual: 'upstream unavailable',
+    evidence: {
+      type: 'ExternalServiceError',
+      message: `storage upstream failed with ${secret}`,
+      status: 503,
+      body: `synthetic response tail with ${secret}`,
+      cause: {
+        type: 'Error',
+        message: `stored nested cause with ${secret}`
+      }
+    }
+  }, [secret], { cause: runtimeCause });
+  assert.equal((failure as Error & { cause?: unknown }).cause, runtimeCause);
+  const direct = safeError(failure, [secret]);
+  const nested = safeError(
+    new AggregateError([failure], 'two failures'),
+    [secret]
+  );
+
+  const output: string[] = [];
+  const logger = createAppLogger(captureDestination(output));
+  createOperationalLog(logger, () => [secret]).error(
+    'storage_operation_failed', failure
+  );
+  const [entry] = capturedEntries(output);
+  assert.ok(entry !== undefined);
+
+  for (const rendered of [
+    JSON.stringify(direct),
+    JSON.stringify(nested),
+    JSON.stringify(entry.error)
+  ]) {
+    assert.match(rendered, /"status":503/u);
+    assert.match(rendered, /synthetic response tail/u);
+    assert.match(rendered, /stored nested cause/u);
+    assert.match(rendered, /native runtime cause/u);
+    assert.match(rendered, /TradeOpsError/u);
+    assert.match(rendered, /"stack"/u);
+    assert.equal(rendered.includes(secret), false);
+  }
+  const logged = entry.error as Record<string, unknown>;
+  assert.equal(logged.phase, 'storage');
+  assert.equal(logged.code, 'STORAGE_OPERATION_FAILED');
 });
 
 test('replaces configured secrets in non-error operational fields', () => {
@@ -179,21 +267,35 @@ test('redacts Fastify request URLs before Pino serialization', () => {
   assert.doesNotMatch(JSON.stringify(line), /must-not-appear/);
 });
 
-test('safe errors exclude arbitrary enumerable fields and nested causes', () => {
+test('safe errors project causes and responses while excluding arbitrary fields', () => {
+  const cause = Object.assign(new Error('disk full ENOSPC'), {
+    code: 'ENOSPC'
+  });
   const error = Object.assign(new Error('database failed'), {
     code: 'SQLITE_ERROR',
-    apiKey: 'must-not-appear',
-    request: { headers: { authorization: 'must-not-appear' } },
-    response: { body: 'must-not-appear' },
-    cause: new Error('must-not-appear')
+    apiKey: 'arbitrary-property-secret',
+    request: { headers: { authorization: 'Bearer request-header-secret' } },
+    response: {
+      status: 507,
+      body: JSON.stringify({
+        message: 'synthetic disk response',
+        apiKey: 'sensitive-body-value',
+        authorization: 'Bearer response-header-secret'
+      })
+    },
+    cause
   });
 
-  const safe = safeError(error, ['must-not-appear']);
+  const safe = safeError(error, ['arbitrary-property-secret']);
+  const projected = safe as unknown as Record<string, unknown>;
 
-  assert.deepEqual(Object.keys(safe).sort(), [
+  assert.deepEqual(Object.keys(projected).sort(), [
+    'body',
+    'cause',
     'code',
     'message',
     'stack',
+    'status',
     'type'
   ]);
   assert.deepEqual(
@@ -204,7 +306,95 @@ test('safe errors exclude arbitrary enumerable fields and nested causes', () => 
       code: 'SQLITE_ERROR'
     }
   );
-  assert.doesNotMatch(JSON.stringify(safe), /apiKey|request|response|cause/);
+  const rendered = JSON.stringify(projected);
+  assert.equal(projected.status, 507);
+  assert.match(String(projected.body), /synthetic disk response/u);
+  assert.match(JSON.stringify(projected.cause), /ENOSPC/u);
+  assert.doesNotMatch(
+    rendered,
+    /arbitrary-property-secret|request-header-secret|sensitive-body-value|response-header-secret/u
+  );
+});
+
+test('safe errors do not execute getters, Proxy traps, or toJSON', () => {
+  const secret = 'hostile-logger-secret';
+  let getterCalls = 0;
+  let proxyCalls = 0;
+  let toJsonCalls = 0;
+  const hostile = new Error('safe logger failure');
+  Object.defineProperty(hostile, 'cause', {
+    get(): never {
+      getterCalls += 1;
+      throw new Error(secret);
+    }
+  });
+  Object.defineProperty(hostile, 'toJSON', {
+    value(): never {
+      toJsonCalls += 1;
+      throw new Error(secret);
+    }
+  });
+  const proxied = new Proxy(new Error(secret), {
+    get(): never {
+      proxyCalls += 1;
+      throw new Error(secret);
+    },
+    getOwnPropertyDescriptor(): never {
+      proxyCalls += 1;
+      throw new Error(secret);
+    },
+    getPrototypeOf(): never {
+      proxyCalls += 1;
+      throw new Error(secret);
+    },
+    ownKeys(): never {
+      proxyCalls += 1;
+      throw new Error(secret);
+    }
+  });
+
+  const rendered = JSON.stringify([
+    safeError(hostile, [secret]),
+    safeError(proxied, [secret])
+  ]);
+
+  assert.equal(getterCalls, 0);
+  assert.equal(proxyCalls, 0);
+  assert.equal(toJsonCalls, 0);
+  assert.equal(rendered.includes(secret), false);
+  assert.match(rendered, /accessor|unreadable|proxy|访问器|不可读|不可检查/iu);
+});
+
+test('safe errors do not invoke custom prepareStackTrace formatters', () => {
+  const original = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+  let calls = 0;
+  Object.defineProperty(Error, 'prepareStackTrace', {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value(): string {
+      calls += 1;
+      return 'synthetic prepared stack';
+    }
+  });
+  const custom = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+  try {
+    const projected = safeError(new Error('stack projection failure'));
+
+    assert.equal(calls, 0);
+    assert.match(projected.stack ?? '', /Error: stack projection failure/u);
+    assert.doesNotMatch(projected.stack ?? '', /synthetic prepared stack/u);
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace'),
+      custom
+    );
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(Error, 'prepareStackTrace');
+    } else {
+      Object.defineProperty(Error, 'prepareStackTrace', original);
+    }
+  }
 });
 
 test('extracts only the six exact non-empty credential values', () => {
@@ -349,6 +539,8 @@ test('writes allowlisted reconciliation warnings with every string redacted', ()
     conclusion: 'pending-test-secret',
     failureCode: 'INCONSISTENT_ORDER_STATE-test-secret',
     reason: 'ORDER_LOOKUP_FAILED-test-secret',
+    check: 'lookup-test-secret',
+    evidence: { type: 'Error', message: 'failure-test-secret', cause: { type: 'Error', message: 'root-test-secret', status: 503, body: 'response-test-secret' } },
     role: 'SPOT_MARKET-test-secret',
     exchangeId: 'bitget-test-secret',
     strategyOrderId: 'order-test-secret',
@@ -384,6 +576,9 @@ test('writes allowlisted reconciliation warnings with every string redacted', ()
   assert.equal(entry.exchangeOrderId, 'exchange-[Redacted]');
   assert.equal(entry.expected, 'closed-[Redacted]');
   assert.equal(entry.actual, 'unknown-[Redacted]');
+  assert.equal(entry.check, 'lookup-[Redacted]');
+  assert.match(JSON.stringify(entry.evidence), /root-\[Redacted\]/u);
+  assert.match(JSON.stringify(entry.evidence), /503/u);
   assert.equal(entry.exposureKnown, true);
   assert.equal(entry.marketSpot, '1-[Redacted]');
   assert.equal(entry.marketContract, '0.6-[Redacted]');

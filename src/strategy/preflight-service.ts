@@ -1,6 +1,7 @@
 import { Decimal } from 'decimal.js';
 import { decimal } from '../domain/decimal.js';
 import {
+  QuantityNormalizationError,
   baseStepFor,
   normalizeCommonBaseQuantity
 } from '../domain/quantity-normalizer.js';
@@ -65,7 +66,8 @@ function failure(
   code: ErrorCode,
   subject: ErrorSubject,
   expected: SafeDiagnosticValue,
-  actual: SafeDiagnosticValue
+  actual: SafeDiagnosticValue,
+  options?: ErrorOptions
 ): TradeOpsError {
   return createTradeOpsError({
     code,
@@ -73,7 +75,7 @@ function failure(
     subject,
     expected,
     actual
-  });
+  }, undefined, options);
 }
 
 function trustedFailure(
@@ -81,7 +83,9 @@ function trustedFailure(
   phase: PreflightPhase = 'preflight'
 ): TradeOpsError | undefined {
   try {
-    return withErrorPhase(error as TradeOpsError, phase);
+    const trusted = error as TradeOpsError;
+    const phased = withErrorPhase(trusted, phase);
+    return trusted.detail.phase === phase ? trusted : phased;
   } catch {
     return undefined;
   }
@@ -275,7 +279,8 @@ function configuredGateway(
       'EXCHANGE_NOT_CONFIGURED',
       { type: 'exchange', exchangeId, operation: 'gateway lookup' },
       'configured identity-matched gateway',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
 }
@@ -297,7 +302,8 @@ async function loadSnapshot(
       'MARKET_UNAVAILABLE',
       marketSubject(exchangeId, symbol, kind),
       'successful forced market refresh',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
 }
@@ -402,7 +408,8 @@ async function readAccountSettings(
       'ACCOUNT_SETTINGS_UNAVAILABLE',
       accountSubject(exchangeId, symbol, 'settings'),
       'successful account settings read',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
   if (settings.positionMode !== 'hedged') {
@@ -501,7 +508,7 @@ function validateQuantityRules(
       'MARKET_RULE_INVALID',
       marketSubject(exchangeId, symbol, kind, 'baseAmountRange'),
       'minimum less than or equal to maximum',
-      'minimum exceeds maximum'
+      `minimum ${minBaseAmount} exceeds maximum ${maxBaseAmount}`
     );
   }
   try {
@@ -516,7 +523,8 @@ function validateQuantityRules(
       'MARKET_RULE_INVALID',
       marketSubject(exchangeId, symbol, kind, 'baseStep'),
       'finite positive derived base step',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
   return Object.freeze({
@@ -546,10 +554,15 @@ function readQuantityRules(
       'MARKET_RULE_INVALID',
       marketSubject(exchangeId, symbol, kind, 'quantityRules'),
       'valid quantity rule snapshot',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
   return validateQuantityRules(rules, exchangeId, symbol, kind);
+}
+
+function boundedDiagnostic(value: string): string {
+  return value.length <= 2000 ? value : `string length ${value.length}; full value in evidence`;
 }
 
 function effectiveQuantity(
@@ -585,12 +598,27 @@ function effectiveQuantity(
       spot: spotRules,
       swap: contractRules
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof QuantityNormalizationError) {
+      const subject: ErrorSubject = error.field === 'spot.minBaseAmount'
+        ? marketSubject(request.spotExchangeId, request.symbol, 'spot', 'amount')
+        : error.field === 'swap.minBaseAmount'
+          ? marketSubject(request.contractExchangeId, request.symbol, 'swap', 'amount')
+          : { type: 'request', field: error.field };
+      throw failure(
+        error.reason === 'OUT_OF_RANGE' ? 'QUANTITY_OUT_OF_RANGE' : 'QUANTITY_INVALID',
+        subject,
+        boundedDiagnostic(error.expected),
+        boundedDiagnostic(error.actual),
+        { cause: error }
+      );
+    }
     throw failure(
-      'QUANTITY_OUT_OF_RANGE',
-      marketSubject(request.spotExchangeId, request.symbol, 'spot', 'amount'),
+      'QUANTITY_INVALID',
+      { type: 'request', field: 'effectiveQuantity' },
       'quantity aligned to both market steps and within both ranges',
-      decimalActual(request.requestedBaseQuantity)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
 }
@@ -613,7 +641,8 @@ async function readPrice(
       'PRICE_UNAVAILABLE',
       marketSubject(exchangeId, symbol, kind, 'price'),
       'successful reference price read',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
   const parsed = parsedDecimal(value);
@@ -646,7 +675,8 @@ function readNotionalRules(
       'MARKET_RULE_INVALID',
       marketSubject(exchangeId, symbol, kind, 'notionalRules'),
       'valid notional rule snapshot',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
   const minQuoteNotional = rules.minQuoteNotional === undefined
@@ -678,7 +708,7 @@ function readNotionalRules(
       'MARKET_RULE_INVALID',
       marketSubject(exchangeId, symbol, kind, 'quoteNotionalRange'),
       'minimum less than or equal to maximum',
-      'minimum exceeds maximum'
+      `minimum ${minQuoteNotional} exceeds maximum ${maxQuoteNotional}`
     );
   }
   return Object.freeze({
@@ -693,7 +723,7 @@ function exactProduct(left: Decimal, right: Decimal): Decimal {
     !Number.isSafeInteger(requiredPrecision)
     || requiredPrecision > 1_000_000
   ) {
-    throw new Error('exact product exceeds supported precision');
+    throw new QuantityNormalizationError('RESOURCE_LIMIT', 'notional', 'required precision at most 1000000', String(requiredPrecision));
   }
   const ExactDecimal = Decimal.clone({
     precision: Math.max(Decimal.precision, requiredPrecision),
@@ -717,8 +747,9 @@ function validateNotional(
     throw failure(
       'QUANTITY_NOT_REPRESENTABLE',
       marketSubject(exchangeId, symbol, kind, 'notional'),
-      'exact finite quote notional',
-      safeFailureCategory(error)
+      error instanceof QuantityNormalizationError ? error.expected : 'exact finite quote notional',
+      error instanceof QuantityNormalizationError ? boundedDiagnostic(error.actual) : safeFailureCategory(error),
+      { cause: error }
     );
   }
   if (
@@ -764,7 +795,8 @@ async function readBalance(
       'BALANCE_UNAVAILABLE',
       accountSubject(exchangeId, symbol, 'balance'),
       'successful non-negative USDT balance read',
-      safeFailureCategory(error)
+      safeFailureCategory(error),
+      { cause: error }
     );
   }
   const parsed = parsedDecimal(value);
@@ -826,7 +858,7 @@ export class PreflightService {
         subject: { type: 'request', field: 'preflight' },
         expected: 'successful preflight request processing',
         actual: safeFailureCategory(error)
-      });
+      }, undefined, { cause: error });
     }
   }
 
@@ -971,7 +1003,8 @@ export class PreflightService {
         'BALANCE_UNAVAILABLE',
         accountSubject(request.contractExchangeId, request.symbol, 'balance'),
         'exact leveraged USDT balance',
-        safeFailureCategory(error)
+        safeFailureCategory(error),
+        { cause: error }
       );
     }
     assertSufficientBalance(

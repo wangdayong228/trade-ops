@@ -1,3 +1,4 @@
+import { diagnosticValue } from '../errors/error-evidence.js';
 import { createHash } from 'node:crypto';
 import { Decimal } from 'decimal.js';
 
@@ -30,13 +31,13 @@ const FundingRateDecimal = Decimal.clone({
   maxE: MAX_DECIMAL_EXPONENT
 });
 
-function invalid(field: string, requirement: string): never {
-  throw new Error(`Invalid ${field}: ${requirement}`);
+function invalid(field: string, requirement: string, actual?: string, options?: ErrorOptions): never {
+  throw new Error(`Invalid ${field}: ${requirement}${actual === undefined ? '' : `; actual ${actual}`}`, options);
 }
 
 function fundingExchangeId(value: unknown): FundingExchangeId {
   if (value !== 'bitget' && value !== 'okx') {
-    return invalid('exchangeId', 'expected bitget or okx');
+    return invalid('exchangeId', 'expected bitget or okx', diagnosticValue(value));
   }
   return value;
 }
@@ -47,30 +48,30 @@ function identityString(value: unknown, field: string): string {
     || value.length === 0
     || value.trim() !== value
   ) {
-    return invalid(field, 'expected a non-empty string without outer whitespace');
+    return invalid(field, 'expected a non-empty string without outer whitespace', diagnosticValue(value));
   }
   return value;
 }
 
 function fundingRate(value: unknown): string {
   if (typeof value !== 'string') {
-    return invalid('funding rate', 'expected a decimal string');
+    return invalid('funding rate', 'expected a decimal string', diagnosticValue(value));
   }
   const normalized = value.trim();
   if (normalized.length === 0 || !DECIMAL_STRING_PATTERN.test(normalized)) {
-    return invalid('funding rate', 'expected a finite decimal string');
+    return invalid('funding rate', 'expected a finite decimal string', diagnosticValue(value));
   }
 
   let parsed: Decimal;
   try {
     parsed = new FundingRateDecimal(normalized);
-  } catch {
-    return invalid('funding rate', 'expected a finite decimal string');
+  } catch (error) {
+    return invalid('funding rate', 'expected a finite decimal string', diagnosticValue(value), { cause: error });
   }
   const coefficient = normalized.split(/[eE]/, 1)[0] ?? '';
   const isLexicalZero = !/[1-9]/.test(coefficient);
   if (!parsed.isFinite() || (parsed.isZero() && !isLexicalZero)) {
-    return invalid('funding rate', 'expected a finite decimal string');
+    return invalid('funding rate', 'expected a finite decimal string', diagnosticValue(value));
   }
   return normalized;
 }
@@ -87,7 +88,8 @@ function fundingTimestamp(value: unknown): number {
   } else {
     return invalid(
       'funding timestamp',
-      'expected a canonical non-negative Unix millisecond timestamp'
+      'expected a canonical non-negative Unix millisecond timestamp',
+      diagnosticValue(value)
     );
   }
 
@@ -98,7 +100,8 @@ function fundingTimestamp(value: unknown): number {
   ) {
     return invalid(
       'funding timestamp',
-      'expected a valid non-negative safe-integer Unix millisecond timestamp'
+      'expected a valid non-negative safe-integer Unix millisecond timestamp',
+      diagnosticValue(value)
     );
   }
   return timestampMs;
