@@ -1,4 +1,6 @@
 import { resolve } from 'node:path';
+import type { RuntimeStatus } from '../operations/runtime-status.js';
+import { registerStatusRoutes } from './status-routes.js';
 import { isNativeError, isProxy } from 'node:util/types';
 import staticPlugin from '@fastify/static';
 import { Decimal } from 'decimal.js';
@@ -62,6 +64,7 @@ import {
 export { LOGGER_REDACT_PATHS } from '../logging/logger.js';
 
 export interface BuildServerDependencies {
+  readonly runtimeStatus?: RuntimeStatus;
   readonly registry: Pick<ExchangeRegistry, 'ids'>;
   readonly preflightService: Pick<PreflightService, 'run'>;
   readonly confirmationService: Pick<ConfirmationService, 'confirm'>;
@@ -1326,7 +1329,7 @@ export function buildServer(
   app.addHook('onSend', async (request, reply) => {
     applySecurityHeaders(
       reply,
-      reply.statusCode >= 400 || request.url.startsWith('/api/')
+      reply.statusCode >= 400 || request.url.startsWith('/api/') || request.url.startsWith('/health/')
     );
   });
 
@@ -1410,6 +1413,8 @@ export function buildServer(
       { logDetail: true, fullLogMessage: true }
     );
   });
+
+  registerStatusRoutes(app, dependencies.runtimeStatus);
 
   app.get('/api/exchanges', async () => ({
     exchanges: dependencies.registry.ids()

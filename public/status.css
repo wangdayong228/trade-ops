@@ -1,0 +1,35 @@
+.status-page { width: min(1440px, calc(100% - 32px)); }
+.status-page nav { display: flex; gap: 20px; margin-bottom: 28px; }
+.status-page a { color: #236b5d; text-underline-offset: 4px; }
+.status-page [aria-current="page"] { font-weight: 750; }
+.status-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
+.status-toolbar p { margin: 0; color: #53616c; }
+.status-cards, .exchange-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.status-card, .exchange-card { padding: 16px; border: 1px solid #d7dee3; border-radius: 10px; min-width: 0; }
+.status-card p:last-child, .exchange-card p:last-child { margin-bottom: 0; }
+.status-value { font-size: 1.25rem; font-weight: 750; }
+.status-note, .status-secondary { color: #53616c; font-size: 0.85rem; line-height: 1.6; }
+.status-note { margin: 18px 0 0; }
+.status-filters { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 16px; margin-bottom: 20px; }
+.status-table-scroll { overflow-x: auto; }
+.status-page table { border-collapse: collapse; width: 100%; font-size: 0.875rem; }
+.status-page th, .status-page td { text-align: left; padding: 14px 12px; border-bottom: 1px solid #e0e6ea; vertical-align: top; }
+.status-page th { color: #53616c; background: #f5f7f8; white-space: nowrap; }
+.status-page td { min-width: 120px; }
+.status-page td p { margin-bottom: 6px; }
+.status-page td:first-child { min-width: 175px; overflow-wrap: anywhere; }
+.status-page td:nth-child(5) { min-width: 235px; }
+.status-badge { display: inline-block; border-radius: 6px; padding: 3px 7px; background: #edf1f4; font-weight: 650; }
+.status-good { color: #185a44; background: #e4f3ec; }
+.status-warn { color: #78540c; background: #fff3d6; }
+.status-bad { color: #8d2731; background: #fbe8e9; }
+.status-page details { margin: 8px 0; }
+.status-page summary { cursor: pointer; color: #236b5d; }
+.status-page pre { max-width: 650px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8rem; line-height: 1.6; }
+.status-page #status-message:not(:empty) { color: #8d2731; background: #fbe8e9; padding: 14px; margin-top: 18px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#status-content[data-stale="true"] { opacity: 0.65; }
+@media (max-width: 720px) {
+  .status-cards, .exchange-cards, .status-filters { grid-template-columns: 1fr; }
+  .status-page .panel { padding: 16px; }
+  .status-page { padding-top: 28px; }
+}

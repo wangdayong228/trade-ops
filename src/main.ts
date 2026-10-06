@@ -13,6 +13,7 @@ import { loadEnvironmentFile } from './config/environment-loader.js';
 import type { ExchangeCredentials } from './config/exchange-credentials.js';
 import { loadExchangeCredentials } from './config/exchange-credentials.js';
 import { fundingRateSyncIntervalMs } from './config/funding-rate-config.js';
+import { RuntimeStatus } from './operations/runtime-status.js';
 import {
   createTradeOpsError,
   safeFailureCategory,
@@ -43,6 +44,7 @@ import {
   configuredSecretValues,
   createAppLogger,
   createOperationalLog,
+  nonThrowingLogCall,
   nonThrowingOperationalLog,
   type OperationalFields,
   type OperationalLog
@@ -119,6 +121,7 @@ export interface ComposeServiceOptions {
 }
 
 export interface ServiceComposition {
+  readonly runtimeStatus: RuntimeStatus;
   readonly config: RuntimeConfig;
   readonly database: Database.Database;
   readonly registry: ExchangeRegistry;
@@ -131,6 +134,7 @@ export interface ServiceComposition {
 }
 
 export interface RunnableComposition {
+  readonly runtimeStatus?: Pick<RuntimeStatus, 'setPhase'>;
   readonly config: {
     readonly host: '127.0.0.1' | '::1';
     readonly port: number;
@@ -550,6 +554,13 @@ export function composeService(
       }
     );
 
+    const runtimeStatus = new RuntimeStatus({
+      repository: fundingRateRepository,
+      checkDatabase: () => { database.prepare('SELECT 1').get(); },
+      nowMs: options.fundingRateNowMs ?? Date.now,
+      intervalMs: config.fundingRateSyncIntervalMs,
+      secretProvider: () => configuredSecretValues(env)
+    });
     const fundingRateSourceFactory = options.fundingRateSourceFactory
       ?? createCcxtFundingRateSources;
     const [bitgetSource, okxSource] = runStartupBoundary(
@@ -573,7 +584,12 @@ export function composeService(
         bitgetSource,
         okxSource,
         repository: fundingRateRepository,
-        events: fundingRateEvents,
+        events: {
+          record(event): void {
+            nonThrowingLogCall(() => runtimeStatus.record(event));
+            nonThrowingLogCall(() => fundingRateEvents.record(event));
+          }
+        },
         intervalMs: config.fundingRateSyncIntervalMs,
         nowMs: options.fundingRateNowMs ?? Date.now,
         sleep: options.fundingRateSleep ?? defaultFundingRateSleep
@@ -668,6 +684,7 @@ export function composeService(
     );
     const server = runStartupBoundary(
       () => buildServer({
+        runtimeStatus,
         registry,
         preflightService,
         confirmationService,
@@ -685,6 +702,7 @@ export function composeService(
       componentContext('http-server', 'constructed')
     );
     return {
+      runtimeStatus,
       config,
       database,
       registry,
@@ -813,11 +831,13 @@ export async function startService<T extends RunnableComposition>(
       operationalLog?.error('service_stop_failed', failure, runtimeFields);
       throw failure;
     }
+    composition.runtimeStatus?.setPhase('STOPPED');
     operationalLog?.info('service_stopped', runtimeFields);
   };
 
   const shutdown = (): Promise<void> => {
     if (shutdownPromise === null) {
+      composition.runtimeStatus?.setPhase('STOPPING');
       operationalLog?.info('service_stopping', runtimeFields);
       shutdownPromise = closeResources();
     }
@@ -868,6 +888,7 @@ export async function startService<T extends RunnableComposition>(
         () => composition.fundingRateSync.start(),
         componentContext('funding-rate-sync', 'started')
       );
+      composition.runtimeStatus?.setPhase('RUNNING');
       operationalLog?.info('service_started', runtimeFields);
     }
     return { composition, shutdown };

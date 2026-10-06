@@ -1376,7 +1376,8 @@ test('composes funding sync on the strategy SQLite without construction I/O', as
   const fundingRateNowMs = () => now.getTime();
   const bitgetSource = new FakeFundingRateSource('bitget', []);
   const okxSource = new FakeFundingRateSource('okx', []);
-  const fundingEvents: FundingRateEventSink = { record(): void {} };
+  const forwardedEvents: string[] = [];
+  const fundingEvents: FundingRateEventSink = { record(event): void { forwardedEvents.push(event.event); } };
   const fundingSleep: FundingSleep = async () => {};
   const sourceFactoryCalls: unknown[][] = [];
   const repositoryFactoryCalls: unknown[][] = [];
@@ -1444,7 +1445,9 @@ test('composes funding sync on the strategy SQLite without construction I/O', as
     syncFactoryCalls[0]?.repository,
     fundingRateRepository
   );
-  assert.equal(syncFactoryCalls[0]?.events, fundingEvents);
+  syncFactoryCalls[0]?.events.record({ event: 'funding_sync_started', phase: 'test' });
+  assert.deepEqual(forwardedEvents, ['funding_sync_started']);
+  assert.equal(composition.runtimeStatus.snapshot().funding.status, 'RUNNING');
   assert.equal(syncFactoryCalls[0]?.intervalMs, 60_000);
   assert.equal(syncFactoryCalls[0]?.nowMs, fundingRateNowMs);
   assert.equal(syncFactoryCalls[0]?.nowMs(), now.getTime());

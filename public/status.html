@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>运行状态 · Trade Ops</title>
+    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/status.css">
+  </head>
+  <body>
+    <main class="status-page">
+      <header>
+        <nav aria-label="主导航"><a href="/">对冲开仓</a><a href="/status.html" aria-current="page">运行状态</a></nav>
+        <p class="eyebrow">TRADE OPS / STATUS</p>
+        <h1>运行状态</h1>
+        <p class="lead">查看服务健康与资金费率同步进度。每 10 秒自动刷新，也可手动获取最新状态。</p>
+        <div class="status-toolbar">
+          <button id="status-refresh" type="button">刷新状态</button>
+          <p id="snapshot-age" role="status" aria-live="polite">正在获取状态…</p>
+        </div>
+        <p id="status-message" class="message" role="alert"></p>
+      </header>
+
+      <div id="status-content" data-stale="true">
+        <section class="panel" aria-labelledby="service-title">
+          <h2 id="service-title">服务与同步器</h2>
+          <div id="service-overview" class="status-cards"><p>等待状态响应</p></div>
+          <p class="status-note">服务就绪表示本机 HTTP 与数据库可用；资金同步健康、交易所可用性与交易预检需分别判断。</p>
+        </section>
+        <section class="panel" aria-labelledby="discovery-title">
+          <h2 id="discovery-title">市场发现与同步概览</h2>
+          <div id="exchange-overview" class="exchange-cards"><p>等待发现结果</p></div>
+          <p class="status-note">发现结果和同步器状态来自本次服务运行，重启后重新记录。数量按数据库中的任务状态统计，“回填中 / 增量中”也可能是中断待恢复的记录。</p>
+        </section>
+        <section class="panel" aria-labelledby="markets-title">
+          <h2 id="markets-title">各市场同步状态</h2>
+          <div class="status-filters">
+            <label>交易所
+              <select id="exchange-filter"><option value="">全部交易所</option><option value="bitget">Bitget</option><option value="okx">OKX</option></select>
+            </label>
+            <label>搜索市场<input id="market-search" type="search" placeholder="例如 BTC 或 BTC-USDT-SWAP" autocomplete="off"></label>
+          </div>
+          <div class="status-table-scroll" tabindex="0" aria-label="市场同步状态表，可横向滚动">
+            <table>
+              <thead><tr><th scope="col">交易所 / 市场</th><th scope="col">活跃状态</th><th scope="col">全范围同步</th><th scope="col">增量同步</th><th scope="col">覆盖与数据时间（UTC）</th><th scope="col">详情</th></tr></thead>
+              <tbody id="market-rows"><tr><td colspan="6">等待市场状态</td></tr></tbody>
+            </table>
+          </div>
+          <p class="status-note">“已覆盖”只证明接口可见历史至对应截止时间；最新已入库结算时间不代表历史完整。全范围与增量状态独立显示。所有时间均为 UTC。</p>
+        </section>
+      </div>
+      <noscript><p class="message">需要启用 JavaScript 才能查看和刷新运行状态。</p></noscript>
+    </main>
+    <script src="/status.js" defer></script>
+  </body>
+</html>

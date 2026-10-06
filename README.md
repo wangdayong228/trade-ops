@@ -83,9 +83,27 @@ npm start
 
 资金费率使用独立、无 API key、secret 或 password 的 CCXT 公共客户端；它不会获得交易 gateway、账户设置、持仓或订单能力。远端请求失败只更新资金费率同步状态，不推进或重试订单，也不改变对冲状态。临时网络类失败最多额外重试三次，间隔为 1、2、4 秒；响应结构、身份、分页或数据完整性错误不会用盲目立即重试掩盖。
 
-数据与现有业务表共用 `TRADING_DATABASE_PATH` 指向的 SQLite 文件，但只写入三张独立持久表：`funding_rate_history` 保存当前版本，`funding_rate_revisions` 永久保存应用观察到的旧版本，`funding_rate_sync_state` 分别保存全范围 `coverage` 与增量 `incremental` 状态。首期不自动删除这些记录，也不提供页面、HTTP 查询或导出入口，因此数据库文件会持续增长，备份和容量规划必须包含这些表。
+数据与现有业务表共用 `TRADING_DATABASE_PATH` 指向的 SQLite 文件，但只写入三张独立持久表：`funding_rate_history` 保存当前版本，`funding_rate_revisions` 永久保存应用观察到的旧版本，`funding_rate_sync_state` 分别保存全范围 `coverage` 与增量 `incremental` 状态。不自动删除这些记录，也不提供费率历史查询或导出入口，因此数据库文件会持续增长，备份和容量规划必须包含这些表。运行中的同步状态可通过下述只读页面和 API 查看。
 
 诊断时应分别查看 `coverage_status` 的 `PENDING`/`BACKFILLING`/`CAUGHT_UP`/`INCOMPLETE` 与 `incremental_status` 的 `IDLE`/`RUNNING`/`INCOMPLETE`，不能用增量成功覆盖一次全范围失败。关键 stdout 结构化事件包括 `funding_market_discovery_completed`/`funding_market_discovery_incomplete`、`funding_coverage_started`/`funding_coverage_completed`、`funding_page_committed`、`funding_incremental_completed`/`funding_incremental_blocked`、`funding_request_retry`、`funding_task_incomplete`、`funding_rate_revised` 和 `funding_sync_fatal`。事件只记录 allowlist 内的 exchange、market、generation、cutoff、游标、计数和脱敏错误上下文，不记录凭证、headers 或完整原始错误对象。
+
+## 在线运行状态
+
+首页点击「运行状态与资金费率同步」，或打开 `http://127.0.0.1:3000/status.html`（默认端口）。页面展示服务健康、同步器状态、两交易所最近发现结果，以及每个市场的全范围/增量状态、最近成功时间、覆盖截止时间和失败摘要。每 10 秒刷新一次，支持手动刷新与市场筛选；请求超过 10 秒或刷新失败会明确标记历史快照已过期。切换到后台或离开页面时暂停轮询。
+
+| 只读入口 | 语义 |
+| --- | --- |
+| `GET /health/live` | `200` 表示 HTTP 进程可响应，不访问数据库或交易所 |
+| `GET /health/ready` | 服务阶段为 `RUNNING` 且现有 SQLite 连接的 `SELECT 1` 成功时 `200`；否则 `503`，JSON 保留实际服务阶段和数据库检查结果 |
+| `GET /api/status` | 服务健康与资金费率同步快照；`generatedAt` 为 UTC ISO 时间，`uptimeMs`、`intervalMs` 和市场 `*Ms` 时间戳均以毫秒为单位；读取失败返回结构化错误 |
+
+健康探针的 `503` 是健康结果，响应包含 `status`、`service`、`database`；数据库失败含脱敏 `error`。其余接口异常继续使用现有 `{requestId, error}` 格式。所有状态和健康响应均禁止缓存、保留本机 Host 边界。读取复用服务持有的数据库连接，不需要停机或打开第二个数据库连接，也不会触发同步、交易所请求或业务写入。
+
+服务就绪不证明交易所可用或资金同步完整。资金同步 fatal 会在页面保留，后续停止事件不会抹掉故障，也不会单独使交易 HTTP 服务失去就绪。发现结果与 fatal 来自本进程内存，重启后重置；市场状态来自持久表。`BACKFILLING`/`RUNNING` 也可能是上次中断的记录，不等于当前进程正在处理该市场；`CAUGHT_UP` 只证明接口可见范围至 `lastCaughtUpCutoffMs`。页面分别统计全范围与增量状态，不根据最新结算时间猜测历史覆盖完整。
+
+`service.startedAt` 在服务成功启动前为 `null`，`uptimeMs` 为 `0`；运行时长从监听与同步启动完成后计起。正常快照不输出数据库路径配置，公开错误不返回凭证或堆栈；错误中的必要文件路径保留用于定位故障。
+
+市场失败原因保留数据库中的错误码和摘要；完整请求证据在 stdout 中，可按交易所、market、generation 查找 `funding_task_incomplete`。市场发现和同步器 fatal 的完整脱敏错误链可在页面展开。操作说明见 [运行状态与资金费率同步](docs/usage/operator-guide.md#运行状态与资金费率同步)。
 
 ## stdout JSON 日志
 
