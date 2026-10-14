@@ -43,6 +43,7 @@ function invalidLeverage(
   exchangeSymbol: string,
   value: unknown,
   position: Record<string, unknown>,
+  field: 'leverage' | 'shortLeverage',
   options?: ErrorOptions
 ): never {
   throw createTradeOpsError({
@@ -57,31 +58,34 @@ function invalidLeverage(
     expected: 'finite decimal greater than zero',
     actual: safeLeverageActual(value),
     evidence: accountSettingsEvidence(
-      'okx', exchangeSymbol, '持仓 leverage',
-      '有限正数', `${diagnosticValue(value)}; ${accountFieldEvidence(position, 'info.lever')}`
+      'okx', exchangeSymbol,
+      field === 'leverage' ? '持仓 leverage' : '全仓 shortLeverage',
+      '有限正数',
+      `${diagnosticValue(value)}; ${accountFieldEvidence(position, field === 'leverage' ? 'info.lever' : 'info.0.lever')}`
     )
   }, undefined, options);
 }
 
 function optionalPositive(
   position: Record<string, unknown>,
-  exchangeSymbol: string
+  exchangeSymbol: string,
+  field: 'leverage' | 'shortLeverage' = 'leverage'
 ): string | null {
-  const value = position.leverage;
+  const value = position[field];
   if (value === undefined || value === null || value === '') {
     return null;
   }
   if (typeof value !== 'number' && typeof value !== 'string') {
-    return invalidLeverage(exchangeSymbol, value, position);
+    return invalidLeverage(exchangeSymbol, value, position, field);
   }
   let parsed: ReturnType<typeof decimal>;
   try {
     parsed = decimal(String(value));
   } catch (error) {
-    return invalidLeverage(exchangeSymbol, value, position, { cause: error });
+    return invalidLeverage(exchangeSymbol, value, position, field, { cause: error });
   }
   return !parsed.isFinite() || parsed.lte(0)
-    ? invalidLeverage(exchangeSymbol, value, position)
+    ? invalidLeverage(exchangeSymbol, value, position, field)
     : parsed.toFixed();
 }
 
@@ -137,6 +141,89 @@ function oneValue<T>(
   return distinct[0];
 }
 
+async function flatCrossSettings(
+  exchange: CcxtExchangeLike,
+  exchangeSymbol: string,
+  exchangeMarketId: string
+): Promise<AccountSettings> {
+  const response = await exchange.fetchLeverage(exchangeSymbol, {
+    marginMode: 'cross'
+  });
+  if (response.symbol !== exchangeSymbol) {
+    throw createTradeOpsError({
+      code: 'ACCOUNT_SETTINGS_CONFLICT',
+      phase: 'preflight',
+      subject: {
+        type: 'account', exchangeId: 'okx', symbol: exchangeSymbol, field: 'symbol'
+      },
+      expected: exchangeSymbol,
+      actual: diagnosticValue(response.symbol),
+      evidence: accountSettingsEvidence(
+        'okx', exchangeSymbol, '全仓杠杆 symbol', exchangeSymbol,
+        `${accountFieldEvidence(response, 'symbol')}; ${accountFieldEvidence(response, 'info.0.instId')}`
+      )
+    });
+  }
+  // CCXT can substitute the requested symbol for an unknown raw instId.
+  const rows = response.info;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const actual = Array.isArray(rows) ? 'array length=0' : diagnosticValue(rows);
+    throw createTradeOpsError({
+      code: 'ACCOUNT_SETTINGS_CONFLICT',
+      phase: 'preflight',
+      subject: {
+        type: 'account', exchangeId: 'okx', symbol: exchangeSymbol, field: 'info'
+      },
+      expected: `non-empty leverage rows bound to ${exchangeMarketId}`,
+      actual,
+      evidence: accountSettingsEvidence(
+        'okx', exchangeSymbol, '全仓杠杆原始身份', exchangeMarketId,
+        `info=${actual}`
+      )
+    });
+  }
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const instId: unknown = typeof row === 'object' && row !== null
+      ? row.instId : undefined;
+    if (instId !== exchangeMarketId) {
+      throw createTradeOpsError({
+        code: 'ACCOUNT_SETTINGS_CONFLICT',
+        phase: 'preflight',
+        subject: {
+          type: 'account', exchangeId: 'okx', symbol: exchangeSymbol, field: `info.${index}.instId`
+        },
+        expected: exchangeMarketId,
+        actual: diagnosticValue(instId),
+        evidence: accountSettingsEvidence(
+          'okx', exchangeSymbol, '全仓杠杆 instId', exchangeMarketId,
+          accountFieldEvidence(response, `info.${index}.instId`)
+        )
+      });
+    }
+  }
+  if (response.marginMode !== 'cross') {
+    throw createTradeOpsError({
+      code: 'ACCOUNT_MARGIN_MODE_MISMATCH',
+      phase: 'preflight',
+      subject: {
+        type: 'account', exchangeId: 'okx', symbol: exchangeSymbol, field: 'marginMode'
+      },
+      expected: 'cross',
+      actual: diagnosticValue(response.marginMode),
+      evidence: accountSettingsEvidence(
+        'okx', exchangeSymbol, '全仓杠杆 marginMode', 'cross',
+        `${accountFieldEvidence(response, 'marginMode')}; ${accountFieldEvidence(response, 'info.0.mgnMode')}`
+      )
+    });
+  }
+  const leverage = optionalPositive(response, exchangeSymbol, 'shortLeverage');
+  if (leverage === null) {
+    return invalidLeverage(exchangeSymbol, response.shortLeverage, response, 'shortLeverage');
+  }
+  return { marginMode: 'cross', positionMode: 'hedged', leverage };
+}
+
 export class OkxProfile implements ExchangeProfile {
   readonly exchangeId = 'okx';
 
@@ -174,7 +261,8 @@ export class OkxProfile implements ExchangeProfile {
 
   async fetchAccountSettings(
     exchange: CcxtExchangeLike,
-    exchangeSymbol: string
+    exchangeSymbol: string,
+    exchangeMarketId: string
   ): Promise<AccountSettings> {
     const mode = await exchange.fetchPositionMode(exchangeSymbol);
     let positionMode: AccountSettings['positionMode'] = 'unknown';
@@ -209,22 +297,7 @@ export class OkxProfile implements ExchangeProfile {
       (position) => position.side === 'short'
     );
     if (shortPositions.length === 0) {
-      const rows = observedPositions.map(({ position, index }) => {
-        const fields = [
-          'symbol', 'side', 'contracts', 'info.instId', 'info.posSide', 'info.pos'
-        ].map((field) => accountFieldEvidence(position, field));
-        return `positions[${index}]: ${fields.join(', ')}`;
-      });
-      return {
-        marginMode: 'unknown',
-        positionMode,
-        leverage: null,
-        evidence: accountSettingsEvidence(
-          'okx', exchangeSymbol, '有效空头持仓',
-          '至少一条 symbol 匹配、contracts 为有限正数且 side="short" 的持仓',
-          `返回持仓数=${positions.length}，匹配市场持仓数=${matchingPositions.length}，有效持仓数=${openPositions.length}，有效空头持仓数=0；持仓证据=[${rows.join('; ')}]`
-        )
-      };
+      return flatCrossSettings(exchange, exchangeSymbol, exchangeMarketId);
     }
     const marginModes: AccountSettings['marginMode'][] = [];
     for (const position of shortPositions) {

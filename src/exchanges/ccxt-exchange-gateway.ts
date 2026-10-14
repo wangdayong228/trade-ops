@@ -135,7 +135,10 @@ export interface CcxtExchangeLike {
   fetchPositions(
     symbols?: string[]
   ): Promise<Array<Record<string, unknown>>>;
-  fetchLeverage(symbol: string): Promise<Record<string, unknown>>;
+  fetchLeverage(
+    symbol: string,
+    params?: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
   fetchPositionMode(symbol?: string): Promise<Record<string, unknown>>;
 }
 
@@ -1246,7 +1249,8 @@ export class CcxtExchangeGateway implements ExchangeGateway {
       notionalRules: () => this.notionalRules(captured, true),
       fetchAccountSettings: () => this.profile.fetchAccountSettings(
         this.exchange,
-        captured.exchangeSymbol
+        captured.exchangeSymbol,
+        captured.identity.marketId
       ),
       fetchLastPrice: async () => {
         const ticker = await this.exchange.fetchTicker(captured.exchangeSymbol);
@@ -1332,7 +1336,8 @@ export class CcxtExchangeGateway implements ExchangeGateway {
     const { market } = await this.resolveMarket(symbol, 'swap');
     return this.profile.fetchAccountSettings(
       this.exchange,
-      market.symbol
+      market.symbol,
+      market.id
     );
   }
 

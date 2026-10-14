@@ -1,5 +1,7 @@
 # Final Execution Safety Hardening Design
 
+> 适用范围更新（2026-10-14）：本文中 OKX 无有效空头时返回 unknown/null 并阻断的要求，已由本次用户要求及 [OKX 全仓设计](../specs/2026-10-14-okx-flat-cross-design.md) 替代。历史实施记录保留，其余约束继续按各自适用设计执行。
+
 Date: 2026-08-01
 
 Status: Approved

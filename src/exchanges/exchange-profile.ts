@@ -68,7 +68,8 @@ export interface ExchangeProfile {
   ): Record<string, unknown>;
   fetchAccountSettings(
     exchange: CcxtExchangeLike,
-    exchangeSymbol: string
+    exchangeSymbol: string,
+    exchangeMarketId: string
   ): Promise<AccountSettings>;
 }
 

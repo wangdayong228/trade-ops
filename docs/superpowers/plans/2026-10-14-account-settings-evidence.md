@@ -1,5 +1,7 @@
 # 账户设置归一化证据修复计划
 
+> 适用范围更新（2026-10-14）：本文中 OKX 无有效空头时返回 unknown/null 并阻断的要求，已由本次用户要求及 [OKX 全仓设计](../specs/2026-10-14-okx-flat-cross-design.md) 替代。历史实施记录保留，其余约束继续按各自适用设计执行。
+
 ## 依据与授权
 
 用户于本次会话要求按 `fail-fast-with-evidence` 检查并修复 `marginMode: unknown` 的证据丢失。本修复落实已批准的 `2026-10-05-fail-fast-with-evidence-design.md` 第 4.2–4.4 节及其计划的网关、预检、执行诊断要求；不重新设计交易行为。main 单独写入 source/tests，最后独立只读审查。

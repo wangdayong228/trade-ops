@@ -10,7 +10,7 @@
 2. Bitget 与 OKX 均已配置 USDT 现货与 USDT 线性永续；合约为双向持仓（hedged）。服务不会自动改账户模式或杠杆。
 3. API key 具备读取与交易权限，且已关闭提现。
 4. 同一数据库只允许单进程运行。
-5. OKX 若当前无合约数量为正的空头仓位，预检可能因保证金模式/杠杆无法唯一确认而拒绝；零合约占位行仍视为空仓。
+5. OKX 已确认 `hedged` 后，若当前合约没有 symbol 匹配、contracts 为有限正数且 side 为 `short` 的有效空头，服务选择 `cross` 并只读查询该合约的全仓杠杆；杠杆有效才继续预检和开空（`tdMode: cross`）。空列表、仅多头、其他市场、零/无效数量行均适用。有有效空头时继续读取其设置并校验一致性。
 
 ## 页面结构
 
@@ -203,7 +203,7 @@ GTC 一旦计划或提交，系统只观察该确定性 client order ID，绝不
 
 错误体只有 `requestId` 与 `error` 两个顶层字段；`error.evidence` 是可选诊断数据，旧的无 evidence 错误仍有效。界面保留长消息末尾和具体网络、JSON 解析、字段校验原因，以纯文本显示。HTTP 不返回堆栈；同次失败日志保留完整安全堆栈。确认复检失效的证据先脱敏再持久化，加载任务仍可查看。
 
-`ACCOUNT_MARGIN_MODE_MISMATCH` 的 `actual: unknown` 表示服务未能确认保证金模式。查看同条错误的原因：例如 `返回持仓数=0` 表示本次没有返回持仓；`contracts=number 0` 表示返回了零仓位；`positions[0].marginMode` 后的原值说明该字段无法识别。错误同时保留相关原始字段（如 `info.mgnMode`、`info.lever`），以区分交易所字段缺失与 CCXT 归一化结果。只有多头或返回市场不匹配也会显示对应的方向、市场和计数；这些情况继续阻止新订单。
+`ACCOUNT_MARGIN_MODE_MISMATCH` 的 `actual: unknown` 表示服务未能确认有效持仓的保证金模式，详情保留 `positions[0].marginMode` 等字段原值。OKX 无有效空头本身不再触发该错误；服务选择全仓并查询杠杆，返回市场不匹配、原始 `instId` 缺失或不匹配时，报 `ACCOUNT_SETTINGS_CONFLICT`，模式不是 `cross` 时报 `ACCOUNT_MARGIN_MODE_MISMATCH`，空头杠杆缺失或无效时报 `ACCOUNT_LEVERAGE_MISMATCH`。错误同时保留可读取的对应原始字段（持仓的 `info.mgnMode`、`info.lever`，杠杆查询的 `info.0.mgnMode`、`info.0.lever` 等）。查询失败时停止，不跳过杠杆检查、不自动修改账户设置。确认及执行前发现保证金模式或杠杆漂移仍会阻止新订单。
 
 `400` 表示请求格式错误，`403` 表示 Host/Origin 被拒绝，`404` 表示策略或路由不存在，`409` 表示确认锁忙、状态不允许或复检已失效，`422` 表示首次业务预检未通过，`500` 表示安全转换后的内部或存储失败。应结合具体错误码和详情判断，不能只凭状态码认为任务已失效。
 

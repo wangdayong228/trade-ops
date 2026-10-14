@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import Database from 'better-sqlite3';
+import { SqliteStrategyRepository } from '../../src/storage/sqlite-strategy-repository.js';
+import { ConfirmationService } from '../../src/strategy/confirmation-service.js';
+import { HedgeCoordinator } from '../../src/strategy/hedge-coordinator.js';
+import { HedgeReconciliation } from '../../src/strategy/hedge-reconciliation.js';
 import {
   AuthenticationError,
   NetworkError,
@@ -214,6 +219,7 @@ class CcxtDouble implements CcxtExchangeLike {
   readonly createCalls: CreateCall[] = [];
   readonly fetchOrderCalls: FetchOrderCall[] = [];
   readonly balanceCalls: Array<Record<string, unknown>> = [];
+  readonly leverageCalls: Array<{ symbol: string; params: Record<string, unknown> }> = [];
   readonly setMarginModeCalls: Array<{
     marginMode: string;
     symbol: string | undefined;
@@ -263,7 +269,13 @@ class CcxtDouble implements CcxtExchangeLike {
   };
   loadMarketsErrorOnReload: unknown;
 
-  constructor(readonly id: 'bitget' | 'okx') {}
+  constructor(readonly id: 'bitget' | 'okx') {
+    if (id === 'okx') {
+      this.leverage.info = [{
+        instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posSide: 'net', lever: '3'
+      }];
+    }
+  }
 
   async loadMarkets(reload = false): Promise<Record<string, CcxtMarket>> {
     this.events.push(reload ? 'loadMarkets:true' : 'loadMarkets');
@@ -370,8 +382,11 @@ class CcxtDouble implements CcxtExchangeLike {
     return structuredClone(this.positions);
   }
 
-  async fetchLeverage(symbol: string): Promise<Record<string, unknown>> {
+  async fetchLeverage(
+    symbol: string, params: Record<string, unknown> = {}
+  ): Promise<Record<string, unknown>> {
     this.events.push(`fetchLeverage:${symbol}`);
+    this.leverageCalls.push({ symbol, params: structuredClone(params) });
     return structuredClone(this.leverage);
   }
 
@@ -592,6 +607,7 @@ function makeCcxtPreflight(options: {
   positions?: Array<Record<string, unknown>>;
 } = {}): {
   service: PreflightService;
+  registry: ExchangeRegistry;
   spotCcxt: CcxtDouble;
   contractCcxt: CcxtDouble;
 } {
@@ -617,11 +633,13 @@ function makeCcxtPreflight(options: {
   }];
   const spot = new CcxtExchangeGateway('bitget', spotCcxt);
   const contract = new CcxtExchangeGateway('okx', contractCcxt);
+  const registry = new ExchangeRegistry(new Map([
+    ['bitget', spot],
+    ['okx', contract]
+  ]));
   return {
-    service: new PreflightService(new ExchangeRegistry(new Map([
-      ['bitget', spot],
-      ['okx', contract]
-    ]))),
+    service: new PreflightService(registry),
+    registry,
     spotCcxt,
     contractCcxt
   };
@@ -3299,54 +3317,6 @@ for (const { name, positionMode, expectedMode } of [
   });
 }
 
-test('keeps a flat OKX hedged account fail-closed without inventing margin mode or leverage', async () => {
-  const { gateway, ccxt } = makeGateway('okx');
-  ccxt.positionMode = {
-    info: { posMode: 'long_short_mode' },
-    hedged: true
-  };
-  ccxt.positions = [];
-
-  const { evidence, ...settings } = await gateway.fetchAccountSettings('BTC/USDT');
-  assert.deepEqual(settings, {
-    marginMode: 'unknown',
-    positionMode: 'hedged',
-    leverage: null
-  });
-  assert.match(evidence?.message ?? '', /返回持仓数=0/);
-  assert.equal(
-    ccxt.events.some((event) => event.startsWith('fetchLeverage:')),
-    false
-  );
-  assert.deepEqual(ccxt.setMarginModeCalls, []);
-});
-
-test('keeps a flat OKX zero-contract short row fail-closed', async () => {
-  const { gateway, ccxt } = makeGateway('okx');
-  ccxt.positionMode = {
-    info: { posMode: 'long_short_mode' },
-    hedged: true
-  };
-  ccxt.positions = [{
-    symbol: 'BTC/USDT:USDT',
-    side: 'short',
-    contracts: 0,
-    contractSize: 0.001,
-    marginMode: 'cross',
-    hedged: true,
-    leverage: 5,
-    info: {}
-  }];
-
-  const { evidence, ...settings } = await gateway.fetchAccountSettings('BTC/USDT');
-  assert.deepEqual(settings, {
-    marginMode: 'unknown',
-    positionMode: 'hedged',
-    leverage: null
-  });
-  assert.match(evidence?.message ?? '', /contracts=number 0/);
-});
-
 test('uses the OKX short-side settings when hedged sides differ', async () => {
   const { gateway, ccxt } = makeGateway('okx');
   ccxt.positionMode = {
@@ -3382,21 +3352,257 @@ const evidenceShortPosition = {
 };
 
 for (const scenario of [
-  { name: 'empty positions', positions: [], fragments: ['有效空头持仓', '返回持仓数=0'] },
-  { name: 'only long', positions: [{ ...evidenceShortPosition, side: 'long' }], fragments: ['有效空头持仓数=0', 'side=string "long"'] },
-  { name: 'zero contracts', positions: [{ ...evidenceShortPosition, contracts: 0 }], fragments: ['有效空头持仓数=0', 'contracts=number 0'] },
-  { name: 'other symbol', positions: [{ ...evidenceShortPosition, symbol: 'ETH/USDT:USDT' }], fragments: ['匹配市场持仓数=0', 'ETH/USDT:USDT'] },
-  ...[
-    { value: undefined, text: 'undefined' },
-    { value: null, text: 'null' },
-    { value: Number.NaN, text: 'number NaN' },
-    { value: -1, text: 'number -1' },
-    { value: 'bad-quantity', text: 'string "bad-quantity"' }
-  ].map(({ value, text }) => ({
-    name: `invalid contracts ${text}`,
-    positions: [{ ...evidenceShortPosition, contracts: value }],
-    fragments: ['有效空头持仓数=0', `contracts=${text}`]
+  { name: 'empty positions', positions: [] },
+  { name: 'only long', positions: [{ ...evidenceShortPosition, side: 'long', marginMode: 'isolated', leverage: 99 }] },
+  { name: 'other symbol', positions: [{ ...evidenceShortPosition, symbol: 'ETH/USDT:USDT', marginMode: 'isolated', leverage: 99 }] },
+  ...[undefined, null, '', ' ', 0, '0', -1, '-1', Number.NaN, Infinity, -Infinity, 'NaN', 'Infinity', 'bad-quantity', true].map((contracts) => ({
+    name: `non-positive or invalid contracts ${String(contracts)}`,
+    positions: [{ ...evidenceShortPosition, contracts, marginMode: 'isolated', leverage: 99 }]
   })),
+  ...[undefined, 'net', 'SHORT'].map((side) => ({
+    name: `non-short side ${String(side)}`,
+    positions: [{ ...evidenceShortPosition, side }]
+  }))
+]) {
+  test(`OKX cross fallback: ${scenario.name} reads cross leverage and continues preflight`, async () => {
+    const context = makeCcxtPreflight({ positions: scenario.positions });
+    const result = await context.service.run(preflightInput);
+    assert.deepEqual(result.accountSettings, {
+      marginMode: 'cross', positionMode: 'hedged', leverage: '3'
+    });
+    assert.deepEqual(context.contractCcxt.leverageCalls, [{
+      symbol: 'BTC/USDT:USDT', params: { marginMode: 'cross' }
+    }]);
+    const events = context.contractCcxt.events;
+    assert(events.indexOf('fetchPositionMode:BTC/USDT:USDT') < events.indexOf('fetchPositions:BTC/USDT:USDT'));
+    assert(events.indexOf('fetchPositions:BTC/USDT:USDT') < events.indexOf('fetchLeverage:BTC/USDT:USDT'));
+    assert(events.indexOf('fetchLeverage:BTC/USDT:USDT') < events.indexOf('fetchTicker:BTC/USDT:USDT'));
+    assert(events.includes('fetchBalance'));
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['set']);
+  });
+}
+
+for (const contracts of [1, '0.0001']) {
+  for (const marginMode of ['cross', 'isolated']) {
+    test(`OKX cross fallback: valid ${contracts} short retains ${marginMode} without a leverage query`, async () => {
+      const context = makeCcxtPreflight({ positions: [
+        { ...evidenceShortPosition, side: 'long', marginMode: 'portfolio', leverage: 99 },
+        { ...evidenceShortPosition, symbol: 'ETH/USDT:USDT', marginMode: 'portfolio', leverage: 99 },
+        { ...evidenceShortPosition, contracts: 0, marginMode: 'portfolio', leverage: 99 },
+        { ...evidenceShortPosition, contracts, marginMode, leverage: '5.0' }
+      ] });
+      const result = await context.service.run(preflightInput);
+      assert.deepEqual(result.accountSettings, { marginMode, positionMode: 'hedged', leverage: '5' });
+      assert.deepEqual(context.contractCcxt.leverageCalls, []);
+    });
+  }
+}
+
+for (const scenario of [
+  { field: 'symbol', value: 'ETH/USDT:USDT', code: 'ACCOUNT_SETTINGS_CONFLICT', fragment: 'ETH/USDT:USDT' },
+  { field: 'symbol', value: undefined, code: 'ACCOUNT_SETTINGS_CONFLICT', fragment: 'undefined' },
+  ...[undefined, 'isolated', 'portfolio'].map((value) => ({
+    field: 'marginMode', value, code: 'ACCOUNT_MARGIN_MODE_MISMATCH', fragment: String(value)
+  })),
+  ...[undefined, null, '', 'bad-leverage', 0, -1, Number.NaN, Infinity, 'Infinity', false].map((value) => ({
+    field: 'shortLeverage', value, code: 'ACCOUNT_LEVERAGE_MISMATCH', fragment: value === '' ? 'string ""' : String(value)
+  }))
+]) {
+  test(`OKX cross fallback: rejects ${scenario.field}=${String(scenario.value)} before price and balance`, async () => {
+    const context = makeCcxtPreflight({ positions: [] });
+    context.contractCcxt.leverage = {
+      symbol: 'BTC/USDT:USDT', marginMode: 'cross', shortLeverage: 3,
+      [scenario.field]: scenario.value,
+      info: [{ instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posSide: 'net', lever: 'RAW-LEVER', password: 'OMIT-SECRET' }]
+    };
+    await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+      const detail = publicErrorDetail(error, []);
+      assert.equal(detail?.code, scenario.code);
+      assert.ok(detail?.message.includes(scenario.fragment), detail?.message);
+      assert.match(detail?.message ?? '', /BTC\/USDT/);
+      if (scenario.field === 'shortLeverage') {
+        assert.match(detail?.message ?? '', /shortLeverage/);
+        assert.match(detail?.message ?? '', /RAW-LEVER/);
+      }
+      assert.doesNotMatch(JSON.stringify(detail), /OMIT-SECRET/);
+      return true;
+    });
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchTicker:', 'fetchBalance', 'createOrder:', 'set']);
+  });
+}
+
+test('OKX cross fallback: a read failure retains its cause and stops without retry', async () => {
+  const context = makeCcxtPreflight({ positions: [] });
+  let calls = 0;
+  context.contractCcxt.fetchLeverage = async () => {
+    calls += 1;
+    throw new NetworkError('offline leverage-info read failed');
+  };
+  await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+    assert.equal(publicErrorDetail(error, [])?.code, 'ACCOUNT_SETTINGS_UNAVAILABLE');
+    assert.match(publicErrorDetail(error, [])?.message ?? '', /offline leverage-info read failed/);
+    return true;
+  });
+  assert.equal(calls, 1);
+  assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchTicker:', 'fetchBalance', 'createOrder:', 'set']);
+});
+
+for (const hedged of [false, undefined, 'true']) {
+  test(`OKX cross fallback: unconfirmed hedged=${String(hedged)} never reads positions or leverage`, async () => {
+    const context = makeCcxtPreflight({ positions: [], positionMode: { hedged } });
+    await assert.rejects(context.service.run(preflightInput), isTradeOpsFailure('ACCOUNT_POSITION_MODE_MISMATCH'));
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchPositions:', 'fetchLeverage:', 'fetchTicker:', 'fetchBalance']);
+  });
+}
+
+for (const posSide of ['net', '']) {
+  test(`OKX cross fallback: pinned CCXT reads explicit cross and parses shared leverage (${posSide}) offline`, async () => {
+    const context = makeCcxtPreflight({ positions: [] });
+    const adapter = new OkxCcxtAdapter({ options: { defaultMarginMode: 'isolated' } });
+    adapter.setMarkets([{ ...swapMarket(), baseId: 'BTC', quoteId: 'USDT', settleId: 'USDT' } as never]);
+    adapter.fetch = async () => { throw new Error('network forbidden in offline test'); };
+    const requests: unknown[] = [];
+    adapter.privateGetAccountLeverageInfo = async (params = {}) => {
+      requests.push(params);
+      return { code: '0', data: [{ instId: 'BTC-USDT-SWAP', mgnMode: 'cross', posSide, lever: '5.00000000' }], msg: '' };
+    };
+    context.contractCcxt.fetchLeverage = async (symbol, params) => ({ ...await adapter.fetchLeverage(symbol, params) });
+    const result = await context.service.run(preflightInput);
+    assert.deepEqual(requests, [{ instId: 'BTC-USDT-SWAP', mgnMode: 'cross' }]);
+    assert.deepEqual(result.accountSettings, { marginMode: 'cross', positionMode: 'hedged', leverage: '5' });
+  });
+}
+
+for (const rawIds of [
+  [undefined], ['UNLISTED-USDT-SWAP'], ['ETH-USDT-SWAP'],
+  ['UNLISTED-USDT-SWAP', 'BTC-USDT-SWAP']
+]) {
+  test(`OKX cross fallback: rejects raw instrument ${rawIds.join(',')} hidden by CCXT symbol fallback`, async () => {
+    const context = makeCcxtPreflight({ positions: [] });
+    const adapter = new OkxCcxtAdapter();
+    adapter.setMarkets([{ ...swapMarket(), baseId: 'BTC', quoteId: 'USDT', settleId: 'USDT' } as never]);
+    adapter.fetch = async () => { throw new Error('network forbidden in offline test'); };
+    adapter.privateGetAccountLeverageInfo = async () => ({
+      code: '0', data: rawIds.map((instId) => ({
+        instId, mgnMode: 'cross', posSide: 'net', lever: '7.00000000'
+      })), msg: ''
+    });
+    context.contractCcxt.fetchLeverage = async (symbol, params) => {
+      const normalized = await adapter.fetchLeverage(symbol, params);
+      assert.equal(normalized.symbol, 'BTC/USDT:USDT');
+      assert.equal(normalized.shortLeverage, 7);
+      return { ...normalized };
+    };
+    await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+      const detail = publicErrorDetail(error, []);
+      assert.equal(detail?.code, 'ACCOUNT_SETTINGS_CONFLICT');
+      assert.match(detail?.message ?? '', /BTC-USDT-SWAP/);
+      assert.ok(detail?.message.includes(String(rawIds[0])), detail?.message);
+      return true;
+    });
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchTicker:', 'fetchBalance', 'createOrder:', 'set']);
+  });
+}
+
+for (const info of [undefined, null, {}, []]) {
+  test(`OKX cross fallback: requires raw instrument evidence ${JSON.stringify(info)}`, async () => {
+    const context = makeCcxtPreflight({ positions: [] });
+    context.contractCcxt.leverage.info = info;
+    await assert.rejects(context.service.run(preflightInput), isTradeOpsFailure('ACCOUNT_SETTINGS_CONFLICT'));
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchTicker:', 'fetchBalance', 'createOrder:']);
+  });
+}
+
+test('OKX cross fallback: raw instrument check uses the captured market ID', async () => {
+  const context = makeCcxtPreflight({ positions: [], contractMarket: { id: 'BOUND-BTC-USDT-SWAP' } });
+  context.contractCcxt.leverage.info = [{
+    instId: 'BOUND-BTC-USDT-SWAP', mgnMode: 'cross', posSide: 'net', lever: '3'
+  }];
+  const result = await context.service.run(preflightInput);
+  assert.equal(result.accountSettings.leverage, '3');
+  assert.equal(context.contractCcxt.events.filter((event) => event.startsWith('loadMarkets')).length, 1);
+});
+
+function useFilledOrders(ccxt: CcxtDouble): void {
+  const create = ccxt.createOrder.bind(ccxt);
+  ccxt.createOrder = async (symbol, type, side, amount, price, params) => {
+    ccxt.createResult = ccxtOrder({
+      id: `${ccxt.id}-filled-${ccxt.createCalls.length}`,
+      clientOrderId: String(params.clientOrderId),
+      symbol, type, side, amount, filled: amount, remaining: 0,
+      price: price ?? 60000, average: 60000, status: 'closed'
+    });
+    ccxt.fetchOrderResult = ccxt.createResult;
+    return create(symbol, type, side, amount, price, params);
+  };
+}
+
+test('OKX cross fallback: flat preflight and confirmation submit a cross SHORT through the coordinator', async (t) => {
+  const context = makeCcxtPreflight({ positions: [] });
+  const database = new Database(':memory:');
+  t.after(() => database.close());
+  const repository = new SqliteStrategyRepository(database);
+  const created = repository.createPending(await context.service.run(preflightInput));
+  await new ConfirmationService(repository, context.service).confirm(created.id);
+  assert.deepEqual(repository.getStrategy(created.id).preflight.accountSettings, {
+    marginMode: 'cross', positionMode: 'hedged', leverage: '3'
+  });
+  useFilledOrders(context.spotCcxt);
+  useFilledOrders(context.contractCcxt);
+  const coordinator = new HedgeCoordinator(context.registry, repository, new HedgeReconciliation(context.registry, repository));
+  await coordinator.confirmAndExecute(created.id);
+  assert.equal(repository.getStrategy(created.id).state, 'HEDGED');
+  assert.equal(context.contractCcxt.createCalls.length, 1);
+  assert.equal(context.spotCcxt.createCalls.length, 1);
+  const call = context.contractCcxt.createCalls[0]!;
+  assert.equal(call.side, 'sell');
+  assert.equal(call.params.marginMode, 'cross');
+  assert.equal(call.params.positionSide, 'short');
+  const request = buildLockedAdapterOrderRequest('okx', Number(call.amount), call.params);
+  assert.equal(request.tdMode, 'cross');
+  assert.equal(request.posSide, 'short');
+  assert.equal(request.reduceOnly, false);
+  assert.deepEqual(context.contractCcxt.setMarginModeCalls, []);
+  assert.equal(context.contractCcxt.events.some((event) => event.startsWith('set')), false);
+});
+
+for (const phase of ['confirmation', 'execution'] as const) {
+  for (const drift of ['marginMode', 'leverage'] as const) {
+    test(`OKX cross fallback: ${phase} rejects ${drift} drift when a valid short appears`, async (t) => {
+      const context = makeCcxtPreflight({ positions: [] });
+      const database = new Database(':memory:');
+      t.after(() => database.close());
+      const repository = new SqliteStrategyRepository(database);
+      const created = repository.createPending(await context.service.run(preflightInput));
+      const confirmation = new ConfirmationService(repository, context.service);
+      if (phase === 'execution') await confirmation.confirm(created.id);
+      context.contractCcxt.positions = [{
+        ...evidenceShortPosition, [drift]: drift === 'marginMode' ? 'isolated' : 4
+      }];
+      if (phase === 'confirmation') {
+        await assert.rejects(confirmation.confirm(created.id), (error: unknown) => {
+          assert.equal(publicErrorDetail(error, [])?.code, 'PREFLIGHT_INVALIDATED');
+          return true;
+        });
+        assert.equal(repository.getStrategy(created.id).state, 'PREFLIGHT_INVALIDATED');
+      } else {
+        const warnings: string[] = [];
+        const coordinator = new HedgeCoordinator(
+          context.registry, repository, new HedgeReconciliation(context.registry, repository),
+          undefined, { info() {}, warn(event) { warnings.push(event); }, error() {}, fatal() {} }
+        );
+        await coordinator.confirmAndExecute(created.id);
+        assert.equal(repository.getStrategy(created.id).state, 'EXECUTING');
+        assert.equal(repository.getStrategy(created.id).failureCode, null);
+        assert.deepEqual(warnings, ['hedge_submission_guard_changed']);
+      }
+      assert.deepEqual(repository.listOrders(created.id), []);
+      assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['createOrder:', 'set']);
+    });
+  }
+}
+
+for (const scenario of [
   ...[
     { value: undefined, text: 'undefined' },
     { value: null, text: 'null' },
@@ -3552,8 +3758,7 @@ test('account evidence: pinned Bitget normalization retains the failing raw leve
 for (const scenario of [
   { field: 'marginMode', position: { ...evidenceShortPosition, marginMode: undefined, info: { mgnMode: 'RAW-MARGIN-MODE' } }, fragment: 'info.mgnMode=string "RAW-MARGIN-MODE"' },
   { field: 'missing leverage', position: { ...evidenceShortPosition, leverage: undefined, info: { lever: 'RAW-MISSING-LEVERAGE' } }, fragment: 'info.lever=string "RAW-MISSING-LEVERAGE"' },
-  { field: 'invalid leverage', position: { ...evidenceShortPosition, leverage: Number.NaN, info: { lever: 'RAW-INVALID-LEVERAGE' } }, fragment: 'info.lever=string "RAW-INVALID-LEVERAGE"' },
-  { field: 'contracts', position: { ...evidenceShortPosition, contracts: undefined, info: { pos: 'RAW-CONTRACTS' } }, fragment: 'info.pos=string "RAW-CONTRACTS"' }
+  { field: 'invalid leverage', position: { ...evidenceShortPosition, leverage: Number.NaN, info: { lever: 'RAW-INVALID-LEVERAGE' } }, fragment: 'info.lever=string "RAW-INVALID-LEVERAGE"' }
 ]) {
   test(`account evidence: OKX retains raw ${scenario.field} after CCXT normalization`, async () => {
     const context = makeCcxtPreflight({ positions: [scenario.position] });
@@ -3579,7 +3784,7 @@ test('account evidence: OKX mode diagnostics never execute an info accessor', as
   assertNoCcxtCalls([ccxt], ['fetchPositions:']);
 });
 
-test('account evidence: discarded OKX rows cannot change the failure through diagnostic getters', async () => {
+test('OKX cross fallback: discarded rows do not execute unrelated getters', async () => {
   const { gateway, ccxt } = makeGateway('okx');
   ccxt.positionMode = { hedged: true };
   let reads = 0;
@@ -3589,10 +3794,10 @@ test('account evidence: discarded OKX rows cannot change the failure through dia
     get contracts() { reads += 1; throw new Error('contracts diagnostic must not execute'); }
   }];
   const settings = await gateway.fetchAccountSettings('BTC/USDT');
-  assert.equal(settings.marginMode, 'unknown');
+  assert.equal(settings.marginMode, 'cross');
+  assert.equal(settings.leverage, '3');
   assert.equal(reads, 0);
-  assert.match(settings.evidence?.message ?? '', /side.*accessor/);
-  assert.match(settings.evidence?.message ?? '', /contracts.*accessor/);
+  assert.equal(settings.evidence, undefined);
 });
 
 test('account evidence: raw diagnostic fields do not execute proxy traps or getters', async () => {
@@ -3617,9 +3822,7 @@ for (const method of ['map', 'indexOf'] as const) {
   test(`account evidence: OKX diagnostics do not call an external array ${method} getter`, async () => {
     const { gateway, ccxt } = makeGateway('okx');
     ccxt.positionMode = { hedged: true };
-    const positions = method === 'map'
-      ? []
-      : [{ ...evidenceShortPosition, marginMode: 'portfolio' }];
+    const positions = [{ ...evidenceShortPosition, marginMode: 'portfolio' }];
     let reads = 0;
     Object.defineProperty(positions, method, {
       get() { reads += 1; throw new Error(`external array ${method} getter`); }
