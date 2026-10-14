@@ -6,8 +6,6 @@ const incrementalLabels = { IDLE: '空闲', RUNNING: '增量中', INCOMPLETE: '�
 const phaseLabels = { STARTING: '启动中', RUNNING: '运行中', STOPPING: '关闭中', STOPPED: '已停止' };
 const fundingLabels = { NOT_STARTED: '尚未启动', RUNNING: '运行中', STOPPED: '已停止', FAILED: '同步故障' };
 const discoveryLabels = { NEVER: '尚无发现结果', SUCCEEDED: '最近发现成功', INCOMPLETE: '最近发现未完成' };
-const coverageKinds = { INITIAL: 1, PERIODIC: 1, INACTIVE_FINAL: 1, REACTIVATION: 1 };
-const failureCodes = { COVERAGE_CANCELED_BY_MARKET_STATE: 1, REQUEST_RETRY_EXHAUSTED: 1, SOURCE_RESPONSE_INVALID: 1, CURSOR_NOT_ADVANCING: 1, BITGET_BOUNDARY_NOT_SEEN: 1, BITGET_SCAN_NOT_CONVERGED: 1, DATABASE_WRITE_FAILED: 1 };
 const PAUSED_REQUEST = Symbol('page paused');
 const byId = (id) => document.getElementById(id);
 let lastSnapshot = null;
@@ -120,43 +118,11 @@ function validateSnapshot(data) {
       object(exchange.counts[key], `counts.${key}`);
       for (const status of Object.keys(labels)) integer(exchange.counts[key][status], `counts.${key}.${status}`);
     }
-    if (!Array.isArray(exchange.markets) || exchange.markets.length !== exchange.counts.total) invalid('markets', `数组长度 ${exchange.counts.total}`, exchange.markets);
-    for (const market of exchange.markets) {
-      object(market, 'market');
-      for (const key of ['symbol', 'exchangeMarketId']) {
-        if (typeof market[key] !== 'string' || !market[key]) invalid(`market.${key}`, '非空字符串', market[key]);
-      }
-      enumValue(market.coverageStatus, coverageLabels, 'market.coverageStatus');
-      enumValue(market.incrementalStatus, incrementalLabels, 'market.incrementalStatus');
-      if (market.exchangeId !== exchange.exchangeId) invalid('market.exchangeId', exchange.exchangeId, market.exchangeId);
-      if (market.coverageTaskKind !== null) enumValue(market.coverageTaskKind, coverageKinds, 'market.coverageTaskKind');
-      for (const category of ['coverage', 'incremental']) {
-        const code = market[`${category}ErrorCode`];
-        const summary = market[`${category}ErrorSummary`];
-        if (code === null) {
-          if (summary !== null) invalid(`market.${category}ErrorSummary`, '错误码为空时为 null', summary);
-        } else {
-          enumValue(code, failureCodes, `market.${category}ErrorCode`);
-          if (typeof summary !== 'string' || !summary) invalid(`market.${category}ErrorSummary`, '非空错误摘要', summary);
-        }
-      }
-      for (const key of ['active', 'reactivationRequired']) if (typeof market[key] !== 'boolean') invalid(`market.${key}`, '布尔值', market[key]);
-      for (const key of ['coverageGeneration', 'incrementalGeneration']) integer(market[key], `market.${key}`);
-      for (const key of ['coverageCutoffMs', 'lastCaughtUpCutoffMs', 'oldestFundingTimestampMs', 'latestFundingTimestampMs']) {
-        if (market[key] === null) continue;
-        integer(market[key], `market.${key}`);
-        if (market[key] > 8_640_000_000_000_000) invalid(`market.${key}`, '有效 Unix 毫秒时间戳', market[key]);
-      }
-      for (const key of ['activeObservedAt', 'coverageStartedAt', 'coverageEndedAt', 'coverageLastSuccessAt', 'incrementalStartedAt', 'incrementalEndedAt', 'incrementalLastSuccessAt']) timestamp(market[key], `market.${key}`);
-    }
-    const active = exchange.markets.filter((market) => market.active).length;
-    if (exchange.counts.active !== active) invalid('counts.active', active, exchange.counts.active);
-    if (exchange.counts.inactive !== exchange.markets.length - active) invalid('counts.inactive', exchange.markets.length - active, exchange.counts.inactive);
+    const activeTotal = exchange.counts.active + exchange.counts.inactive;
+    if (activeTotal !== exchange.counts.total) invalid('counts.active + counts.inactive', exchange.counts.total, activeTotal);
     for (const [category, labels] of [['coverage', coverageLabels], ['incremental', incrementalLabels]]) {
-      for (const status of Object.keys(labels)) {
-        const expected = exchange.markets.filter((market) => market[`${category}Status`] === status).length;
-        if (exchange.counts[category][status] !== expected) invalid(`counts.${category}.${status}`, expected, exchange.counts[category][status]);
-      }
+      const total = Object.keys(labels).reduce((sum, status) => sum + exchange.counts[category][status], 0);
+      if (total !== exchange.counts.total) invalid(`counts.${category} 合计`, exchange.counts.total, total);
     }
   }
   return data;
@@ -219,60 +185,11 @@ function exchangeOverview(data) {
   return result;
 }
 
-function marketRows(data) {
-  const result = document.createDocumentFragment();
-  const filter = byId('exchange-filter').value;
-  const search = byId('market-search').value.trim().toLowerCase();
-  let matched = 0;
-  let total = 0;
-  for (const exchange of data.funding.exchanges) {
-    total += exchange.markets.length;
-    for (const market of exchange.markets) {
-      if (filter && exchange.exchangeId !== filter) continue;
-      if (!`${market.symbol} ${market.exchangeMarketId}`.toLowerCase().includes(search)) continue;
-      matched += 1;
-      const row = node('tr');
-      const identity = node('td');
-      identity.append(node('p', `${exchange.exchangeId.toUpperCase()} · ${market.symbol}`), node('p', market.exchangeMarketId, 'status-secondary'));
-      const active = node('td');
-      active.append(badge(market.active ? '活跃' : '非活跃'));
-      if (market.reactivationRequired) active.append(node('p', '重新激活待复核', 'status-secondary'));
-      const coverage = node('td');
-      coverage.append(statusBadge(market.coverageStatus, coverageLabels), node('p', `最近成功：${dateText(market.coverageLastSuccessAt)}`, 'status-secondary'));
-      const incremental = node('td');
-      incremental.append(statusBadge(market.incrementalStatus, incrementalLabels), node('p', `最近成功：${dateText(market.incrementalLastSuccessAt)}`, 'status-secondary'));
-      const times = node('td');
-      times.append(node('p', `已验证覆盖至：${dateText(market.lastCaughtUpCutoffMs)}`), node('p', `最新结算：${dateText(market.latestFundingTimestampMs)}`, 'status-secondary'), node('p', `最早结算：${dateText(market.oldestFundingTimestampMs)}`, 'status-secondary'));
-      const extra = node('td');
-      if (market.coverageErrorCode) extra.append(details('全范围失败原因', { code: market.coverageErrorCode, message: market.coverageErrorSummary, at: market.coverageEndedAt }));
-      if (market.incrementalErrorCode) extra.append(details('增量失败原因', { code: market.incrementalErrorCode, message: market.incrementalErrorSummary, at: market.incrementalEndedAt }));
-      extra.append(details('任务与时间', {
-        '全范围任务类型': market.coverageTaskKind, '全范围任务代次': market.coverageGeneration,
-        '本次覆盖截止 UTC': dateText(market.coverageCutoffMs), '全范围开始 UTC': dateText(market.coverageStartedAt), '全范围结束 UTC': dateText(market.coverageEndedAt),
-        '增量任务代次': market.incrementalGeneration, '增量开始 UTC': dateText(market.incrementalStartedAt), '增量结束 UTC': dateText(market.incrementalEndedAt),
-        '市场活跃状态观察 UTC': dateText(market.activeObservedAt)
-      }));
-      row.append(identity, active, coverage, incremental, times, extra);
-      result.append(row);
-    }
-  }
-  if (matched === 0) {
-    const row = node('tr');
-    const empty = node('td', total === 0 ? '暂无已知市场，请查看市场发现结果。' : '没有匹配的市场。');
-    empty.setAttribute('colspan', '6');
-    row.append(empty);
-    result.append(row);
-  }
-  return result;
-}
-
 function renderSnapshot(data) {
   const service = serviceOverview(data);
   const exchanges = exchangeOverview(data);
-  const markets = marketRows(data);
   byId('service-overview').replaceChildren(service);
   byId('exchange-overview').replaceChildren(exchanges);
-  byId('market-rows').replaceChildren(markets);
 }
 
 async function refreshStatus() {
@@ -319,11 +236,6 @@ function resumeRefresh() {
 }
 
 byId('status-refresh').addEventListener('click', refreshStatus);
-for (const [id, event] of [['exchange-filter', 'change'], ['market-search', 'input']]) {
-  byId(id).addEventListener(event, () => {
-    if (lastSnapshot !== null) byId('market-rows').replaceChildren(marketRows(lastSnapshot));
-  });
-}
 document.addEventListener('visibilitychange', () => {
   clearTimeout(refreshTimer);
   if (document.hidden) controller?.abort(PAUSED_REQUEST);

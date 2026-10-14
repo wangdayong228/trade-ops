@@ -91,21 +91,23 @@ npm start
 
 ## 在线运行状态
 
-首页点击「运行状态与资金费率同步」，或打开 `http://127.0.0.1:3000/status.html`（默认端口）。页面展示服务健康、同步器状态、两交易所最近发现结果，以及每个市场的全范围/增量状态、最近成功时间、覆盖截止时间和失败摘要。每 10 秒刷新一次，支持手动刷新与市场筛选；请求超过 10 秒或刷新失败会明确标记历史快照已过期。切换到后台或离开页面时暂停轮询。
+首页点击「运行状态与资金费率同步」，或打开 `http://127.0.0.1:3000/status.html`（默认端口）。页面展示服务健康、同步器状态、两交易所最近发现结果，以及按交易所汇总的活跃/非活跃市场数量、全范围/增量状态计数。每 10 秒刷新一次，支持手动刷新；请求超过 10 秒或刷新失败会明确标记历史快照已过期。切换到后台或离开页面时暂停轮询。
 
 | 只读入口 | 语义 |
 | --- | --- |
 | `GET /health/live` | `200` 表示 HTTP 进程可响应，不访问数据库或交易所 |
 | `GET /health/ready` | 服务阶段为 `RUNNING` 且现有 SQLite 连接的 `SELECT 1` 成功时 `200`；否则 `503`，JSON 保留实际服务阶段和数据库检查结果 |
-| `GET /api/status` | 服务健康与资金费率同步快照；`generatedAt` 为 UTC ISO 时间，`uptimeMs`、`intervalMs` 和市场 `*Ms` 时间戳均以毫秒为单位；读取失败返回结构化错误 |
+| `GET /api/status` | 服务健康与资金费率同步汇总快照，不含 `markets` 明细；`generatedAt` 为 UTC ISO 时间，`uptimeMs`、`intervalMs` 以毫秒为单位；读取失败返回结构化错误 |
+
+状态响应包含 `generatedAt`、`status`、`service{phase,startedAt,uptimeMs}`、`database` 与 `funding{status,intervalMs,lastFatal,exchanges}`。每个交易所仅含 `exchangeId`、`counts{total,active,inactive,coverage,incremental}` 和 `discovery`；全范围与增量的全部状态分类始终存在，零计数也返回。
 
 健康探针的 `503` 是健康结果，响应包含 `status`、`service`、`database`；数据库失败含脱敏 `error`。其余接口异常继续使用现有 `{requestId, error}` 格式。所有状态和健康响应均禁止缓存、保留本机 Host 边界。读取复用服务持有的数据库连接，不需要停机或打开第二个数据库连接，也不会触发同步、交易所请求或业务写入。
 
-服务就绪不证明交易所可用或资金同步完整。资金同步 fatal 会在页面保留，后续停止事件不会抹掉故障，也不会单独使交易 HTTP 服务失去就绪。发现结果与 fatal 来自本进程内存，重启后重置；市场状态来自持久表。`BACKFILLING`/`RUNNING` 也可能是上次中断的记录，不等于当前进程正在处理该市场；`CAUGHT_UP` 只证明接口可见范围至 `lastCaughtUpCutoffMs`。页面分别统计全范围与增量状态，不根据最新结算时间猜测历史覆盖完整。
+服务就绪不证明交易所可用或资金同步完整。资金同步 fatal 会在页面保留，后续停止事件不会抹掉故障，也不会单独使交易 HTTP 服务失去就绪。发现结果与 fatal 来自本进程内存，重启后重置；市场计数来自持久表。`BACKFILLING`/`RUNNING` 也可能是上次中断的记录，不等于当前进程正在处理该市场；`CAUGHT_UP` 只证明接口可见范围至该市场已持久化的覆盖截止时间。页面分别统计全范围与增量状态，不根据最新结算时间猜测历史覆盖完整。
 
 `service.startedAt` 在服务成功启动前为 `null`，`uptimeMs` 为 `0`；运行时长从监听与同步启动完成后计起。正常快照不输出数据库路径配置，公开错误不返回凭证或堆栈；错误中的必要文件路径保留用于定位故障。
 
-市场失败原因保留数据库中的错误码和摘要；完整请求证据在 stdout 中，可按交易所、market、generation 查找 `funding_task_incomplete`。市场发现和同步器 fatal 的完整脱敏错误链可在页面展开。操作说明见 [运行状态与资金费率同步](docs/usage/operator-guide.md#运行状态与资金费率同步)。
+单市场失败原因仍保留在数据库中，不在汇总快照返回；完整请求证据在 stdout 中，可按交易所、market、generation 查找 `funding_task_incomplete`。市场发现和同步器 fatal 的完整脱敏错误链可在页面展开。操作说明见 [运行状态与资金费率同步](docs/usage/operator-guide.md#运行状态与资金费率同步)。
 
 ## stdout JSON 日志
 

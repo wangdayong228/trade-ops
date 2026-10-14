@@ -39,6 +39,9 @@ test('empty state says no discovery has completed, keeps cache disabled and perf
   assert.equal(response.statusCode, 200);
   assert.match(response.headers['cache-control'] ?? '', /no-store/);
   const data = response.json();
+  assert.deepEqual(Object.keys(data).sort(), ['database', 'funding', 'generatedAt', 'service', 'status']);
+  assert.deepEqual(Object.keys(data.service).sort(), ['phase', 'startedAt', 'uptimeMs']);
+  assert.deepEqual(Object.keys(data.funding).sort(), ['exchanges', 'intervalMs', 'lastFatal', 'status']);
   assert.equal(data.generatedAt, new Date(STATUS_TIME).toISOString());
   assert.equal(data.funding.status, 'NOT_STARTED');
   assert.equal(data.funding.intervalMs, 3_600_000);
@@ -47,7 +50,12 @@ test('empty state says no discovery has completed, keeps cache disabled and perf
     assert.equal(exchange.discovery.status, 'NEVER');
     assert.equal(exchange.discovery.lastSuccessAt, null);
     assert.equal(exchange.counts.total, 0);
-    assert.deepEqual(exchange.markets, []);
+    assert.deepEqual(Object.keys(exchange).sort(), ['counts', 'discovery', 'exchangeId']);
+    assert.deepEqual(exchange.counts, {
+      total: 0, active: 0, inactive: 0,
+      coverage: { PENDING: 0, BACKFILLING: 0, CAUGHT_UP: 0, INCOMPLETE: 0 },
+      incremental: { IDLE: 0, RUNNING: 0, INCOMPLETE: 0 }
+    });
   }
   assert.deepEqual(fixture.database.prepare('SELECT total_changes() AS count').get(), before);
   for (const source of fixture.sources) assert.equal(source.operationCalls.length, 0);
@@ -63,18 +71,14 @@ test('persisted interrupted coverage stays separate from current process and inc
   let exchange = response.json().funding.exchanges[1];
   assert.equal(exchange.discovery.status, 'NEVER');
   assert.equal(exchange.counts.coverage.BACKFILLING, 1);
-  assert.equal(exchange.markets[0].coverageStatus, 'BACKFILLING');
-  assert.equal(exchange.markets[0].incrementalStatus, 'IDLE');
-  assert.equal(exchange.markets[0].lastCaughtUpCutoffMs, null);
+  assert.equal(exchange.counts.incremental.IDLE, 1);
+  assert.equal(Object.hasOwn(exchange, 'markets'), false);
   const lease = fixture.repository.resumeInterruptedCoverage(market, new Date(STATUS_TIME + 1));
   fixture.repository.failCoverage(lease, fundingTaskFailure('SOURCE_RESPONSE_INVALID'), new Date(STATUS_TIME + 2));
   response = await fixture.composition.server.inject({ url: '/api/status', headers: STATUS_HEADERS });
   exchange = response.json().funding.exchanges[1];
   assert.equal(exchange.counts.coverage.INCOMPLETE, 1);
   assert.equal(exchange.counts.incremental.IDLE, 1);
-  assert.equal(exchange.markets[0].coverageErrorCode, 'SOURCE_RESPONSE_INVALID');
-  assert.equal(exchange.markets[0].coverageEndedAt, new Date(STATUS_TIME + 2).toISOString());
-  assert.equal(Object.hasOwn(exchange.markets[0], 'lastExhaustionEvidenceJson'), false);
 });
 
 test('discovery retains last success across failures, and its error is redacted without losing evidence', async (t) => {
@@ -143,13 +147,12 @@ test('new status and health routes retain the local Host boundary and no-store h
   }
 });
 
-test('short database filenames cannot redact market identities or diagnostic words', async (t) => {
+test('short database filenames cannot redact diagnostic words', async (t) => {
   const fixture = runtimeStatusFixture({ databasePath: 'a' });
   t.after(fixture.close);
   fixture.repository.applyCompleteDiscovery('okx', [{ ...market, exchangeMarketId: 'a-USDT-SWAP', symbol: 'a/USDT:USDT', active: true }], new Date(STATUS_TIME));
   const response = await fixture.composition.server.inject({ url: '/api/status', headers: STATUS_HEADERS });
   assert.equal(response.statusCode, 200);
-  assert.equal(response.json().funding.exchanges[1].markets[0].symbol, 'a/USDT:USDT');
   assert.equal(Object.hasOwn(response.json().service, 'databasePath'), false);
   fixture.database.prepare = () => { throw new Error('database access failed at a'); };
   const ready = await fixture.composition.server.inject({ url: '/health/ready', headers: STATUS_HEADERS });
@@ -193,7 +196,7 @@ test('service uptime starts only after listening completes', async (t) => {
   await started.shutdown();
 });
 
-test('incremental running and failure stay independent of successful coverage and its cutoff', async (t) => {
+test('incremental running and failure counts stay independent of successful coverage', async (t) => {
   const fixture = runtimeStatusFixture();
   t.after(fixture.close);
   fixture.repository.applyCompleteDiscovery('okx', [{ ...market, active: true }], new Date(STATUS_TIME));
@@ -204,15 +207,48 @@ test('incremental running and failure stay independent of successful coverage an
   const running = await read();
   assert.equal(running.counts.coverage.CAUGHT_UP, 1);
   assert.equal(running.counts.incremental.RUNNING, 1);
-  assert.equal(running.markets[0].incrementalStatus, 'RUNNING');
   fixture.repository.failIncremental(incremental, fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'), new Date(STATUS_TIME + 2));
   const failed = await read();
   assert.equal(failed.counts.coverage.CAUGHT_UP, 1);
   assert.equal(failed.counts.incremental.INCOMPLETE, 1);
-  assert.equal(failed.markets[0].incrementalStatus, 'INCOMPLETE');
-  assert.equal(failed.markets[0].incrementalErrorCode, 'REQUEST_RETRY_EXHAUSTED');
-  assert.equal(failed.markets[0].incrementalEndedAt, new Date(STATUS_TIME + 2).toISOString());
-  assert.equal(failed.markets[0].coverageErrorCode, null);
-  assert.equal(failed.markets[0].coverageLastSuccessAt, new Date(STATUS_TIME).toISOString());
-  assert.equal(failed.markets[0].lastCaughtUpCutoffMs, STATUS_TIME);
+});
+
+
+test('summary counts include inactive markets and every independent task status per exchange', async (t) => {
+  const fixture = runtimeStatusFixture();
+  t.after(fixture.close);
+  const at = new Date(STATUS_TIME);
+  const markets = Array.from({ length: 4 }, (_, index) => ({
+    ...market, exchangeMarketId: `M${index}-USDT-SWAP`, symbol: `M${index}/USDT:USDT`, active: true
+  }));
+  fixture.repository.applyCompleteDiscovery('okx', markets, at);
+  fixture.repository.startCoverage(markets[1]!, 'INITIAL', STATUS_TIME, at);
+  const priorCoverage = fixture.repository.startCoverage(markets[2]!, 'INITIAL', STATUS_TIME, at);
+  fixture.repository.completeCoverage(priorCoverage, { exchangeId: 'okx', generation: priorCoverage.generation, cutoffMs: STATUS_TIME, explicitEmpty: true, finalRequestAfterMs: null }, at);
+  const failedCoverage = fixture.repository.startCoverage(markets[2]!, 'PERIODIC', STATUS_TIME, at);
+  fixture.repository.failCoverage(failedCoverage, fundingTaskFailure('SOURCE_RESPONSE_INVALID'), at);
+  const completed = fixture.repository.startCoverage(markets[3]!, 'INITIAL', STATUS_TIME, at);
+  fixture.repository.completeCoverage(completed, { exchangeId: 'okx', generation: completed.generation, cutoffMs: STATUS_TIME, explicitEmpty: true, finalRequestAfterMs: null }, at);
+  const failedIncremental = fixture.repository.startIncremental(markets[3]!, at);
+  fixture.repository.failIncremental(failedIncremental, fundingTaskFailure('REQUEST_RETRY_EXHAUSTED'), at);
+  fixture.repository.startIncremental(markets[2]!, at);
+  fixture.repository.applyCompleteDiscovery('okx', markets.map((item, index) => ({ ...item, active: index !== 0 })), at);
+  fixture.repository.applyCompleteDiscovery('bitget', [{ exchangeId: 'bitget', exchangeMarketId: 'BTCUSDT', symbol: 'BTC/USDT:USDT', active: true }], at);
+  const response = await fixture.composition.server.inject({ url: '/api/status', headers: STATUS_HEADERS });
+  assert.equal(response.statusCode, 200);
+  const exchanges = response.json().funding.exchanges;
+  assert.deepEqual(exchanges.map((item: { exchangeId: string }) => item.exchangeId), ['bitget', 'okx']);
+  assert.deepEqual(exchanges[0].counts, {
+    total: 1, active: 1, inactive: 0,
+    coverage: { PENDING: 1, BACKFILLING: 0, CAUGHT_UP: 0, INCOMPLETE: 0 },
+    incremental: { IDLE: 1, RUNNING: 0, INCOMPLETE: 0 }
+  });
+  assert.deepEqual(exchanges[1].counts, {
+    total: 4, active: 3, inactive: 1,
+    coverage: { PENDING: 1, BACKFILLING: 1, CAUGHT_UP: 1, INCOMPLETE: 1 },
+    incremental: { IDLE: 2, RUNNING: 1, INCOMPLETE: 1 }
+  });
+  for (const exchange of exchanges) {
+    assert.deepEqual(Object.keys(exchange).sort(), ['counts', 'discovery', 'exchangeId']);
+  }
 });

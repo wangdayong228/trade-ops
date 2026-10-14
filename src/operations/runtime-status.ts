@@ -2,8 +2,7 @@ import type { ErrorEvidence } from '../errors/error-evidence.js';
 import { projectErrorEvidence } from '../errors/trade-ops-error.js';
 import type { FundingRateEvent, FundingRateEventSink } from '../funding-rates/funding-rate-events.js';
 import type { FundingExchangeId } from '../funding-rates/funding-rate-record.js';
-import { redactText } from '../logging/logger.js';
-import type { FundingMarketState, FundingRateRepository } from '../storage/funding-rate-repository.js';
+import type { FundingRateRepository } from '../storage/funding-rate-repository.js';
 
 type ServicePhase = 'STARTING' | 'RUNNING' | 'STOPPING' | 'STOPPED';
 type FundingStatus = 'NOT_STARTED' | 'RUNNING' | 'STOPPED' | 'FAILED';
@@ -29,37 +28,6 @@ function emptyDiscovery(): DiscoveryStatus {
   return {
     status: 'NEVER', lastAttemptAt: null, lastSuccessAt: null,
     observedActiveCount: null, observedInactiveCount: null, error: null
-  };
-}
-
-function marketStatus(state: FundingMarketState, secrets: readonly string[]) {
-  const text = (value: string | null) => value === null ? null : redactText(value, secrets);
-  return {
-    exchangeId: state.exchangeId,
-    exchangeMarketId: redactText(state.exchangeMarketId, secrets),
-    symbol: redactText(state.symbol, secrets),
-    active: state.active,
-    activeObservedAt: state.activeObservedAt,
-    reactivationRequired: state.reactivationRequired,
-    coverageStatus: state.coverageStatus,
-    coverageTaskKind: state.coverageTaskKind,
-    coverageGeneration: state.coverageGeneration,
-    coverageCutoffMs: state.coverageCutoffMs,
-    lastCaughtUpCutoffMs: state.lastCaughtUpCutoffMs,
-    oldestFundingTimestampMs: state.oldestFundingTimestampMs,
-    latestFundingTimestampMs: state.latestFundingTimestampMs,
-    coverageStartedAt: state.coverageStartedAt,
-    coverageEndedAt: state.coverageEndedAt,
-    coverageLastSuccessAt: state.coverageLastSuccessAt,
-    coverageErrorCode: state.coverageErrorCode,
-    coverageErrorSummary: text(state.coverageErrorSummary),
-    incrementalStatus: state.incrementalStatus,
-    incrementalGeneration: state.incrementalGeneration,
-    incrementalStartedAt: state.incrementalStartedAt,
-    incrementalEndedAt: state.incrementalEndedAt,
-    incrementalLastSuccessAt: state.incrementalLastSuccessAt,
-    incrementalErrorCode: state.incrementalErrorCode,
-    incrementalErrorSummary: text(state.incrementalErrorSummary)
   };
 }
 
@@ -153,8 +121,7 @@ export class RuntimeStatus implements FundingRateEventSink {
         discovery: {
           ...discovery,
           error: discovery.error === null ? null : this.publicError(discovery.error)
-        },
-        markets: states.map((state) => marketStatus(state, this.options.secretProvider()))
+        }
       };
     });
     return {
