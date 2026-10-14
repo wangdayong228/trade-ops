@@ -14,6 +14,7 @@ import {
 } from '../../src/config/exchange-credentials.js';
 import { makeClientOrderId } from '../../src/domain/client-order-id.js';
 import type {
+  AccountSettings,
   MarketKind,
   OrderRequest,
   OrderSnapshot
@@ -39,6 +40,7 @@ import {
 } from '../../src/exchanges/exchange-profile.js';
 import { ExchangeRegistry } from '../../src/exchanges/exchange-registry.js';
 import { PreflightService } from '../../src/strategy/preflight-service.js';
+import { publicErrorDetail } from '../../src/http/public-error.js';
 
 function market(overrides: Partial<CcxtMarket> = {}): CcxtMarket {
   return {
@@ -429,11 +431,7 @@ interface SnapshotLike {
     minQuoteNotional?: string;
     maxQuoteNotional?: string;
   }>;
-  fetchAccountSettings(): Promise<{
-    marginMode: 'isolated' | 'cross' | 'unknown';
-    positionMode: 'one-way' | 'hedged' | 'unknown';
-    leverage: string | null;
-  }>;
+  fetchAccountSettings(): Promise<AccountSettings>;
   fetchLastPrice(): Promise<string>;
 }
 
@@ -545,7 +543,7 @@ function isRedactedLeverageFailure(
     );
     assert.equal(typeof error.detail.actual, 'string');
     assert.notEqual(error.detail.actual, '');
-    const rendered = JSON.stringify(error);
+    const rendered = JSON.stringify(publicErrorDetail(error, forbidden));
     for (const value of forbidden) {
       assert.equal(rendered.includes(value), false);
     }
@@ -1359,11 +1357,13 @@ test('bound snapshot readers do not parse malformed later-stage rules', async ()
     { reload: true }
   );
 
-  assert.deepEqual(await snapshot.fetchAccountSettings(), {
+  const { evidence, ...settings } = await snapshot.fetchAccountSettings();
+  assert.deepEqual(settings, {
     marginMode: 'unknown',
     positionMode: 'one-way',
     leverage: null
   });
+  assert.match(evidence?.message ?? '', /hedged=boolean false/);
   assert.equal(await snapshot.fetchLastPrice(), '60000');
   assert.throws(() => snapshot.quantityRules());
   assert.throws(() => snapshot.notionalRules());
@@ -3285,11 +3285,13 @@ for (const { name, positionMode, expectedMode } of [
       info: {}
     }];
 
-    assert.deepEqual(await gateway.fetchAccountSettings('BTC/USDT'), {
+    const { evidence, ...settings } = await gateway.fetchAccountSettings('BTC/USDT');
+    assert.deepEqual(settings, {
       marginMode: 'unknown',
       positionMode: expectedMode,
       leverage: null
     });
+    assert.match(evidence?.message ?? '', /hedged=/);
     assert.equal(
       ccxt.events.some((event) => event.startsWith('fetchPositions:')),
       false
@@ -3305,11 +3307,13 @@ test('keeps a flat OKX hedged account fail-closed without inventing margin mode 
   };
   ccxt.positions = [];
 
-  assert.deepEqual(await gateway.fetchAccountSettings('BTC/USDT'), {
+  const { evidence, ...settings } = await gateway.fetchAccountSettings('BTC/USDT');
+  assert.deepEqual(settings, {
     marginMode: 'unknown',
     positionMode: 'hedged',
     leverage: null
   });
+  assert.match(evidence?.message ?? '', /返回持仓数=0/);
   assert.equal(
     ccxt.events.some((event) => event.startsWith('fetchLeverage:')),
     false
@@ -3334,11 +3338,13 @@ test('keeps a flat OKX zero-contract short row fail-closed', async () => {
     info: {}
   }];
 
-  assert.deepEqual(await gateway.fetchAccountSettings('BTC/USDT'), {
+  const { evidence, ...settings } = await gateway.fetchAccountSettings('BTC/USDT');
+  assert.deepEqual(settings, {
     marginMode: 'unknown',
     positionMode: 'hedged',
     leverage: null
   });
+  assert.match(evidence?.message ?? '', /contracts=number 0/);
 });
 
 test('uses the OKX short-side settings when hedged sides differ', async () => {
@@ -3369,6 +3375,262 @@ test('uses the OKX short-side settings when hedged sides differ', async () => {
     leverage: '5'
   });
 });
+
+const evidenceShortPosition = {
+  symbol: 'BTC/USDT:USDT', side: 'short', contracts: 1,
+  marginMode: 'cross', leverage: 3, info: { password: 'ignored-raw-info' }
+};
+
+for (const scenario of [
+  { name: 'empty positions', positions: [], fragments: ['有效空头持仓', '返回持仓数=0'] },
+  { name: 'only long', positions: [{ ...evidenceShortPosition, side: 'long' }], fragments: ['有效空头持仓数=0', 'side=string "long"'] },
+  { name: 'zero contracts', positions: [{ ...evidenceShortPosition, contracts: 0 }], fragments: ['有效空头持仓数=0', 'contracts=number 0'] },
+  { name: 'other symbol', positions: [{ ...evidenceShortPosition, symbol: 'ETH/USDT:USDT' }], fragments: ['匹配市场持仓数=0', 'ETH/USDT:USDT'] },
+  ...[
+    { value: undefined, text: 'undefined' },
+    { value: null, text: 'null' },
+    { value: Number.NaN, text: 'number NaN' },
+    { value: -1, text: 'number -1' },
+    { value: 'bad-quantity', text: 'string "bad-quantity"' }
+  ].map(({ value, text }) => ({
+    name: `invalid contracts ${text}`,
+    positions: [{ ...evidenceShortPosition, contracts: value }],
+    fragments: ['有效空头持仓数=0', `contracts=${text}`]
+  })),
+  ...[
+    { value: undefined, text: 'undefined' },
+    { value: null, text: 'null' },
+    { value: '', text: 'string ""' },
+    { value: 'portfolio', text: 'string "portfolio"' },
+    { value: 'x'.repeat(3_000) + 'MARGIN-TAIL', text: 'MARGIN-TAIL' }
+  ].map(({ value, text }) => ({
+    name: `invalid margin ${text}`,
+    positions: [{ ...evidenceShortPosition, marginMode: value }],
+    fragments: ['marginMode', text]
+  }))
+]) {
+  test(`account evidence: OKX identifies ${scenario.name}`, async () => {
+    const context = makeCcxtPreflight({ positions: scenario.positions });
+    await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+      assert(error instanceof TradeOpsError);
+      assert.equal(error.detail.code, 'ACCOUNT_MARGIN_MODE_MISMATCH');
+      const detail = publicErrorDetail(error, []);
+      assert.ok(detail?.evidence, 'the caller must receive the normalization evidence');
+      for (const fragment of scenario.fragments) {
+        assert.ok(detail.message.includes(fragment), `missing ${fragment}: ${detail.message}`);
+      }
+      assert.doesNotMatch(JSON.stringify(detail), /ignored-raw-info/);
+      return true;
+    });
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchTicker:', 'fetchBalance', 'createOrder:']);
+  });
+}
+
+for (const value of [undefined, null, '', 'not-a-number', 0, -1, Number.NaN, Infinity]) {
+  test(`account evidence: OKX preserves leverage ${String(value)}`, async () => {
+    const context = makeCcxtPreflight({
+      positions: [{ ...evidenceShortPosition, leverage: value }]
+    });
+    await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+      assert(error instanceof TradeOpsError);
+      assert.equal(error.detail.code, 'ACCOUNT_LEVERAGE_MISMATCH');
+      const detail = publicErrorDetail(error, []);
+      assert.ok(detail?.evidence);
+      assert.match(detail.message, /leverage/);
+      assert.ok(detail.message.includes(value === '' ? 'string ""' : String(value)));
+      return true;
+    });
+    assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchTicker:', 'fetchBalance', 'createOrder:']);
+  });
+}
+
+test('account evidence: OKX unknown position mode retains both source fields and stops', async () => {
+  const context = makeCcxtPreflight({ positionMode: { hedged: 'unexpected', info: { posMode: 'raw-unrecognized-mode', password: 'ignored-mode-secret' } } });
+  await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+    assert(error instanceof TradeOpsError);
+    assert.equal(error.detail.code, 'ACCOUNT_POSITION_MODE_MISMATCH');
+    const detail = publicErrorDetail(error, []);
+    assert.ok(detail?.evidence);
+    assert.match(detail.message, /hedged.*unexpected/);
+    assert.match(detail.message, /posMode.*raw-unrecognized-mode/);
+    assert.doesNotMatch(JSON.stringify(detail), /ignored-mode-secret/);
+    return true;
+  });
+  assertNoCcxtCalls([context.spotCcxt, context.contractCcxt], ['fetchPositions:', 'fetchTicker:', 'fetchBalance']);
+});
+
+for (const scenario of [
+  { name: 'position mode', leverage: { info: { posMode: 'unrecognized-position' }, marginMode: 'cross', shortLeverage: 3 }, code: 'ACCOUNT_POSITION_MODE_MISMATCH', fragment: 'unrecognized-position' },
+  { name: 'margin mode', leverage: { info: { posMode: 'hedge_mode', marginMode: 'raw-unrecognized-margin' }, shortLeverage: 3 }, code: 'ACCOUNT_MARGIN_MODE_MISMATCH', fragment: 'raw-unrecognized-margin' },
+  { name: 'missing margin', leverage: { info: { posMode: 'hedge_mode' }, shortLeverage: 3 }, code: 'ACCOUNT_MARGIN_MODE_MISMATCH', fragment: 'undefined' },
+  ...[undefined, null, '', 'bad-leverage', 0, -1, Number.NaN, Infinity].map((value) => ({
+    name: `leverage ${String(value)}`,
+    leverage: { info: { posMode: 'hedge_mode' }, marginMode: 'cross', shortLeverage: value },
+    code: 'ACCOUNT_LEVERAGE_MISMATCH', fragment: value === '' ? 'string ""' : String(value)
+  }))
+]) {
+  test(`account evidence: Bitget identifies ${scenario.name}`, async () => {
+    const contract = makeGateway('bitget');
+    const spot = makeGateway('okx');
+    contract.ccxt.leverage = scenario.leverage;
+    const service = new PreflightService(new ExchangeRegistry(new Map([
+      ['bitget', contract.gateway], ['okx', spot.gateway]
+    ])));
+    await assert.rejects(service.run({ ...preflightInput, spotExchangeId: 'okx', contractExchangeId: 'bitget' }), (error: unknown) => {
+      assert(error instanceof TradeOpsError);
+      assert.equal(error.detail.code, scenario.code);
+      const detail = publicErrorDetail(error, []);
+      assert.ok(detail?.evidence);
+      assert.ok(detail.message.includes(scenario.fragment), detail.message);
+      return true;
+    });
+    assertNoCcxtCalls([spot.ccxt, contract.ccxt], ['fetchTicker:', 'fetchBalance']);
+  });
+}
+
+test('account evidence: Bitget stops inspecting fields after the first invalid setting', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  let laterReads = 0;
+  ccxt.fetchLeverage = async () => ({
+    info: { posMode: 'not-hedged' },
+    get marginMode() { laterReads += 1; return 'cross'; },
+    get shortLeverage() { laterReads += 1; return 3; }
+  });
+  const settings = await gateway.fetchAccountSettings('BTC/USDT');
+  assert.equal(settings.positionMode, 'unknown');
+  assert.equal(laterReads, 0);
+});
+
+test('account evidence: Bitget margin failure stops before leverage access', async () => {
+  const { gateway, ccxt } = makeGateway('bitget');
+  let laterReads = 0;
+  ccxt.fetchLeverage = async () => ({
+    info: { posMode: 'hedge_mode' }, marginMode: 'portfolio',
+    get shortLeverage() { laterReads += 1; throw new Error('later leverage read'); }
+  });
+  const settings = await gateway.fetchAccountSettings('BTC/USDT');
+  assert.equal(settings.marginMode, 'unknown');
+  assert.match(settings.evidence?.message ?? '', /portfolio/);
+  assert.equal(laterReads, 0);
+});
+
+test('account evidence: margin rejection keeps configured secrets redacted through confirmation', async () => {
+  const secret = 'SYNTHETIC-ACCOUNT-SECRET';
+  const context = makeCcxtPreflight({ positions: [{
+    ...evidenceShortPosition, marginMode: `portfolio ${secret} apiKey=KEY-SENTINEL`
+  }] });
+  await assert.rejects(context.service.run(preflightInput, 'confirmation'), (error: unknown) => {
+    assert(error instanceof TradeOpsError);
+    const detail = publicErrorDetail(error, [secret]);
+    assert.equal(detail?.phase, 'confirmation');
+    assert.match(detail?.message ?? '', /portfolio/);
+    assert.doesNotMatch(JSON.stringify(detail), /SYNTHETIC-ACCOUNT-SECRET|KEY-SENTINEL|ignored-raw-info/);
+    return true;
+  });
+});
+
+test('account evidence: pinned Bitget normalization retains the failing raw leverage', async () => {
+  const adapter = new BitgetCcxtAdapter();
+  const contract = makeGateway('bitget');
+  const spot = makeGateway('okx');
+  contract.ccxt.leverage = { ...adapter.parseLeverage({
+    posMode: 'hedge_mode', marginMode: 'crossed',
+    crossedMarginLeverage: 'RAW-BITGET-BAD-LEVERAGE', password: 'RAW-SECRET-EXCLUDED'
+  }) };
+  const service = new PreflightService(new ExchangeRegistry(new Map([
+    ['bitget', contract.gateway], ['okx', spot.gateway]
+  ])));
+  await assert.rejects(service.run({ ...preflightInput, spotExchangeId: 'okx', contractExchangeId: 'bitget' }), (error: unknown) => {
+    const detail = publicErrorDetail(error, []);
+    assert.equal(detail?.code, 'ACCOUNT_LEVERAGE_MISMATCH');
+    assert.match(detail?.message ?? '', /info\.crossedMarginLeverage.*RAW-BITGET-BAD-LEVERAGE/);
+    assert.doesNotMatch(JSON.stringify(detail), /RAW-SECRET-EXCLUDED/);
+    return true;
+  });
+});
+
+for (const scenario of [
+  { field: 'marginMode', position: { ...evidenceShortPosition, marginMode: undefined, info: { mgnMode: 'RAW-MARGIN-MODE' } }, fragment: 'info.mgnMode=string "RAW-MARGIN-MODE"' },
+  { field: 'missing leverage', position: { ...evidenceShortPosition, leverage: undefined, info: { lever: 'RAW-MISSING-LEVERAGE' } }, fragment: 'info.lever=string "RAW-MISSING-LEVERAGE"' },
+  { field: 'invalid leverage', position: { ...evidenceShortPosition, leverage: Number.NaN, info: { lever: 'RAW-INVALID-LEVERAGE' } }, fragment: 'info.lever=string "RAW-INVALID-LEVERAGE"' },
+  { field: 'contracts', position: { ...evidenceShortPosition, contracts: undefined, info: { pos: 'RAW-CONTRACTS' } }, fragment: 'info.pos=string "RAW-CONTRACTS"' }
+]) {
+  test(`account evidence: OKX retains raw ${scenario.field} after CCXT normalization`, async () => {
+    const context = makeCcxtPreflight({ positions: [scenario.position] });
+    await assert.rejects(context.service.run(preflightInput), (error: unknown) => {
+      const detail = publicErrorDetail(error, []);
+      assert.ok(detail?.message.includes(scenario.fragment), detail?.message ?? 'missing error detail');
+      return true;
+    });
+  });
+}
+
+test('account evidence: OKX mode diagnostics never execute an info accessor', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  let reads = 0;
+  ccxt.fetchPositionMode = async () => ({
+    hedged: false,
+    get info() { reads += 1; throw new Error('evidence accessor must not execute'); }
+  });
+  const settings = await gateway.fetchAccountSettings('BTC/USDT');
+  assert.equal(settings.positionMode, 'one-way');
+  assert.equal(reads, 0);
+  assert.match(settings.evidence?.message ?? '', /info.*accessor/);
+  assertNoCcxtCalls([ccxt], ['fetchPositions:']);
+});
+
+test('account evidence: discarded OKX rows cannot change the failure through diagnostic getters', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  ccxt.positionMode = { hedged: true };
+  let reads = 0;
+  ccxt.fetchPositions = async () => [{
+    symbol: 'ETH/USDT:USDT',
+    get side() { reads += 1; throw new Error('side diagnostic must not execute'); },
+    get contracts() { reads += 1; throw new Error('contracts diagnostic must not execute'); }
+  }];
+  const settings = await gateway.fetchAccountSettings('BTC/USDT');
+  assert.equal(settings.marginMode, 'unknown');
+  assert.equal(reads, 0);
+  assert.match(settings.evidence?.message ?? '', /side.*accessor/);
+  assert.match(settings.evidence?.message ?? '', /contracts.*accessor/);
+});
+
+test('account evidence: raw diagnostic fields do not execute proxy traps or getters', async () => {
+  const { gateway, ccxt } = makeGateway('okx');
+  let reads = 0;
+  for (const info of [
+    { get posMode() { reads += 1; throw new Error('raw getter'); } },
+    new Proxy({}, {
+      get() { reads += 1; throw new Error('raw get trap'); },
+      getOwnPropertyDescriptor() { reads += 1; throw new Error('raw descriptor trap'); }
+    })
+  ]) {
+    ccxt.fetchPositionMode = async () => ({ hedged: false, info });
+    const settings = await gateway.fetchAccountSettings('BTC/USDT');
+    assert.equal(settings.positionMode, 'one-way');
+    assert.match(settings.evidence?.message ?? '', /accessor|Proxy/);
+  }
+  assert.equal(reads, 0);
+});
+
+for (const method of ['map', 'indexOf'] as const) {
+  test(`account evidence: OKX diagnostics do not call an external array ${method} getter`, async () => {
+    const { gateway, ccxt } = makeGateway('okx');
+    ccxt.positionMode = { hedged: true };
+    const positions = method === 'map'
+      ? []
+      : [{ ...evidenceShortPosition, marginMode: 'portfolio' }];
+    let reads = 0;
+    Object.defineProperty(positions, method, {
+      get() { reads += 1; throw new Error(`external array ${method} getter`); }
+    });
+    ccxt.fetchPositions = async () => positions;
+    const settings = await gateway.fetchAccountSettings('BTC/USDT');
+    assert.equal(settings.marginMode, 'unknown');
+    assert.ok(settings.evidence);
+    assert.equal(reads, 0);
+  });
+}
 
 test('registry exposes only configured Bitget and OKX gateways', () => {
   const bitget = makeGateway('bitget').gateway;

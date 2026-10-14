@@ -1530,6 +1530,26 @@ test('fresh contract settings reject one-way, unknown, margin drift, and leverag
   }
 });
 
+test('account evidence: execution guard retains normalization evidence without reclassifying settings', async (t) => {
+  const operations = new CapturingOperationalLog();
+  const context = setup(t, 'CONTRACT_FIRST', { operationalLog: operations });
+  const evidence = { type: 'AccountSettingsEvidence', message: 'OKX 有效空头持仓检查失败：实际返回持仓数=0' };
+  context.contract.accountSettingsResults.push(Object.assign({
+    marginMode: 'unknown' as const, positionMode: 'hedged' as const, leverage: null
+  }, { evidence }));
+
+  await context.coordinator.confirmAndExecute(context.strategyId);
+
+  const warning = operations.warnings.find(({ event }) => event === 'hedge_submission_guard_changed');
+  assert.ok(warning);
+  assert.match(JSON.stringify(warning), /实际返回持仓数=0/);
+  assert.equal(operations.warnings.some(({ event }) => event === 'hedge_submission_guard_pending'), false);
+  assert.equal(context.repository.getStrategy(context.strategyId).state, 'EXECUTING');
+  assert.equal(context.repository.listOrders(context.strategyId).length, 0);
+  assert.equal(context.contract.createdRequests.length, 0);
+  assert.equal(context.spot.createdRequests.length, 0);
+});
+
 test('fresh settings fetch uncertainty stays executing and submits only after a later valid check', async (t) => {
   const operations = new CapturingOperationalLog();
   const context = setup(t, 'CONTRACT_FIRST', {

@@ -8,6 +8,8 @@ import type {
   CcxtExchangeLike
 } from '../ccxt-exchange-gateway.js';
 import {
+  accountFieldEvidence,
+  accountSettingsEvidence,
   buildCreateOrderParams,
   type ExchangeProfile
 } from '../exchange-profile.js';
@@ -117,15 +119,44 @@ export class BitgetProfile implements ExchangeProfile {
     const rawInfo = typeof info === 'object' && info !== null
       ? info as Record<string, unknown>
       : {};
+    const rawPositionMode = rawInfo.posMode;
+    const positionMode = normalizedPositionMode(rawPositionMode);
+    if (positionMode !== 'hedged') {
+      return {
+        marginMode: 'unknown', positionMode, leverage: null,
+        evidence: accountSettingsEvidence(
+          'bitget', exchangeSymbol, 'info.posMode',
+          '"hedge_mode"', diagnosticValue(rawPositionMode)
+        )
+      };
+    }
+    const unifiedMarginMode = leverage.marginMode;
+    const rawMarginMode = unifiedMarginMode ?? rawInfo.marginMode;
+    const marginMode = normalizedMarginMode(rawMarginMode);
+    if (marginMode === 'unknown') {
+      return {
+        marginMode, positionMode, leverage: null,
+        evidence: accountSettingsEvidence(
+          'bitget', exchangeSymbol,
+          unifiedMarginMode === undefined || unifiedMarginMode === null
+            ? 'info.marginMode' : 'marginMode',
+          '"isolated"、"cross" 或 "crossed"',
+          `${accountFieldEvidence(leverage, 'marginMode')}; ${accountFieldEvidence(leverage, 'info.marginMode')}`
+        )
+      };
+    }
     const rawLeverage = leverage.shortLeverage;
     const parsedLeverage = finitePositive(rawLeverage);
-
     return {
-      marginMode: normalizedMarginMode(
-        leverage.marginMode ?? rawInfo.marginMode
-      ),
-      positionMode: normalizedPositionMode(rawInfo.posMode),
-      leverage: parsedLeverage
+      marginMode, positionMode, leverage: parsedLeverage,
+      ...(parsedLeverage === null ? {
+        evidence: accountSettingsEvidence(
+          'bitget', exchangeSymbol, 'shortLeverage',
+          '有限正数',
+          ['shortLeverage', 'info.marginMode', 'info.crossedMarginLeverage', 'info.isolatedShortLever']
+            .map((field) => accountFieldEvidence(leverage, field)).join('; ')
+        )
+      } : {})
     };
   }
 }

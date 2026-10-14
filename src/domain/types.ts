@@ -1,3 +1,5 @@
+import type { ErrorEvidence } from '../errors/error-evidence.js';
+
 export type MarketKind = 'spot' | 'swap';
 export type OrderSide = 'buy' | 'sell';
 export type OrderType = 'market' | 'limit';
@@ -37,6 +39,7 @@ export interface AccountSettings {
   marginMode: 'isolated' | 'cross' | 'unknown';
   positionMode: 'one-way' | 'hedged' | 'unknown';
   leverage: string | null;
+  readonly evidence?: ErrorEvidence;
 }
 
 export interface OrderRequest {

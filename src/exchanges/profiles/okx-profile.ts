@@ -1,4 +1,5 @@
 import { decimal } from '../../domain/decimal.js';
+import { diagnosticValue } from '../../errors/error-evidence.js';
 import type {
   AccountSettings,
   OrderRequest
@@ -11,6 +12,8 @@ import type {
   CcxtExchangeLike
 } from '../ccxt-exchange-gateway.js';
 import {
+  accountFieldEvidence,
+  accountSettingsEvidence,
   buildCreateOrderParams,
   type ExchangeProfile
 } from '../exchange-profile.js';
@@ -38,7 +41,9 @@ function safeLeverageActual(value: unknown): SafeDiagnosticValue {
 
 function invalidLeverage(
   exchangeSymbol: string,
-  value: unknown
+  value: unknown,
+  position: Record<string, unknown>,
+  options?: ErrorOptions
 ): never {
   throw createTradeOpsError({
     code: 'ACCOUNT_LEVERAGE_MISMATCH',
@@ -50,28 +55,33 @@ function invalidLeverage(
       field: 'leverage'
     },
     expected: 'finite decimal greater than zero',
-    actual: safeLeverageActual(value)
-  });
+    actual: safeLeverageActual(value),
+    evidence: accountSettingsEvidence(
+      'okx', exchangeSymbol, '持仓 leverage',
+      '有限正数', `${diagnosticValue(value)}; ${accountFieldEvidence(position, 'info.lever')}`
+    )
+  }, undefined, options);
 }
 
 function optionalPositive(
-  value: unknown,
+  position: Record<string, unknown>,
   exchangeSymbol: string
 ): string | null {
+  const value = position.leverage;
   if (value === undefined || value === null || value === '') {
     return null;
   }
   if (typeof value !== 'number' && typeof value !== 'string') {
-    return invalidLeverage(exchangeSymbol, value);
+    return invalidLeverage(exchangeSymbol, value, position);
   }
   let parsed: ReturnType<typeof decimal>;
   try {
     parsed = decimal(String(value));
-  } catch {
-    return invalidLeverage(exchangeSymbol, value);
+  } catch (error) {
+    return invalidLeverage(exchangeSymbol, value, position, { cause: error });
   }
   return !parsed.isFinite() || parsed.lte(0)
-    ? invalidLeverage(exchangeSymbol, value)
+    ? invalidLeverage(exchangeSymbol, value, position)
     : parsed.toFixed();
 }
 
@@ -87,13 +97,7 @@ function positionMarginMode(
   return 'unknown';
 }
 
-function isOpenPosition(
-  position: Record<string, unknown>,
-  exchangeSymbol: string
-): boolean {
-  if (position.symbol !== exchangeSymbol) {
-    return false;
-  }
+function isOpenPosition(position: Record<string, unknown>): boolean {
   const { contracts } = position;
   if (
     (typeof contracts !== 'number' && typeof contracts !== 'string')
@@ -183,25 +187,60 @@ export class OkxProfile implements ExchangeProfile {
       return {
         marginMode: 'unknown',
         positionMode,
-        leverage: null
+        leverage: null,
+        evidence: accountSettingsEvidence(
+          'okx', exchangeSymbol, '持仓模式', 'hedged=true',
+          `${accountFieldEvidence(mode, 'hedged')}, ${accountFieldEvidence(mode, 'info.posMode')}`
+        )
       };
     }
 
     const positions = await exchange.fetchPositions([exchangeSymbol]);
-    const openPositions = positions.filter((position) => (
-      isOpenPosition(position, exchangeSymbol)
-    ));
+    const observedPositions: Array<{
+      position: Record<string, unknown>;
+      index: number;
+    }> = [];
+    const matchingPositions = positions.filter((position, index) => {
+      observedPositions.push({ position, index });
+      return position.symbol === exchangeSymbol;
+    });
+    const openPositions = matchingPositions.filter(isOpenPosition);
     const shortPositions = openPositions.filter(
       (position) => position.side === 'short'
     );
-    const marginModes = shortPositions
-      .map(positionMarginMode);
-    if (marginModes.includes('unknown')) {
+    if (shortPositions.length === 0) {
+      const rows = observedPositions.map(({ position, index }) => {
+        const fields = [
+          'symbol', 'side', 'contracts', 'info.instId', 'info.posSide', 'info.pos'
+        ].map((field) => accountFieldEvidence(position, field));
+        return `positions[${index}]: ${fields.join(', ')}`;
+      });
       return {
         marginMode: 'unknown',
         positionMode,
-        leverage: null
+        leverage: null,
+        evidence: accountSettingsEvidence(
+          'okx', exchangeSymbol, '有效空头持仓',
+          '至少一条 symbol 匹配、contracts 为有限正数且 side="short" 的持仓',
+          `返回持仓数=${positions.length}，匹配市场持仓数=${matchingPositions.length}，有效持仓数=${openPositions.length}，有效空头持仓数=0；持仓证据=[${rows.join('; ')}]`
+        )
       };
+    }
+    const marginModes: AccountSettings['marginMode'][] = [];
+    for (const position of shortPositions) {
+      const mode = positionMarginMode(position);
+      if (mode === 'unknown') {
+        return {
+          marginMode: 'unknown', positionMode, leverage: null,
+          evidence: accountSettingsEvidence(
+            'okx', exchangeSymbol,
+            `positions[${observedPositions.find((row) => row.position === position)?.index}].marginMode`,
+            '"isolated" 或 "cross"',
+            `${accountFieldEvidence(position, 'marginMode')}; ${accountFieldEvidence(position, 'info.mgnMode')}`
+          )
+        };
+      }
+      marginModes.push(mode);
     }
     const marginMode = oneValue(
       marginModes,
@@ -210,7 +249,7 @@ export class OkxProfile implements ExchangeProfile {
       'one consistent margin mode'
     ) ?? 'unknown';
     const leverages = shortPositions
-      .map((position) => optionalPositive(position.leverage, exchangeSymbol))
+      .map((position) => optionalPositive(position, exchangeSymbol))
       .filter((value): value is string => value !== null);
     const leverage = oneValue(
       leverages,
@@ -219,6 +258,17 @@ export class OkxProfile implements ExchangeProfile {
       'one consistent positive leverage'
     ) ?? null;
 
+    if (leverage === null) {
+      return {
+        marginMode, positionMode, leverage,
+        evidence: accountSettingsEvidence(
+          'okx', exchangeSymbol, '空头杠杆 leverage', '至少一个有限正数',
+          shortPositions.map((position) => (
+            `positions[${observedPositions.find((row) => row.position === position)?.index}]: ${accountFieldEvidence(position, 'leverage')}; ${accountFieldEvidence(position, 'info.lever')}`
+          )).join('; ')
+        )
+      };
+    }
     return { marginMode, positionMode, leverage };
   }
 }

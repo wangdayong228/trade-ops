@@ -203,6 +203,8 @@ GTC 一旦计划或提交，系统只观察该确定性 client order ID，绝不
 
 错误体只有 `requestId` 与 `error` 两个顶层字段；`error.evidence` 是可选诊断数据，旧的无 evidence 错误仍有效。界面保留长消息末尾和具体网络、JSON 解析、字段校验原因，以纯文本显示。HTTP 不返回堆栈；同次失败日志保留完整安全堆栈。确认复检失效的证据先脱敏再持久化，加载任务仍可查看。
 
+`ACCOUNT_MARGIN_MODE_MISMATCH` 的 `actual: unknown` 表示服务未能确认保证金模式。查看同条错误的原因：例如 `返回持仓数=0` 表示本次没有返回持仓；`contracts=number 0` 表示返回了零仓位；`positions[0].marginMode` 后的原值说明该字段无法识别。错误同时保留相关原始字段（如 `info.mgnMode`、`info.lever`），以区分交易所字段缺失与 CCXT 归一化结果。只有多头或返回市场不匹配也会显示对应的方向、市场和计数；这些情况继续阻止新订单。
+
 `400` 表示请求格式错误，`403` 表示 Host/Origin 被拒绝，`404` 表示策略或路由不存在，`409` 表示确认锁忙、状态不允许或复检已失效，`422` 表示首次业务预检未通过，`500` 表示安全转换后的内部或存储失败。应结合具体错误码和详情判断，不能只凭状态码认为任务已失效。
 
 stdout 中，每个完成的 HTTP 请求只记录一条 `request completed`。状态码低于 `400` 时级别为 `info`，且不带失败请求快照；`4xx` 为 `warn`，`5xx` 为 `error`。失败日志包含 `httpError` 和 `httpRequest`；后者只包含 `method`、含 query 的 `url`、`body`、`truncated`、`originalByteLength`。Host/Origin 在任何 body 观察或 parser 之前检查；该边界早拒绝的 `403` 不读取或缓存攻击 payload，日志 body 为 `null`。路由解析前发现畸形 URL 时返回结构化 `400`，保留安全响应头与一条完成日志，不读取 body，日志 URL 使用 `[Unavailable]`。

@@ -416,7 +416,8 @@ export class HedgeCoordinator {
         'hedge_submission_guard_changed',
         'ACCOUNT_SETTINGS_CHANGED',
         exposureKnown,
-        current
+        current,
+        current.evidence
       );
       return false;
     }

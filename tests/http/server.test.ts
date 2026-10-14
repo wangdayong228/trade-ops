@@ -2259,6 +2259,58 @@ test('AJV field failures expose trusted schema evidence without echoing request 
   assert.equal(fixture.getExecutionCount(), 0);
 });
 
+test('account evidence: HTTP and operator UI expose the same redacted preflight cause', async (t) => {
+  const secret = 'SYNTHETIC-HTTP-ACCOUNT-SECRET';
+  const configured = configuredRealPreflightService();
+  configured.contract.accountSettings = Object.assign({
+    positionMode: 'hedged' as const, marginMode: 'unknown' as const, leverage: null
+  }, { evidence: { type: 'AccountSettingsEvidence', message: `OKX marginMode 检查失败：实际 portfolio ${secret}` } });
+  const fixture = setup(t, {
+    runPreflight: (input) => configured.service.run(input),
+    secretProvider: () => [secret]
+  });
+  const response = await fixture.server.inject({
+    method: 'POST', url: '/api/hedges/preflight', headers: LOCAL_HEADERS,
+    payload: { spotExchangeId: 'bitget', contractExchangeId: 'okx', symbol: SYMBOL, requestedBaseQuantity: '1', mode: 'CONTRACT_FIRST' }
+  });
+  assert.equal(response.statusCode, 422);
+  const detail = assertPublicHttpError(response, { code: 'ACCOUNT_MARGIN_MODE_MISMATCH', phase: 'preflight' });
+  assert.match(detail.message, /实际 portfolio/);
+  assert.doesNotMatch(response.body, new RegExp(secret));
+  const browser = await browserHarness();
+  browser.setFetch(async () => browserResponse(422, response.json()));
+  await browser.element('preflight-form').emit('submit');
+  assert.match(browser.element('operator-message').textContent, /实际 portfolio/);
+  assert.doesNotMatch(browser.element('operator-message').textContent, new RegExp(secret));
+  assert.equal(fixture.repository.listRecoverable().length, 0);
+  assert.equal(fixture.getExecutionCount(), 0);
+});
+
+test('account evidence: confirmation persists normalized account failure for the status response', async (t) => {
+  const secret = 'SYNTHETIC-PERSISTED-ACCOUNT-SECRET';
+  const configured = configuredRealPreflightService();
+  configured.contract.accountSettings = {
+    positionMode: 'hedged', marginMode: 'unknown', leverage: null,
+    evidence: { type: 'AccountSettingsEvidence', message: `OKX 有效空头持仓检查失败：实际返回持仓数=0 ${secret}` }
+  };
+  const fixture = setup(t, { secretProvider: () => [secret] });
+  const pending = fixture.repository.createPending(preflight());
+  const confirmation = new ConfirmationService(fixture.repository, configured.service, () => [secret]);
+  await assert.rejects(confirmation.confirm(pending.id));
+  const stored = fixture.repository.getStrategy(pending.id);
+  assert.equal(stored.state, 'PREFLIGHT_INVALIDATED');
+  assert.match(stored.preflightFailure?.message ?? '', /实际返回持仓数=0/);
+  assert.doesNotMatch(JSON.stringify(stored.preflightFailure), new RegExp(secret));
+  assert.equal(fixture.repository.listOrders(pending.id).length, 0);
+  const response = await fixture.server.inject({
+    method: 'GET', url: `/api/hedges/${pending.id}`, headers: LOCAL_HEADERS
+  });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /实际返回持仓数=0/);
+  assert.doesNotMatch(response.body, new RegExp(secret));
+  assert.equal(fixture.getExecutionCount(), 0);
+});
+
 test('preflight preserves heterogeneous trusted business errors as 422', async (t) => {
   const failures = [
     createTradeOpsError({

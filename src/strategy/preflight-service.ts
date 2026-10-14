@@ -1,5 +1,6 @@
 import { Decimal } from 'decimal.js';
 import { decimal } from '../domain/decimal.js';
+import type { ErrorEvidence } from '../errors/error-evidence.js';
 import {
   QuantityNormalizationError,
   baseStepFor,
@@ -67,14 +68,16 @@ function failure(
   subject: ErrorSubject,
   expected: SafeDiagnosticValue,
   actual: SafeDiagnosticValue,
-  options?: ErrorOptions
+  options?: ErrorOptions,
+  evidence?: ErrorEvidence
 ): TradeOpsError {
   return createTradeOpsError({
     code,
     phase: 'preflight',
     subject,
     expected,
-    actual
+    actual,
+    ...(evidence === undefined ? {} : { evidence })
   }, undefined, options);
 }
 
@@ -417,7 +420,9 @@ async function readAccountSettings(
       'ACCOUNT_POSITION_MODE_MISMATCH',
       accountSubject(exchangeId, symbol, 'positionMode'),
       'hedged',
-      observedText(settings.positionMode)
+      observedText(settings.positionMode),
+      undefined,
+      settings.evidence
     );
   }
   if (settings.marginMode !== 'isolated' && settings.marginMode !== 'cross') {
@@ -425,7 +430,9 @@ async function readAccountSettings(
       'ACCOUNT_MARGIN_MODE_MISMATCH',
       accountSubject(exchangeId, symbol, 'marginMode'),
       ['isolated', 'cross'],
-      observedText(settings.marginMode)
+      observedText(settings.marginMode),
+      undefined,
+      settings.evidence
     );
   }
   const leverage = parsedDecimal(settings.leverage);
@@ -434,7 +441,9 @@ async function readAccountSettings(
       'ACCOUNT_LEVERAGE_MISMATCH',
       accountSubject(exchangeId, symbol, 'leverage'),
       'finite decimal greater than zero',
-      decimalActual(settings.leverage)
+      decimalActual(settings.leverage),
+      undefined,
+      settings.evidence
     );
   }
   return {
